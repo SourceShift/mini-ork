@@ -477,6 +477,60 @@ for the relations (patch + base per relation) and `2N + 2p` for the differential
 pathological ceiling is 30 single-file runs (if every preserve input diverges)
 at ≤120 s each — the lane knobs bound the lane calls, not the probes.
 
+## ⑯ Suite strengthening (SWE-ABS, shadow)
+
+**What it checks.** When the ③ adequacy audit returns `INADEQUATE`, the suite
+cannot kill its own mutants. SWE-ABS (arXiv 2603.00520) strengthens a suite by
+synthesising plausible-but-incorrect patches and keeping the generated tests
+that pass gold and fail those patches. mini-ork has no gold patch, so the
+incorrect patches are the audit's own surviving AST mutants (deterministic:
+regenerated with `suite_adequacy.generate_mutants(..., seed=0)`), and the anchor
+is the base tree.
+
+**Trigger.** An `INADEQUATE` audit with survivors and a kickoff in
+`run_profile.json`. It runs inside the code-fix test verifier, not as a
+workflow node: a `strengthen` verifier node would become `contract` evidence in
+`levels`, would run after the verdict was already written, and a crash in an
+optional node would fail the run.
+
+**Admission rule.** A generated pytest module is admitted only when it passes on
+the candidate and kills at least one targeted surviving mutant, AND its base
+outcome is informative:
+- **`target`** — it fails on the base: new fail-to-pass evidence, the same bar
+  the replay uses.
+- **`preserve`** — it passes on the base: it pins behaviour the patch preserved.
+- **`candidate_red`** — the candidate fails the generated test. This is the
+  SWE-ABS rejection signal, but it is only *recorded*: without gold, such a test
+  cannot be told apart from a wrong test.
+- `no_kill`, `unanchored`, `abstained` and `inadmissible` are recorded and
+  never admitted.
+
+Everything is **shadow**: `pass`, the exit code and every existing payload key
+are unchanged. `gate` is reserved — `MO_SUITE_STRENGTHEN=gate` records the mode
+but behaves exactly like shadow in this version.
+
+**Knobs.**
+- `MO_SUITE_STRENGTHEN` (`shadow|0|gate`, default shadow). A typo never gates.
+- `MO_SUITE_STRENGTHEN_MAX_SURVIVORS` (5, range 1–20): survivors to target.
+- `MO_SUITE_STRENGTHEN_MAX_TESTS` (3, range 1–10): generated tests to keep.
+- `MO_SUITE_STRENGTHEN_TIMEOUT_S` (60, at least 1): per-run pytest timeout.
+- `MO_SUITE_STRENGTHEN_BUDGET_S` (240, at least 1): wall budget for the whole
+  pass. Past it the lane is not called and no pytest runs; those tests record
+  `abstained`, so the pass can never push the verifier past its own timeout.
+
+**Evidence.** `verifier_test.json` key `suite_strengthening` (directly after
+`suite_adequacy`) and `<run_dir>/strengthen/` (`t1.py`… plus
+`strengthen.json`). The record is twelve keys: `mode`, `status`, `reason`,
+`targeted`, `unmatched`, `tests`, `admitted`, `newly_killed`, `score_before`,
+`score_after`, `verdict_after`, `would_rescue`. A run without the trigger is
+byte-identical to today's payload.
+
+**Cost.** One lane call, plus at most `max_tests` × (2 + `max_survivors`)
+single-file pytest runs: 2 (candidate, base) per generated test and one mutant
+copy run per targeted survivor per candidate-passing test. With the defaults
+that is at most 21 probes; the mutant runs happen in one throwaway copy, and
+neither the candidate nor the base tree is ever written.
+
 ## Fixes the live runs found
 
 The real-run smokes caught defects that unit tests had hidden. All are fixed:

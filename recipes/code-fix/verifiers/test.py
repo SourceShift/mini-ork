@@ -55,6 +55,12 @@
 #   MO_CODEFIX_CERTIFY_BUDGET_S     total wall budget for the certify pass (default 300)
 #   MO_CODEFIX_CERTIFY_PYTHON       interpreter for the certify probe runs
 #                                   (default: the verifier's interpreter)
+#   MO_SUITE_STRENGTHEN             shadow|0|gate, default shadow — try to
+#                                   strengthen an INADEQUATE suite (SWE-ABS)
+#   MO_SUITE_STRENGTHEN_MAX_SURVIVORS  survivors to target (default 5, 1..20)
+#   MO_SUITE_STRENGTHEN_MAX_TESTS   generated tests to keep (default 3, 1..10)
+#   MO_SUITE_STRENGTHEN_TIMEOUT_S   per-run pytest timeout (default 60, >=1)
+#   MO_SUITE_STRENGTHEN_BUDGET_S    wall budget for the whole pass (default 240)
 
 from __future__ import annotations
 import json
@@ -90,6 +96,13 @@ try:
     from mini_ork.certify import codefix_terms as _codefix_terms
 except Exception:                       # pragma: no cover — defensive only
     _codefix_terms = None               # type: ignore[assignment]
+
+try:
+    # Late import — the shadow suite-strengthening pass (SWE-ABS). Same seam:
+    # a target repo without mini_ork keeps its verifier.
+    from mini_ork.gates import suite_strengthen as _suite_strengthen
+except Exception:                       # pragma: no cover — defensive only
+    _suite_strengthen = None            # type: ignore[assignment]
 
 try:
     # Late import — same seam as the two above. `scrubbed_test_env` lives
@@ -1254,6 +1267,11 @@ TARGET_WAIVER = ""
 # change that reads this block from the level vector.
 CERTIFY = None
 CERTIFY_REPORT = os.path.join(LOG_DIR, "certify_terms.json")
+# The shadow suite-strengthening record (SWE-ABS), or None. Set by
+# `_record_strengthen` when an INADEQUATE audit yields a non-skipped record;
+# emitted into the payload as `suite_strengthening`. It NEVER changes `pass` or
+# the exit code.
+STRENGTHEN = None
 
 
 def run_suite(log, env=None):  # returns the exit code, never raises
@@ -1285,6 +1303,8 @@ def emit(passed, reason, post_rc, replay=None, adequacy=None):
         payload["replay"] = replay
     if adequacy is not None:
         payload["suite_adequacy"] = adequacy
+    if STRENGTHEN is not None:
+        payload["suite_strengthening"] = STRENGTHEN
     if CERTIFY is not None:
         payload["certify"] = CERTIFY
     if TARGET_WAIVER:
@@ -1320,6 +1340,8 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
         payload["replay"] = replay
     if adequacy is not None:
         payload["suite_adequacy"] = adequacy
+    if STRENGTHEN is not None:
+        payload["suite_strengthening"] = STRENGTHEN
     if CERTIFY is not None:
         payload["certify"] = CERTIFY
     payload["status"] = "unverified"
@@ -1478,6 +1500,56 @@ def _record_certify(replay) -> None:
         return
 
 
+def _record_strengthen(a) -> None:
+    """Run the shadow suite-strengthening pass for an INADEQUATE audit.
+
+    Records the result in ``STRENGTHEN`` so `emit`/`emit_unverified` carry it,
+    and in ``<LOG_DIR>/strengthen/``. Only an INADEQUATE audit with survivors, a
+    non-``off`` mode, a kickoff and a base worktree reaches the lane. The record
+    NEVER changes `pass` or the exit code; this helper never raises.
+    """
+    global STRENGTHEN
+    try:
+        if _suite_strengthen is None or not isinstance(a, dict):
+            return
+        if a.get("verdict") != "INADEQUATE" or not a.get("survivors"):
+            return
+        md = _suite_strengthen.mode()
+        if md == "off":
+            return
+        issue = _kickoff_text(_git_toplevel(os.getcwd()))
+        if not issue:
+            sys.stderr.write("[test] strengthen: skipped (no kickoff text)\n")
+            return
+        base_ref = _run_dir_base_ref()
+        wt = _attach_git_worktree_base(base_ref)
+        if wt is None:
+            sys.stderr.write("[test] strengthen: skipped (no base worktree)\n")
+            return
+        try:
+            rec = _suite_strengthen.strengthen(
+                a, issue=issue, candidate_dir=os.getcwd(), base_dir=wt, mode=md,
+                python=os.environ.get("MO_CODEFIX_CERTIFY_PYTHON") or sys.executable,
+                out_dir=os.path.join(LOG_DIR, "strengthen"),
+            )
+        except Exception as exc:
+            rec = {
+                "mode": md, "status": "error",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "targeted": [], "unmatched": [], "tests": [], "admitted": [],
+                "newly_killed": [], "score_before": a.get("score"),
+                "score_after": None, "verdict_after": None, "would_rescue": False,
+            }
+        finally:
+            _detach_git_worktree(wt)
+        if rec.get("status") != "skipped":
+            STRENGTHEN = rec
+    except Exception:
+        # The strengthening pass is an instrument, not a gate: it must never
+        # break a verifier run.
+        return
+
+
 def _green_pass(reason, post_rc, replay=None, require_adequate=False):
     """Route a green post-patch suite through the adequacy audit (default ON).
 
@@ -1516,6 +1588,7 @@ def _green_pass(reason, post_rc, replay=None, require_adequate=False):
             os.getcwd(), CMD, _changed_source_files(os.getcwd()),
             report_path=os.path.join(LOG_DIR, "suite_adequacy.json"),
         )
+    _record_strengthen(a)
     if a["verdict"] == "ADEQUATE":
         return emit(True, f"{reason}; suite adequacy ADEQUATE (score {a['score']:.3f})",
                     post_rc, replay=replay, adequacy=a)
