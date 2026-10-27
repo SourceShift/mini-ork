@@ -33,6 +33,8 @@ or remove `MINI_ORK_ON_EVENT`.
 | B1 | Typed failure classes and one action table (retry the chain / next lane / stop the walk / wait hint), stored in `metadata_json` (the `error_category` CHECK is unchanged) | `bif-b1-failure-classes.md` (after B6, B3) |
 | B2 | A first-output deadline (default 300 s) on every streaming lane but the chain's last | `bif-b2-first-output-deadline.md` (after B1) |
 | B4 | Held lanes: per-class cooldowns from B1's classes and wait hints, plus a single probe on re-admission | written after B1 lands |
+| B1b | The pre-push review's findings on B1 and B3: stdout prose may only promote to provider-structured classes (never a fuse-terminal one), the model-access phrase stays on one line, affinity reorders the FINAL chain (it was a no-op for the planner), transient failures carry the wait hint | `bif-b1b-review-findings.md` |
+| R5c | Test gaming is HIGH on every review attempt; runtime and eval render the round block from one function, and the eval replays the block a case's run received; an errored eval case scores as an error | `bif-r5c-gaming-is-high.md` |
 
 Not adopted (from the study): a semantic response cache, virtual keys and
 multi-tenant governance, Starlark code mode. A per-lane `gateway:` setting to
@@ -51,3 +53,34 @@ use Bifrost itself as an optional secure-tier transport stays a later option.
 - Anomaly: run `rev6-r2d-gate-cache-degraded-20261026-192210` completed (14
   `llm_calls`, 10 `node_attempts`) but has no `task_runs` row. Nothing in
   `mini_ork/` deletes or replaces `task_runs` rows; cause not found.
+
+## Results
+
+| # | Landed | Notes |
+|---|---|---|
+| B6, B3, E1, R4b | on main | Operator review fixes before each merge (see each commit) |
+| B1 | 437b2fa3 | Operator fix-forward: the kickoff stopped the walk on every `environment` failure, but `[Errno 2]` reads the same for a missing cwd (run-wide) and a missing CLI binary (one lane), and `classify_error`'s `config` (missing key, `$X is empty`, no providers.yaml entry) maps there too. A laptop with one provider key would have stopped at the first keyless lane. Now `spawn_local` names a missing cwd and only run-wide faults stop the walk. Three blind spec tests pinned the kickoff's rule and fail by design |
+| R2e | awaiting the user's approval | High tier (`scripts/mini_ork_worktree.py`); approval binds to patch-id 2e5bb817 |
+
+### Why the in-run reviewer passed K10, K12 and K13
+
+The reviewer eval (lane `opus_lens` → GLM-5.3) blocks all three, so two
+explanations were tested:
+
+1. **Missing verifier context** (R4b): with the reports, summary and verdict
+   the in-run reviewer saw, the eval still scores 5/5 incidents, 0/7 false
+   blocks (fingerprint 78883e82, $2.10). Refuted.
+2. **A repair round the reviewer never re-reviewed**: in all three runs the
+   last review ran after the last implementer round, over a diff that
+   contained the defect. Refuted.
+3. **The round-aware severity bar.** The home sets `MO_REVIEW_ROUND_AWARE=on`
+   (since 2026-10-08), so the reviewer is told to block only on HIGH, and on
+   the final attempt only if shipping is worse than discarding. The in-run
+   K10 reviewer named the pytest shim, rated it medium and passed. Replaying
+   K10 with the block its run received (attempt 4 of 4): pass 2/2, defect
+   named both times; without it, block 2/2. **Confirmed for K10.** K12 (arm
+   on, attempt 1 of 3) and K13 (holdout arm, no block) still block 2/2 with
+   their block, so their misses are not explained yet: the eval still omits
+   the injected lessons, artifact context and scope guard, or the in-run
+   misses were single bad samples. R5c makes test gaming always high and
+   lets the eval measure the configuration this home runs.
