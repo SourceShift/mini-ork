@@ -55,8 +55,15 @@ All paths are relative to the repository root.
      | `target_root` is empty | `"dispatch_epics.target_root is required: a dispatched run edits its working tree, which must never be the engine checkout"` |
      | `not os.path.isabs(target_root)` | `f"dispatch_epics.target_root must be an absolute path: {target_root}"` |
      | `os.path.isdir(target_root)` is false | `f"dispatch_epics.target_root does not exist: {target_root}"` |
-     | `t == e`, or `t.startswith(e + os.sep)` | `"dispatch_epics.target_root is inside the engine checkout"` |
-     | `e.startswith(t + os.sep)` | `"dispatch_epics.target_root contains the engine checkout"` |
+     | `t` or any ancestor of `t` is the same directory as `e` | `"dispatch_epics.target_root is inside the engine checkout"` |
+     | `e` or any ancestor of `e` is the same directory as `t` | `"dispatch_epics.target_root contains the engine checkout"` |
+
+     "The same directory" means `os.path.samefile(a, b)`, which compares
+     device and inode. A string comparison would miss a case variant on a
+     case-insensitive filesystem (macOS APFS): `/Users/X/Repo` and
+     `/users/x/repo` are one directory. Walk the ancestors of the realpath with
+     `os.path.dirname` until it stops changing, and skip any ancestor for which
+     `samefile` raises `OSError`.
 
      These checks are what make setting `MO_ALLOW_FRAMEWORK_CWD=1` on the
      child safe. That flag lifts the run's "do not edit the engine" guard, and
@@ -121,6 +128,13 @@ the only permitted edits to existing tests:
 - **Signature checks.** Any existing test that inspects `sweep`'s or
   `_rule_dispatch_epic`'s parameters accepts the new `dispatch_target_root` /
   `target_root` parameter, which defaults to `""`.
+- **Direct calls.** Every existing test that calls `_default_dispatch_epic(...)`
+  directly with 4 arguments passes a 5th, `target_root` (an absolute tmp dir).
+  Its `cwd` / env assertions may be updated to the target-root values this spec
+  defines.
+- **The example config.** The existing test that pins the
+  `dispatch_epics` block of `config/self-driving.example.yaml` expects the
+  added `target_root: ""` key.
 
 Do NOT modify any other file.
 
@@ -134,6 +148,7 @@ Do NOT modify any other file.
   - the same directory as `engine_root`;
   - an existing subdirectory of `engine_root`;
   - the parent directory of `engine_root`;
+  - a symlink, created under `tmp_path`, that points at `engine_root`;
 
   then:
   - the action list contains one `dispatch_refused` action with the exact
