@@ -32,7 +32,8 @@ or remove `MINI_ORK_ON_EVENT`.
 | B3 | Lane affinity: a node's later rounds try first the lane that served its first success, while the routing lead is unchanged; an operator remap always wins | `bif-b3-lane-affinity.md` |
 | B1 | Typed failure classes and one action table (retry the chain / next lane / stop the walk / wait hint), stored in `metadata_json` (the `error_category` CHECK is unchanged) | `bif-b1-failure-classes.md` (after B6, B3) |
 | B2 | A first-output deadline (default 300 s) on every streaming lane but the chain's last | `bif-b2-first-output-deadline.md` (after B1) |
-| B4 | Held lanes: per-class cooldowns from B1's classes and wait hints, plus a single probe on re-admission | written after B1 lands |
+| B4 | Held lanes: per-class cooldowns from B1's classes and wait hints, plus a single probe on re-admission | **Deferred** (measured below) |
+| G1 | The gradient extractor's hard-coded 120 s cap becomes `MINI_ORK_GRADIENT_TIMEOUT_S` (default 300) | `bif-g1-gradient-timeout.md` |
 | B1b | The pre-push review's findings on B1 and B3: stdout prose may only promote to provider-structured classes (never a fuse-terminal one), the model-access phrase stays on one line, affinity reorders the FINAL chain (it was a no-op for the planner), transient failures carry the wait hint | `bif-b1b-review-findings.md` |
 | R5c | Test gaming is HIGH on every review attempt; runtime and eval render the round block from one function, and the eval replays the block a case's run received; an errored eval case scores as an error | `bif-r5c-gaming-is-high.md` |
 
@@ -84,3 +85,13 @@ explanations were tested:
    the injected lessons, artifact context and scope guard, or the in-run
    misses were single bad samples. R5c makes test gaming always high and
    lets the eval measure the configuration this home runs.
+
+### Where failed-call time goes (14 days to 2026-10-27)
+
+48.8 hours over 1,073 failed `llm_calls` rows. Timeouts are 41 h (84%).
+`gradient-extract` on glm alone is 21.9 h: 411 calls, each `timeout after
+120.0s`, against successes with p90 107 s and p95 113 s, so the hard-coded
+cap cuts the latency tail of a call that mostly works (G1). The classes B4
+would hold (quota, auth, config, capacity) cost 0.1 h: the existing 1-strike
+fuse already fails them fast. B4 is deferred until a measurement shows it
+pays; B2 (the first-output deadline) is the targeted fix for hung lanes.
