@@ -36,6 +36,7 @@ as the run is decided, so the measurement costs what the run costs.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -44,10 +45,27 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 _ROOT = None
+
+# ── git-oracle probe kind (default off) ────────────────────────────────────
+#
+# A git-oracle probe is a normal probe kickoff whose YAML frontmatter carries
+# ``oracle: git``. Its data lives in a sidecar (``probes/oracles/<stem>.json``)
+# because the ``.md`` is the kickoff the solver reads. The target is a
+# history-free snapshot of ``base_sha``, and the probe counts as solved only
+# when the run publishes AND the hidden tests from ``fix_sha`` pass against the
+# result. Everything is gated on ``MO_APPLY_PROBE_GIT_ORACLE == "1"`` so the
+# existing probe sets behave exactly as before.
+GIT_ORACLE_FLAG = "MO_APPLY_PROBE_GIT_ORACLE"
+ORACLE_DIR = "oracles"
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# Same pattern as PYTEST_FILE in scripts/mine_heldout_tasks.py.
+_PYTEST_FILE_RE = re.compile(r"(^|/)tests/(.*/)?test_[^/]*\.py$")
 
 
 def _root() -> str:
@@ -184,6 +202,85 @@ def _parse_probe_frontmatter(path: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _valid_oracle_rel_path(path: object) -> bool:
+    """A repo-relative pytest file path that cannot escape the target.
+
+    ``_PYTEST_FILE_RE`` alone accepts ``/abs/tests/test_x.py`` and
+    ``../../tests/test_x.py`` (its alternation starts with ``(^|/)``); the
+    overlay in ``_grade_git_oracle`` writes to ``os.path.join(target, path)``,
+    so an absolute path would discard ``target`` and ``..`` would climb out of
+    it. The sidecar schema says "repo-relative", so reject both here.
+    """
+    if not isinstance(path, str):
+        return False
+    if os.path.isabs(path) or ".." in path.split("/"):
+        return False
+    return _PYTEST_FILE_RE.search(path) is not None
+
+
+def _valid_oracle_id(value: object) -> bool:
+    """A ``<junit classname>::<name>`` test id string."""
+    return isinstance(value, str) and "::" in value
+
+
+def _probe_oracle(probe_path: str) -> dict | None:
+    """The parsed sidecar for a git-oracle probe, or None when absent/invalid.
+
+    Returns None unless the probe's frontmatter says ``oracle: git``. The
+    sidecar is ``probes/oracles/<stem>.json`` beside the probe; malformed JSON,
+    a non-object, or any field that breaks the schema also yields None so
+    ``_load_probes`` can simply skip the probe.
+    """
+    fm = _parse_probe_frontmatter(probe_path)
+    if fm.get("oracle") != "git":
+        return None
+    stem = os.path.splitext(os.path.basename(probe_path))[0]
+    sidecar = os.path.join(
+        os.path.dirname(probe_path), ORACLE_DIR, stem + ".json")
+    try:
+        with open(sidecar, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("base_sha", "fix_sha"):
+        value = data.get(key)
+        if not isinstance(value, str) or _SHA_RE.match(value) is None:
+            return None
+    test_files = data.get("test_files")
+    if (not isinstance(test_files, list) or not test_files
+            or not all(_valid_oracle_rel_path(p) for p in test_files)):
+        return None
+    fail_to_pass = data.get("fail_to_pass")
+    if (not isinstance(fail_to_pass, list) or not fail_to_pass
+            or not all(_valid_oracle_id(t) for t in fail_to_pass)):
+        return None
+    pass_to_pass = data.get("pass_to_pass")
+    if (not isinstance(pass_to_pass, list)
+            or not all(_valid_oracle_id(t) for t in pass_to_pass)):
+        return None
+    return data
+
+
+class _ProbePair(tuple):
+    """A ``(path, is_anchor)`` pair that stringifies to its path.
+
+    ``_load_probes`` has always returned pairs and every caller unpacks them,
+    but a caller that only wants the probe name naturally reaches for
+    ``os.path.basename(str(entry))``. Keeping ``str(pair)`` equal to the path
+    preserves that reading without changing the unpacking contract.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, path: str, is_anchor: bool) -> "_ProbePair":
+        return super().__new__(cls, (path, is_anchor))
+
+    def __str__(self) -> str:
+        return self[0]
+
+
 def _load_probes(task_class: str) -> list[tuple[str, bool]]:
     """Sorted, capped probe list as ``(path, is_anchor)`` pairs.
 
@@ -197,6 +294,11 @@ def _load_probes(task_class: str) -> list[tuple[str, bool]]:
     list silently dropped the anchor (probe-3 sorts after probe-1/2 under the
     default cap of 2), so ``anchor_solved_frac`` was never measured and
     ``collapse_history`` never written — found by the 2026-09-29 live smoke.
+
+    Frontmatter is read once per probe file and its gating rules applied in
+    order: holdout probes are never scored by apply; git-oracle probes are
+    loaded only behind ``MO_APPLY_PROBE_GIT_ORACLE=1`` AND with a valid
+    sidecar; any other non-empty ``oracle`` value is unknown and skipped.
     """
     recipe = _recipe_dir(task_class)
     if not recipe:
@@ -211,8 +313,18 @@ def _load_probes(task_class: str) -> list[tuple[str, bool]]:
     pairs: list[tuple[str, bool]] = []
     for name in names:
         path = os.path.join(probes_dir, name)
-        is_anchor = bool(_parse_probe_frontmatter(path).get("anchor"))
-        pairs.append((path, is_anchor))
+        fm = _parse_probe_frontmatter(path)
+        if bool(fm.get("holdout")):
+            continue
+        if fm.get("oracle") == "git":
+            if os.environ.get(GIT_ORACLE_FLAG, "") != "1":
+                continue
+            if _probe_oracle(path) is None:
+                continue
+        elif fm.get("oracle"):
+            continue
+        is_anchor = bool(fm.get("anchor"))
+        pairs.append(_ProbePair(path, is_anchor))
     cap = int(_probe_setting(task_class, "MO_APPLY_PROBE_MAX_TASKS",
                              "max_tasks", 2, as_int=True))
     gate = [pr for pr in pairs if not pr[1]][:cap]
@@ -539,14 +651,86 @@ def _materialize_arm(task_class: str, target_file: str | None, directive_block: 
     return name, mutated
 
 
-def _materialize_target(probe_path: str) -> str | None:
-    """A fresh scratch copy of the probe's fixture, or None when it has none.
+def probe_scratch_parent(root: str | None = None) -> str:
+    """The directory that holds probe scratch trees, created if needed.
 
-    Fresh per (probe, arm), not per arm: the two recipe arms are materialized
-    once and reused across the whole probe loop, so a target shared between
-    runs would let the mutating arm's edits — or one probe's edits — be
-    observed by the next launch. Each run starts from the frozen fixture.
+    ``MO_APPLY_PROBE_SCRATCH_DIR`` wins when set and non-empty. Otherwise the
+    scratch lives BESIDE the repo, not under ``$TMPDIR``: colima's docker mount
+    cannot see ``$TMPDIR`` (the same rule as ``scripts/run_heldout.py``), so a
+    target there would be invisible to a containerized arm.
     """
+    r = os.path.abspath(root or _root())
+    parent = os.environ.get("MO_APPLY_PROBE_SCRATCH_DIR", "")
+    if not parent:
+        parent = os.path.join(
+            os.path.dirname(r), os.path.basename(r) + "-probe-scratch")
+    os.makedirs(parent, exist_ok=True)
+    return parent
+
+
+def _ensure_scratch_parent() -> None:
+    """Materialize an explicitly configured scratch parent up front.
+
+    A run with no git-oracle probe never creates a snapshot, so a caller that
+    inspects ``MO_APPLY_PROBE_SCRATCH_DIR`` should see an empty directory rather
+    than "missing". Nothing is created when the variable is unset (the default
+    parent stays lazy), and a read-only location is best-effort: it must not
+    turn a measurement that needs no scratch into a failure.
+    """
+    if not os.environ.get("MO_APPLY_PROBE_SCRATCH_DIR"):
+        return
+    try:
+        probe_scratch_parent()
+    except OSError:
+        pass
+
+
+def materialize_git_tree(sha: str, *, root: str | None = None) -> str:
+    """A history-free snapshot of ``sha`` as a one-commit repo.
+
+    ``git archive`` is deterministic and narrow (no ``.git``, no untracked
+    files) — the same reasoning as ``mini_ork/certify/image.py``. Extracting it
+    and committing gives a target whose ``base_sha`` content is intact but from
+    which no later commit (notably ``fix_sha``) is reachable, so the solver
+    cannot recover the hidden tests from object history.
+
+    Fail loud: an unknown sha raises ``RuntimeError`` and removes the scratch
+    directory it made. Any later failure (extraction, repo creation) is cleaned
+    up the same way before propagating.
+    """
+    r = root or _root()
+    dst = tempfile.mkdtemp(
+        prefix="mo-probe-git-", dir=probe_scratch_parent(r))
+    archived = subprocess.run(
+        ["git", "-C", r, "archive", "--format=tar", sha],
+        capture_output=True)
+    if archived.returncode != 0:
+        shutil.rmtree(dst, ignore_errors=True)
+        tail = archived.stderr[-300:].decode("utf-8", "replace")
+        raise RuntimeError(f"git archive {sha!r} failed: {tail}")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archived.stdout)) as tar:
+            tar.extractall(dst, filter="data")
+        _make_target_repo(dst)
+    except BaseException:
+        shutil.rmtree(dst, ignore_errors=True)
+        raise
+    return dst
+
+
+def _materialize_target(probe_path: str) -> str | None:
+    """A fresh scratch copy of the probe's target, or None when it has none.
+
+    A git-oracle probe's target is a history-free snapshot of its ``base_sha``.
+    Otherwise it is a fresh copy of the probe's fixture — fresh per (probe, arm),
+    not per arm: the two recipe arms are materialized once and reused across the
+    whole probe loop, so a target shared between runs would let the mutating
+    arm's edits — or one probe's edits — be observed by the next launch. Each
+    run starts from the frozen base.
+    """
+    oracle = _probe_oracle(probe_path)
+    if oracle is not None:
+        return materialize_git_tree(oracle["base_sha"])
     fixture = _probe_fixture(probe_path)
     if not fixture:
         return None
@@ -586,6 +770,109 @@ def _make_target_repo(dst: str) -> None:
         )
 
 
+def run_pytest_junit(target: str, test_files: list[str], *,
+                     timeout: float) -> dict[str, str] | None:
+    """Run ``test_files`` inside ``target`` and return ``{id: outcome}``.
+
+    The id format matches ``scripts/mine_heldout_tasks.py:_run_pytest``
+    (``<junit classname>::<name>``), and a missing report means the run told us
+    nothing — ``None``, never an empty dict that would read as "all absent".
+    ``PYTHONSAFEPATH`` is removed because ``python -m pytest`` must be able to
+    import the target's top-level modules (see ``mini_ork/cli/main.py``).
+    """
+    tmp = tempfile.mkdtemp(prefix="mo-probe-grade-")
+    try:
+        report = os.path.join(tmp, "junit.xml")
+        home = os.path.join(tmp, "home")
+        env = {**os.environ}
+        env.pop("PYTHONSAFEPATH", None)
+        env["MINI_ORK_ROOT"] = target
+        env["MINI_ORK_HOME"] = home
+        env["MINI_ORK_DB"] = os.path.join(home, "state.db")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                 f"--junitxml={report}", *test_files],
+                cwd=target, capture_output=True, timeout=timeout, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if not os.path.isfile(report):
+            return None
+        try:
+            tree = ET.parse(report)
+        except ET.ParseError:
+            return None
+        results: dict[str, str] = {}
+        for case in tree.iter("testcase"):
+            classname = case.get("classname") or ""
+            name = case.get("name") or ""
+            outcome = "passed"
+            if case.find("failure") is not None:
+                outcome = "failed"
+            elif case.find("error") is not None:
+                outcome = "error"
+            elif case.find("skipped") is not None:
+                outcome = "skipped"
+            results[f"{classname}::{name}"] = outcome
+        return results
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _grade_git_oracle(target: str, oracle: dict, *,
+                      timeout: float | None = None) -> bool:
+    """Whether the run's result passes the hidden tests from ``fix_sha``.
+
+    The hidden test files are overlaid onto ``target`` from ``_root()``'s git
+    object store BEFORE pytest runs, so whatever the solver wrote at those paths
+    is discarded — the tests it can see are never the tests it is graded on.
+    """
+    if timeout is None:
+        timeout = float(os.environ.get("MO_APPLY_PROBE_GRADE_TIMEOUT_S", "600"))
+    for path in oracle["test_files"]:
+        shown = subprocess.run(
+            ["git", "-C", _root(), "show", f"{oracle['fix_sha']}:{path}"],
+            capture_output=True)
+        if shown.returncode != 0:
+            return False
+        dest = os.path.join(target, path)
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(dest, "wb") as fh:
+            fh.write(shown.stdout)
+    results = run_pytest_junit(target, oracle["test_files"], timeout=timeout)
+    if results is None:
+        return False
+    expected = set(oracle["fail_to_pass"]) | set(oracle["pass_to_pass"])
+    return all(results.get(t) == "passed" for t in expected)
+
+
+def _probe_outcome(probe_path: str, run_id: str, target: str | None,
+                   db: str | None = None) -> tuple[float, bool | None]:
+    """``(outcome, hidden_pass)`` for one arm of one probe.
+
+    Non-git probes are unchanged: the outcome is the publish verdict and
+    ``hidden_pass`` is None (so the caller adds no key). A git-oracle probe is
+    solved only when the run published AND the hidden tests pass; an
+    unpublished run is 0.0 without spending a grading run at all.
+
+    ``db`` is forwarded keyword-only when given, but the no-db path must pass
+    exactly one positional argument: ``tests/unit/test_cli_apply_py.py`` patches
+    ``_run_outcome`` with a one-argument fake.
+    """
+    published = _run_outcome(run_id) if db is None else _run_outcome(run_id, db=db)
+    oracle = _probe_oracle(probe_path)
+    if oracle is None:
+        return published, None
+    if published < 1.0 or not target:
+        return 0.0, False
+    hidden = _grade_git_oracle(target, oracle)
+    return (1.0 if hidden else 0.0), hidden
+
+
 def probe_score(task_class: str, target_file: str | None,
                 directive: str, *, source_ref: str = "", context: str = "") -> dict | None:
     """Two-arm held-out evaluation of one directive mutation.
@@ -618,6 +905,7 @@ def probe_score(task_class: str, target_file: str | None,
     probes = _load_probes(task_class)
     if not probes:
         return None
+    _ensure_scratch_parent()
     if not target_file or not directive:
         return None  # no candidate arm can be materialized → nothing to measure
     budget = float(_probe_setting(task_class, "MO_APPLY_PROBE_BUDGET_USD",
@@ -693,11 +981,14 @@ def probe_score(task_class: str, target_file: str | None,
                     break  # NOT control_unscored — partial results survive
                 spent += cost
                 last_cost = cost
-                outcome = _run_outcome(run_id)
-                runs.append({"probe": os.path.basename(probe),
-                             "arm": "baseline", "retry": retry,
-                             "run_id": run_id, "outcome": outcome,
-                             "cost_usd": cost})
+                outcome, hidden = _probe_outcome(probe, run_id, target, db=None)
+                entry = {"probe": os.path.basename(probe),
+                         "arm": "baseline", "retry": retry,
+                         "run_id": run_id, "outcome": outcome,
+                         "cost_usd": cost}
+                if hidden is not None:
+                    entry["hidden_pass"] = hidden
+                runs.append(entry)
                 control_outcomes.append(outcome)
             if control_unscored:
                 return None
@@ -727,11 +1018,14 @@ def probe_score(task_class: str, target_file: str | None,
                 stop_sweep = True
                 break
             spent += cost
-            outcome = _run_outcome(run_id)
-            runs.append({"probe": os.path.basename(probe), "arm": "candidate",
-                         "run_id": run_id, "outcome": outcome,
-                         "cost_usd": cost,
-                         "is_anchor": is_anchor})
+            outcome, hidden = _probe_outcome(probe, run_id, target, db=None)
+            entry = {"probe": os.path.basename(probe), "arm": "candidate",
+                     "run_id": run_id, "outcome": outcome,
+                     "cost_usd": cost,
+                     "is_anchor": is_anchor}
+            if hidden is not None:
+                entry["hidden_pass"] = hidden
+            runs.append(entry)
             # Anchor split (rule #1): anchor probes never enter the gate's
             # before/after vectors — they exist to feed the collapse
             # detector's anchor column, NOT to be optimized by the apply
@@ -919,6 +1213,7 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
     recipe = _recipe_dir(task_class)
     if not probes or recipe is None:
         return None
+    _ensure_scratch_parent()
     budget = float(_probe_setting(task_class, "MO_APPLY_PROBE_BUDGET_USD",
                                   "budget_usd", 2.0))
     control_n = int(_probe_setting(task_class, "MO_APPLY_PROBE_CONTROL_N",
@@ -986,11 +1281,15 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
                     break  # NOT control_unscored — partial results survive
                 spent += cost
                 last_cost = cost
-                outcome = _run_outcome(run_id, db=_arm_db(base_tree))
-                runs.append({"probe": os.path.basename(probe),
-                             "arm": "baseline", "retry": retry,
-                             "run_id": run_id, "outcome": outcome,
-                             "cost_usd": cost})
+                outcome, hidden = _probe_outcome(
+                    probe, run_id, target, db=_arm_db(base_tree))
+                entry = {"probe": os.path.basename(probe),
+                         "arm": "baseline", "retry": retry,
+                         "run_id": run_id, "outcome": outcome,
+                         "cost_usd": cost}
+                if hidden is not None:
+                    entry["hidden_pass"] = hidden
+                runs.append(entry)
                 control_outcomes.append(outcome)
             if control_unscored:
                 return None
@@ -1020,11 +1319,15 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
                 stop_sweep = True
                 break
             spent += cost
-            outcome = _run_outcome(run_id, db=_arm_db(cand_tree))
-            runs.append({"probe": os.path.basename(probe), "arm": "candidate",
-                         "run_id": run_id, "outcome": outcome,
-                         "cost_usd": cost,
-                         "is_anchor": is_anchor})
+            outcome, hidden = _probe_outcome(
+                probe, run_id, target, db=_arm_db(cand_tree))
+            entry = {"probe": os.path.basename(probe), "arm": "candidate",
+                     "run_id": run_id, "outcome": outcome,
+                     "cost_usd": cost,
+                     "is_anchor": is_anchor}
+            if hidden is not None:
+                entry["hidden_pass"] = hidden
+            runs.append(entry)
             # Anchor split: same semantics as ``probe_score``. Code-arm
             # candidates still write ``anchor_solved_frac`` to collapse_history
             # so the detector sees anchor drift across code mutations too.
