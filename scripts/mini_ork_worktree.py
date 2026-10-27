@@ -646,19 +646,62 @@ def create_worktree(slug: str, opts: list[str]) -> None:
     print(f"[mo-worktree] ready: {wt}  (branch {branch})")
 
 
-def _prereview(wt: str) -> None:
+def _patch_id(wt: str) -> str:
+    """``git patch-id --stable`` of ``origin/main...HEAD``, or ``""``.
+
+    A standalone duplicate of ``mini_ork.gates.merge_risk.branch_patch_id``:
+    this driver keeps its "no top-level mini_ork import" promise (it runs under
+    the system ``python3`` that ``make`` resolves), so the same identity is
+    computed here rather than imported. The three-dot range is the patch
+    ``run_gate`` reviews (``merge-base..HEAD``); a clean rebase leaves it
+    unchanged, which is what lets the pre-lock review satisfy the in-lock hook.
+
+    The diff is *piped* into ``patch-id`` exactly as the gate does it. ``Popen``
+    rather than the ``git()`` helper keeps this off a caller's ``subprocess.run``
+    seam and avoids buffering the whole diff in this process.
+    """
+    diff = subprocess.Popen(
+        ["git", "-C", wt, "diff", "--no-color", "--no-renames",
+         "origin/main...HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = subprocess.Popen(
+        ["git", "-C", wt, "patch-id", "--stable"],
+        stdin=diff.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if diff.stdout is not None:
+        diff.stdout.close()
+    out, _ = pid.communicate()
+    if diff.wait() != 0 or pid.returncode != 0:
+        return ""
+    tokens = (out or "").split()
+    return tokens[0] if tokens else ""
+
+
+def _prereview(wt: str) -> str:
     """Run the pre-push code-review gate *before* the merge lock is taken.
 
     A review can take minutes (an LLM panel), and ``_merge_lock`` serialises
     every merge on the machine — reviewing inside it would block peers. The
-    in-lock push fires the same gate through the hook; the patch-id cache makes
-    that second call a no-op. ``rc 1`` means the review blocked; any other
-    non-zero code is a reviewer error the push hook will surface and retry.
+    in-lock push fires the same gate through the hook, which skips it when the
+    patch-id it just reviewed is handed to it as
+    ``MO_REVIEW_PRECHECKED_PATCH``.
+
+    Returns the reviewed patch-id when the gate exited 0, else ``""``. A clean
+    exit means the in-lock hook can skip the panel by receiving the patch-id
+    through ``MO_REVIEW_PRECHECKED_PATCH``. ``rc 1`` means the review blocked;
+    any other non-zero code is a reviewer error the push hook will surface and
+    retry — no patch-id is returned then, so the in-lock hook runs the review
+    again.
     """
     if os.environ.get("MO_REVIEW_SKIP") == "1":
-        return
+        return ""
     if not os.path.isfile(os.path.join(wt, ".githooks", "pre-push")):
-        return
+        return ""
     venv_python = os.path.join(ROOT, ".venv", "bin", "python")
     python = venv_python if os.access(venv_python, os.X_OK) else sys.executable
     env = os.environ.copy()
@@ -677,6 +720,8 @@ def _prereview(wt: str) -> None:
     if rc != 0:
         print(f"[mo-worktree] pre-push review errored (rc={rc}); "
               "the push hook will retry it")
+        return ""
+    return _patch_id(wt)
 
 
 def merge_worktree(args: list[str]) -> None:
@@ -714,8 +759,13 @@ def merge_worktree(args: list[str]) -> None:
         die(f"green gate failed ({test_cmd}) in {wt}; "
             f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
     # Review here, *before* the lock: a multi-minute review must never hold
-    # the merge lock. The in-lock push hits the patch-id cache instead.
-    _prereview(wt)
+    # the merge lock. The reviewed patch-id rides along to the in-lock push so
+    # the hook can skip re-running the panel (the patch-id cache deliberately
+    # does not cache a degraded review, so the cache alone is not enough).
+    reviewed = _prereview(wt)
+    push_env = None
+    if reviewed:
+        push_env = {**os.environ, "MO_REVIEW_PRECHECKED_PATCH": reviewed}
     # The gate above runs for minutes, so origin/main has moved since the fetch
     # at the top: pushing now is rejected as non-fast-forward whenever any peer
     # landed during the gate. The tree is green; only the base is stale. Rebase
@@ -742,7 +792,7 @@ def merge_worktree(args: list[str]) -> None:
             if high_risk:
                 _risk_guard(wt, slug)
             push = git("-C", wt, "push", "origin", "HEAD:main",
-                       check=False, capture=True)
+                       check=False, capture=True, env=push_env)
             if push.returncode == 0:
                 if attempt > 1:
                     print(f"[mo-worktree] push won on attempt {attempt}/{attempts} "

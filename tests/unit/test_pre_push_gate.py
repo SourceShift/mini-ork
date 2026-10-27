@@ -478,7 +478,7 @@ def test_prereview_runs_the_gate_with_the_worktree_on_pythonpath(tmp_path, monke
     recorder = _RunRecorder(0)
     monkeypatch.setattr(module.subprocess, "run", recorder)
 
-    assert module._prereview(str(wt)) is None
+    assert module._prereview(str(wt)) == ""  # R2e: returns the reviewed patch-id or ""
     assert len(recorder.calls) == 1
     call = recorder.calls[0]
     assert call["cmd"][1:] == ["-m", "mini_ork.pre_push_review", "gate",
@@ -511,13 +511,13 @@ def test_prereview_skips_on_review_skip_or_without_a_hook(tmp_path, monkeypatch)
     monkeypatch.setattr(module.subprocess, "run", recorder)
 
     monkeypatch.setenv("MO_REVIEW_SKIP", "1")
-    assert module._prereview(str(wt)) is None
+    assert module._prereview(str(wt)) == ""  # R2e: returns the reviewed patch-id or ""
     assert recorder.calls == []
 
     monkeypatch.delenv("MO_REVIEW_SKIP")
     bare_wt = tmp_path / "bare-wt"
     bare_wt.mkdir()
-    assert module._prereview(str(bare_wt)) is None
+    assert module._prereview(str(bare_wt)) == ""
     assert recorder.calls == []
 
 
@@ -540,7 +540,7 @@ def test_prereview_continues_on_a_reviewer_error(tmp_path, monkeypatch, capsys):
     wt = _worktree_with_hook(tmp_path)
     monkeypatch.setattr(module.subprocess, "run", _RunRecorder(3))
 
-    assert module._prereview(str(wt)) is None
+    assert module._prereview(str(wt)) == ""  # R2e: returns the reviewed patch-id or ""
     out = capsys.readouterr()
     assert ("[mo-worktree] pre-push review errored (rc=3); "
             "the push hook will retry it") in (out.out + out.err)

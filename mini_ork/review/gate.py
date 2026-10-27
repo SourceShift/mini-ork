@@ -389,6 +389,10 @@ def _llm_lenses_all_failed(
     ``fresh=True`` means the review *just ran* in hybrid mode. When the table
     exists but holds no row for ``review_id``, a panel that ran recorded
     nothing, so report ``(True, 0)``. A missing table is still ``(False, 0)``.
+
+    A row for the panel itself with ``status == "error"`` means the panel
+    raised mid-review. That is a degraded review whatever the per-lens rows
+    say — a surviving ``ok`` lens must not hide the crash.
     """
     try:
         rows = _lens_runs(review_id, db)
@@ -398,6 +402,9 @@ def _llm_lenses_all_failed(
             return False, 0
     except Exception:  # noqa: BLE001 — evidence must not flip the decision
         return False, 0
+    if any(lens == "llm.panel" and status == "error"
+           for lens, status, _, _ in rows):
+        return True, len(rows)
     return (not any(status == "ok" for _, status, _, _ in rows)), len(rows)
 
 
@@ -529,6 +536,22 @@ def run_gate(
             GateResult(0, "empty", None, False, "no diff to review"), target
         )
 
+    # The merge driver reviews the branch before it takes the merge lock, then
+    # pushes with the reviewed patch-id. Skipping here is what keeps a degraded
+    # review (which is never cached) from re-running the LLM panel while the
+    # lock is held. A value that no longer matches (a rebase replayed the
+    # patch) is ignored, so the review runs normally. It only skips on an exact
+    # patch-id match, so it is no weaker than MO_REVIEW_SKIP.
+    prechecked = merged.get("MO_REVIEW_PRECHECKED_PATCH") or ""
+    if prechecked and prechecked == pid:
+        return _emit(
+            GateResult(
+                0, "skipped", None, False,
+                f"reviewed before the merge lock (patch {pid[:12]})",
+            ),
+            target,
+        )
+
     mode = "hybrid" if merged.get("MO_REVIEW_LLM_LENSES") == "1" else "heuristic"
     db = resolve_db(cwd, merged)
     db_reason = _db_unavailable_reason(db)
@@ -562,8 +585,15 @@ def run_gate(
             if verdict in _TERMINAL_VERDICTS:
                 cached = True
                 if mode == "hybrid":
-                    all_failed, lens_count = _llm_lenses_all_failed(review_id, db)
-                    if all_failed and lens_count >= 1:
+                    # ``fresh=True``: a cached review with zero lens rows —
+                    # the cached review predates the ``review_lens_runs``
+                    # table — is degraded exactly like an all-failed one, so
+                    # it is re-run instead of silently approving on heuristics
+                    # alone.
+                    all_failed, _ = _llm_lenses_all_failed(
+                        review_id, db, fresh=True
+                    )
+                    if all_failed:
                         degraded_stale = (review_id, verdict)
                         review_id = None
                         cached = False
@@ -652,11 +682,23 @@ def run_gate(
                     GateResult(1, "unavailable", review_id, cached, text), target
                 )
             if tier == "secure":
+                # The review behind a refusing verdict is the only evidence the
+                # operator gets: print it (and, for a block, the blocking
+                # findings) instead of replacing it with a bare "unavailable".
+                # Display only — a missing row or a locked DB must not raise
+                # here, or the gate's rc 2 would fail *open* in the hook.
+                if verdict in ("warn", "block"):
+                    try:
+                        _print_review(review_show(review_id, db=str(db)))
+                    except Exception:  # noqa: BLE001 — display only
+                        pass
+                if verdict == "block":
+                    _print_block_findings(review_id, db)
+                reason = "secure tier: no LLM lens ran"
+                if verdict == "block":
+                    reason += " (review verdict: block)"
                 return _emit(
-                    GateResult(
-                        1, "unavailable", review_id, cached,
-                        "secure tier: no LLM lens ran",
-                    ),
+                    GateResult(1, "unavailable", review_id, cached, reason),
                     target,
                 )
 
