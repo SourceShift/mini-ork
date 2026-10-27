@@ -116,6 +116,12 @@ Use the `mock` provider kind or fake specs for the providers-level cases.
    warning.
 7. `is_model_event` table: `assistant`, `stream_event`, `user`, `result` →
    True; `system`, plain text, `{}` → False.
+8. **B1 interaction.** The cutoff error with rc 124 classifies as `timeout`
+   (`mini_ork.dispatch.failure_class.classify(err, 124)[0] == "timeout"`), and
+   `failure_class.action("timeout")` walks to the next lane without re-running
+   the chain (`next_lane` true, `retry_chain` false). Do not change
+   `failure_class.py`; this test pins that the deadline's message keeps that
+   meaning.
 
 ## Verification commands
 
