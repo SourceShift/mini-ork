@@ -984,28 +984,44 @@ def _failing_verifier_sections(run_dir: Path) -> list[str]:
         summary = data.get("error_summary") or data.get("reason") or data.get("reasons")
         if summary:
             lines.append(f"error summary: {summary}")
-        # ``failed_checks`` is a list of check NAMES in the artifacts this
-        # reads; only ``checks`` holds the dicts. Treating the name list as
-        # the dict list skipped every entry as a non-dict, so the round never
-        # named the failing check and fell back to the log's error-shaped
-        # lines (a passing check's by-design failures among them).
+        # ``failed_checks`` carries check NAMES in most artifacts, but some
+        # verifiers put the failing check DICTS (with ``log``) there and ship
+        # no ``checks`` at all. Reading only ``checks`` dropped those rounds'
+        # ``failing check:`` lines and logs, so the round fell back to the
+        # log's error-shaped lines (a passing check's by-design failures among
+        # them). Iterate dicts from BOTH containers, de-duplicated by id/name
+        # so a check present in both is listed once.
         raw_names = data.get("failed_checks")
         failed_names = [name for name in raw_names if isinstance(name, str)] \
             if isinstance(raw_names, list) else []
-        checks = data.get("checks")
-        if isinstance(checks, list):
-            for c in checks:
-                if not isinstance(c, dict):
+        candidates: list[tuple[dict, bool]] = []
+        for key in ("checks", "failed_checks"):
+            raw = data.get(key)
+            if isinstance(raw, list):
+                candidates.extend(
+                    (entry, key == "failed_checks")
+                    for entry in raw
+                    if isinstance(entry, dict)
+                )
+        seen: set = set()
+        for c, from_failed in candidates:
+            cid = c.get("id") or c.get("name")
+            if not (from_failed
+                    or c.get("pass") is False
+                    or str(c.get("status") or "").upper() in ("FAIL", "REFUTED")
+                    or (cid is not None and cid in failed_names)):
+                continue
+            if cid is not None:
+                # Dedupe only emitted checks: a *passing* dict under ``checks``
+                # sharing its id with a failing dict under ``failed_checks``
+                # must not swallow the failing one.
+                if cid in seen:
                     continue
-                cid = c.get("id") or c.get("name")
-                if not (c.get("pass") is False
-                        or str(c.get("status") or "").upper() in ("FAIL", "REFUTED")
-                        or (cid is not None and cid in failed_names)):
-                    continue
-                lines.append(f"failing check: {cid or 'check'}")
-                log = c.get("log") or c.get("output")
-                if isinstance(log, str) and log.strip():
-                    lines.extend(log.splitlines()[:8])
+                seen.add(cid)
+            lines.append(f"failing check: {cid or 'check'}")
+            log = c.get("log") or c.get("output")
+            if isinstance(log, str) and log.strip():
+                lines.extend(log.splitlines()[:8])
         declared = _declared_evidence_path(data, run_dir)
         logs = list(execute_mod._verifier_log_candidates(str(run_dir), stem))
         if declared:

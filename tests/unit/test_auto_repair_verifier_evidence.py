@@ -185,3 +185,42 @@ def test_failing_static_check_is_named_and_its_lines_shown(tmp_path):
     assert "pytest-env-probe" in section
     assert "patch failed" not in section
     assert "failing check: diff-apply-check-clean" not in section
+
+
+# ── failed_checks can hold the check DICTS, not just names ─────────────────
+
+
+def test_check_dicts_under_failed_checks_are_named_and_shown(tmp_path):
+    """Some verifier payloads ship no ``checks`` and put the failing dicts
+    (with the log) under ``failed_checks``. Reading only ``checks`` dropped
+    the round's ``failing check:`` lines and the captured tool output."""
+    run_dir = tmp_path / "runs" / "run-dicts"
+    run_dir.mkdir(parents=True)
+    (run_dir / "verifier_static-check.json").write_text(json.dumps({
+        "name": "static-check",
+        "pass": False,
+        "failed_checks": [
+            {"name": "lint", "pass": False, "log": "E501 line too long"},
+        ],
+    }), encoding="utf-8")
+
+    section = ar._failing_verifier_sections(run_dir)[0]
+
+    assert "failing check: lint" in section
+    assert "E501 line too long" in section
+
+
+def test_a_check_present_in_both_containers_is_listed_once(tmp_path):
+    entry = {"name": "lint", "pass": False, "log": "E501 line too long"}
+    run_dir = tmp_path / "runs" / "run-both"
+    run_dir.mkdir(parents=True)
+    (run_dir / "verifier_static-check.json").write_text(json.dumps({
+        "pass": False,
+        "checks": [entry],
+        "failed_checks": [dict(entry)],
+    }), encoding="utf-8")
+
+    section = ar._failing_verifier_sections(run_dir)[0]
+
+    assert "failing check: lint" in section
+    assert section.count("E501 line too long") == 1

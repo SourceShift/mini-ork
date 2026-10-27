@@ -463,6 +463,16 @@ def _prereview_fixture(driver, monkeypatch, tmp_path, rc, pid):
 
 
 def test_prereview_returns_the_reviewed_patch(driver, monkeypatch, tmp_path):
+    # F2: a clean gate exit alone is not evidence of a review (an unavailable
+    # review also exits 0); the gate's cache must hold this exact patch.
+    import time
+
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    (home / "state" / "pre-push-review-cache.json").write_text(json.dumps(
+        {"abc123": {"review_id": 1, "mode": "hybrid", "target": "main",
+                    "at": int(time.time())}}))
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
     wt = _prereview_fixture(driver, monkeypatch, tmp_path, 0, "abc123")
     assert driver._prereview(wt) == "abc123"
 

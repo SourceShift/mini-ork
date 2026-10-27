@@ -682,6 +682,42 @@ def _patch_id(wt: str) -> str:
     return tokens[0] if tokens else ""
 
 
+# Duplicated by value from ``mini_ork/review/gate.py`` (``CACHE_REL`` and
+# ``CACHE_TTL_S``): this driver keeps its "no top-level mini_ork import"
+# promise, so the cache contract is mirrored here rather than imported.
+_REVIEW_CACHE_REL = os.path.join("state", "pre-push-review-cache.json")
+_REVIEW_CACHE_TTL_S = 7 * 86400
+
+
+def _review_cached(pid: str) -> bool:
+    """True only when ``pid`` has a fresh terminal review in the gate's cache.
+
+    The gate writes ``<home>/state/pre-push-review-cache.json`` only for a
+    review that actually ran and did not degrade (see ``mini_ork/review/
+    gate.py``); an entry keyed by the patch-id with a fresh int ``at`` is the
+    evidence that the panel reviewed exactly this patch. Anything unreadable or
+    malformed means "no cached review" — fail closed, so the push hook runs
+    the panel instead of skipping it on an unproven review.
+    """
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(ROOT, ".mini-ork")
+    path = os.path.join(home, _REVIEW_CACHE_REL)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    entry = data.get(pid)
+    if not isinstance(entry, dict):
+        return False
+    at = entry.get("at")
+    if not isinstance(at, int):
+        return False
+    age = int(time.time()) - at
+    return 0 <= age <= _REVIEW_CACHE_TTL_S
+
+
 def _prereview(wt: str) -> str:
     """Run the pre-push code-review gate *before* the merge lock is taken.
 
@@ -691,12 +727,13 @@ def _prereview(wt: str) -> str:
     patch-id it just reviewed is handed to it as
     ``MO_REVIEW_PRECHECKED_PATCH``.
 
-    Returns the reviewed patch-id when the gate exited 0, else ``""``. A clean
-    exit means the in-lock hook can skip the panel by receiving the patch-id
-    through ``MO_REVIEW_PRECHECKED_PATCH``. ``rc 1`` means the review blocked;
-    any other non-zero code is a reviewer error the push hook will surface and
-    retry — no patch-id is returned then, so the in-lock hook runs the review
-    again.
+    Returns the reviewed patch-id only when the gate exited 0 *and* the gate's
+    cache holds a fresh review of that exact patch, else ``""``. That second
+    condition is what makes the handoff sound: the gate also exits 0 when the
+    review was unavailable in the simple tier and merely proceeded, so a bare
+    rc 0 is not evidence that a review happened. ``rc 1`` means the review
+    blocked; any other non-zero code is a reviewer error the push hook will
+    surface and retry — no patch-id is returned then either.
     """
     if os.environ.get("MO_REVIEW_SKIP") == "1":
         return ""
@@ -705,6 +742,10 @@ def _prereview(wt: str) -> str:
     venv_python = os.path.join(ROOT, ".venv", "bin", "python")
     python = venv_python if os.access(venv_python, os.X_OK) else sys.executable
     env = os.environ.copy()
+    # An ambient precheck (the operator's shell, or a parent process) must
+    # never satisfy the gate this call exists to run: only a review this path
+    # actually completes may hand a patch-id to the in-lock hook.
+    env.pop("MO_REVIEW_PRECHECKED_PATCH", None)
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join(part for part in (wt, existing) if part)
     rc = subprocess.run(
@@ -721,7 +762,12 @@ def _prereview(wt: str) -> str:
         print(f"[mo-worktree] pre-push review errored (rc={rc}); "
               "the push hook will retry it")
         return ""
-    return _patch_id(wt)
+    pid = _patch_id(wt)
+    if pid and _review_cached(pid):
+        return pid
+    print("[mo-worktree] pre-push review did not complete a cached review; "
+          "the push hook will run it")
+    return ""
 
 
 def merge_worktree(args: list[str]) -> None:
@@ -760,8 +806,10 @@ def merge_worktree(args: list[str]) -> None:
             f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
     # Review here, *before* the lock: a multi-minute review must never hold
     # the merge lock. The reviewed patch-id rides along to the in-lock push so
-    # the hook can skip re-running the panel (the patch-id cache deliberately
-    # does not cache a degraded review, so the cache alone is not enough).
+    # the hook can skip re-running the panel — but only when the gate cached a
+    # real review of that exact patch. A clean rc from a degraded or
+    # unavailable review is not evidence one happened, so it hands off ``""``
+    # and the in-lock hook runs the panel itself.
     reviewed = _prereview(wt)
     push_env = None
     if reviewed:
