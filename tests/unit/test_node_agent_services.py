@@ -2080,3 +2080,239 @@ def test_delete_network_rejects_a_name_that_is_not_a_leaf(client, docker, name):
 def test_delete_network_requires_a_bearer(client):
     r = client.delete(f"/v1/networks/{NETWORK}")
     assert r.status_code in (401, 403)
+
+
+# ── volume files ────────────────────────────────────────────────────────────
+#
+# One file inside a volume, for data that grows continuously (a WAL archive).
+# The containment tests matter more than the happy path: this route turns a
+# caller-supplied relative string into a filesystem path under tenant data.
+
+WAL_SEGMENT = "00000001000000000000000A"
+
+
+def _volume_file(tmp_path: Path, service_id: str = "db", volume: str = "wal-archive",
+                 rel: str = f"wal/{WAL_SEGMENT}") -> Path:
+    path = tmp_path / "volumes" / service_id / volume / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_volume_files_are_listed_with_size_and_mtime(client, tmp_path):
+    first = _volume_file(tmp_path, rel=f"wal/{WAL_SEGMENT}")
+    first.write_bytes(b"segment-a")
+    second = _volume_file(tmp_path, rel="wal/00000001000000000000000B")
+    second.write_bytes(b"segment-bb")
+    _volume_file(tmp_path, rel="base/0123/PG_VERSION").write_bytes(b"16")
+
+    r = client.get("/v1/services/db/volumes/wal-archive/files", headers=AUTH)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert [f["path"] for f in body["files"]] == [
+        "base/0123/PG_VERSION",
+        f"wal/{WAL_SEGMENT}",
+        "wal/00000001000000000000000B",
+    ]
+    assert [f["bytes"] for f in body["files"]] == [2, 9, 10]
+    assert body["truncated"] is False
+    assert all(f["mtime"].endswith("Z") for f in body["files"])
+
+
+def test_volume_file_listing_can_be_scoped_to_a_directory(client, tmp_path):
+    _volume_file(tmp_path, rel=f"wal/{WAL_SEGMENT}").write_bytes(b"x")
+    _volume_file(tmp_path, rel="base/0123/PG_VERSION").write_bytes(b"16")
+
+    r = client.get(
+        "/v1/services/db/volumes/wal-archive/files", params={"parent": "wal"}, headers=AUTH
+    )
+
+    assert r.status_code == 200
+    assert [f["path"] for f in r.json()["files"]] == [f"wal/{WAL_SEGMENT}"]
+
+
+def test_volume_file_listing_honours_the_limit_and_says_it_truncated(client, tmp_path):
+    for i in range(5):
+        _volume_file(tmp_path, rel=f"wal/0000000100000000000000{i:02X}").write_bytes(b"x")
+
+    r = client.get(
+        "/v1/services/db/volumes/wal-archive/files", params={"limit": 2}, headers=AUTH
+    )
+
+    assert r.status_code == 200
+    assert len(r.json()["files"]) == 2
+    assert r.json()["truncated"] is True
+
+
+def test_listing_an_unmaterialized_volume_is_404(client):
+    r = client.get("/v1/services/db/volumes/wal-archive/files", headers=AUTH)
+    assert r.status_code == 404
+
+
+def test_listing_symlinks_is_not_listing_their_targets(client, tmp_path):
+    _volume_file(tmp_path, rel="real").write_bytes(b"data")
+    (tmp_path / "volumes" / "db" / "wal-archive" / "link").symlink_to(tmp_path / "outside")
+    (tmp_path / "outside").mkdir()
+
+    r = client.get("/v1/services/db/volumes/wal-archive/files", headers=AUTH)
+
+    assert [f["path"] for f in r.json()["files"]] == ["real"]
+
+
+@pytest.mark.parametrize("parent", ["..", "../..", "/etc", "wal/../../..", "."])
+def test_listing_a_parent_outside_the_volume_is_refused(client, tmp_path, parent):
+    _volume_file(tmp_path, rel="wal/x").write_bytes(b"x")
+
+    r = client.get(
+        "/v1/services/db/volumes/wal-archive/files", params={"parent": parent}, headers=AUTH
+    )
+
+    # "." is the volume root and is allowed; every other probe must fail.
+    if parent == ".":
+        assert r.status_code == 200
+    else:
+        assert r.status_code == 400
+
+
+def test_reading_a_volume_file_reports_the_bytes_it_served(client, tmp_path):
+    _volume_file(tmp_path).write_bytes(b"segment-a")
+
+    r = client.get(f"/v1/services/db/volumes/wal-archive/files/wal/{WAL_SEGMENT}", headers=AUTH)
+
+    assert r.status_code == 200
+    assert r.content == b"segment-a"
+    import hashlib
+
+    assert r.headers["x-content-sha256"] == hashlib.sha256(b"segment-a").hexdigest()
+    assert r.headers["x-content-bytes"] == "9"
+    assert r.headers["x-content-mtime"].endswith("Z")
+
+
+def test_reading_a_missing_volume_file_is_404(client, tmp_path):
+    _volume_file(tmp_path).write_bytes(b"x")
+    r = client.get("/v1/services/db/volumes/wal-archive/files/wal/nope", headers=AUTH)
+    assert r.status_code == 404
+
+
+def test_reading_a_symlink_inside_the_volume_is_not_a_file_read(client, tmp_path):
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "secret").write_bytes(b"secret")
+    (tmp_path / "volumes" / "db" / "wal-archive").mkdir(parents=True)
+    (tmp_path / "volumes" / "db" / "wal-archive" / "link").symlink_to(
+        tmp_path / "outside" / "secret"
+    )
+
+    r = client.get("/v1/services/db/volumes/wal-archive/files/link", headers=AUTH)
+
+    assert r.status_code == 400
+    assert b"secret" not in r.content
+
+
+def test_reading_a_path_that_escapes_the_volume_is_refused(client, tmp_path):
+    marker = b"UNIQUE-OUTSIDE-BYTES"
+    (tmp_path / "outside-file").write_bytes(marker)
+    (tmp_path / "volumes" / "db" / "wal-archive").mkdir(parents=True)
+
+    # Percent-encoded dots: a literal ``..`` is collapsed by the HTTP client
+    # before it leaves, so this is the shape that actually reaches the node.
+    r = client.get(
+        "/v1/services/db/volumes/wal-archive/files/%2E%2E/%2E%2E/outside-file", headers=AUTH
+    )
+
+    assert r.status_code == 400
+    assert marker not in r.content
+
+
+def test_writing_a_volume_file_is_verified_and_idempotent(client, tmp_path):
+    import hashlib
+
+    body = b"segment-a"
+    digest = hashlib.sha256(body).hexdigest()
+    url = f"/v1/services/db/volumes/wal-archive/files/wal/{WAL_SEGMENT}"
+
+    first = client.put(url, content=body, headers={**AUTH, "X-Content-Sha256": digest})
+    assert first.status_code == 200
+    assert first.json()["written"] is True
+    assert first.json()["sha256"] == digest
+    assert _volume_file(tmp_path).read_bytes() == body
+
+    again = client.put(url, content=body, headers={**AUTH, "X-Content-Sha256": digest})
+    assert again.status_code == 200
+    assert again.json()["written"] is False
+
+
+def test_writing_different_bytes_under_an_existing_name_is_409(client, tmp_path):
+    import hashlib
+
+    _volume_file(tmp_path).write_bytes(b"original")
+    replacement = b"replacement"
+    url = f"/v1/services/db/volumes/wal-archive/files/wal/{WAL_SEGMENT}"
+
+    r = client.put(
+        url,
+        content=replacement,
+        headers={**AUTH, "X-Content-Sha256": hashlib.sha256(replacement).hexdigest()},
+    )
+
+    assert r.status_code == 409
+    assert _volume_file(tmp_path).read_bytes() == b"original"
+
+
+def test_writing_over_an_existing_file_needs_the_overwrite_flag(client, tmp_path):
+    import hashlib
+
+    _volume_file(tmp_path).write_bytes(b"original")
+    replacement = b"replacement"
+    url = f"/v1/services/db/volumes/wal-archive/files/wal/{WAL_SEGMENT}"
+
+    r = client.put(
+        url,
+        params={"overwrite": "true"},
+        content=replacement,
+        headers={**AUTH, "X-Content-Sha256": hashlib.sha256(replacement).hexdigest()},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["written"] is True
+    assert _volume_file(tmp_path).read_bytes() == replacement
+
+
+def test_writing_without_a_digest_header_is_refused(client, tmp_path):
+    url = f"/v1/services/db/volumes/wal-archive/files/wal/{WAL_SEGMENT}"
+    r = client.put(url, content=b"segment-a", headers=AUTH)
+    assert r.status_code == 400
+    assert not _volume_file(tmp_path).exists()
+
+
+def test_a_body_that_does_not_match_its_digest_leaves_no_file(client, tmp_path):
+    import hashlib
+
+    url = f"/v1/services/db/volumes/wal-archive/files/wal/{WAL_SEGMENT}"
+    r = client.put(
+        url,
+        content=b"segment-a",
+        headers={**AUTH, "X-Content-Sha256": hashlib.sha256(b"other").hexdigest()},
+    )
+
+    assert r.status_code == 400
+    assert not _volume_file(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "path",
+    # Percent-encoded so the HTTP client's own path normalisation does not
+    # rewrite the probe before it reaches the node.
+    ["%2E%2E/escape", "wal/%2E%2E/%2E%2E/escape", "%2Fetc%2Fpasswd", "wal/%2E/x", "wal//x"],
+)
+def test_writing_a_path_that_escapes_the_volume_is_refused(client, tmp_path, path):
+    import hashlib
+
+    (tmp_path / "volumes" / "db" / "wal-archive").mkdir(parents=True)
+    r = client.put(
+        f"/v1/services/db/volumes/wal-archive/files/{path}",
+        content=b"x",
+        headers={**AUTH, "X-Content-Sha256": hashlib.sha256(b"x").hexdigest()},
+    )
+
+    assert r.status_code in (400, 404)
+    assert not (tmp_path / "escape").exists()

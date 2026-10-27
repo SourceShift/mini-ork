@@ -163,6 +163,19 @@ _SNAPSHOT_SHA256_HEADER = "x-content-sha256"
 _SNAPSHOT_SHA256_NAME = "X-Content-Sha256"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+#: Cap on one *file* inside a volume, for the read/write routes below. A
+#: volume file is one artifact — a 16 MiB WAL segment, a configuration file —
+#: not a whole archive, so the bound is deliberately far below the snapshot
+#: cap: a request that names a file cannot fill the disk the way an upload of
+#: a whole volume could. ``MO_NODE_VOLUME_FILE_MAX_BYTES`` is the lever.
+_VOLUME_FILE_MAX_BYTES_ENV = "MO_NODE_VOLUME_FILE_MAX_BYTES"
+_DEFAULT_VOLUME_FILE_MAX_BYTES = 256 * 1024**2
+
+#: Most paths one listing returns. Bounded because a volume can hold a dense
+#: tree (a WAL archive after a month is thousands of segments) and a listing
+#: that streams it all would be a memory answer to a paging question.
+_VOLUME_FILE_LIST_MAX = 1000
+
 #: A Docker network name. The platform sends an environment-scoped network so
 #: services of one environment reach each other by name; the node may have to
 #: create it. Held to a leaf shape (no dots, no slashes) even though it is
@@ -209,6 +222,15 @@ class ServiceError(ValueError):
 def _utc_now() -> str:
     """ISO-8601 UTC with a ``Z`` suffix (the wire style used elsewhere)."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _iso_from_timestamp(timestamp: float) -> str:
+    """A file's ``st_mtime`` on the same wire shape as ``_utc_now``."""
+    return (
+        datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _parse_log_line(replica: int, raw: str) -> dict[str, Any] | None:
@@ -479,6 +501,24 @@ class SnapshotExistsError(ServiceError):
 
 class SnapshotTooLargeError(ServiceError):
     """An imported body exceeds ``MO_NODE_SNAPSHOT_MAX_BYTES``."""
+
+
+class VolumeFileNotFoundError(ServiceError):
+    """No file at that path inside the volume (or it is not a regular file)."""
+
+
+class VolumeFileConflictError(ServiceError):
+    """A write would replace a volume file whose bytes differ from the upload.
+
+    A repeat write of the *same* bytes is idempotent and succeeds; different
+    bytes under a name the volume already holds are refused unless the caller
+    explicitly asks to overwrite. Silently replacing a segment the engine
+    wrote would be the quiet kind of data loss.
+    """
+
+
+class VolumeFileTooLargeError(ServiceError):
+    """One volume file exceeds ``MO_NODE_VOLUME_FILE_MAX_BYTES``."""
 
 
 class NetworkInUseError(ServiceError):
@@ -806,6 +846,7 @@ class ServiceManager:
         volume_root: Path | None = None,
         snapshot_root: Path | None = None,
         snapshot_max_bytes: int | None = None,
+        volume_file_max_bytes: int | None = None,
         _run_fn: Callable[..., Any] | None = None,
         _run_input_fn: Callable[..., Any] | None = None,
         _popen_fn: Callable[[list[str]], subprocess.Popen] | None = None,
@@ -819,6 +860,7 @@ class ServiceManager:
         self.volume_root = self._resolve_volume_root(volume_root)
         self.snapshot_root = self._resolve_snapshot_root(snapshot_root)
         self.snapshot_max_bytes = self._resolve_snapshot_max_bytes(snapshot_max_bytes)
+        self.volume_file_max_bytes = self._resolve_volume_file_max_bytes(volume_file_max_bytes)
         self._path = self.state_dir / "services.json"
         self._run = _run_fn or default_run
         self._specs: dict[str, ServiceSpec] = {}
@@ -896,6 +938,31 @@ class ServiceManager:
         if value <= 0:
             raise ServiceError(
                 f"{_SNAPSHOT_MAX_BYTES_ENV} must be a positive integer, got {value!r}"
+            )
+        return value
+
+    def _resolve_volume_file_max_bytes(self, explicit: int | None) -> int:
+        """Bound on one file served from or written into a volume.
+
+        Same fail-closed rule as the snapshot bound: a node whose lever is
+        unreadable refuses to start rather than running with a limit the
+        operator did not choose.
+        """
+        if explicit is not None:
+            value = explicit
+        else:
+            raw = os.environ.get(_VOLUME_FILE_MAX_BYTES_ENV)
+            if raw is None or raw.strip() == "":
+                return _DEFAULT_VOLUME_FILE_MAX_BYTES
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ServiceError(
+                    f"{_VOLUME_FILE_MAX_BYTES_ENV} must be a positive integer, got {raw!r}"
+                ) from exc
+        if value <= 0:
+            raise ServiceError(
+                f"{_VOLUME_FILE_MAX_BYTES_ENV} must be a positive integer, got {value!r}"
             )
         return value
 
@@ -1315,6 +1382,209 @@ class ServiceManager:
         finally:
             meta_tmp.unlink(missing_ok=True)
         return {**meta, "imported": True}
+
+    # ---- volume files -------------------------------------------------
+    #
+    # A snapshot is the whole volume; these three methods move *one file*
+    # inside it. They exist because some data is append-only and continuous —
+    # a database's WAL archive — and copying the whole volume on every tick
+    # to protect one new segment would turn continuous protection into a
+    # bandwidth bill. The paths are relative and containment-checked on every
+    # call, including after a directory is created, because the volume holds
+    # engine-written data and the node must not assume the caller is the only
+    # writer.
+
+    def _volume_file_path(self, service_id: str, volume_name: str, rel_path: object) -> Path:
+        """Resolve a relative path inside one volume, or refuse it.
+
+        Symlinks are resolved and re-checked, so a link planted inside the
+        volume cannot become a read or write outside it. The resolved parent
+        is checked as well as the leaf: a file that does not exist yet is
+        created under a directory that might be a link.
+        """
+        root = self._volume_dir(service_id, volume_name)
+        rel = str(rel_path if rel_path is not None else "")
+        if rel == "" or len(rel) > 512:
+            raise ServiceError("volume file path must be 1..512 characters")
+        if rel.startswith("/") or "\x00" in rel:
+            raise ServiceError("volume file path must be relative and contain no NUL")
+        parts = rel.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise ServiceError(
+                f"volume file path {rel!r} contains an empty, '.' or '..' segment"
+            )
+        root_resolved = root.resolve()
+        candidate = root / rel
+        for probe in (candidate.parent, candidate):
+            try:
+                probe.resolve().relative_to(root_resolved)
+            except ValueError as exc:
+                raise ServiceError(f"volume file path {rel!r} escapes the volume") from exc
+        return candidate
+
+    def list_volume_files(
+        self,
+        service_id: str,
+        volume_name: str,
+        parent: str = "",
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Every regular file under ``parent``, relative to the volume root.
+
+        Digests are deliberately absent: hashing a tree on every listing would
+        read every byte the control plane is trying to avoid copying. A caller
+        that needs the digest reads the file, and the read reports it.
+        """
+        root = self._volume_dir(service_id, volume_name)
+        if not root.is_dir():
+            raise VolumeNotMaterializedError(
+                f"volume {volume_name!r} of service {service_id!r} has no directory on this node"
+            )
+        base = root if parent in ("", ".") else self._volume_file_path(
+            service_id, volume_name, parent
+        )
+        if not base.is_dir() or base.is_symlink():
+            raise ServiceError(f"volume directory {parent!r} does not exist")
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(f"limit must be an integer, got {limit!r}") from exc
+        limit = max(1, min(limit, _VOLUME_FILE_LIST_MAX))
+
+        found: list[dict[str, Any]] = []
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames.sort()
+            for fname in sorted(filenames):
+                path = Path(dirpath) / fname
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    stat = path.stat()
+                except OSError:
+                    continue
+                found.append(
+                    {
+                        "path": path.relative_to(root).as_posix(),
+                        "bytes": stat.st_size,
+                        "mtime": _iso_from_timestamp(stat.st_mtime),
+                    }
+                )
+                if len(found) > limit:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        found.sort(key=lambda item: item["path"])
+        return {"files": found[:limit], "count": min(len(found), limit), "truncated": truncated}
+
+    def volume_file(self, service_id: str, volume_name: str, rel_path: object) -> tuple[Path, dict[str, Any]]:
+        """One file plus the digest and size it was served as.
+
+        The digest is computed from the same bytes the caller is about to
+        receive, so a transfer corrupted in flight is refused by the control
+        plane instead of stored. Postgres never rewrites a completed WAL
+        segment, so hashing-then-serving does not race the engine.
+        """
+        path = self._volume_file_path(service_id, volume_name, rel_path)
+        try:
+            stat = path.lstat()
+        except OSError as exc:
+            raise VolumeFileNotFoundError(
+                f"no file {rel_path!r} in volume {volume_name!r} of service {service_id!r}"
+            ) from exc
+        if path.is_symlink() or not path.is_file():
+            raise VolumeFileNotFoundError(
+                f"no regular file {rel_path!r} in volume {volume_name!r} of service {service_id!r}"
+            )
+        if stat.st_size > self.volume_file_max_bytes:
+            raise VolumeFileTooLargeError(
+                f"file {rel_path!r} is {stat.st_size} bytes, above the "
+                f"{self.volume_file_max_bytes}-byte limit ({_VOLUME_FILE_MAX_BYTES_ENV})"
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return path, {
+            "path": str(rel_path),
+            "bytes": stat.st_size,
+            "sha256": digest.hexdigest(),
+            "mtime": _iso_from_timestamp(stat.st_mtime),
+        }
+
+    async def write_volume_file(
+        self,
+        service_id: str,
+        volume_name: str,
+        rel_path: object,
+        chunks: AsyncIterator[bytes],
+        *,
+        sha256: str,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Write one file into a volume, verified and atomically.
+
+        Idempotent by content: the same bytes at the same path succeed without
+        rewriting them, which makes a retried import safe. Different bytes are
+        refused unless ``overwrite`` is set — the caller that re-imports a
+        segment the engine left torn is the one that opts in, by design.
+        """
+        digest_hex = str(sha256 or "")
+        if not _SHA256_RE.match(digest_hex):
+            raise ServiceError(
+                f"{_SNAPSHOT_SHA256_NAME} must be 64 lowercase hex characters"
+            )
+        target = self._volume_file_path(service_id, volume_name, rel_path)
+        if target.exists() and not target.is_symlink():
+            existing = self.volume_file(service_id, volume_name, rel_path)[1]
+            if existing["sha256"] == digest_hex:
+                return {**existing, "written": False}
+            if not overwrite:
+                raise VolumeFileConflictError(
+                    f"file {rel_path!r} already exists with different content; "
+                    "pass overwrite to replace it"
+                )
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            raise RuntimeError(f"could not create directory for {rel_path!r}: {exc}") from exc
+        # Re-check containment after creation: the directory we just used must
+        # still resolve inside the volume.
+        self._volume_file_path(service_id, volume_name, rel_path)
+
+        tmp = target.parent / f".{target.name}.import-{uuid.uuid4().hex}"
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with tmp.open("wb") as handle:
+                async for chunk in chunks:
+                    if not isinstance(chunk, (bytes, bytearray)):
+                        raise ServiceError("file body must be binary")
+                    size += len(chunk)
+                    if size > self.volume_file_max_bytes:
+                        raise VolumeFileTooLargeError(
+                            f"file body exceeds {self.volume_file_max_bytes} bytes "
+                            f"({_VOLUME_FILE_MAX_BYTES_ENV})"
+                        )
+                    digest.update(chunk)
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if digest.hexdigest() != digest_hex:
+                raise ServiceError(
+                    f"file body sha256 {digest.hexdigest()} does not match "
+                    f"{_SNAPSHOT_SHA256_NAME} {digest_hex}"
+                )
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return {
+            "path": str(rel_path),
+            "bytes": size,
+            "sha256": digest_hex,
+            "written": True,
+        }
 
     def _volume_holders(self, service_id: str) -> list[tuple[str, str]]:
         """Containers whose mounts still point at the volume.
@@ -2225,6 +2495,82 @@ def make_router(
         except RuntimeError as exc:
             raise HTTPException(500, str(exc)) from exc
 
+    # ---- volume files -------------------------------------------------
+    #
+    # One file inside a volume, for data that grows continuously (a WAL
+    # archive). Separate from the snapshot routes on purpose: a snapshot is
+    # all-or-nothing and quiesced; a file move is neither, and conflating them
+    # would make every segment copy stop the engine.
+
+    @router.get("/v1/services/{sid}/volumes/{name}/files")
+    def list_volume_files_route(sid: str, name: str, parent: str = "", limit: int = 500,
+                                _: None = Depends(bearer)) -> dict:
+        try:
+            return services.list_volume_files(sid, name, parent, limit)
+        except VolumeNotMaterializedError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.get("/v1/services/{sid}/volumes/{name}/files/{path:path}")
+    def get_volume_file_blob(sid: str, name: str, path: str,
+                             _: None = Depends(bearer)) -> FileResponse:
+        try:
+            file, meta = services.volume_file(sid, name, path)
+        except VolumeFileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except VolumeFileTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return FileResponse(
+            file,
+            media_type="application/octet-stream",
+            filename=Path(path).name,
+            headers={
+                # Same header names as the snapshot blob, for the same reason:
+                # the bytes are self-describing, so the reader verifies what it
+                # stored without a second call that could race a change.
+                _SNAPSHOT_SHA256_HEADER: meta["sha256"],
+                "x-content-bytes": str(meta["bytes"]),
+                "x-content-mtime": meta["mtime"],
+            },
+        )
+
+    @router.put("/v1/services/{sid}/volumes/{name}/files/{path:path}")
+    async def put_volume_file_blob(sid: str, name: str, path: str, request: Request,
+                                   overwrite: bool = False,
+                                   _: None = Depends(bearer)) -> dict:
+        declared = request.headers.get(_SNAPSHOT_SHA256_HEADER, "")
+        if not _SHA256_RE.match(declared):
+            raise HTTPException(
+                400,
+                f"{_SNAPSHOT_SHA256_NAME} header is required: 64 lowercase hex characters",
+            )
+        declared_length = request.headers.get("content-length")
+        if declared_length is not None:
+            try:
+                if int(declared_length) > services.volume_file_max_bytes:
+                    raise HTTPException(
+                        413,
+                        f"file body exceeds {services.volume_file_max_bytes} bytes "
+                        f"({_VOLUME_FILE_MAX_BYTES_ENV})",
+                    )
+            except ValueError:
+                raise HTTPException(400, "Content-Length must be an integer") from None
+        try:
+            return await services.write_volume_file(
+                sid, name, path, request.stream(), sha256=declared, overwrite=overwrite
+            )
+        except VolumeFileTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except VolumeFileConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc)) from exc
+
     @router.post("/v1/services/{sid}/volumes/{name}/restore")
     def post_volume_restore(sid: str, name: str, payload: dict,
                             _: None = Depends(bearer)) -> dict:
@@ -2250,6 +2596,9 @@ __all__ = [
     "SnapshotExistsError",
     "SnapshotNotFoundError",
     "SnapshotTooLargeError",
+    "VolumeFileConflictError",
+    "VolumeFileNotFoundError",
+    "VolumeFileTooLargeError",
     "VolumeInUseError",
     "VolumeNotMaterializedError",
     "make_router",
