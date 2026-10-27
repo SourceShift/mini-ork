@@ -21,6 +21,10 @@ same values it exports to the bash subprocess):
   MO_CB_DISABLE           → disable           (default False; "1" enables)
   MO_CB_COLLAPSE          → collapse_history injection + opt-out
                               (default ON; "0" disables the collapse signal)
+  MO_CB_COLLAPSE_FLOOR    → diversity / pass@k floor (default ON; "0" disables;
+                              also off when MO_CB_COLLAPSE=0)
+  MO_CB_FLOOR_WINDOW      → floor window in terminal runs (default 20; read by
+                              collapse_floor.resolve_window)
 
 ``MO_CB_DISABLE`` is honoured at function entry BEFORE any DB work — matches
 the bash lines 109-112 escape-hatch contract. The kwarg and the env combine
@@ -73,6 +77,7 @@ Public surface:
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sqlite3
@@ -83,6 +88,18 @@ from typing import Any, Sequence
 # Module-level dedupe so a broken detector cannot spam stderr on every
 # breaker evaluation. Reset on process restart.
 _LAST_COLLAPSE_LOG: str | None = None
+
+# Register the floor submodules on ``mini_ork.learning`` so the
+# attribute-based lookup in ``_eval_floor_signal`` resolves. Nothing here is
+# bound for use: the helper re-reads the attributes on every call, which is
+# what lets a stripped / unavailable submodule fail open instead of breaking
+# this module's import. A slim harness without ``mini_ork.learning`` still
+# imports fine — the helper then reports the import failure per call.
+try:
+    import mini_ork.learning.collapse_detector  # noqa: F401
+    import mini_ork.learning.collapse_floor  # noqa: F401
+except Exception:  # pragma: no cover - slim harness without the learning pkg
+    pass
 
 
 def _resolve_db(db: str | None) -> str:
@@ -363,6 +380,78 @@ def _eval_collapse_signal(
     return fired, n, rationale, report
 
 
+def _eval_floor_signal(
+    con: sqlite3.Connection | None,
+    tr: sqlite3.Row | None,
+    floor_runs: Sequence[dict] | None,
+    enabled: bool,
+) -> tuple[bool, dict]:
+    """Signal 5: the diversity / pass@k floor recommends ``halt``.
+
+    RSI Tier-1 #12b. ``collapse_detector.floor`` compares the most recent
+    ``window`` terminal runs of a task class against the ``window`` before
+    them: pass@k must fall while the implementer-lane set narrows to one.
+    That is a diversity collapse, independent of the score-vs-anchor
+    divergence signal above.
+
+    The floor is **edge-triggered by the caller**, not here: this helper
+    only reports whether the floor currently recommends ``halt``. The
+    breaker latches on ``collapse_floor`` in ``last_reason`` so a persistent
+    breach trips once and then lets subsequent runs proceed; latching here
+    would make the helper stateful and untestable in isolation.
+
+    ``floor_runs`` is a TEST SEAM: when not ``None`` the DB read is skipped
+    and the injected ``{"run_id", "passed", "task_key", "lanes"}`` rows are
+    run through the detector directly. Production (``None``) reads terminal
+    runs for the run's ``task_class`` via ``collapse_floor.evaluate``.
+
+    Fail-open is load-bearing: a broken import or a detector that raises
+    must never halt a healthy run, so both return ``fired=False`` with the
+    failure surfaced in the report's ``reason``.
+    """
+    if not enabled:
+        return False, {
+            "recommendation": "none",
+            "breach": False,
+            "reason": "collapse floor disabled "
+                      "(MO_CB_COLLAPSE_FLOOR=0 or MO_CB_COLLAPSE=0)",
+        }
+
+    # Lazy lookup: mirrors _eval_collapse_signal so the breaker stays
+    # importable in slim harnesses. The submodules are resolved by attribute
+    # on every call (never bound at import time), so a genuinely unavailable
+    # submodule — or one stripped from the package — surfaces here as the
+    # fail-open import error.
+    try:
+        learning = importlib.import_module("mini_ork.learning")
+        collapse_detector = getattr(learning, "collapse_detector")
+        collapse_floor = getattr(learning, "collapse_floor")
+    except Exception as exc:
+        _log_collapse_once(f"floor import failed: {type(exc).__name__}: {exc}")
+        return False, {
+            "recommendation": "none",
+            "breach": False,
+            "reason": f"floor import failed: {exc}",
+        }
+
+    try:
+        if floor_runs is not None:
+            report = collapse_detector.floor(
+                list(floor_runs), window=collapse_floor.resolve_window()
+            )
+        else:
+            report = collapse_floor.evaluate(con, tr["task_class"])
+    except Exception as exc:
+        _log_collapse_once(f"floor raised {type(exc).__name__}: {exc}")
+        return False, {
+            "recommendation": "none",
+            "breach": False,
+            "reason": f"floor raised {type(exc).__name__}: {exc}",
+        }
+
+    return report.get("recommendation") == "halt", report
+
+
 def check_liveness_breaker(
     run_id: str,
     db: str | None = None,
@@ -373,6 +462,7 @@ def check_liveness_breaker(
     cooldown_s: int = 1800,
     disable: bool = False,
     collapse_history: Sequence[dict] | None = None,
+    floor_runs: Sequence[dict] | None = None,
 ) -> tuple[dict, int]:
     """Port of ``mo_check_liveness_breaker``. Returns (json_dict, rc).
 
@@ -394,6 +484,9 @@ def check_liveness_breaker(
     # but reports fired=False with a stable rationale so audit rows stay
     # honest about why the signal did not participate.
     collapse_enabled = os.environ.get("MO_CB_COLLAPSE", "1") != "0"
+    floor_enabled = collapse_enabled and os.environ.get(
+        "MO_CB_COLLAPSE_FLOOR", "1"
+    ) != "0"
 
     db = _resolve_db(db)
     artifact_window = int(artifact_window)
@@ -461,6 +554,20 @@ def check_liveness_breaker(
         )
     )
 
+    # Diversity / pass@k floor (RSI Tier-1 #12b). Unlike the score-vs-anchor
+    # signal above, the floor is edge-triggered: it trips once per breach
+    # episode and then latches on ``collapse_floor`` in ``last_reason``.
+    # Every run of a breached scope must not trip — each tripped run ends
+    # failed, which keeps pass@k down and would make the breach permanent.
+    floor_fired, floor_report = _eval_floor_signal(
+        con, tr, floor_runs, floor_enabled
+    )
+    floor_latched = (
+        st is not None
+        and "collapse_floor" in str(st["last_reason"] or "").split(",")
+    )
+    floor_trip = floor_fired and not floor_latched
+
     # Collapse is an INDEPENDENT trip, not a vote. The original three
     # stagnation signals drive `signals_fired` (so fired_count /
     # signal_count and every policy semantics are unchanged on
@@ -484,6 +591,11 @@ def check_liveness_breaker(
     if collapse_fired and not trip:
         trip = True
         independent_collapse_trip = True
+
+    independent_floor_trip = False
+    if floor_trip and not trip:
+        trip = True
+        independent_floor_trip = True
 
     # State transition.
     if prev_state == "HALF_OPEN":
@@ -528,6 +640,15 @@ def check_liveness_breaker(
                 f"({fired_count}/{signal_count} stagnation signals fired) — halting"
             )
             last_reason_tokens = ["collapse_halt"]
+        elif independent_floor_trip:
+            # Floor-driven trips (RSI Tier-1 #12b) rewrite fired_names to
+            # the single latch token so the audit row reads cleanly and
+            # the next run can tell the breach is already latched.
+            top_rationale = (
+                f"collapse_floor fired under policy={policy} "
+                f"({fired_count}/{signal_count} stagnation signals fired) — halting"
+            )
+            last_reason_tokens = ["collapse_floor"]
         else:
             top_rationale = (
                 f"{fired_count}/{signal_count} stagnation signals fired under "
@@ -546,6 +667,13 @@ def check_liveness_breaker(
             f"— below trip threshold, proceeding"
         )
         last_reason_tokens = list(fired_names) if fired_names else []
+
+    # Persist the floor latch on EVERY verdict (PROCEED and PROBE included):
+    # while the breach persists the token stays set so subsequent runs do
+    # not re-trip. The first evaluation without a breach clears it because
+    # ``last_reason_tokens`` no longer contains it.
+    if floor_fired and "collapse_floor" not in last_reason_tokens:
+        last_reason_tokens.append("collapse_floor")
 
     con.execute(
         """
@@ -612,6 +740,11 @@ def check_liveness_breaker(
             "history_rows": collapse_n,
             "enabled": collapse_enabled,
             "rationale": collapse_rationale,
+            "floor_enabled": floor_enabled,
+            "floor_fired": floor_fired,
+            "floor_latched": floor_latched,
+            "floor_independent_trip": independent_floor_trip,
+            "floor": floor_report,
         },
         "policy": policy,
         "fired_count": fired_count,
