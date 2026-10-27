@@ -81,6 +81,31 @@ flowchart LR
   the unchanged node-agent protocol, so sync, mirror, reattach and secret
   scoping are reused rather than reimplemented.
 
+### Why this is not `verifiers.v1.runtimes`
+
+A reader who finds `mini_ork/runtime/engine.py` wrapping
+[`verifiers.v1.runtimes`](../../THIRD_PARTY.md) reasonably asks why the
+providers here do not use it too — Modal and E2B appear in both. They answer
+different questions, and the difference decides it:
+
+| | `v1.runtimes` (Crucible) | `NodeProvider` (this doc) |
+|---|---|---|
+| Question | run this command in an isolated box | where does this run's machine come from |
+| Unit | one rollout — a patch plus a test | one node-agent, serving a whole run |
+| Lifecycle | `start` → `run`/`read` → `stop` → `teardown` | `create`/`attach` → node-agent v1 → `release`/`reap` |
+| Re-find by handle | `info.id` / `borrowed`, for a runtime you still hold | required — a later OS process must attach to the same node |
+| TTL sweep | none | `reap(max_age_s)` over every labelled sandbox the account owns |
+| Who executes | the Runtime | the node-agent, over its own HTTP API |
+
+The deciding constraint is the **reaper**: a run must be able to find and
+destroy sandboxes it abandoned, which needs *list-by-label* and
+*delete-by-handle* on the vendor API. `Runtime` exposes neither at any version
+through 0.4.0 — it is scoped to one runtime you already have. Routing providers
+through it would remove a duplication of two thin vendor adapters
+(`e2b.py`, `modal_sandbox.py`) and delete the sweep in exchange. That is a bad
+trade, so the duplication stays, and `scripts/smoke_sandbox_node.py --provider
+<name>` remains its acceptance test.
+
 The provider is chosen by the environment profile:
 
 ```yaml

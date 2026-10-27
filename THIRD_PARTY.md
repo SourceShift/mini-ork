@@ -9,8 +9,15 @@ contribute fixes back rather than forking. This file records what we use and why
 
 - **Upstream:** https://github.com/PrimeIntellect-ai/verifiers
 - **License:** MIT
-- **Version:** `>=0.2.0,<0.3` — the `verifiers.v1` namespace, which upstream ships as a
-  *preview*. We pin deliberately and bump on purpose.
+- **Version:** `>=0.2.0,<0.5` — the `verifiers.v1` namespace, which upstream ships as a
+  *preview*. We pin deliberately and bump on purpose. The floor is the first release with
+  the `v1.runtimes` shape Crucible calls; the ceiling was raised from `<0.3` to `<0.5` by
+  dependabot (PR #230, 2026-10-27). Before accepting that, `mini_ork/runtime/engine.py`'s
+  entire surface — `make_runtime`, the four `*Config` classes, and the Runtime protocol
+  methods — was checked against **both ends**, `0.2.0` and `0.4.0`, and is unchanged. That
+  check is now a test (`tests/unit/test_crucible_runtime.py::
+  test_the_engine_api_surface_survives_the_pinned_range`) and a CI job (`verifiers-pin`),
+  so the next automated bump is verified rather than merely merged.
 - **Used by:** `mini_ork/runtime/` (Crucible — our verified-execution seam). This is the
   **only** import site; nothing else in mini-ork may import `verifiers`, so an upstream API
   change touches exactly one file.
@@ -20,18 +27,33 @@ contribute fixes back rather than forking. This file records what we use and why
   anything we would hand-roll, and it makes cloud execution a config field rather than a
   rewrite. (Their v1 message-DAG trace and interception server are on our roadmap for the
   same reason; not wired yet.)
+- **Where we deliberately do not use it: node providers.** `mini_ork/remote/providers/`
+  (static, daytona, e2b, modal) is a different layer and does not route through
+  `v1.runtimes`, even where the vendor is the same. A node provider answers "where does
+  this run's machine come from", then boots a node-agent inside it; the protocol that
+  matters — sync, run-dir mirror, reattach, secret scoping — is ours. It also needs verbs
+  `Runtime` does not offer at any version through 0.4.0: `attach` by the cloud's handle
+  (a later process must find the same node), and `reap(max_age_s)` — a TTL sweep over
+  every labelled sandbox the account owns. `Runtime` has `start`/`stop`/`teardown` for a
+  runtime you already hold, and no list-by-label API. Routing providers through it would
+  trade two thin vendor adapters for losing the reaper. See
+  `docs/architecture/cloud-sandbox-providers.md`, "Why this is not `verifiers.v1.runtimes`".
 - **Why we depend rather than fork:** upstream ships daily and v1 is explicitly a preview.
   A fork would rot within a month. We depend, pin, and wrap behind our own seam — and when
   `verifiers` is absent, Crucible drives the `docker` CLI directly and behaves identically,
   so mini-ork stays zero-dependency by default.
 - **Where we diverge — and where we do not.** It would be wrong to say `verifiers` "scores
   with an LLM judge." In v1 a task's `@vf.reward` is arbitrary Python, and their SWE
-  tasksets score on test execution exactly as we do. The real divergence is a **layer they
-  do not have**: nothing in their stack — or in Harbor, or in any harness in their registry
-  — asks whether a **passing** patch is **actually correct**. A reward function returning
-  `1.0` because the test went green *is* the extensional-verifier-hacking failure mode
-  (a patch can special-case the test; ~73.6% shortcut rate under compute pressure). mini-ork
-  adds two layers on top of theirs:
+  tasksets score on test execution exactly as we do. They also defend against reward hacks,
+  but at a **different boundary**. Their interception server sits between the harness and
+  the model API, so it can cut egress or rewrite a tool or search result that would let a
+  rollout cheat (`docs/v1/architecture.md`: "Intercepting and rewriting tool responses or
+  server-side web search results to block reward hacks"). That is a *tool-boundary*
+  defence, and it is real. mini-ork's is an *oracle-boundary* defence: a reward function
+  returning `1.0` because the test went green still says nothing about whether the
+  **passing** patch is **actually correct** — a patch can special-case the test, and a
+  tool-boundary proxy cannot see that (~73.6% shortcut rate under compute pressure). The
+  two are complementary, not competing. mini-ork adds two layers on top of theirs:
     - **Crucible** (`mini_ork/runtime/`) — execution-anchored outcome. Its `failed` vs
       `error` split is ours: an *error* is a broken environment, not a failed patch, and
       blaming the patch for it is a false-reject (PR #170). A judge may **veto**, never
@@ -40,7 +62,8 @@ contribute fixes back rather than forking. This file records what we use and why
       gating, explicit abstention). This has no counterpart upstream and is the component we
       claim as differentiating.
 
-  See `docs/epics/20260713-verified-execution-substrate.md`.
+  See `docs/architecture/verification-stack.md` for where each of these runs, and
+  `mini_ork/certify/` for Assay's implementation.
 
 ```
 MIT License

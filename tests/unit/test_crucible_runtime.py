@@ -224,6 +224,38 @@ def test_cloud_backends_are_selectable():
     assert set(available_backends()) >= {"docker", "prime", "modal", "subprocess"}
 
 
+@pytest.mark.skipif(not _have_verifiers(), reason="verifiers not installed")
+def test_the_engine_api_surface_survives_the_pinned_range():
+    """Every call `engine.py` makes into `verifiers` must exist on any version the pin admits.
+
+    The declared range is `verifiers>=0.2.0,<0.5`, and the ceiling moves on its own —
+    dependabot raised it `<0.3` -> `<0.5` on 2026-10-27 with nothing checking that the
+    preview API had stayed put. This asserts the *shape* engine.py depends on, not a
+    version, so it runs against whatever is installed; CI's `verifiers-pin` job runs it at
+    both ends of the range. Widening a pin is only safe while this test is green.
+    """
+    from verifiers.v1 import runtimes as R
+
+    # engine.py:105 probes the namespace; :200 builds these four configs; :216 starts one.
+    for name in ("SubprocessConfig", "DockerConfig", "PrimeConfig", "ModalConfig"):
+        assert hasattr(R, name), name
+    assert callable(R.make_runtime)
+    # The Runtime protocol is async (start/run/read/stop/teardown) and owns one sync method.
+    for method in ("start", "run", "read", "stop", "teardown", "cleanup"):
+        assert hasattr(R.Runtime, method), method
+
+    # Mirror `_runtime_config`, including the optional cpu/memory passthrough.
+    R.SubprocessConfig(type="subprocess")
+    cfg = R.DockerConfig(
+        type="docker", image="python:3.11-slim", workdir="/work", cpu=2, memory=1024
+    )
+    assert (cfg.type, cfg.image) == ("docker", "python:3.11-slim")
+    assert cfg.cpu == 2.0 and cfg.memory == 1024.0   # pydantic coerces int -> float
+
+    rt = R.make_runtime(R.SubprocessConfig(type="subprocess"), name="pin-probe")
+    assert rt.is_local is True, "the subprocess runtime must stay local"
+
+
 def test_a_runtime_that_never_started_reports_no_run_not_a_failure():
     """A dead runtime must not be mistaken for a dead patch."""
     c = Crucible(RuntimeSpec(image="x", backend="docker-cli"))
