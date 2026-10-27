@@ -634,6 +634,12 @@ def run_gate(
                 # cache miss in the output.
                 review_id, verdict = degraded_stale
                 cached = True
+                # The earlier review was degraded by definition (that is why
+                # it was re-run). Record its real state now, with ``fresh``:
+                # a zero-row review counts as degraded, so the hybrid check
+                # below warns (simple tier) or blocks (secure tier) instead of
+                # silently approving on heuristics alone.
+                lens_state = _llm_lenses_all_failed(review_id, db, fresh=True)
             else:
                 if mode == "hybrid":
                     # A hybrid review that just ran and recorded no successful

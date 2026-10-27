@@ -470,3 +470,32 @@ def test_prereview_returns_the_reviewed_patch(driver, monkeypatch, tmp_path):
 def test_prereview_returns_empty_when_the_reviewer_errors(driver, monkeypatch, tmp_path):
     wt = _prereview_fixture(driver, monkeypatch, tmp_path, 3, "abc123")
     assert driver._prereview(wt) == ""
+
+
+# ── F1: a degraded fallback is never approved silently ─────────────────────
+
+
+def test_degraded_fallback_with_zero_lens_rows_warns(gate_repo, capsys):
+    """A cached zero-row review whose re-run raises leaves that review
+    standing, but the hybrid check must still say no LLM lens ran."""
+    from mini_ork.review.gate import run_gate
+
+    wt, home, db, pid = gate_repo
+    rid = _make_db(db, verdict="approve", lens_rows=())
+    _write_cache(home, pid, rid)
+
+    def raising_review(*args, **kwargs):
+        raise RuntimeError("review lane down")
+
+    result = run_gate(
+        target="main", cwd=wt, now=T0,
+        env=_env(home, db, MO_REVIEW_LLM_LENSES="1"),  # hybrid, simple tier
+        review_fn=raising_review,
+    )
+    out = capsys.readouterr().out
+
+    assert "no LLM lens ran" in out, out
+    assert result.verdict == "approve"
+    assert result.review_id == rid
+    assert result.cached is True
+    assert result.rc == 0, "simple tier: the warning does not block the push"
