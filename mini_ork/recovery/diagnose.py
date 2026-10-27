@@ -7,6 +7,7 @@ stage (``plan`` / ``execute`` / ``verify`` / ``review`` / ``deliver``) and which
 node. This module adds exactly that answer, as a first-match-wins rule set:
 
   * ``R1``  publisher withheld with a proven level vector → engine / deliver / publisher
+  * ``R1f`` publisher refused a frozen-path edit → kickoff / deliver / owner
   * ``R1b`` publisher withheld with unproven levels      → change / verify / reverify
   * ``R2``  traceback inside mini-ork's own source       → engine / <stage> / fix_epic
   * ``R3``  infra or provider trouble                    → provider / execute / retry
@@ -571,6 +572,39 @@ def _rule_publish_abstain(run_dir: Path, run_id: str, ends: dict[str, dict[str, 
     )
 
 
+def _rule_frozen_refusal(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]]
+                         ) -> dict[str, Any] | None:
+    """R1f — the publisher refused a frozen-path edit: an owner decision.
+
+    ``publish-frozen-path`` is not an engine fault. The change touches a path in
+    ``config/kernel-frozen.yaml``, so the refusal is the policy working: only the
+    operator can authorise it (``MO_ALLOW_FROZEN_EDIT=1``) or re-scope the change.
+    Matched whatever ``_levels_ok`` says — a proven vector would otherwise meet
+    R1 and open a fix epic to "fix" the engine that correctly refused — and
+    placed FIRST so it wins over R1 and R1b alike.
+    """
+    got = _publisher_withheld(run_dir, ends)
+    if got is None:
+        return None
+    pub, reason, abstain = got
+    if not isinstance(abstain, dict):
+        return None
+    if str(abstain.get("reason") or "") != "publish-frozen-path":
+        return None
+    levels_ok = _levels_ok(run_dir)
+    evidence = _abstain_evidence(pub, reason, abstain, levels_ok,
+                                 str((ends.get(pub) or {}).get("event_id") or ""))
+    return _result(
+        run_id, rule_id="R1f", layer=LAYER_KICKOFF, stage="deliver",
+        node=pub or "publisher", confidence=0.95, evidence=evidence,
+        routes_to=ROUTE_OWNER,
+        summary=("the publisher refused a frozen-path edit (config/kernel-frozen.yaml) — "
+                 "only the owner can authorise it (MO_ALLOW_FROZEN_EDIT=1) or re-scope "
+                 "the change"),
+        ends=ends,
+    )
+
+
 def _rule_withheld_unproven(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]]
                             ) -> dict[str, Any] | None:
     """R1b — the publisher withheld, but not as an engine fault.
@@ -979,6 +1013,7 @@ def _diagnose(home: Path, run_id: str) -> dict[str, Any]:
     lifecycle_evidence = r2_evidence or _log_traceback_evidence(run_dir)
 
     for rule in (
+        lambda: _rule_frozen_refusal(run_dir, run_id, ends),
         lambda: _rule_publish_abstain(run_dir, run_id, ends),
         lambda: _rule_withheld_unproven(run_dir, run_id, ends),
         lambda: _rule_framework_error(run_dir, run_id, ends, failed_node, fail_reason, log),

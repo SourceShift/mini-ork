@@ -436,7 +436,8 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
         log(f"  [warn] publisher: {len(foreign)} foreign hunk(s) left uncommitted "
             f"(publish-foreign-hunks.txt)")
     msg = f"mini-ork({recipe}): {node_desc} [run {run_id}]"
-    landed = _pap.land_patch(target_repo, authored.patch_text, "", message=msg)
+    landed = _pap.land_patch(target_repo, authored.patch_text, "", message=msg,
+                             run_id=run_id)
     if isinstance(landed, _pap.Abstain):
         log(f"  [skip-publish] abstain {landed.reason}: {landed.detail}")
         _record_publish_abstain(run_dir, landed.reason, landed.detail)

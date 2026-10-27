@@ -1427,7 +1427,36 @@ def resolve_authored_patch(run_dir: str, repo: str | None = None) -> AuthoredPat
                    "reconciles — the declared files_changed is a tree delta, not a source")
 
 
-def land_patch(repo: str, patch_text: str, branch: str, *, message: str = "") -> str | Abstain:
+def _record_frozen_event(tripwire_id: str, severity: str, paths: list[str],
+                         *, run_id: str = "") -> bool:
+    """Record a frozen-path publish refusal or override in ``safety_events``.
+
+    Written under the same tripwire id the framework-edit verifier uses
+    (``frozen-kernel-edit``), so one query finds every frozen refusal; the
+    ``boundary: "publish"`` key in the evidence tells a publish row apart from
+    the verifier's. The store resolves its own DB path (``MINI_ORK_DB``, then
+    ``MINI_ORK_HOME/state.db``), so no ``db=`` is passed.
+
+    Never raises: the refusal must not depend on the event being written. Any
+    failure — an absent table, a broken store, an unimportable module — answers
+    ``False`` and lets the caller refuse (or override) exactly as before.
+    """
+    try:
+        from mini_ork.stores import safety_events  # noqa: PLC0415
+        event = safety_events.emit(
+            tripwire_id,
+            severity,
+            json.dumps({"run_id": run_id, "paths": list(paths),
+                        "boundary": "publish"}),
+            run_id=run_id,
+        )
+        return bool(isinstance(event, dict) and event.get("id"))
+    except Exception:  # noqa: BLE001 — a failed event must never change the verdict
+        return False
+
+
+def land_patch(repo: str, patch_text: str, branch: str, *, message: str = "",
+               run_id: str = "") -> str | Abstain:
     """Commit ``patch_text`` onto ``branch`` through a private index. Returns the sha.
 
     The parent is the CURRENT HEAD, never ``pre-implementer-ref``: a tree built
@@ -1473,12 +1502,19 @@ def land_patch(repo: str, patch_text: str, branch: str, *, message: str = "") ->
     # change and disguise the violation).
     frozen = frozen_hits(_frozen_scan_paths(patch_text), enforced_frozen_paths(repo))
     if frozen and not frozen_edit_allowed():
+        # Record the refusal (best effort) BEFORE abstaining; the return value is
+        # deliberately ignored so a broken store can never change the verdict.
+        _record_frozen_event("frozen-kernel-edit", "high", frozen, run_id=run_id)
         named = ", ".join(frozen)
         return Abstain(
             "publish-frozen-path",
             f"refusing to publish: {named} is frozen (config/kernel-frozen.yaml); "
             "set MO_ALLOW_FROZEN_EDIT=1 to override a deliberate frozen edit",
         )
+    if frozen:
+        # Reached only when MO_ALLOW_FROZEN_EDIT=1 let the frozen edit through:
+        # the override is recorded, then the normal landing path continues.
+        _record_frozen_event("frozen-kernel-override", "medium", frozen, run_id=run_id)
 
     branch = (branch or "").strip()
     if not branch:
