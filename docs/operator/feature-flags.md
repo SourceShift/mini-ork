@@ -27,10 +27,10 @@ variable is unset.*
 | `MO_TRAJECTORY_TTL_DAYS` | `30` | turn_jsonl retention; 0 disables the run-end prune |
 | `MO_FALLBACK_CODING` | `"minimax,glm,deepseek_flash"` | Fallback lane chain for coding roles |
 | `MO_FALLBACK_REVIEW` | `"opus,glm,sonnet"` | Fallback lane chain for review roles |
-| `MO_FALLBACK_STOP_ON_CALLER_FAULT` | `"0"` | `1`: a `caller_fault` failure (prompt too long, a rejected request) stops the fallback walk instead of trying the next lane. Default walks on, since a prompt too long for one lane can fit another. Each failed `llm_calls` row records its typed class in `metadata_json.failure_class` (`mini_ork/dispatch/failure_class.py`); only a run-wide fault (a missing cwd, a confused target) always stops the walk, and its row is marked `:refused` so it never counts as a fuse strike |
+| `MO_FALLBACK_STOP_ON_CALLER_FAULT` | `"0"` | `1`: a `caller_fault` failure (prompt too long, a rejected request) stops the fallback walk instead of trying the next lane. Default walks on, since a prompt too long for one lane can fit another. Failed `llm_calls` rows written by `llm_dispatch` record the typed class in `metadata_json.failure_class` (`mini_ork/dispatch/failure_class.py`); only a run-wide fault (a missing cwd, a confused target) always stops the walk, and its row is marked `:refused` so it never counts as a fuse strike |
 | `MO_DISPATCH_RETRY_MAX_SLEEP_S` | `"45"` | Cap on one retry's sleep. A provider that asks for a longer wait (`Retry-After`, `try again in …`, `try again at …`) is not retried on the same chain; the walk moves on |
 | `MO_LANE_AFFINITY` | `"1"` | A node's later rounds try first the lane that served its first success (`<run_dir>/.lane-affinity.json`), while the routing lead is unchanged; an operator remap always wins and a fused lane stays dropped. `0` disables |
-| `MO_MOCK_SEED` | *(unset)* | Seed for the probabilistic rules of `kind: mock` lanes; a lane's own `env.MO_MOCK_SEED` wins. See [mock-provider.md](mock-provider.md) |
+| `MO_MOCK_SEED` | `"0"` | Seed for the probabilistic rules of `kind: mock` lanes; a lane's `extra_env: {MO_MOCK_SEED: …}` in `providers.yaml` wins over the process env. See [mock-provider.md](mock-provider.md) |
 | `MINI_ORK_LEASE_TOKEN` | *(flag)* | Single-writer lease token passed through recovery |
 | `MINI_ORK_RECOVERY_CLOSURE` | `""` | Recovery closure node set (set by `mini-ork recover`) |
 | `MINI_ORK_WORKFLOW_VERSION_ID` | *(flag)* | Pin the workflow version stamped in traces |
