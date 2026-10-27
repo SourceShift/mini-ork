@@ -36,6 +36,8 @@ or remove `MINI_ORK_ON_EVENT`.
 | G1 | The gradient extractor's hard-coded 120 s cap becomes `MINI_ORK_GRADIENT_TIMEOUT_S` (default 300) | `bif-g1-gradient-timeout.md` |
 | B1b | The pre-push review's findings on B1 and B3: stdout prose may only promote to provider-structured classes (never a fuse-terminal one), the model-access phrase stays on one line, affinity reorders the FINAL chain (it was a no-op for the planner), transient failures carry the wait hint | `bif-b1b-review-findings.md` |
 | R5c | Test gaming is HIGH on every review attempt; runtime and eval render the round block from one function, and the eval replays the block a case's run received; an errored eval case scores as an error | `bif-r5c-gaming-is-high.md` |
+| S1 | A wrapped "do not modify" sentence keeps its polarity on every line of the scope check (found in R5c's static-check log: every bif kickoff wraps it, so each run was allowed `docs/`, `recipes/` and the kernel-frozen list) | `bif-s1-scope-wrapped-deny.md` |
+| S2 | Revise and repair feedback leads with the FAILED checks' own log sections (R5c's three rounds never saw the one-line finding) | `bif-s2-feedback-names-failing-check.md` (high tier: `mini_ork/cli/execute.py`) |
 
 Not adopted (from the study): a semantic response cache, virtual keys and
 multi-tenant governance, Starlark code mode. A per-lane `gateway:` setting to
@@ -61,7 +63,14 @@ use Bifrost itself as an optional secure-tier transport stays a later option.
 |---|---|---|
 | B6, B3, E1, R4b | on main | Operator review fixes before each merge (see each commit) |
 | B1 | 437b2fa3 | Operator fix-forward: the kickoff stopped the walk on every `environment` failure, but `[Errno 2]` reads the same for a missing cwd (run-wide) and a missing CLI binary (one lane), and `classify_error`'s `config` (missing key, `$X is empty`, no providers.yaml entry) maps there too. A laptop with one provider key would have stopped at the first keyless lane. Now `spawn_local` names a missing cwd and only run-wide faults stop the walk. Three blind spec tests pinned the kickoff's rule and fail by design |
+| G1 | f1dc3604 | Default 300 s; pattern_induction keeps 120 s (it holds a process lock for its whole dispatch) |
+| R5c | 1ccebeb7 | Operator salvage: the no-test-gaming scan flagged the new prompt line, which quoted the probe tokens (the kickoff's own exact text); reworded. Round feedback is read from `revise/round-<attempt-1>.md` first |
+| B1b | e3457063, e3649b22 | The first merge was blocked by review 123 (two highs): run-wide environment rows now carry the `:refused` actor and never count as fuse strikes; a stdout-promoted class lands in metadata only, never in the fuse-read `error_category` |
+| S1 | 7d106336, 8adc3fa0 | Review 130 found a regression (a `Do not` line after an unterminated line); fixed with `break_before_negative` |
+| B2 | 7a9affcf | Real lanes: glm, deepseek_flash, opus armed; codex not. Remote/workspace spawns get no deadline (by design; follow-up below) |
+| Flag docs | b25c845e, + B2 rows | 10 flags documented |
 | R2e | awaiting the user's approval | High tier (`scripts/mini_ork_worktree.py`); approval binds to patch-id 2e5bb817 |
+| S2 | awaiting the user's approval | High tier (`mini_ork/cli/execute.py`); approval binds to patch-id 9c00f10b. Replayed on the R5c run dir, the repair section names no-test-gaming and quotes execute_handlers.py:1715 |
 
 ### Why the in-run reviewer passed K10, K12 and K13
 
@@ -95,3 +104,18 @@ cap cuts the latency tail of a call that mostly works (G1). The classes B4
 would hold (quota, auth, config, capacity) cost 0.1 h: the existing 1-strike
 fuse already fails them fast. B4 is deferred until a measurement shows it
 pays; B2 (the first-output deadline) is the targeted fix for hung lanes.
+
+### Open follow-ups
+
+- **Remote first-output deadline.** B2 arms only host spawns; the
+  workspace/remote transport does not read stdout line by line.
+- **Reviewer-eval fidelity** (review 120, medium): the eval resolves the
+  dispatch lane with a different home than `fingerprint()`, caps the diff
+  twice (`_cap` then `cap_block`), renders `(not available)` slots for
+  commit-sourced cases, and `copy_evidence` on an unreadable run dir deletes a
+  case's stored evidence.
+- **K12 and K13** in-run misses are still unexplained after the round-block
+  replay; the eval still omits the injected lessons, artifact context and
+  scope guard.
+- **`throttle_retryable`** is dead code since B1, kept because
+  `test_dispatch_retry_py.py` pins it.
