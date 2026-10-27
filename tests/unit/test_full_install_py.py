@@ -40,14 +40,15 @@ def test_package_declares_core_and_full_runtime_dependencies():
     assert full[1] == "uvicorn[standard]>=0.29"
     assert full[-1] == "gepa>=0.1.4,<0.2"
     # The `verifiers` *ceiling* is not this test's business: it moves on its own
-    # schedule (dependabot raised it `<0.3` -> `<0.5` on 2026-10-27).
+    # schedule (dependabot raised it `<0.3` -> `<0.5` on 2026-10-27), so any
+    # `<X.Y` is accepted. What t0f pins is that exactly one `verifiers`
+    # requirement is present and carries the py3.14 marker;
     # `tests/unit/test_crucible_runtime.py` and the CI `verifiers-pin` job hold
-    # the other end of it. This pins that exactly one `verifiers` requirement is
-    # present; the py3.14 marker becomes mandatory with the t0f installer fix.
+    # the other end of it.
     verifiers = [req for req in full if req.startswith("verifiers>=")]
     assert len(verifiers) == 1, full
     assert re.fullmatch(
-        r'verifiers>=0\.2\.0,<0\.\d+(; python_version < "3\.14")?', verifiers[0]
+        r'verifiers>=0\.2\.0,<\d+(?:\.\d+)*; python_version < "3\.14"', verifiers[0]
     ), verifiers[0]
 
 
@@ -88,7 +89,7 @@ def test_runtime_pointer_selects_a_custom_venv(tmp_path):
     pointer = installer.write_runtime_pointer(root, venv, dry_run=False)
 
     assert pointer == root / ".mini-ork" / "runtime-python"
-    assert pointer.read_text(encoding="utf-8") == str(installer.venv_python(venv).resolve()) + "\n"
+    assert pointer.read_text(encoding="utf-8") == str(installer.venv_python(venv).absolute()) + "\n"
 
 
 def test_full_installer_exposes_git_for_windows_bash_to_its_process(tmp_path):

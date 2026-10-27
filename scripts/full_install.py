@@ -103,7 +103,7 @@ def installation_commands(root: Path, venv: Path, install_args: Sequence[str]) -
 def write_runtime_pointer(root: Path, venv: Path, *, dry_run: bool) -> Path:
     """Persist the interpreter selected by this install for the public launcher."""
     pointer = root / RUNTIME_POINTER
-    python = venv_python(venv).resolve()
+    python = venv_python(venv).absolute()
     print(f"+ write {pointer} -> {python}")
     if dry_run:
         return pointer

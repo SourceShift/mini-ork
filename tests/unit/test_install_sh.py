@@ -153,6 +153,7 @@ def remote(tmp_path: Path) -> dict:
     _make_fake_git(bin_dir)
     py_record = tmp_path / "py-argv.txt"
     git_log = tmp_path / "git.log"
+    _make_fake_python(bin_dir, "python3.13", version_ok=False)
     _make_fake_python(bin_dir, "python3.12", version_ok=False)
     _make_fake_python(bin_dir, "python3.11", version_ok=True, record_argv=py_record)
     install_dir = tmp_path / "install-dir"
@@ -252,6 +253,7 @@ def test_remote_install_system_deps_zero_skips_marker(remote: dict) -> None:
 def test_remote_no_acceptable_python_exits_with_message(tmp_path: Path) -> None:
     bin_dir = tmp_path / "fake-bin"
     bin_dir.mkdir()
+    _make_fake_python(bin_dir, "python3.13", version_ok=False)
     _make_fake_python(bin_dir, "python3.12", version_ok=False)
     _make_fake_python(bin_dir, "python3.11", version_ok=False)
     _make_fake_python(bin_dir, "python3", version_ok=False)
