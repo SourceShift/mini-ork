@@ -48,9 +48,13 @@ def _floor_main(task_class: str, json_flag: bool) -> int:
         sys.stderr.write(f"collapse-check: no state.db at {path}\n")
         return 0
 
+    # connect_readonly, not a raw mode=ro URI: on an idle WAL state.db a mode=ro
+    # handle fails every query, and the floor reader would then report
+    # "insufficient history" instead of the real answer.
+    from mini_ork.sqlite_read import connect_readonly  # noqa: PLC0415
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error as exc:
+        con = connect_readonly(path)
+    except (sqlite3.Error, OSError) as exc:
         sys.stderr.write(f"collapse-check: cannot open {path}: {exc}\n")
         return 0
     try:
