@@ -11,6 +11,13 @@ only when every REQUIRED level is PROVEN:
     preserve  — no regression against a green base.
     contract  — a behavioral verifier PROVED the contract (unrequired today).
 
+``target`` and ``preserve`` also honour a recorded certify veto: when the test
+verifier wrote ``certify.mode == "gate"`` with a REFUTED ``certify.verdict``, a
+``relations`` veto is a ``target`` failure and a ``differential`` veto is a
+``preserve`` failure. Both downgrade PROVEN to UNVERIFIED — never REFUTED — so
+the publish is withheld without a rollback. The mode recorded at verify time
+decides; the environment is never read for this.
+
 Each level is scored independently and is three-valued (PROVEN / REFUTED /
 UNVERIFIED), mirroring :class:`mini_ork.verify.behavioral.BehavioralVerdict`
 and :class:`mini_ork.runtime.engine.ExecOutcome`: PROVEN only from the
@@ -384,6 +391,65 @@ def _contract_from_recipe_verifiers(run_dir):
     return PROVEN, "recipe verifier evidence PROVEN (" + ", ".join(verdicts) + ")"
 
 
+# The certify terms that veto a level. A relations veto ("the patch
+# special-cases the reported input") is a target failure; a differential veto
+# ("collateral divergence on preserve inputs") is a preserve failure.
+_CERTIFY_VETO_TERMS = ("relations", "differential")
+
+
+def certify_vetoes(T):
+    """The certify veto terms a gate-mode verdict recorded, in their original order.
+
+    Returns ``[]`` unless the test evidence carries a ``certify`` dict whose
+    ``mode`` is ``"gate"`` and whose ``verdict`` is REFUTED. Only ``relations``
+    and ``differential`` entries of a list-valued ``vetoed_by`` count; a
+    non-list ``vetoed_by`` (or any malformed block) gives ``[]``. Never raises.
+
+    The mode is read from the RECORDED block, never from the environment: the
+    mode the verifier stamped at verify time is the one that decides.
+    """
+    try:
+        if not isinstance(T, dict):
+            return []
+        C = T.get("certify")
+        if not isinstance(C, dict):
+            return []
+        if C.get("mode") != "gate" or C.get("verdict") != REFUTED:
+            return []
+        vetoed_by = C.get("vetoed_by")
+        if not isinstance(vetoed_by, list):
+            return []
+        return [term for term in vetoed_by if term in _CERTIFY_VETO_TERMS]
+    except Exception:
+        return []
+
+
+def _veto_reason(T, term):
+    """The human reason for ``term``'s certify veto, else ``""``.
+
+    First the term's own non-empty string reason (``certify.<term>.reason``),
+    then the block-level ``certify.reason`` (stringified, ``None`` → ``""``),
+    and ``""`` on any error. The term's reason only counts when the block
+    carries a reason too: the nine-key certify record always writes one, so a
+    block without it is malformed and contributes no reason rather than a
+    half-read one.
+    """
+    try:
+        term_reason = T["certify"][term]["reason"]
+        if (
+            isinstance(term_reason, str)
+            and term_reason
+            and T["certify"].get("reason")
+        ):
+            return term_reason
+    except Exception:
+        pass
+    try:
+        return str(T["certify"].get("reason") or "")
+    except Exception:
+        return ""
+
+
 def derive_levels(run_dir, task_class=None):
     """Derive the five-level vector ``(vector, reasons)`` from run evidence.
 
@@ -564,6 +630,25 @@ def derive_levels(run_dir, task_class=None):
         reasons["preserve"] = f"verifier_test.json: post_rc={rc} on green base (regression)"
     else:
         reasons["preserve"] = "verifier_test.json: preserve not proven"
+
+    # certify — a gate-mode veto withholds publish without rolling back the
+    # fix. A relations veto is a target failure; a differential veto is a
+    # preserve failure. Both downgrade PROVEN to UNVERIFIED (never REFUTED),
+    # so publish_decision abstains rather than refuting. A level that is not
+    # PROVEN (n/a, REFUTED, UNVERIFIED) is never touched.
+    vetoes = certify_vetoes(T)
+    if "relations" in vetoes and vector["target"] == PROVEN:
+        vector["target"] = UNVERIFIED
+        reasons["target"] = (
+            "verifier_test.json: certify veto (relations): "
+            f"{_veto_reason(T, 'relations')}"
+        )
+    if "differential" in vetoes and vector["preserve"] == PROVEN:
+        vector["preserve"] = UNVERIFIED
+        reasons["preserve"] = (
+            "verifier_test.json: certify veto (differential): "
+            f"{_veto_reason(T, 'differential')}"
+        )
 
     # contract ← verifier_behavioral.json, else the recipe's own contract
     # verifier evidence (verifier_<stem>.json envelopes at the run root). With

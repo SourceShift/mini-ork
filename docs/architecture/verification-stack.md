@@ -424,14 +424,20 @@ shape) runs the terms rather than abstaining on an empty diff. A run without the
 first two is byte-identical to today's payload — no `certify` key, no report
 file.
 
-**How it decides.** The terms run in **veto mode** and are recorded, never
-obeyed:
+**How it decides.** The terms run in **veto mode** and are recorded; shadow
+never obeys them, gate does:
 - **Shadow** (default) — `verdict`, `vetoed_by` and `would_block` are recorded;
   `pass` and the exit code are unchanged.
-- **Gate** — `MO_CODEFIX_CERTIFY=gate` records the same block with `mode: "gate"`,
-  still inert. The level-vector consumer that withholds publish on
-  `would_block` lands in a separate change; until it exists, gate refuses
-  nothing.
+- **Gate** — `MO_CODEFIX_CERTIFY=gate` records the same block with
+  `mode: "gate"`, and the publisher's level vector
+  (`mini_ork/verify/levels.py:derive_levels`) consumes it. A REFUTED
+  `relations` veto maps to `target`; a REFUTED `differential` veto maps to
+  `preserve`. Both downgrade a PROVEN level to **UNVERIFIED** — never
+  REFUTED — so `publish_decision` abstains: the publish is withheld and the
+  fix stays in the tree, with no rollback. The mode recorded in the evidence
+  decides; `derive_levels` never reads `MO_CODEFIX_CERTIFY` itself. Flip the
+  default only after shadow evidence shows no veto on a run whose fix was
+  confirmed correct.
 - **Off** — `MO_CODEFIX_CERTIFY=0` (or `off`/`false`/`no`) skips the terms and
   keeps every payload byte-identical to the pre-feature verifier.
 - **Abstention.** No kickoff, no Python fail-to-pass test, no base worktree, an
