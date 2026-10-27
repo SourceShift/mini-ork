@@ -38,6 +38,60 @@ def last_route_provenance() -> dict:
     return dict(_ROUTE_PROVENANCE.get())
 
 
+REGION_NODE_TYPES = ("implementer",)
+
+
+def region_of_path(path: str) -> str:
+    """The top-level directory a declared scope path lives under.
+
+    Same normalisation as ``infer_trace_code_region`` in
+    ``mini_ork/cli/execute.py``; duplicated here rather than imported because
+    ``routing`` must not depend on ``mini_ork.cli``.
+    """
+    p = str(path or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    if not p or p.startswith("../") or p.startswith("/"):
+        return ""
+    return p.split("/", 1)[0] if "/" in p else "(root)"
+
+
+def scope_region(run_dir: str | None) -> str:
+    """The region a run's declared scope most often lives in, or "" when none.
+
+    Reads ``run_profile.json`` → ``scope_allow`` through the existing
+    ``preferences.scope_paths`` parser and takes the most common top-level
+    directory; ties go to the entry that appears first.
+    """
+    if not run_dir:
+        return ""
+    try:
+        from mini_ork.memory import preferences
+        paths = preferences.scope_paths(run_dir)
+    except Exception:
+        return ""
+    regions = [r for r in (region_of_path(p) for p in paths) if r]
+    if not regions:
+        return ""
+    counts: dict[str, int] = {}
+    for r in regions:
+        counts[r] = counts.get(r, 0) + 1
+    best = max(counts.values())
+    for r in regions:
+        if counts[r] == best:
+            return r
+    return ""
+
+
+def route_segment(node_type: str, run_dir: str | None) -> str:
+    """The region segment to route on for ``node_type``; "default" opts out."""
+    if os.environ.get("MO_ROUTE_REGION", "1") == "0":
+        return "default"
+    if node_type not in REGION_NODE_TYPES:
+        return "default"
+    return scope_region(run_dir) or "default"
+
+
 def _registry_known_lanes(root: str | None) -> set[str] | None:
     """Lane names present in the providers registry, or None when unavailable.
 
@@ -162,6 +216,7 @@ def learning_governed_lane(
     *,
     root=None,
     task_class: str | None = None,
+    run_dir: str | None = None,
 ) -> str:
     """Port of bash `_mo_learning_governed_lane`: delegate the routing read to the
     canonical NATIVE `decide()` in ``mini_ork.steering.decision_service`` — the same
@@ -182,7 +237,8 @@ def learning_governed_lane(
     try:
         from mini_ork.steering import decision_service
         decision = decision_service.decide(
-            node_type, task_class, objective_domain, db=db)
+            node_type, task_class, objective_domain,
+            segment=route_segment(node_type, run_dir), db=db)
         route = decision.get("route", "")
         if route:
             # Stamp the brain's own account of the decision so the dispatcher can
@@ -215,6 +271,7 @@ class RoutingContext:
     current_lane: str
     root: str | None = None
     task_class: str | None = None
+    run_dir: str | None = None
 
 
 RoutingPolicy = Callable[[RoutingContext], str]
@@ -260,6 +317,7 @@ def _policy_learning_governed(ctx: RoutingContext) -> str:
         learning_static_lane(ctx.node_type, ctx.current_lane),
         root=ctx.root,
         task_class=ctx.task_class,
+        run_dir=ctx.run_dir,
     )
 
 
@@ -345,6 +403,7 @@ def policy_route_lane(
     dry_run=False,
     root=None,
     task_class: str | None = None,
+    run_dir: str | None = None,
 ) -> str:
     """Port of bash `_mo_policy_route_lane`. Applied to every live node BEFORE dispatch
     so the routed lane (not the raw node_type/workflow lane) reaches --node-type. Dry-run
@@ -359,7 +418,8 @@ def policy_route_lane(
     if handler is None:
         sys.stderr.write(f"  [warn] unknown MO_ROUTING_POLICY={policy} — using workflow lane {current_lane}\n")
         return current_lane
-    lane = handler(RoutingContext(node_type, current_lane, root=root, task_class=task_class))
+    lane = handler(RoutingContext(node_type, current_lane, root=root,
+                                  task_class=task_class, run_dir=run_dir))
     if _ROUTE_PROVENANCE.get():
         _record_route(route_policy=policy)
     else:

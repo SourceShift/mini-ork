@@ -653,6 +653,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         dry_run=False,
         root=root,
         task_class=task_class,
+        run_dir=run_dir,
     )
     _base_trace = trace_fn or (lambda *a, **k: None)
     # F4: durable DAG checkpoint writer (E1). Single seam — the trace

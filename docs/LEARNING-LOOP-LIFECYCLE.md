@@ -177,6 +177,7 @@ ON in `mini_ork/cli/execute.py`:
 | `MO_ROUTING_POLICY` | `learning_governed` | read learnings to route | `MO_ROUTING_POLICY=workflow_default` |
 | `MO_LEARNING_WRITEBACK` | `1` | GRPO + conductor writeback | `MO_LEARNING_WRITEBACK=0` |
 | `MO_LEARNING_MIN_SAMPLES` | `3` | evidence floor before override | raise/lower as needed |
+| `MO_ROUTE_REGION` | `1` | an unpinned implementer's route consults the region slice first (region = most common top-level dir of `run_profile.json` scope) | `MO_ROUTE_REGION=0` |
 
 ---
 
