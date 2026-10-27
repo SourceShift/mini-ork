@@ -95,7 +95,7 @@ the autonomy you want.
 | `lib/epic_graph.sh`     | E5 | `epic_graph_ready_now`, `epic_graph_on_done`, dep cascade. |
 | `lib/cross_epic_gradient.sh` | E7 | Promotes recurring TARGETS (across task_classes) into `__cross_class__` gradients. |
 | `lib/bug_report.sh`     | bug-channel | `bug_report_emit / sweep / prioritize / promote`. |
-| `bin/mini-ork-bug-collector` | auto-collector | Fires after every node trace; heuristic regex scan of agent output. |
+| `mini_ork/observability/bug_collector.py` (`mini-ork bug-collector`) | collector | Heuristic regex scan of agent output. **Run by hand** — nothing calls it after a node (checked 2026-10-27). |
 | `lib/context_assembler.sh` | reader | Injects `prior_similar_runs[]` + `known_failure_modes[]` per task_class, ranking `__cross_class__` above per-class. |
 
 ## The four learning channels
@@ -146,9 +146,10 @@ mutations: a pattern that consistently succeeds is evidence the workflow
 should be promoted; a pattern that consistently fails is evidence the
 verifier needs an addition.
 
-Cadence: every `mini-ork reflect` when `MO_PATTERN_MINER=1` (opt-in
-because pattern mining contends with reflect's gradient extraction for
-sqlite locks under heavy concurrency).
+Cadence: every `mini-ork reflect` unless `MO_PATTERN_MINER=0` (on by
+default — `mini_ork/cli/reflect.py` reads `MO_PATTERN_MINER` with default
+`"1"`; set it to `0` if mining contends with gradient extraction for sqlite
+locks under heavy concurrency).
 
 ### 4. Bug-report channel (b2c832b + 25a93da)
 
@@ -158,8 +159,8 @@ notices while doing its main work but does not have scope to fix.
 
 Two trigger styles:
 
-- **Per-agent (auto)**: `mini_ork/cli/execute.py` calls
-  `bin/mini-ork-bug-collector` after every node's `_trace_write_node_rich`.
+- **Per-agent (manual today)**: the collector (`mini-ork bug-collector`) is
+  not called after nodes — the bash-era per-node hook was not ported.
   The collector (heuristic mode by default) regex-scans the agent's
   output for `noticed ... but`, `out of scope but`, `should fix`,
   `deferred`, `TODO/FIXME/HACK/XXX`, etc., and emits up to 5 JSONL rows

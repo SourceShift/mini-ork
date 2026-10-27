@@ -73,7 +73,7 @@ Stages recognised by the dispatcher (`bin/mini-ork:15`): `classify → plan → 
 | eval | `bin/mini-ork-eval` | Benchmarks a candidate, computes `utility_delta` vs baseline, transitions candidate→shadow. |
 | promote | `bin/mini-ork-promote` | `promotion_evaluate`; on pass registers a version + status `promoted`; on fail `quarantined` (permanent block). |
 
-**Online reward inside `run`:** between execute and verify, an 8-item rubric pre-screen (`mo_rubric_run_score`) runs and `mo_grade_run_reward` stamps the 0–8 score as `reward_g` on every trace of the run (`bin/mini-ork:468-489`), so GRPO learns run *quality*, not just pass/fail. Auto-reflect fires after verify (`MO_AUTO_REFLECT=1`, batch 25).
+**Online reward inside `run`:** between execute and verify, an 8-item rubric pre-screen (`mo_rubric_run_score`) runs and `mo_grade_run_reward` stamps the 0–8 score as `reward_g` on the traces the per-node stamp missed (fill-only: `mini_ork/trace_store.py` writes only `WHERE reward_g IS NULL`, so most traces keep their per-node `verifier@v1` reward), so GRPO learns run *quality*, not just pass/fail. Auto-reflect fires after verify (`MO_AUTO_REFLECT=1`, batch 25).
 
 ### A2. Model lanes and the router
 
@@ -104,7 +104,7 @@ Persists to `agent_performance_memory` (global), `lane_domain_advantage`, `lane_
 
 1. **`compute_reward_g`** (`mini_ork/trace_store.py:28-40`): `reward_g = sign·(value−anchor)/|anchor|`; `sign=+1` if higher-is-better else `−1`; **`anchor==0 → None`** (unanchored = no signal). Scale-free, direction-normalised gain the router reads.
 2. **Verifiable-first shaping** (`mini_ork/cli/execute.py`): precedence `process_reward` → status anchor (0.85 success / 0.15 fail) → reviewer-verdict tie-break `±0.10`, zeroed on same-family lanes. The 0.5 anchor gap means an adversarial reviewer can't flip a known-good/bad trace.
-3. **Process Reward Model (PRM)** (`lib/process_reward.sh` + `mini_ork/learning/process_reward.py:55-124`): additive weights `W_STATUS=0.40, W_TOOL=0.20, W_FILE=0.10, W_VERDICT=0.15, W_DURATION=0.10, W_COST=0.05`. **Goodhart guard** `ACTIVITY_CAP=0.15` clamps tool+file so noisy failed work can't outscore bare success. Bash/Python parity enforced to 1e-6 (`test_process_reward_parity.py`).
+3. **Process Reward Model (PRM)** (`lib/process_reward.sh` + `mini_ork/learning/process_reward.py:55-124`): additive weights `W_STATUS=0.50, W_TOOL=0.10, W_FILE=0.05, W_VERDICT=0.30, W_DURATION=0.05, W_COST=0.00` (cost retired: it rewarded cost>0; checked against `process_reward.py:61-66` on 2026-10-27). **Goodhart guard** `ACTIVITY_CAP=0.15` clamps tool+file so noisy failed work can't outscore bare success. Bash/Python parity enforced to 1e-6 (`test_process_reward_parity.py`).
 
 **`grade_run_reward`** (`trace_store.py:195-223`): rubric `score/8` normalised against neutral **anchor 0.5** → `reward_g=(val−0.5)/0.5 ∈ [−1,+1]`, `reward_source='rubric@v1'`.
 
@@ -145,11 +145,11 @@ Also present: `krippendorff_alpha_gate`, `refute_or_promote_gate`, `honest_ci_ga
 
 ### A9. GEPA optimizer (prompt evolution)
 
-`mini_ork/optimize/gepa.py` — reflective **prompt** optimiser (not weights). `optimize(seed, adapter, minibatch=8, budget=4)` maintains a `ParetoFront` over `(candidate, full_score)`; each iteration selects the best parent, `make_reflective_dataset` → `reflect_on_component` (LLM rewrites one component key), then a **strict-improvement minibatch gate** (`sum(new)>sum(parent)`) before paying a full eval — the "35× rollout savings." `miniork_adapter.py` sources offline `execution_traces` (`reward_value` signal), never fabricates (hash-miss → parent mean). **Wired suggest-only, only under `MO_OPTIMIZER=gepa`** — never auto-applies.
+`mini_ork/gepa/` (the `optimize/gepa.py` module was deleted in f95b7f9c; `mini_ork/cli/reflect.py` documents that the `MO_OPTIMIZER=gepa` block was not ported, so nothing consumes its proposals — run it by hand via `mini_ork/gepa/run_gepa.py`) — reflective **prompt** optimiser (not weights). `optimize(seed, adapter, minibatch=8, budget=4)` maintains a `ParetoFront` over `(candidate, full_score)`; each iteration selects the best parent, `make_reflective_dataset` → `reflect_on_component` (LLM rewrites one component key), then a **strict-improvement minibatch gate** (`sum(new)>sum(parent)`) before paying a full eval — the "35× rollout savings." `miniork_adapter.py` sources offline `execution_traces` (`reward_value` signal), never fabricates (hash-miss → parent mean). **Wired suggest-only, only under `MO_OPTIMIZER=gepa`** — never auto-applies.
 
 ### A10. Scoring-math inventory
 
-GRPO advantage (mean-sub / z-score) · shrinkage `n/(n+5)` · EMA α=0.30 · recency half-life 14d · decayed defect penalty · ε-greedy (the *only* bandit — **no Thompson/Beta/UCB implemented**) · Krippendorff's α `1−D_o/D_e` (escalate below 0.4) · pairwise ρ ceiling 0.25 · win-rate `wins/(wins+losses)` (`prompt_win_rates`) · topology selection `performance·√novelty` · UtilityScore `U = 0.45·success + 0.20·verifier + 0.15·quality − 0.10·cost − 0.05·latency − 0.05·risk`.
+GRPO advantage (mean-sub / z-score) · shrinkage `n/(n+5)` · EMA α=0.30 · recency half-life 14d · decayed defect penalty · ε-greedy plus a UCB bandit (`mini_ork/lane_router.py`, `MO_ROUTER_UCB_C` default 0.5 — on by default) with EquiRouter/EntroRouter ordering; no Thompson/Beta · Krippendorff's α `1−D_o/D_e` (escalate below 0.4) · pairwise ρ ceiling 0.25 · win-rate `wins/(wins+losses)` (`prompt_win_rates`) · topology selection `performance·√novelty` · UtilityScore `U = 0.45·success + 0.20·verifier + 0.15·quality − 0.10·cost − 0.05·latency − 0.05·risk`.
 
 ---
 
@@ -306,7 +306,7 @@ Bidirectional (`docs/roadmap/epics/agent-context-pack.md`, complete 2026-06-17):
 
 ## Part E — Honest caveats (do not paper over these)
 
-- **mini-ork:** GEPA is wired **suggest-only** under `MO_OPTIMIZER=gepa`; PRM same-family decontamination was removed pending a real `reviewer_model` column; there is **no Thompson/Beta/UCB** — ε-greedy is the only bandit.
+- **mini-ork:** GEPA is wired **suggest-only** under `MO_OPTIMIZER=gepa`; PRM same-family decontamination was removed pending a real `reviewer_model` column; routing uses a UCB bandit by default (`MO_ROUTER_UCB_C=0.5`, `mini_ork/lane_router.py`) plus ε-greedy exploration; there is no Thompson/Beta sampler.
 - **TraceOtter:** real code-vs-artifact drift — base model appears as Qwen3-4B (current exporter+eval), Qwen2.5-Coder-1.5B (stale vendored yaml), and Qwen2.5-0.5B (local smoke default); the emitted LF yaml says 3 epochs while the local trainer enforces 1. The **"$0.70/cycle" figure is not in the codebase** — treat it as an external estimate.
 - **ContextNest:** the elegant `src/context/*` neural-field/resonance layer is **largely NOT on the live request path** — retrieval scoring is reimplemented inline in `tools.rs`. Memories live in in-memory sidecars + WAL, not SQL/Qdrant. Embeddings are DeepInfra Qwen3 / local, **not Gemini**. The consolidation worker must run or the basin pipeline is dormant.
 - **General:** the impressive economics (84% token savings, quality parity) are modeled/held-out, not yet proven on an external customer workload.

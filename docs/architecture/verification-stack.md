@@ -3,7 +3,8 @@
 *Added 2026-10-05/06. Six techniques from the 2000-paper verification review
 (`recipes/verification-technique-review/`, run `verify-review-20261005-122958`),
 each built by a mini-ork `framework-edit` run with RSI on and proven by a real
-mini-ork run. All are ON by default.*
+mini-ork run. Each is on by default **where it runs**, but most do not run
+in a plain `mini-ork run`; see "Where each instrument runs today" below.*
 
 *A second review on 2026-10-18 (`verify-agentic-20261018-215339`, 2000 arXiv
 papers) added eight more instruments — sections ⑦–⑭ — also each built by a
@@ -68,6 +69,29 @@ flowchart TB
     E["⑥ declared EQUIVALENCE operator<br/>verify/equivalence.py"]
   end
 ```
+
+## Where each instrument runs today (checked 2026-10-27)
+
+"On by default" means on inside the path that calls the instrument. Only ③,
+④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
+at promotion, or when a recipe opts in, or they have no producer yet.
+
+| # | Instrument | Runs in | State |
+|---|---|---|---|
+| ① | Metamorphic relations | `mini-ork certify` only (the code-fix verifier imports just `certify.replay_check`) | on inside certify |
+| ② | Differential check | `mini-ork certify` only | on inside certify |
+| ③ | Suite adequacy | every code-fix run (`recipes/code-fix/verifiers/test.py`) | **live** |
+| ④ | Level vector | the publisher, for recipes that declare levels (code_fix) | **live** |
+| ⑤ | Gate hackability | read by the promotion gate; records come only from a manual `mini-ork gate-fuzz --hackability` | consumer on, producer manual |
+| ⑥ | Equivalence operator | the behavioral verifier, for recipes whose contract declares an operator | opt-in per recipe |
+| ⑦ | Oracle integrity | read by the promotion gate; nothing writes it | no producer |
+| ⑧ | Judge validity | panel gates | off (`MO_JUDGE_VALIDITY`) |
+| ⑨ | Reward↔evidence pairing | every GRPO writeback | **live** |
+| ⑩ | Verifier mutation | read by the verify catalog; nothing writes scores | no producer |
+| ⑪ | Conformal abstention | — | removed (669c181c) |
+| ⑫ | Discrimination evidence | `mini-ork certify`, and only when candidates are passed | certify only |
+| ⑬ | Behavioral recomputation | the behavioral verifier, declared recipes | opt-in per recipe |
+| ⑭ | Hidden regenerable checks | `mini-ork certify` only | certify only |
 
 ## ① Metamorphic relations (G10-T01): `mini_ork/certify/relations.py`
 

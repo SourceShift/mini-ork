@@ -159,10 +159,13 @@ State lives in `$MINI_ORK_DB` (default `.mini-ork/state.db`):
 - `self_improve_runs` — one row per iteration with outcome, deadlines,
   branch, and notes.
 - `learning_record` — one row per ranked bottleneck. Status moves through
-  `open → queued → attempted → resolved | rejected | deferred`.
+  `open → resolved` (the implemented rank-1 finding) or `open → deferred →
+  superseded` (lower ranks, superseded by the next successful iteration).
+  `queued`/`attempted`/`rejected` are allowed by the schema but never written.
 - `self_improve_arxiv_refs` — many-to-many between iterations and the
-  arXiv papers they cited. `used_in_patch` flips to 1 when a paper's
-  technique actually lands in a successful patch.
+  arXiv papers they cited. `used_in_patch` is meant to flip to 1 when a
+  paper's technique lands in a successful patch, but nothing writes it yet
+  (only the web learning page reads it).
 
 Inspect after a run:
 

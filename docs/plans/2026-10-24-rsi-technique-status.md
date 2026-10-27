@@ -199,16 +199,35 @@ Corrections to the Tier 0 list above:
   any done → non-done change by design. Its dependency edges were resolved in
   June, so the wrong status blocks nothing.
 
-Follow-ups found while landing Tier 0:
+Follow-ups found while landing Tier 0 (corrected 2026-10-27):
 
-- **Concurrent framework-edit runs delete each other's pytest `tmp_path`.**
-  pytest keeps only the 3 newest `pytest-of-<user>/pytest-N` dirs and prunes the
-  rest. The framework-edit test and spec-test verifiers should pass a run-local
-  `--basetemp`.
-- **`mini-ork epics show` lists no outgoing dependencies** even when
-  `epic_dependencies` has them.
-- **R8's cap counts `in progress` epics.** An epic left `in progress` by a
-  crashed scheduler holds the cap until someone resets it.
+- ~~Concurrent framework-edit runs delete each other's pytest `tmp_path`.~~
+  **Refuted.** A direct repro ran 6 concurrent pytest 9.1.1 sessions, each
+  holding a `tmp_path` while new sessions started, and none lost its dir:
+  pytest's `.lock` files protect live dirs. The gates-python spec-test failure
+  has no known cause. The salvage stands (23 of 23 spec tests pass alone).
+- ~~`mini-ork epics show` lists no outgoing dependencies.~~ **Not a bug.** The
+  output had been piped through `head -12`, which cut the section off.
+- **R8's cap counts `in progress` epics**, and R8 spawned the scheduler in the
+  engine checkout. Both are addressed by `kickoffs/auto/rsi-t0f-r8-hardening.md`:
+  it requires a `target_root` distinct from the engine checkout, and it
+  reclaims stale epics with the scheduler's own rules.
+
+### Changes on main since this audit (2026-10-25 / 10-26, other sessions)
+
+- **The eco6 program** (`docs/plans/2026-10-25-ecosystem-section6.md`):
+  - removed improve/eval/promote, CoBa, per-node `gates:`, the metric-anchor
+    arm and the abstain/conformal evaluators;
+  - fixed the cost-pause halt, the RouteMoA screen and the CN outcome ids
+    (1aeeec09 was incomplete; 7950699e);
+  - archived 18 epics and the arx queue.
+
+  Its routing finding corrects Tier 1 #10 below: the lane keys were fine, and
+  learned-route starvation was operational (`MO_ROUTING_POLICY=workflow_default`
+  launches, and framework-edit pinning every node).
+- **The RSI cycle C1–C5 is built** (83bb253a … 785e91f7) and has run 20+
+  cycles, so Tier 1 #11 below is done. It has had no cadence while the minimax
+  lane is quota-dead (until about Nov 8).
 
 ### Tier 1: build the missing load-bearing techniques
 
@@ -223,8 +242,8 @@ Follow-ups found while landing Tier 0:
 | 7 | **Harness evolution beyond prompt files** (E6): node order and tool grants in `workflow.yaml` | "pointing it there is the whole change" | TOP-20 #5 |
 | 8 | **Wire certify into the code-fix path**: relations, differential and hidden checks (vt1/vt4). Today they run only under `mini-ork certify` | the doc claims they are "all ON by default" | VS ①②⑫⑭ |
 | 9 | **SWE-ABS test strengthening**: suite adequacy is LIVE (18 reports, 3 INADEQUATE), but nothing strengthens a weak suite | "directly attacks mini-ork's known worst weakness" | S17 #2 |
-| 10 | **Learned routing coverage.** It decides 97 of 11,188 routes. Pass a segment, and key the bandit on canonical lanes rather than alias/chain strings | the router is the most-cited learning surface | S17 #1/3/4 |
-| 11 | **RSI cycle graph C1–C5**: harvest + `rsi_cycles`, `recipes/rsi-cycle/`, driver, LEARN, cadence. Designed, not built | the find→suggest→implement→validate→learn loop itself | RSIC |
+| 10 | **Learned routing coverage.** It decides 97 of 11,188 routes. *(2026-10-27: eco6 found the lane keys fine and the starvation operational; RouteMoA fixed in 13fe4e81. Only the never-passed region segment may remain.)* | the router is the most-cited learning surface | S17 #1/3/4 |
+| 11 | **RSI cycle graph C1–C5**: harvest + `rsi_cycles`, `recipes/rsi-cycle/`, driver, LEARN, cadence. **Built 2026-10-25/26 by another session** (83bb253a … 785e91f7) | the find→suggest→implement→validate→learn loop itself | RSIC |
 | 12 | **Diversity / pass@k floor** for collapse, and a **GEPA anti-bloat guard** (append mode grows prompts) | "collapse is the default trajectory"; GEPA "bloats prompts 3× with no gain" | R2K, S17 |
 
 ### Tier 2: the survey tail (no kickoff exists yet)
@@ -469,6 +488,12 @@ API-only lanes.
 | Routers collapse to the expensive model | **Unmeasured**: Equi/Entro address it; UCCI escalation to `MO_FRONTIER_LANE` is not tracked |
 
 ## Docs that claim more than the code does
+
+*2026-10-27: verification-stack.md / CLAUDE.md ("all ON"), the compendium's
+PRM weights, "no UCB", GEPA module and rubric lines, RMEL's bug collector
+and `MO_PATTERN_MINER` default, and RECURSIVE-SELF-IMPROVE's lifecycle and
+`used_in_patch` were corrected in the commit that added this note. The rest of
+the list still stands.*
 
 Fix these so the next audit doesn't trust them:
 
