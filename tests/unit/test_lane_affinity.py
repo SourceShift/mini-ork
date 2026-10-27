@@ -171,3 +171,73 @@ def test_disabled_knob_round2_keeps_routing_lead(run_dir, tmp_path, capsys, monk
     assert r2.run(tmp_path, CHAIN) == 0
     assert r2.calls[0] == ["glm", "deepseek_flash"]
     assert "[lane_affinity]" not in capsys.readouterr().err
+
+
+# ── affinity reorders the FINAL (post-expansion) chain ─────────────────────
+
+def _planner_chain(tmp_path, monkeypatch) -> list[str]:
+    """The planner chain llm_dispatch actually composes under the harness."""
+    from mini_ork.dispatch.routing import dispatch_chain
+    monkeypatch.setenv("MO_FALLBACK_CODING", "minimax,codex,sonnet")
+    return dispatch_chain("planner", "glm", str(tmp_path)).split(",")
+
+
+def _seed_affinity(run_dir, lead="glm", served="minimax") -> None:
+    with open(_affinity_path(run_dir), "w", encoding="utf-8") as fh:
+        json.dump({"planner": {"lead": lead, "served": served}}, fh)
+
+
+def _run_planner(tmp_path, monkeypatch, *, extra_env=None):
+    """Dispatch the planner with no ``--model`` override (the incident path)."""
+    monkeypatch.setenv("MO_NODE_ID", "planner")
+    monkeypatch.setenv("MO_FALLBACK_CODING", "minimax,codex,sonnet")
+    monkeypatch.delenv("MO_SHAPE_CHECK", raising=False)
+    monkeypatch.delenv("MO_PLAN_ARTIFACT", raising=False)
+    monkeypatch.setattr("mini_ork.dispatch.llm_dispatch.resolve_lane_model",
+                        lambda *a, **k: "glm")
+    monkeypatch.setattr("mini_ork.dispatch.llm_dispatch.resolve_lane_family",
+                        lambda lane, *a, **k: lane)
+    for key, value in (extra_env or {}).items():
+        monkeypatch.setenv(key, value)
+    calls: list[list[str]] = []
+
+    def fake(model, prompt_text, out_file, timeout_s, max_turns):
+        calls.append([m.strip() for m in str(model).split(",") if m.strip()])
+        with open(out_file, "w", encoding="utf-8") as fh:
+            fh.write("output")
+        return 0
+
+    rc = llm_dispatch(
+        ["--node-type", "planner", "--prompt-text", "test round",
+         "--out", str(tmp_path / "out.txt")],
+        root=str(tmp_path), dispatch_fn=fake)
+    return rc, calls
+
+
+def test_affinity_reorders_the_expanded_planner_chain(run_dir, tmp_path,
+                                                     monkeypatch, capsys):
+    """The served lane only exists in the chain AFTER the shape-contract
+    expansion; affinity must still put it first (kickoff defect 3)."""
+    chain = _planner_chain(tmp_path, monkeypatch)
+    assert len(chain) >= 2 and chain[0] == "glm", chain
+    served = chain[1]
+    _seed_affinity(run_dir, lead="glm", served=served)
+    rc, calls = _run_planner(tmp_path, monkeypatch)
+    assert rc == 0
+    assert calls, "the fake dispatch must have been called"
+    assert calls[0][0] == served, calls
+    assert sorted(calls[0]) == sorted(set(chain)), calls
+    assert f"[lane_affinity] planner: {served} first" in capsys.readouterr().err
+
+
+def test_affinity_disabled_first_call_is_the_lead(run_dir, tmp_path,
+                                                  monkeypatch):
+    chain = _planner_chain(tmp_path, monkeypatch)
+    served = chain[1]
+    _seed_affinity(run_dir, lead="glm", served=served)
+    rc, calls = _run_planner(tmp_path, monkeypatch,
+                             extra_env={"MO_LANE_AFFINITY": "0"})
+    assert rc == 0
+    assert calls[0][0] == "glm", calls
+    # the kill switch disables the reorder, not the shape-contract expansion
+    assert calls[0] == chain, calls

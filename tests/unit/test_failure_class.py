@@ -66,6 +66,23 @@ def test_classify_checks_the_full_text():
         "timeout", "network")
 
 
+def test_model_access_phrase_is_line_bounded():
+    # A "model" on one line and a missing *file* on another is not a model
+    # access rejection (kickoff defect 2).
+    assert failure_class.classify(
+        "model: glm\nspawn helper: file does not exist", 1)[0] != "model_access"
+    assert failure_class.classify(
+        "using model registry from config\n"
+        "trace: /var/db/models.json does not exist", 1)[0] != "model_access"
+
+
+def test_single_line_model_does_not_exist_is_model_access():
+    assert failure_class.classify(
+        "The model `gpt-x` does not exist", 1)[0] == "model_access"
+    assert failure_class.classify(
+        "deployment glm-prod does not exist", 1)[0] == "model_access"
+
+
 def test_db_category_always_within_the_check_constraint():
     allowed = {"auth", "quota", "capacity", "request", "safety", "network",
                "stream", "provider", "config", "unknown"}
@@ -104,6 +121,14 @@ def test_action_table():
     assert failure_class.action("rate_limit", "Retry-After: 30").wait_hint_s == 30
     assert failure_class.action("timeout") == failure_class.Action(
         False, True, False, None)
+
+
+def test_transient_action_carries_the_wait_hint():
+    # Kickoff defect 4: a transient failure must not drop the provider's hint.
+    assert failure_class.action("transient", "Retry-After: 7").wait_hint_s == 7
+    assert failure_class.action("transient", "").wait_hint_s is None
+    assert failure_class.action("transient", "Retry-After: 9") == failure_class.Action(
+        True, True, False, 9.0)
 
 
 # ── 4/5. the fallback walk ─────────────────────────────────────────────────
@@ -226,6 +251,27 @@ def _make_fake(script):
     return fake, calls
 
 
+def _make_fake_stdout(stdout, rc=1):
+    """A failing fake whose per-attempt observer carries model *stdout*.
+
+    The stdout tail is the only input mechanism 1 can be red on, and the
+    historic ``_make_fake`` always hands ``text=""`` to ``on_attempt``.
+    """
+    calls = []
+
+    def fake(model, prompt_text, out_file, timeout_s, max_turns,
+             on_attempt=None, accept=None):
+        calls.append(str(model))
+        Path(out_file).write_text("")
+        if on_attempt is not None:
+            lane = str(model).split(",")[0].strip()
+            on_attempt(lane, DispatchResult(ok=False, rc=rc, text=stdout,
+                                            error="", model=lane))
+        return rc
+
+    return fake, calls
+
+
 def _dispatch(fake, tmp_path, model="codex"):
     from mini_ork.dispatch import llm_dispatch as mod
     return mod.llm_dispatch(
@@ -289,3 +335,38 @@ def test_hint_above_cap_does_not_retry(hermetic, tmp_path, capsys):
     meta = json.loads(row["metadata_json"])
     assert meta["failure_class"] == "rate_limit"
     assert float(meta["wait_hint_s"]) == 600.0
+
+
+# 9. model prose on stdout may not fuse a lane (RB-10)
+def test_stdout_prose_never_classifies_auth(hermetic, tmp_path):
+    fake, _calls = _make_fake_stdout(
+        "I checked: the API returned 401 unauthorized.")
+    assert _dispatch(fake, tmp_path) != 0
+    rows = _rows(hermetic)
+    assert rows
+    assert all(r["error_category"] != "auth" for r in rows)
+    attempts = [r for r in rows
+                if "dispatch_attempt" in (r["metadata_json"] or "")]
+    assert attempts
+    for row in attempts:
+        assert json.loads(row["metadata_json"])["failure_class"] == "unknown"
+
+
+# 10. a structured provider rejection on stdout may still promote
+def test_stdout_structured_model_not_found_promotes(hermetic, tmp_path):
+    fake, _calls = _make_fake_stdout(
+        '{"error":{"code":"model_not_found",'
+        '"message":"The model `gpt-x` does not exist"}}')
+    assert _dispatch(fake, tmp_path) != 0
+    attempts = [r for r in _rows(hermetic)
+                if "dispatch_attempt" in (r["metadata_json"] or "")]
+    assert attempts
+    for row in attempts:
+        assert json.loads(row["metadata_json"])["failure_class"] == "model_access"
+
+
+# 11. a non-retryable class does not re-run the chain
+def test_non_retryable_timeout_calls_the_chain_once(hermetic, tmp_path):
+    fake, calls = _make_fake([(124, "timeout after 5.0s", "")])
+    assert _dispatch(fake, tmp_path) != 0
+    assert len(calls) == 1

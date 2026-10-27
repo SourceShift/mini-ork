@@ -36,6 +36,13 @@ CLASSES = ("transient", "rate_limit", "credential", "quota", "model_access",
 # moves on (or halts) instead of burning the same wall-clock again.
 RETRYABLE_CLASSES = frozenset({"transient", "rate_limit", "shape"})
 
+# The only classes a stdout tail may PROMOTE an otherwise-unknown failure to.
+# These are phrases a provider emits in a structured rejection envelope, so a
+# tail carrying one is provider output rather than model prose. Everything else
+# stays ``unknown``: RB-10 is model prose saying "401"/"forbidden" fusing a
+# healthy lane for the run, and ``credential`` is fuse-terminal.
+TAIL_PROMOTABLE = frozenset({"quota", "model_access", "rate_limit"})
+
 
 @dataclass(frozen=True)
 class Action:
@@ -58,9 +65,15 @@ _ENVIRONMENT_RE = re.compile(
 _RUN_WIDE_RE = re.compile(
     r"cwd does not exist|likely cwd-confusion|refusing codex dispatch")
 _SHAPE_RE = re.compile(r"failed shape check|shape reject")
+# The "… does not exist" phrase is bounded to ONE line and 120 chars: over a
+# multi-line error text, a bare ``[\s\S]*`` let the word "model" on one line and
+# "does not exist" on a later line (a *file* or *path*) classify as
+# ``model_access`` — a 1-strike, fuse-terminal mistake. The ``(?!s\b)`` guard
+# additionally keeps a plural path fragment ("…/models.json does not exist")
+# from being read as a model name.
 _MODEL_ACCESS_RE = re.compile(
     r"model_not_found|model is not supported"
-    r"|(model|deployment)[\s\S]*does not exist"
+    r"|(model|deployment)(?!s\b)[^\n]{0,120}does not exist"
     r"|do(es)? not have access to (the )?model")
 
 _RETRY_AFTER_RE = re.compile(r"retry-after[:=\s]+(\d+)", re.IGNORECASE)
@@ -157,7 +170,7 @@ def action(failure_class_name: str, text: str = "",
            env: Mapping[str, str] | None = None) -> Action:
     """The one behaviour table for a failure class."""
     if failure_class_name == "transient":
-        return Action(True, True, False, None)
+        return Action(True, True, False, wait_hint(text))
     if failure_class_name == "rate_limit":
         return Action(True, True, False, wait_hint(text))
     if failure_class_name == "timeout":

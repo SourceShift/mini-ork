@@ -984,25 +984,15 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     # cache that lane had warmed. Move the lane that served this node's first
     # successful round to the front, but ONLY while the routing lead is
     # unchanged: a remapped lead (operator, `recover --lane`, agents.yaml) makes
-    # `preferred` return None and the operator's choice wins. Both fuse passes
-    # below still run on the reordered chain, so a fused lane stays dropped.
-    # `_aff_lead` is bound unconditionally (pre-reorder chain[0]) because the
+    # `preferred` return None and the operator's choice wins. The reorder runs
+    # AFTER the shape-contract expansion below (it must see the final chain: a
+    # JSON-contract node's fallback tail did not exist here), and the second
+    # fuse pass still runs after it, so a fused affinity lane stays dropped.
+    # `_aff_lead` is bound unconditionally (pre-expansion chain[0]) because the
     # success path records against it and must never NameError into the guard.
     _aff_run_dir = context_env("MINI_ORK_RUN_DIR")
     _aff_node = context_env("MO_NODE_ID")
     _aff_lead = str(model).split(",", 1)[0].strip()
-    if _aff_run_dir and _aff_node and lane_affinity.enabled():
-        try:
-            _aff_lanes = [m.strip() for m in str(model).split(",") if m.strip()]
-            _aff_served = lane_affinity.preferred(_aff_run_dir, _aff_node, _aff_lead)
-            _aff_reordered = lane_affinity.apply(_aff_lanes, _aff_served)
-            if _aff_reordered != _aff_lanes:
-                model = ",".join(_aff_reordered)
-                sys.stderr.write(
-                    f"[lane_affinity] {_aff_node}: {_aff_served} first "
-                    f"(served an earlier round; lead {_aff_lead})\n")
-        except Exception:  # noqa: BLE001 — affinity must never change dispatch
-            pass
 
     # lane fuse — on by default, because a fuse that is off by default is not a
     # safety system. Keyed on the LANE (llm_calls.model_id), not the node role:
@@ -1061,6 +1051,24 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         except Exception:
             pass
 
+    # B3 lane affinity — apply the reorder to the FINAL chain, after the
+    # shape-contract expansion above. For a JSON-contract node (the planner,
+    # which also sees the most shape rejects) the lane that served an earlier
+    # round only becomes a chain member here; reordering before the expansion
+    # made affinity a no-op for exactly the node that needed it.
+    if _aff_run_dir and _aff_node and lane_affinity.enabled():
+        try:
+            _aff_lanes = [m.strip() for m in str(model).split(",") if m.strip()]
+            _aff_served = lane_affinity.preferred(_aff_run_dir, _aff_node, _aff_lead)
+            _aff_reordered = lane_affinity.apply(_aff_lanes, _aff_served)
+            if _aff_reordered != _aff_lanes:
+                model = ",".join(_aff_reordered)
+                sys.stderr.write(
+                    f"[lane_affinity] {_aff_node}: {_aff_served} first "
+                    f"(served an earlier round; lead {_aff_lead})\n")
+        except Exception:  # noqa: BLE001 — affinity must never change dispatch
+            pass
+
     # Second fuse pass — the chain above did not exist when the first one ran.
     if os.environ.get("MO_FUSE_ENABLED", "1") == "1" and os.path.isfile(db):
         chain, refused = _apply_lane_fuse(db, model)
@@ -1107,16 +1115,22 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             # Classify the FULL error text, not the 200-char ``error_message``
             # slice: Codex prints a generic rc=1 header first and the real
             # provider rejection (quota, model access) in the tail. The stdout
-            # tail is model prose, so it is only consulted when the error alone
-            # is unclassifiable and only for a non-shape attempt (RB-10: prose
-            # mentioning "401"/"forbidden" must not fuse a lane).
+            # tail is model prose, so a non-shape attempt whose error alone is
+            # unclassifiable may only be PROMOTED by it to a provider-structured
+            # class (``TAIL_PROMOTABLE``) — never to a fuse-terminal one like
+            # ``credential`` (RB-10: prose mentioning "401"/"forbidden" must not
+            # fuse a lane for the run).
+            cls, category = failure_class.classify(raw_err, result_rc)
             class_text = raw_err
-            if (str(result_rc) != str(SHAPE_REJECT_RC)
-                    and failure_class.classify(class_text, result_rc)[0] == "unknown"):
+            if cls == "unknown" and str(result_rc) != str(SHAPE_REJECT_RC):
                 out_tail = (getattr(result, "text", "") or "")[-1000:]
                 if out_tail:
-                    class_text = class_text + "\n" + out_tail
-            cls, category = failure_class.classify(class_text, result_rc)
+                    tail_text = raw_err + "\n" + out_tail
+                    tail_cls, tail_category = failure_class.classify(
+                        tail_text, result_rc)
+                    if tail_cls in failure_class.TAIL_PROMOTABLE:
+                        cls, category, class_text = (
+                            tail_cls, tail_category, tail_text)
             hint = failure_class.wait_hint(class_text)
             row_actor = actor
             if _is_prespawn_guard_refusal(raw_err):
