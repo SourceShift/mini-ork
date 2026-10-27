@@ -70,21 +70,13 @@ All paths are relative to the repository root.
    `"secure tier: no LLM lens ran"`, plus `" (review verdict: block)"` when the
    verdict was block. rc stays 1.
 
-### 3. `docs/operator/feature-flags.md`
-
-Add a row: `MO_REVIEW_PRECHECKED_PATCH` | unset | set by `make worktree-merge`
-for its in-lock push: the patch-id the driver already reviewed before taking
-the merge lock; the push hook skips the review when it matches the real
-patch-id. Internal; do not set it by hand.
-
 ## Files in scope (touch ONLY these)
 
 - `scripts/mini_ork_worktree.py`
 - `mini_ork/review/gate.py`
-- `docs/operator/feature-flags.md`
 - `tests/unit/test_review_outside_lock.py` (new)
 
-Do NOT modify `.githooks/pre-push`, `mini_ork/pre_push_review.py`,
+Do NOT modify `docs/` (another worktree holds feature-flags.md; the doc row lands separately), `.githooks/pre-push`, `mini_ork/pre_push_review.py`,
 `mini_ork/review/lenses.py`, any migration, or any path in
 `config/kernel-frozen.yaml`. Every existing test must pass unchanged.
 
