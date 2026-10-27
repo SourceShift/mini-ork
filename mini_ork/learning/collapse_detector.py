@@ -140,3 +140,129 @@ def summarize(report: dict) -> str:
         f"recommendation={report['recommendation']}\n"
         f"reason={report['reason']}"
     )
+
+
+# --- Diversity / pass@k floor (RSI Tier-1 #12a) -----------------------------
+#
+# The detector above needs a score-vs-anchor history that nothing currently
+# writes. The floor instead consumes terminal run outcomes that already exist:
+# a task class whose pass@k falls while its implementer-lane set narrows is a
+# diversity collapse. Both conditions are required — many recipes pin one lane
+# by design, so narrowing alone carries no signal.
+FLOOR_WINDOW = 20
+FLOOR_K = 3
+FLOOR_DROP = 0.2
+FLOOR_MAX_LANES = 1
+
+
+def _floor_half(rows: Sequence[dict], k: int) -> dict:
+    """Summarize one half: pass@1, pass@k by task, and lane diversity."""
+    n = len(rows)
+    pass_at_1 = _round(sum(1 for r in rows if bool(r.get("passed"))) / n)
+
+    # Group runs of the same task (first-appearance order): a task counts as
+    # solved if any of its first k runs passed.
+    groups: dict[str, list[bool]] = {}
+    for i, row in enumerate(rows):
+        key = str(row.get("task_key") or "")
+        if not key:
+            key = str(row.get("run_id") or "")
+        if not key:
+            key = f"#{i}"
+        groups.setdefault(key, []).append(bool(row.get("passed")))
+    pass_at_k = _round(
+        sum(1 for group in groups.values() if any(group[:k])) / len(groups)
+    )
+
+    lanes = sorted(
+        {
+            str(x).strip()
+            for row in rows
+            for x in (row.get("lanes") or [])
+            if str(x).strip()
+        }
+    )
+    return {
+        "n": n,
+        "pass_at_1": pass_at_1,
+        "pass_at_k": pass_at_k,
+        "lane_count": len(lanes),
+        "lanes": lanes,
+    }
+
+
+def floor(
+    runs: Sequence[dict],
+    *,
+    window: int = FLOOR_WINDOW,
+    k: int = FLOOR_K,
+    drop: float = FLOOR_DROP,
+    max_lanes: int = FLOOR_MAX_LANES,
+) -> dict:
+    """Report whether a task class is collapsing on pass@k and lane diversity.
+
+    ``runs`` is oldest-first; each row is
+    ``{"run_id", "passed", "task_key", "lanes"}``. Compares the most recent
+    ``window`` terminal runs against the ``window`` before them. A ``halt``
+    requires pass@k to fall by more than ``drop`` **and** the lane set to
+    narrow to at most ``max_lanes``.
+    """
+    window = max(1, int(window))
+    k = max(1, int(k))
+    drop = float(drop)
+    max_lanes = int(max_lanes)
+    n = len(runs)
+
+    report = {
+        "n": n,
+        "window": window,
+        "k": k,
+        "drop": drop,
+        "max_lanes": max_lanes,
+        "prior": None,
+        "recent": None,
+        "pass_at_k_drop": None,
+        "fell": False,
+        "narrowed": False,
+        "breach": False,
+        "recommendation": "none",
+        "reason": f"insufficient history (n < {2 * window})",
+    }
+
+    if n < 2 * window:
+        return report
+
+    prior = _floor_half(runs[n - 2 * window:n - window], k)
+    recent = _floor_half(runs[n - window:], k)
+    pass_at_k_drop = _round(prior["pass_at_k"] - recent["pass_at_k"])
+    fell = pass_at_k_drop > drop
+    narrowed = (
+        recent["lane_count"] < prior["lane_count"]
+        and recent["lane_count"] <= max_lanes
+    )
+    breach = fell and narrowed
+
+    if breach:
+        recommendation = "halt"
+        reason = "pass@k fell while lane diversity narrowed (diversity floor breached)"
+    elif fell:
+        recommendation = "watch"
+        reason = "pass@k fell but lane diversity did not narrow"
+    elif narrowed:
+        recommendation = "watch"
+        reason = "lane diversity narrowed but pass@k did not fall"
+    else:
+        recommendation = "none"
+        reason = "no floor breach"
+
+    report.update({
+        "prior": prior,
+        "recent": recent,
+        "pass_at_k_drop": pass_at_k_drop,
+        "fell": fell,
+        "narrowed": narrowed,
+        "breach": breach,
+        "recommendation": recommendation,
+        "reason": reason,
+    })
+    return report
