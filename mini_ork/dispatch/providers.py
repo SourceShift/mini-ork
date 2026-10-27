@@ -728,6 +728,32 @@ def _wants_stream_json(entry: Mapping[str, object]) -> bool:
     return entry.get("gateway") is not True
 
 
+def _lane_streams_json(
+    model: str,
+    root: str | os.PathLike[str] | None = None,
+) -> bool:
+    """True when ``model``'s resolved argv streams newline-delimited JSON.
+
+    This is the B2 first-output-deadline gate: only a lane whose child prints
+    stream-json events on stdout can be *seen* to have produced model output, so
+    only such a lane may be cut when it stays silent. Checking the resolved
+    argv (rather than the registry entry's ``gateway`` flag) is load-bearing —
+    codex/opencode are transport lanes that write to a result file and
+    openai/uhp/executable lanes emit plain text, yet none of their entries sets
+    ``gateway: true``. ``_claude_spec`` is the only builder that emits
+    ``stream-json``, so the argv is the honest predicate.
+
+    Resolution failures (unknown lane, unreadable rules, missing script,
+    credentials) mean "no deadline", never a crash: the existing fallback tests
+    walk fake lane names through here. Mirrors ``_lane_kind``'s broad swallow.
+    """
+    try:
+        spec = resolve_provider(model, root)
+    except Exception:  # noqa: BLE001 — a lane we cannot resolve gets no deadline
+        return False
+    return "stream-json" in spec.command
+
+
 def _build_anthropic_native(name, entry, root, extra_env, model_id) -> ProviderSpec:
     del root
     env: dict[str, str] = {}
@@ -1628,6 +1654,7 @@ def dispatch_model(
         cwd=target_cwd,
         workspace=_select_workspace(request.workspace, merged_env, lane_kind=lane_kind),
         path_map=getattr(request, "path_map", None),
+        first_output_s=getattr(request, "first_output_s", None),
     )
     # remote-nodes-13 (D6): a remote spawn carries exactly THIS lane's secrets,
     # gated by the environment profile, decided here where the lane is known —
@@ -2601,6 +2628,7 @@ def dispatch_with_fallback(
     root: str | os.PathLike[str] | None = None,
     *,
     per_attempt_timeout_s: float | None = None,
+    first_output_s: float | None = None,
     accept: Callable[[DispatchResult], bool] | None = None,
     on_attempt: Callable[[str, DispatchResult], None] | None = None,
 ) -> DispatchResult:
@@ -2631,6 +2659,13 @@ def dispatch_with_fallback(
     only (``predicates.looks_like_json``); semantic validation stays
     ``validate_artifact``'s job. Passing ``None`` is the pre-A.2 behaviour.
 
+    ``first_output_s`` (B2) arms a first-output deadline on every lane that can
+    actually be watched: all but the last (it has nowhere to fall back to) and
+    only when its resolved argv streams JSON (see ``_lane_streams_json``). A
+    lead lane that hangs before emitting any model output is cut in seconds
+    instead of spending the node's whole timeout, and the timeout-class rc=124
+    keeps walking the chain.
+
     Returns the last failed result if every lane fails (so the caller still sees
     a faithful rc/error, never a silent hang). A final result rejected only by
     ``accept`` is downgraded to ok=False with rc=SHAPE_REJECT_RC so the caller
@@ -2643,7 +2678,19 @@ def dispatch_with_fallback(
 
     last: DispatchResult | None = None
     tried: list[str] = []
+    lanes = list(lanes)
+    last_index = len(lanes) - 1
     for i, lane in enumerate(lanes):
+        # The last lane never gets a deadline (there is no next lane to hand
+        # the turn to), and a lane that cannot stream JSON can never prove
+        # first output — arming it would kill a legitimately long plain-text
+        # lane at the deadline. Resolution failure means "no deadline".
+        lane_first_output_s = (
+            first_output_s
+            if (i < last_index and first_output_s is not None
+                    and first_output_s > 0 and _lane_streams_json(lane, root))
+            else None
+        )
         req = DispatchRequest(
             model=lane,
             prompt=request.prompt,
@@ -2653,6 +2700,7 @@ def dispatch_with_fallback(
             cwd=request.cwd,
             workspace=request.workspace,
             path_map=getattr(request, "path_map", None),
+            first_output_s=lane_first_output_s,
         )
         result = dispatch_model(req, root)
         tried.append(lane)

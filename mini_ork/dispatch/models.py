@@ -60,6 +60,14 @@ class DispatchRequest:
     # keeps byte-parity. Type hint is lazy (``"PathMap | None"``) so the
     # dispatch core stays free of the runtime import at module load.
     path_map: "object | None" = None
+    # B2 first-output deadline: when set (> 0), the host spawn is cut — rc 124 —
+    # if the child has produced no model event (see ``core.is_model_event``)
+    # within this many seconds of spawn. A hung lead lane then yields its turn
+    # to the next lane instead of spending the node's whole timeout. ``None``
+    # (the default, and the last lane of every chain) keeps today's behaviour
+    # byte-for-byte. Trailing field with a default so every existing
+    # constructor keeps working.
+    first_output_s: float | None = None
 
 
 # SE-3 Phase B2: a dispatch refused because the resolved engine cannot honor

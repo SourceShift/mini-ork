@@ -722,6 +722,48 @@ def _insert_llm_calls_row(con, provider, model_id, tier, feature_name, actor, st
 
 # ── model-level dispatch (delegates to the ported mini_ork.dispatch core) ──
 
+# B2: how long a lead lane may stay silent before the walk moves on. The
+# signal is "no model output at all", not wall clock, so a legitimately long
+# implementer session that is streaming is never cut. ``"0"``/empty disables;
+# a non-number fails CLOSED (disabled + one warning) rather than silently
+# turning the safety net into a mystery timeout.
+_DEFAULT_FIRST_OUTPUT_S = "300"
+
+
+def _first_output_deadline_s() -> float | None:
+    """Parse ``MO_DISPATCH_FIRST_OUTPUT_S``; ``None`` means disabled."""
+    raw = os.environ.get("MO_DISPATCH_FIRST_OUTPUT_S")
+    if raw is None:
+        raw = _DEFAULT_FIRST_OUTPUT_S
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        sys.stderr.write(
+            f"[dispatch] MO_DISPATCH_FIRST_OUTPUT_S={raw!r} is not a number; "
+            "first-output deadline disabled\n"
+        )
+        return None
+    # > 0 is the arm condition (mirrors core.spawn_local); NaN/negative/0 all
+    # mean "disabled" rather than an accidental immediate kill.
+    return seconds if seconds > 0 else None
+
+
+def _attempt_timeout_s() -> float | None:
+    """Parse ``MO_DISPATCH_ATTEMPT_TIMEOUT_S``; ``None`` means unset/disabled."""
+    raw = os.environ.get("MO_DISPATCH_ATTEMPT_TIMEOUT_S")
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        # Fail closed: a malformed value must not crash the dispatch.
+        return None
+    return seconds if seconds > 0 else None
+
+
 def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accept=None,
                     on_attempt=None) -> int:
     """Provider call via mini_ork.dispatch; writes out_file + .cost/.err.log sidecars.
@@ -746,7 +788,14 @@ def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accep
     req = DispatchRequest(model=lanes[0], prompt=prompt, timeout_s=float(timeout_s),
                           max_turns=int(max_turns))
     if len(lanes) > 1:
-        res = dispatch_with_fallback(req, lanes, accept=accept, on_attempt=on_attempt)
+        # Only a chain can hand a silent lead lane's turn to a next lane; the
+        # single-lane branch below IS the last lane and never gets a deadline.
+        res = dispatch_with_fallback(
+            req, lanes,
+            per_attempt_timeout_s=_attempt_timeout_s(),
+            first_output_s=_first_output_deadline_s(),
+            accept=accept, on_attempt=on_attempt,
+        )
     else:
         res = dispatch_model(req)
         if accept is not None and res.ok and (res.text or "").strip() and not accept(res):

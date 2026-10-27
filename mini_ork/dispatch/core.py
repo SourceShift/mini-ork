@@ -339,6 +339,37 @@ def _kill_reap_timeout_s() -> float:
     return max(0.0, value)
 
 
+# Event ``type`` values that mean the model actually produced output. Claude
+# CLI stream-json emits ``system`` (init/metadata), ``assistant``,
+# ``stream_event`` (token deltas), ``user`` (tool results) and ``result``
+# (final). Only the latter four are model output; a lane that has printed just
+# its init line is still silent as far as a first-output deadline cares (B2).
+_MODEL_EVENT_TYPES = frozenset({"assistant", "stream_event", "user", "result"})
+
+
+def is_model_event(line: str) -> bool:
+    """True when ``line`` is a JSON object whose ``type`` is model output.
+
+    Robust by contract: the reader thread calls this on whatever a killed child
+    left in the pipe, so a non-JSON line, a JSON array/scalar, an empty line or
+    a truncated write must return False rather than raise. ``system`` (CLI
+    init/metadata) is deliberately not model output.
+    """
+    if not isinstance(line, str):
+        return False
+    stripped = line.strip()
+    if not stripped:
+        return False
+    try:
+        doc = json.loads(stripped)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    event_type = doc.get("type")
+    return isinstance(event_type, str) and event_type in _MODEL_EVENT_TYPES
+
+
 def spawn_local(
     argv: Sequence[str],
     *,
@@ -346,6 +377,7 @@ def spawn_local(
     timeout: float,
     env: Mapping[str, str],
     cwd: str | None,
+    first_output_s: float | None = None,
 ) -> tuple[int, str, str]:
     """Host spawn primitive: run ``argv`` as a subprocess of THIS process and
     return ``(rc, stdout, stderr)`` — raw, unparsed, streams **separated**.
@@ -366,6 +398,14 @@ def spawn_local(
     rc contract is unchanged and non-negotiable: a timeout still SIGKILLs the
     group and returns ``124``, and the captured stdout/stderr still reach the
     parsers whole, so switching the drain mechanism is invisible to callers.
+
+    ``first_output_s`` (B2) arms a *first-output* deadline, not a wall-clock
+    cut: when the child has produced no model event (``is_model_event``) on
+    stdout within that many seconds of spawn, its whole group is killed with
+    the same bounded reap as the overall timeout and ``124`` is returned with a
+    distinct message. A lane that streams in time is left to run to the ordinary
+    ``timeout``; passing ``None`` (the default) keeps the pre-B2 path
+    byte-for-byte.
     """
     # The per-node live sidecar arrives on the REQUEST env (providers sets it for
     # every in-a-run dispatch); the parent owns the writer and the child never
@@ -420,6 +460,13 @@ def spawn_local(
             # group because a slow ``Popen`` pushed the record earlier than it.
             recorded = _record_agent_pgid(pgids_path, pgid, int(time.time()))
 
+    # Armed only for a positive deadline; ``None``/0 keeps the unarmed path.
+    first_output = (
+        threading.Event()
+        if first_output_s is not None and first_output_s > 0
+        else None
+    )
+
     with open_live_writer(live_path) as live:
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
@@ -427,8 +474,11 @@ def spawn_local(
             threading.Thread(
                 target=_drain_stream,
                 args=(proc.stdout, live, "stdout", stdout_parts),
+                kwargs={"first_output": first_output},
                 daemon=True,
             ),
+            # stderr never arms the deadline: harness init/advisory chatter is
+            # not model output, and must not make a silent lane look alive.
             threading.Thread(
                 target=_drain_stream,
                 args=(proc.stderr, live, "stderr", stderr_parts),
@@ -441,20 +491,14 @@ def spawn_local(
         # cannot be written from the thread that owns the timeout.
         threading.Thread(target=_feed_stdin, args=(proc, stdin), daemon=True).start()
 
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # A hung harness is the single biggest reliability failure. Reap its
-            # whole detached group, then let the readers drain to EOF — killing
-            # the group closes the inherited pipes, which is what unblocks them
-            # and reaps the zombie. Then surface the distinct rc=124 so
-            # dispatch_with_fallback abandons this lane.
-            #
-            # Every wait below is bounded. The old bare proc.wait() blocked
-            # forever, so a stuck child made a "120 s" lane run for thousands of
-            # seconds with nothing recording where the time went. The error text
-            # now carries the split so the next outlier is attributable:
-            # timeout spent before the kill vs. time the kill took to take.
+        def _kill_and_reap() -> tuple[float, float]:
+            """SIGKILL the lane's process group and reap it, bounded (RBF-21).
+
+            Shared by the overall timeout and the first-output cutoff: both
+            abandon the lane the same way, so a new trigger cannot reintroduce
+            the unbounded post-kill wait. Returns ``(killed_at, reaped_at)``
+            for the wall-clock diagnostic in the error text.
+            """
             _terminate_process_group(proc)
             killed_at = time.time()
             try:
@@ -478,6 +522,56 @@ def spawn_local(
             # line so a later reap does not signal a recycled pid.
             if recorded and pgids_path is not None and pgid is not None:
                 _forget_agent_pgid(pgids_path, pgid)
+            return killed_at, reaped_at
+
+        # A hung harness is the single biggest reliability failure. Both the
+        # overall timeout and the first-output deadline reap its whole detached
+        # group, let the readers drain to EOF, and surface rc=124 so
+        # dispatch_with_fallback abandons this lane.
+        timed_out = False
+        first_output_cut = False
+        try:
+            if first_output is None:
+                proc.wait(timeout=timeout)
+            else:
+                # Armed: poll in one-second slices so a model event can be
+                # noticed mid-lane without waiting for the whole timeout. The
+                # overall deadline is checked FIRST, so a first-output deadline
+                # longer than the lane timeout degrades to today's message.
+                while proc.poll() is None:
+                    now = time.time()
+                    overall_remaining = spawned_at + timeout - now
+                    if overall_remaining <= 0:
+                        timed_out = True
+                        break
+                    if first_output.is_set():
+                        # The lane spoke; from here it is an ordinary run and
+                        # only the existing overall timeout may cut it.
+                        proc.wait(timeout=overall_remaining)
+                        break
+                    first_remaining = spawned_at + first_output_s - now
+                    if first_remaining <= 0:
+                        first_output_cut = True
+                        break
+                    try:
+                        proc.wait(
+                            timeout=min(1.0, overall_remaining, first_remaining)
+                        )
+                    except subprocess.TimeoutExpired:
+                        continue
+        except subprocess.TimeoutExpired:
+            timed_out = True
+
+        if timed_out or first_output_cut:
+            killed_at, reaped_at = _kill_and_reap()
+            if first_output_cut:
+                # Synthetic text only — never the lane's stdout tail (RB-10),
+                # so a hung lane cannot be reclassified as a content failure.
+                return 124, "", (
+                    f"no model output within {first_output_s:.0f}s "
+                    f"(first-output deadline; "
+                    f"spawned→kill {killed_at - spawned_at:.0f}s)"
+                )
             return 124, "", (
                 f"timeout after {timeout}s "
                 f"(spawned→kill {killed_at - spawned_at:.0f}s, "
@@ -501,6 +595,8 @@ def _drain_stream(
     live: LiveWriter,
     name: str,
     sink: list[str],
+    *,
+    first_output: "threading.Event | None" = None,
 ) -> None:
     """Drain one pipe line by line, teeing each line to the live sink.
 
@@ -513,12 +609,19 @@ def _drain_stream(
     The harness's startup chatter is kept in ``sink`` but withheld from the
     live view — see ``_HARNESS_STARTUP_NOISE``. ``sink`` is what a failed lane
     reports through ``_failure_detail``, so diagnostics are unaffected.
+
+    ``first_output`` (B2) is set on the first stdout line that is real model
+    output. It is passed only for stdout: a lane's stderr chatter must never
+    disarm the first-output deadline. Keyword-only and optional so the existing
+    four-argument callers keep working unchanged.
     """
     if stream is None:
         return
     try:
         for line in stream:
             sink.append(line)
+            if first_output is not None and is_model_event(line):
+                first_output.set()
             if name == "stderr" and _is_harness_startup_noise(line):
                 continue
             live.write_line(line, name, partial=not line.endswith("\n"))
@@ -842,12 +945,19 @@ def dispatch(
     # triple flows into ONE finalize below, so timeout/spawn-fail/parse semantics
     # are defined once regardless of where the harness ran.
     if request.workspace == "host":
+        spawn_kwargs: dict[str, object] = {}
+        # Byte-parity for every existing caller: only mention the kwarg when a
+        # deadline is actually armed. The workspace/remote spawn path never
+        # gets one — its transport does not drain stdout line by line.
+        if getattr(request, "first_output_s", None) is not None:
+            spawn_kwargs["first_output_s"] = request.first_output_s
         rc, stdout, stderr = spawn_local(
             command,
             stdin=request.prompt,
             timeout=request.timeout_s,
             env=proc_env,
             cwd=request.cwd,
+            **spawn_kwargs,
         )
     else:
         rc, stdout, stderr = _spawn_in_workspace(
