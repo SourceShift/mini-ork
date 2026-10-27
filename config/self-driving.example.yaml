@@ -35,14 +35,23 @@ orphan_after_s: 3600
 
 # R8 — dispatch one ready epic per sweep (opt-in).
 #
-# Off by default because R8 starts paid runs. When enabled, each sweep picks the
-# highest-priority ready epic and spawns `mini-ork scheduler --once --epic <id>`
-# in the background, unless `max_in_progress` epics are already running.
-# `only` is an optional allow-list of epic ids; an empty list means "any ready
-# epic". Budgets are enforced by the scheduler (per-epic cap and
-# MO_DAILY_BUDGET_USD). Both tiers read this same key: the simple tier
-# (launchd/cron `--once`) and the service tier (`--interval`).
+# Off by default because R8 starts paid runs. When enabled, each sweep first
+# reclaims stale `in progress` epics with the scheduler's own rules, then picks
+# the highest-priority ready epic and spawns
+# `mini-ork scheduler --once --epic <id>` in the background, unless
+# `max_in_progress` epics are still running. `only` is an optional allow-list of
+# epic ids; an empty list means "any ready epic". Budgets are enforced by the
+# scheduler (per-epic cap and MO_DAILY_BUDGET_USD). Both tiers read this same
+# key: the simple tier (launchd/cron `--once`) and the service tier
+# (`--interval`).
 dispatch_epics:
   enabled: false
   max_in_progress: 1
   only: []
+  # Required to enable R8. A dispatched run edits its working tree, so this must
+  # be a dedicated, clean checkout or worktree — for example one made with
+  # `make worktree SLUG=dispatch` — never the engine checkout, a directory
+  # inside it, or a parent of it (R8 refuses an unsafe target and spawns
+  # nothing). Dispatched runs commit in this tree; landing them on main is the
+  # operator's `make worktree-merge SLUG=dispatch`.
+  target_root: ""

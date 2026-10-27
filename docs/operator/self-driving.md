@@ -124,16 +124,33 @@ The outcome file belongs to the split patch (`NNN.outcome.json`), so
 nothing.
 
 **R8 — dispatch ready epics (opt-in).** Off by default, because a dispatch
-starts a paid run. When `dispatch_epics.enabled` is true, each sweep picks the
-highest-priority ready epic from `scheduler.pick_ready` and spawns a detached
+starts a paid run. When `dispatch_epics.enabled` is true, each sweep **first
+reclaims stale `in progress` epics** with the scheduler's own rules
+(`reclaim_stale`), so an epic wedged by a crashed scheduler cannot hold the cap
+forever; it then picks the highest-priority ready epic from
+`scheduler.pick_ready` and spawns a detached
 `mini-ork scheduler --once --epic <id>`; stdout and stderr go to
 `<home>/state/supervisor-dispatch-<epic_id>.log`. It starts at most one epic
 per sweep and pauses entirely once `max_in_progress` epics (default 1) are
-already `in progress`. `dispatch_epics.only` is an optional allow-list of epic
+still `in progress`. `dispatch_epics.only` is an optional allow-list of epic
 ids; an empty list allows any ready epic. The scheduler still enforces the
 per-epic budget and `MO_DAILY_BUDGET_USD` — R8 adds no budget logic of its own.
-Turn it on by setting `dispatch_epics.enabled: true` in the config file below;
-the simple (`--once`) and service (`--interval`) tiers read the same key.
+
+`dispatch_epics.target_root` is **required to enable R8**. A dispatched run
+edits its working tree — and a framework-edit run can stash and roll it back —
+so the target must be a dedicated, clean checkout or worktree, for example one
+made with `make worktree SLUG=dispatch`, and never the engine checkout, a
+directory inside it, or a parent of it. R8 refuses an unsafe target
+(`dispatch_refused`) and spawns nothing. Dispatched runs commit in the target
+tree; landing them on `main` is the operator's
+`make worktree-merge SLUG=dispatch`. The run child gets
+`MO_TARGET_CWD=<target_root>`, `MO_ALLOW_FRAMEWORK_CWD=1` — safe only because
+R8 proved the target is disjoint from the engine — and `MO_PLACEMENT=local`
+unless the operator's environment already sets a non-empty placement.
+
+Turn it on by setting `dispatch_epics.enabled: true` and
+`dispatch_epics.target_root: <path>` in the config file below; the simple
+(`--once`) and service (`--interval`) tiers read the same keys.
 
 `dry_run` computes the same action list without materializing the workflow:
 it installs no `NNN.applied.json`, spawns nothing, and leaves `repair.json`
@@ -211,6 +228,7 @@ dispatch_epics:      # R8 — opt-in; off because it starts paid runs
   enabled: false
   max_in_progress: 1
   only: []
+  target_root: ""    # required to enable R8: a dedicated clean worktree
 ```
 
 With no config named, the same values are the built-in defaults. A path that is
@@ -233,7 +251,10 @@ Each action is a small dict: `{"run_id", "action", "reason", ...}`.
 | `split_done` | every split child is `done`; the parent was superseded (`patch`, `child_epic_ids`) |
 | `split_failed` | a split child `escalated`/`abandoned`; the parent gave up and the operator was notified (`patch`, `child_epic_ids`) |
 | `backlink` | a done epic's notes gained `delivered_by=<run|commit>` |
-| `error` | that run dir could not be processed; the sweep continued |
+| `dispatch_epic` | R8 spawned one ready epic through the scheduler (`pid`, `log`); dry-run reports it with `dry_run` |
+| `dispatch_refused` | R8 refused before spawning because `target_root` is unsafe; `reason` names the fix (required, must be absolute, does not exist, inside the engine checkout, contains the engine checkout). A refusal exits 0, so fix `dispatch_epics.target_root` in the config |
+| `reclaim_stale` | R8 returned wedged `in progress` epics to the queue before counting the cap (`epic_ids`) |
+| `error` | that run dir could not be processed, or a reclaim failed (`reclaim: ...`); the sweep continued |
 
 Without `--json` the output is one line per action; with `--json` it is the full
 list, which is what an automation should consume.

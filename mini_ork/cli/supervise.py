@@ -36,7 +36,8 @@ DEFAULTS = {
     "interval_s": 300,
     "max_revives": 2,
     "orphan_after_s": 3600,
-    "dispatch_epics": {"enabled": False, "max_in_progress": 1, "only": []},
+    "dispatch_epics": {"enabled": False, "max_in_progress": 1, "only": [],
+                       "target_root": ""},
 }
 _SCALAR_KEYS = ("interval_s", "max_revives", "orphan_after_s")
 _MIN_TTL_S = 900
@@ -84,7 +85,8 @@ def _parse_dispatch_block(path: str, raw) -> dict:
     :class:`ConfigError` naming the key, so the caller exits 2 rather than
     silently running a paid dispatch with a value the operator did not mean.
     """
-    block = {"enabled": False, "max_in_progress": 1, "only": []}
+    block = {"enabled": False, "max_in_progress": 1, "only": [],
+             "target_root": ""}
     if raw is None:
         return block
     if not isinstance(raw, dict):
@@ -115,6 +117,14 @@ def _parse_dispatch_block(path: str, raw) -> dict:
                 f"supervise config {path}:"
                 " dispatch_epics.only must be a list of strings")
         block["only"] = list(only)
+
+    if raw.get("target_root") is not None:
+        target_root = raw["target_root"]
+        if not isinstance(target_root, str):
+            raise ConfigError(
+                f"supervise config {path}:"
+                " dispatch_epics.target_root must be a string")
+        block["target_root"] = os.path.expanduser(target_root)
 
     return block
 
@@ -182,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_epics=bool(dispatch["enabled"]),
             dispatch_max_in_progress=int(dispatch["max_in_progress"]),
             dispatch_only=list(dispatch["only"]),
+            dispatch_target_root=str(dispatch["target_root"]),
         )
 
     try:

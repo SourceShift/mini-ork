@@ -48,6 +48,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from subprocess import DEVNULL, STDOUT
 from typing import Any, Callable
 
 from mini_ork.learning.code_findings import landed_patch_ids, run_patch_id
@@ -486,7 +487,8 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
           dry_run: bool = False, spawn=None, max_revives: int = 2,
           orphan_after_s: int = 3600, dispatch_epics: bool = False,
           dispatch_max_in_progress: int = 1,
-          dispatch_only: list[str] | None = None, dispatch_fn=None) -> list[dict]:
+          dispatch_only: list[str] | None = None, dispatch_fn=None,
+          dispatch_target_root: str = "") -> list[dict]:
     """One supervisor pass over ``home/runs/*/repair.json``.
 
     Args:
@@ -508,8 +510,12 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
         dispatch_max_in_progress: R8's cap on epics already ``in progress``.
         dispatch_only: optional allow-list of epic ids R8 may pick.
         dispatch_fn: injectable
-            ``callable(engine_root, home, db, epic_id) -> dict``; the default
-            spawns a detached ``mini-ork scheduler --once --epic <id>``.
+            ``callable(engine_root, home, db, epic_id, target_root) -> dict``;
+            the default spawns a detached
+            ``mini-ork scheduler --once --epic <id>``.
+        dispatch_target_root: the working tree a dispatched run edits. Required
+            to enable R8: it must be an absolute, existing directory that is
+            neither the engine checkout, inside it, nor a parent of it.
 
     Returns:
         One action dict per run or epic acted on (``run_id`` or ``epic_id`` /
@@ -605,7 +611,8 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
             actions.extend(_rule_dispatch_epic(
                 home, db, engine_root, dry_run,
                 max_in_progress=dispatch_max_in_progress,
-                only=dispatch_only, dispatch_fn=dispatch_fn))
+                only=dispatch_only, dispatch_fn=dispatch_fn,
+                target_root=dispatch_target_root))
         except Exception as exc:  # a failed spawn must never stop the sweep
             actions.append({"epic_id": "", "action": "error",
                             "reason": f"dispatch rule: {type(exc).__name__}: {exc}"})
@@ -1212,15 +1219,20 @@ def _rule_backlink(db: str, engine_root: str, dry_run: bool) -> list[dict]:
 
 
 def _default_dispatch_epic(engine_root: str, home: str, db: str,
-                           epic_id: str) -> dict:
+                           epic_id: str, target_root: str) -> dict:
     """Spawn a detached ``mini-ork scheduler --once --epic <id>`` (R8).
 
-    The child gets the supervisor's home/root/DB pinned and every run-scoped key
-    popped (the same list :func:`_default_spawn` drops) so an inherited run from
-    the supervisor's own shell can never steer the dispatch. stdout and stderr
-    go to ``<home>/state/supervisor-dispatch-<epic_id>.log``. On ``OSError`` it
-    returns ``{"error": ...}`` and never raises — one failed spawn must not stop
-    the sweep.
+    The child runs in ``target_root`` — the dedicated checkout the dispatched run
+    edits, never the engine checkout itself. It gets the supervisor's
+    home/root/DB pinned and every run-scoped key popped (the same list
+    :func:`_default_spawn` drops) so an inherited run from the supervisor's own
+    shell can never steer the dispatch. ``MO_TARGET_CWD`` names the target for
+    the run, ``MO_ALLOW_FRAMEWORK_CWD=1`` lifts the run's "do not edit the
+    engine" guard (correct only because R8 refused every unsafe target first),
+    and ``MO_PLACEMENT`` defaults to ``local`` unless the operator set one.
+    stdout and stderr go to ``<home>/state/supervisor-dispatch-<epic_id>.log``.
+    On ``OSError`` it returns ``{"error": ...}`` and never raises — one failed
+    spawn must not stop the sweep.
     """
     home_p = Path(home)
     state_dir = home_p / "state"
@@ -1230,6 +1242,10 @@ def _default_dispatch_epic(engine_root: str, home: str, db: str,
     env["MINI_ORK_ROOT"] = str(engine_root)
     env["MINI_ORK_HOME"] = str(home)
     env["MINI_ORK_DB"] = str(db)
+    env["MO_TARGET_CWD"] = str(target_root)
+    env["MO_ALLOW_FRAMEWORK_CWD"] = "1"
+    if not env.get("MO_PLACEMENT"):
+        env["MO_PLACEMENT"] = "local"
     for key in ("MINI_ORK_RUN_ID", "MINI_ORK_RUN_DIR", "MINI_ORK_PLAN_PATH"):
         env.pop(key, None)
 
@@ -1242,11 +1258,11 @@ def _default_dispatch_epic(engine_root: str, home: str, db: str,
         try:
             proc = subprocess.Popen(
                 argv,
-                cwd=str(engine_root),
+                cwd=str(target_root),
                 env=env,
                 stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
+                stderr=STDOUT,
+                stdin=DEVNULL,
                 start_new_session=True,
             )
         finally:
@@ -1256,35 +1272,117 @@ def _default_dispatch_epic(engine_root: str, home: str, db: str,
     return {"pid": getattr(proc, "pid", None), "log": str(log_path)}
 
 
+def _same_dir_or_ancestor(path: str, other: str) -> bool:
+    """True when ``path`` or any of its ancestors is the same directory as ``other``.
+
+    ``samefile`` compares device and inode, so a case-variant path on a
+    case-insensitive filesystem (macOS APFS) and a symlink both resolve to the
+    same directory. An ancestor whose ``samefile`` raises ``OSError`` (a broken
+    symlink, a vanished path) is skipped.
+    """
+    current = path
+    while True:
+        try:
+            if os.path.samefile(current, other):
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def _dispatch_refusal(target_root: str, engine_root: str) -> dict | None:
+    """Return R8's refusal action for an unsafe target, or ``None`` when safe.
+
+    Ordering is the contract: the first matching row wins, so an empty target is
+    reported as required, a relative one as non-absolute, and only an existing
+    absolute directory is compared against the engine checkout.
+    """
+    if not target_root:
+        return {
+            "epic_id": "", "action": "dispatch_refused",
+            "reason": ("dispatch_epics.target_root is required: a dispatched "
+                       "run edits its working tree, which must never be the "
+                       "engine checkout")}
+    if not os.path.isabs(target_root):
+        return {
+            "epic_id": "", "action": "dispatch_refused",
+            "reason": (f"dispatch_epics.target_root must be an absolute path: "
+                       f"{target_root}")}
+    if not os.path.isdir(target_root):
+        return {
+            "epic_id": "", "action": "dispatch_refused",
+            "reason": f"dispatch_epics.target_root does not exist: {target_root}"}
+
+    target = os.path.realpath(target_root)
+    engine = os.path.realpath(engine_root)
+    if _same_dir_or_ancestor(target, engine):
+        return {
+            "epic_id": "", "action": "dispatch_refused",
+            "reason": "dispatch_epics.target_root is inside the engine checkout"}
+    if _same_dir_or_ancestor(engine, target):
+        return {
+            "epic_id": "", "action": "dispatch_refused",
+            "reason": ("dispatch_epics.target_root contains the engine "
+                       "checkout")}
+    return None
+
+
 def _rule_dispatch_epic(home: str, db: str, engine_root: str, dry_run: bool,
                         *, max_in_progress: int, only: list[str] | None,
-                        dispatch_fn) -> list[dict]:
+                        dispatch_fn, target_root: str = "") -> list[dict]:
     """R8 — start at most one ready epic through the scheduler.
 
-    Bounded by the number of epics already ``in progress`` (the scheduler enforces
-    the per-epic budget and ``MO_DAILY_BUDGET_USD``; R8 adds no budget logic of
-    its own). ``only`` intersects the ready-set with an allow-list. Nothing ready
-    or the cap reached → no action. ``dry_run`` reports the pick and spawns
-    nothing.
+    First refuses an unsafe ``target_root`` — a dispatched run edits its working
+    tree, so it must never be the engine checkout, inside it, or a parent of it
+    (that is what makes setting ``MO_ALLOW_FRAMEWORK_CWD=1`` on the child safe).
+    Then reclaims stale ``in progress`` epics with the scheduler's own rules, so
+    an epic wedged by a crashed scheduler cannot hold the cap forever. Only then
+    is the cap counted: it must see the post-reclaim state, or the fix is a
+    no-op. Bounded by the number of epics still ``in progress`` (the scheduler
+    enforces the per-epic budget and ``MO_DAILY_BUDGET_USD``; R8 adds no budget
+    logic of its own). ``only`` intersects the ready-set with an allow-list.
+    Nothing ready or the cap reached → the reclaim action, if any. ``dry_run``
+    reports the pick and spawns nothing.
     """
     from mini_ork import scheduler  # noqa: PLC0415 — avoids an import cycle
+
+    refusal = _dispatch_refusal(target_root, engine_root)
+    if refusal is not None:
+        return [refusal]
+
+    actions: list[dict] = []
+    if not dry_run:
+        try:
+            reclaimed = scheduler.reclaim_stale(db)
+        except Exception as exc:  # reclaim is best-effort; dispatch continues
+            actions.append({"epic_id": "", "action": "error",
+                            "reason": f"reclaim: {type(exc).__name__}: {exc}"})
+        else:
+            if reclaimed:
+                actions.append({"epic_id": "", "action": "reclaim_stale",
+                                "epic_ids": list(reclaimed)})
 
     rows = _query(db, "SELECT COUNT(*) FROM epics"
                       " WHERE status='in progress' AND archived_at IS NULL")
     in_progress = int(rows[0][0]) if rows else 0
     if in_progress >= int(max_in_progress):
-        return []
+        return actions
 
     ready = scheduler.pick_ready(db, only=set(only) if only else None)
     if not ready:
-        return []
+        return actions
     epic_id = str(ready[0])
 
     if dry_run:
-        return [{"epic_id": epic_id, "action": "dispatch_epic",
-                 "reason": "ready; dry-run", "dry_run": True}]
+        actions.append({"epic_id": epic_id, "action": "dispatch_epic",
+                        "reason": "ready; dry-run", "dry_run": True})
+        return actions
 
     result = (dispatch_fn or _default_dispatch_epic)(
-        engine_root, home, db, epic_id)
-    return [{"epic_id": epic_id, "action": "dispatch_epic",
-             "reason": "ready", **result}]
+        engine_root, home, db, epic_id, target_root)
+    actions.append({"epic_id": epic_id, "action": "dispatch_epic",
+                    "reason": "ready", **result})
+    return actions
