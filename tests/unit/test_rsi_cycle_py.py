@@ -703,6 +703,17 @@ def test_a_rejected_cycle_still_records_what_it_spent(world):
     assert _cycle(world.db)["cost_usd"] == pytest.approx(1.39)
 
 
+def test_an_explicit_cost_still_wins_over_the_cycle_sum(world):
+    """The default is the cycle total; a call site may narrow it. Merge and
+    quarantine forward the child's own measurement, and this pins that the
+    `_cycle_spend` default does not quietly overwrite them."""
+    h = Harness(world)
+    h.runtime.implement = lambda req, cand, sel: _impl(world.root, cand, cost=25.0)
+    out = h.run()
+    assert out.status == "quarantined"
+    assert _cycle(world.db)["cost_usd"] == pytest.approx(25.0)
+
+
 def test_a_rejected_selection_never_reaches_implement(world):
     h = Harness(world)
     h.runtime.propose = lambda req, cand: Proposal(
