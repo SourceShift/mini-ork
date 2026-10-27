@@ -918,7 +918,7 @@ def _solver_games_the_harness(tree: str) -> bool:
     code that probes or patches pytest at import time could forge results that
     no file-level guard sees. ``mini_ork.verify.gaming_scan`` checks the diff the
     snapshot will actually run (base → base + solver files) for those patterns
-    (pytest/_pytest probes, MonkeyPatch, frame inspection, writes on imported
+    (pytest/_pytest probes, harness patch fixtures, frame inspection, writes on imported
     modules); any finding, or a diff that cannot be produced, fails closed.
     """
     from mini_ork.verify import gaming_scan
