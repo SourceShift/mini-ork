@@ -7,6 +7,7 @@ reflection→store loop through ``reflection_pipeline.reflection_extract_gradien
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 
@@ -532,3 +533,34 @@ def test_no_diagnosis_passes(tmp_path, monkeypatch):
 
     assert len(stored) == 1
     assert refusals(home) is None
+
+
+def test_on_mode_refused_trace_is_not_re_extracted(tmp_path, monkeypatch, capsys):
+    # Review fix: a refused gradient is never stored, so gradient_records holds
+    # no watermark; the refusal log must stand in for it, or every reflect pass
+    # pays to re-extract and re-refuse the same trace.
+    home, stored = seed(tmp_path, monkeypatch, status="failed", layer="kickoff")
+    monkeypatch.setenv("MO_LAYER_ROUTING", "on")
+    calls = []
+    original = reflection_pipeline._gradient_extract
+    monkeypatch.setattr(reflection_pipeline, "_gradient_extract",
+                        lambda tid: calls.append(tid) or original(tid))
+
+    reflection_pipeline.reflection_extract_gradients(0)
+    reflection_pipeline.reflection_extract_gradients(0)
+
+    assert calls == ["tr-1"]
+    assert stored == []
+    assert len(refusals(home)) == 1
+    assert layer_routing.trace_refused(str(home), os.environ["MINI_ORK_DB"], "tr-1")
+
+
+def test_shadow_refusal_is_not_a_watermark(tmp_path, monkeypatch, capsys):
+    # A shadow refusal stores the gradient, so it must not suppress extraction
+    # through the refusal log, and its log line says it was stored.
+    home, stored = seed(tmp_path, monkeypatch, status="failed", layer="kickoff")
+    monkeypatch.setenv("MO_LAYER_ROUTING", "shadow")
+    reflection_pipeline.reflection_extract_gradients(0)
+    _out, err = capsys.readouterr()
+    assert "would layer-refuse (shadow, stored) agent.reviewer.prompt from tr-1" in err
+    assert not layer_routing.trace_refused(str(home), os.environ["MINI_ORK_DB"], "tr-1")

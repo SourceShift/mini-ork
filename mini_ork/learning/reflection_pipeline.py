@@ -728,6 +728,18 @@ def _layer_check(gradient_json: str, trace_id: str) -> dict | None:
         return None
 
 
+def _layer_refused_before(trace_id: str) -> bool:
+    """``layer_routing.trace_refused`` for the active DB/home; False on any error."""
+    db = os.environ.get("MINI_ORK_DB", "")
+    if not db:
+        return False
+    home = os.environ.get("MINI_ORK_HOME") or str(Path(db).parent)
+    try:
+        return layer_routing.trace_refused(home, db, trace_id)
+    except Exception:  # noqa: BLE001 - never stop reflection
+        return False
+
+
 def reflection_extract_gradients(since_ts: int = 0) -> None:
     """Extract and persist gradients for eligible traces.
 
@@ -762,6 +774,12 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
             continue
 
         if _ge.has_watermark(tid):
+            skipped_watermark += 1
+            continue
+        # A trace whose gradients were all layer-refused in `on` mode has no
+        # gradient_records watermark; its refusal-log line is the watermark, so
+        # reflection does not pay to re-extract and re-refuse it every pass.
+        if lr_mode == "on" and _layer_refused_before(tid):
             skipped_watermark += 1
             continue
         # A per-trace dispatch refusal (cost circuit open, lane down, quota) must
@@ -802,8 +820,10 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
                     home = verdict.pop("_home")
                     record = dict(verdict, mode=lr_mode, ts=int(time.time()))
                     layer_routing.record_refusal(home, verdict["run_id"], record)
+                    verb = ("layer-refused" if lr_mode == "on"
+                            else "would layer-refuse (shadow, stored)")
                     print(
-                        f"reflection_extract_gradients: layer-refused "
+                        f"reflection_extract_gradients: {verb} "
                         f"{verdict['target']} from {tid}: {verdict['reason']}",
                         file=sys.stderr,
                     )

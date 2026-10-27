@@ -166,3 +166,32 @@ def record_refusal(home: str, run_id: str, refusal: Mapping[str, Any]) -> bool:
     except (OSError, TypeError, ValueError):
         return False
     return True
+
+
+def trace_refused(home: str, db: str, trace_id: str) -> bool:
+    """Whether ``trace_id`` was already refused in ``on`` mode.
+
+    A refused gradient is never stored, so ``gradient_records`` holds no
+    watermark for its trace and every reflect pass would pay to re-extract it
+    and refuse it again. The run's refusal log is that watermark: True when it
+    holds a line for this trace with ``mode == "on"``. Fails closed to False
+    (re-extract) on any read error.
+    """
+    run_id = trace_run_id(db, trace_id)
+    if not run_id:
+        return False
+    path = Path(home) / "runs" / run_id / REFUSALS_FILE
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(rec, dict) and rec.get("trace_id") == trace_id
+                        and rec.get("mode") == "on"):
+                    return True
+    except OSError:
+        return False
+    return False
+
