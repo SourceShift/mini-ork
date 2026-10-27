@@ -289,6 +289,31 @@ def test_clean_failure_raises(tmp_path):
         clean(cfg, runner=FakeRunner().on("clean", cfg.slug, rc=1, err="dirty"))
 
 
+def test_clean_does_not_trust_a_zero_exit_for_removal(tmp_path):
+    """``clean`` exits 0 for a slug it never touched — the directory decides.
+
+    Cycle 21 (2026-10-27) was recorded ``rejected`` and kept its worktree and
+    three file claims: the script printed ``cleaned`` and returned 0, and the
+    cycle moved on. The next attempt at that gap would have paid for SUGGEST
+    and then refused with ``worktree_claim_conflict``, so a survivor here has
+    to be an error, not a printout.
+    """
+    cfg = _cfg(tmp_path)
+    Path(cfg.path).mkdir(parents=True)
+    with pytest.raises(WorktreeError, match="still exists"):
+        clean(cfg, runner=FakeRunner().on("clean", cfg.slug))
+
+
+def test_clean_does_not_trust_a_zero_exit_for_claims(tmp_path):
+    """The claims outlive the directory in the failure worth guarding against."""
+    cfg = _cfg(tmp_path)
+    registry = Path(cfg.worktrees_dir) / ".ownership"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(f"{cfg.slug}\tmini_ork/rsi/cycle.py\n", encoding="utf-8")
+    with pytest.raises(WorktreeError, match="claims are still registered"):
+        clean(cfg, runner=FakeRunner().on("clean", cfg.slug))
+
+
 def test_release_asks_the_script_for_claims_only(tmp_path):
     """`release` must not become a second spelling of `clean`.
 

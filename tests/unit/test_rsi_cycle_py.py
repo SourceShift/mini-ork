@@ -676,6 +676,31 @@ def test_an_empty_diff_is_a_rejection_that_cleans_its_worktree(world):
     assert _cycle(world.db)["halt_reason"].startswith("implement_empty: ")
 
 
+def test_a_failed_cleanup_does_not_erase_the_rejection(world):
+    """The row outranks the tidy-up.
+
+    ``clean`` raises when the worktree or its claims survive, and the reject
+    path is also the one that writes ``implement_empty``. Letting that exception
+    escape would replace a decided rejection with an opaque ``error`` — the
+    reason gone, the survivor still there. Both facts belong in the row.
+    """
+    h = Harness(world)
+    h.runtime.implement = lambda req, cand, sel: Implementation(
+        worktree=SimpleNamespace(path=world.root), detail="the child produced no diff")
+
+    def _explode(req, impl):
+        raise RuntimeError("its claims are still registered")
+
+    h.runtime.clean = _explode
+    out = h.run()
+
+    assert out.status == "rejected"
+    assert "cleanup failed (RuntimeError): its claims are still registered" in out.detail
+    row = _cycle(world.db)
+    assert row["status"] == "rejected"
+    assert "cleanup failed" in row["halt_reason"]
+
+
 def _seed_spend(db: Path, run_id: str, cost: float) -> None:
     """Give ``_cycle_spend`` something to sum — the production DB's ``llm_calls``
     is not part of the rsi migration set this fixture applies."""
@@ -1668,6 +1693,54 @@ def test_a_failed_restore_is_an_implementation_detail_not_a_silent_pass(world, m
 
     assert impl is not None and not impl.landed_something, impl
     assert "could not be restored" in impl.detail
+
+
+def test_a_killed_child_is_not_reported_as_having_done_nothing(world, monkeypatch):
+    """``no diff`` hid 218 lines of real work in cycle 21 (2026-10-27).
+
+    A child that hits its wall mid-edit never writes ``framework-edit.diff``, so
+    the cycle rejected with ``the child produced no diff`` while the worktree
+    held every line the implementer had typed. That sentence sends the operator
+    to a dead lane; the defect was the child's clock. The leftover work is named
+    in the detail and kept on disk, because the reject path is about to force-
+    remove the tree it sits in.
+    """
+    repo = world.tmp / "wt"
+    _init_repo(repo)
+    (repo / "a.py").write_text("pre\n", encoding="utf-8")
+    (repo / "b.py").write_text("pre\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    (repo / "a.py").write_text("half-written\n", encoding="utf-8")  # the killed edit
+    (repo / "b.py").write_text("staged edit\n", encoding="utf-8")
+    _git(repo, "add", "b.py")  # staged before the kill: `git diff` alone would miss it
+
+    from mini_ork.rsi import worktree as wt_mod
+
+    monkeypatch.setattr(wt_mod, "claim_and_create", lambda cfg: SimpleNamespace(path=repo))
+    monkeypatch.setattr(wt_mod, "assert_worktree_root", lambda wt, runner=None: None)
+
+    def _dispatch(req, wt, kickoff, child_home):
+        (child_home / "runs" / "rid").mkdir(parents=True)  # no diff, no verdict
+        return "rid", 124, ""
+
+    monkeypatch.setattr(cycle_mod, "_dispatch_child", _dispatch)
+
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg, cycle_id="rsi-ctest")
+    cand = _cand(files=("a.py",))
+    selection = Selection(candidate_id=cand.candidate_id, accepted=True, files=("a.py",),
+                          verification_command=cand.success_command, kickoff="# k\n")
+
+    impl = cycle_mod._default_implement(req, cand, selection)
+
+    assert impl is not None and not impl.landed_something, impl
+    assert "rc=124" in impl.detail
+    assert "uncommitted work in 2 file(s): a.py, b.py" in impl.detail
+    salvage = world.tmp / "rsi" / "rsi-ctest" / "salvage.diff"
+    assert "saved to" in impl.detail and salvage.is_file()
+    saved = salvage.read_text(encoding="utf-8")
+    assert "half-written" in saved
+    assert "staged edit" in saved, "a staged edit is uncommitted work too"
 
 
 # --------------------------------------------------------------------------

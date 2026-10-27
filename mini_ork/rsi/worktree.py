@@ -344,11 +344,43 @@ def merge(cfg: WorktreeConfig, *,
 
 
 def clean(cfg: WorktreeConfig, *, runner: Runner = subprocess_runner) -> None:
-    """Remove the worktree and release its claims. Fails on a dirty tree."""
+    """Remove the worktree and release its claims. Fails on a dirty tree.
+
+    The exit code is not the postcondition. ``clean_worktree`` prints
+    ``cleaned <slug>`` and returns 0 whether or not a directory was there to
+    remove, and it resolves ``WORKTREES_DIR`` from its own environment — a
+    process whose ``MINI_ORK_WORKTREES_DIR`` names a different directory gets a
+    green exit for work performed somewhere else. Cycle 21 (2026-10-27) ended
+    ``rejected`` through this path and left its worktree and three file claims
+    on disk; every later attempt at that gap would have paid for SUGGEST and
+    then refused with ``worktree_claim_conflict``. So the result is verified
+    against the state the caller meant, and a survivor is an error.
+    """
     rc, out, err = _run_script(cfg, ["clean", cfg.slug], runner=runner)
     if rc != 0:
         raise WorktreeError(
             f"worktree clean failed for {cfg.slug!r}: {_tail(err) or _tail(out)}")
+    survivors = _clean_survivors(cfg)
+    if survivors:
+        raise WorktreeError(
+            f"worktree clean for {cfg.slug!r} reported success but {survivors}")
+
+
+def _clean_survivors(cfg: WorktreeConfig) -> str:
+    """What a "successful" ``clean`` left behind, as a clause, or ``""``.
+
+    Reading the registry directly rather than asking the script: the whole
+    failure being guarded against is the script and the caller disagreeing
+    about where that registry lives.
+    """
+    from .select import read_claims
+
+    left: list[str] = []
+    if Path(cfg.path).exists():
+        left.append(f"the directory {cfg.path} still exists")
+    if any(slug == cfg.slug for slug, _ in read_claims(cfg.worktrees_dir)):
+        left.append(f"its claims are still registered in {cfg.worktrees_dir}/.ownership")
+    return " and ".join(left)
 
 
 def release(primary: Path, slug: str, *, runner: Runner = subprocess_runner,

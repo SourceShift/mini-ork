@@ -439,15 +439,25 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
     impl = (rt.implement or _default_implement)(req, cand, selection)
     if impl is None or not impl.landed_something:
         detail = (impl.detail if impl is not None else "the implementer produced nothing")
+        extra = {**_candidate_fields(cand),
+                 "child_run_id": getattr(impl, "child_run_id", "")}
         if impl is not None:
-            (rt.clean or _default_clean)(req, impl)
+            # A cleanup that fails must not delete the rejection it was tidying.
+            # ``clean`` now raises when the worktree or its claims survive, and
+            # an exception escaping here would turn a decided ``rejected`` row
+            # into an opaque ``error`` — losing the reason AND leaving the same
+            # survivor in place. The row carries both facts instead; ``detail``
+            # is the column, because a made-up key is refused by the ledger.
+            try:
+                (rt.clean or _default_clean)(req, impl)
+            except Exception as exc:  # noqa: BLE001 - recorded in the row, not swallowed
+                detail += f"; cleanup failed ({type(exc).__name__}): {exc}"
         # Same reason-code discipline as the SUGGEST rejection: a child that
         # lands nothing is a *kind* of failure (`implement_empty`), and the
         # operator needs it in the row to tell it from a pre-dispatch filter.
         return _finish(req, rt, con, "rejected", rc=0, candidate_id=cand.candidate_id,
                        halt_reason=f"implement_empty: {detail}", detail=detail,
-                       extra={**_candidate_fields(cand),
-                              "child_run_id": getattr(impl, "child_run_id", "")})
+                       extra=extra)
 
     # --- VALIDATE ----------------------------------------------------------
     measurement = (rt.measure or _default_measure)(req, cand, impl, selection)
@@ -714,12 +724,16 @@ def _quarantine(req: CycleRequest, rt: Runtime, con, cand: Candidate,
     path = (rt.quarantine or _default_quarantine)(req, cand, impl, report, reason)
     ledger.set_candidate_status(con, cand.candidate_id, "quarantined", now=rt.clock(),
                                 reason=f"{reason}: {failing}")
+    cleanup_note = ""
     if not req.config.decide.quarantine_keep_worktree and impl is not None:
-        (rt.clean or _default_clean)(req, impl)
+        try:
+            (rt.clean or _default_clean)(req, impl)
+        except Exception as exc:  # noqa: BLE001 - the quarantine record outranks the tidy-up
+            cleanup_note = f"; cleanup failed: {exc}"
     return _finish(
         req, rt, con, "quarantined", rc=0, halt_reason=reason,
         candidate_id=cand.candidate_id,
-        detail=(detail + "; " if detail else "") + "failing gates: " + failing,
+        detail=(detail + "; " if detail else "") + "failing gates: " + failing + cleanup_note,
         gates=report,
         extra={**_candidate_fields(cand),
                "child_run_id": impl.child_run_id,
@@ -1329,7 +1343,7 @@ def _default_implement(req: CycleRequest, cand: Candidate,
     verdict = _read_json(verdict_path)
     cost = _child_cost(req, run_id, rc)
     if not diff.strip():
-        return Implementation(wt, cfg, detail=f"the child produced no diff (rc={rc})",
+        return Implementation(wt, cfg, detail=_empty_diff_detail(req, wt, rc),
                               child_run_id=run_id, cost_usd=cost, verdict=verdict)
 
     landed = apply_patch(wt, diff, message=f"rsi: {cand.title} [{req.cycle_id}]")
@@ -1416,6 +1430,64 @@ def _changed_files(wt) -> list[str]:
     except (OSError, subprocess.SubprocessError):
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _uncommitted_files(wt) -> list[str]:
+    """Paths the working tree has modified, as ``git status`` sees them.
+
+    Distinct from :func:`_changed_files`, which reads the *landed commit*. A
+    child that is killed mid-edit leaves the second kind non-empty and the
+    first empty — the work exists, but no diff was ever written.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(wt.path), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows: list[str] = []
+    for line in proc.stdout.splitlines():
+        path = line[3:].strip()
+        if " -> " in path:  # a rename is reported as "old -> new"
+            path = path.split(" -> ", 1)[1]
+        if path:
+            rows.append(path)
+    return rows
+
+
+def _empty_diff_detail(req: CycleRequest, wt, rc: int) -> str:
+    """Why the child landed nothing, with the work it *did* leave named.
+
+    ``the child produced no diff`` on its own reads as a model that had nothing
+    to say. Cycle 21 (2026-10-27) died at its wall mid-edit: the worktree held
+    218 lines across the two files it had claimed, and the row said only
+    ``no diff`` — sending the operator after a dead lane when the real defect
+    was the child's budget. A killed child cannot restore its tree the way a
+    finished one does, so anything still uncommitted here is salvage: keep it
+    on disk, out of the worktree that is about to be removed.
+    """
+    detail = f"the child produced no diff (rc={rc})"
+    left = _uncommitted_files(wt)
+    if not left:
+        return detail
+    shown = ", ".join(left[:5]) + (", …" if len(left) > 5 else "")
+    detail += f"; the worktree holds uncommitted work in {len(left)} file(s): {shown}"
+    salvage = req.home / "rsi" / req.cycle_id / "salvage.diff"
+    try:
+        # ``git diff HEAD``, not ``git diff``: a child that ran ``git add``
+        # before it was killed would otherwise salvage nothing while the file
+        # count above still named the file. Untracked files are in neither
+        # diff; they are named in the detail, which is what an operator reads.
+        proc = subprocess.run(
+            ["git", "-C", str(wt.path), "diff", "HEAD"],
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode == 0 and proc.stdout.strip():
+            salvage.parent.mkdir(parents=True, exist_ok=True)
+            salvage.write_text(proc.stdout, encoding="utf-8")
+            detail += f" (saved to {salvage})"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return detail
 
 
 def _restore_landed(wt: Path, paths: Sequence[str], *,
