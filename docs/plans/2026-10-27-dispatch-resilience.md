@@ -69,8 +69,11 @@ use Bifrost itself as an optional secure-tier transport stays a later option.
 | S1 | 7d106336, 8adc3fa0 | Review 130 found a regression (a `Do not` line after an unterminated line); fixed with `break_before_negative` |
 | B2 | 7a9affcf | Real lanes: glm, deepseek_flash, opus armed; codex not. Remote/workspace spawns get no deadline (by design; follow-up below) |
 | Flag docs | b25c845e, + B2 rows | 10 flags documented |
-| R2e | awaiting the user's approval | High tier (`scripts/mini_ork_worktree.py`); approval binds to patch-id 2e5bb817 |
-| S2 | awaiting the user's approval | High tier (`mini_ork/cli/execute.py`); approval binds to patch-id 9c00f10b. Replayed on the R5c run dir, the repair section names no-test-gaming and quotes execute_handlers.py:1715 |
+| R2e | 702123f9 | High tier; approved under the operator's waiver (patch-id 2e5bb817) |
+| F1 | c8b0efac | Review 140/141 findings, low tier: check-log reads the verdict line and keeps the tail; the degraded fallback re-checks with fresh=True |
+| V1 | 5f7a9e31 | The test verifier excused 10 red verification commands (patched rc 1 vs base rc 4: the base lacks the diff's new test file), incl. eco6-K13; now only a same-rc base failure abstains |
+| F2 | awaiting the user's approval | High tier (driver + frozen-kernel auto_repair.py), patch-id 733d652e. Salvaged: the reviewer escalated because a test pinned the old handoff contract and the kickoff forbade editing it |
+| S2 | 2c2e619c | High tier; approved under the operator's waiver ("do all yourself", after seeing paths, patch-id 9c00f10b and the gate result) |
 
 ### Why the in-run reviewer passed K10, K12 and K13
 
@@ -123,5 +126,9 @@ pays; B2 (the first-output deadline) is the targeted fix for hung lanes.
 - **K12 and K13** in-run misses are still unexplained after the round-block
   replay; the eval still omits the injected lessons, artifact context and
   scope guard.
+- **Gate fallback fails open on a transient DB error** (review 145, medium):
+  `_llm_lenses_all_failed` returns `(False, 0)` on any exception.
+- **ContextNest store path skips the ingest redactor** (DeepSeek/GLM keys
+  reached `wal.jsonl` 09-09..09-24 although the default `sk-` rule matches).
 - **`throttle_retryable`** is dead code since B1, kept because
   `test_dispatch_retry_py.py` pins it.
