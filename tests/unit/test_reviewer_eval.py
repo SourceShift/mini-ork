@@ -192,7 +192,9 @@ def test_build_prompt_sections_and_heading_fallback(tmp_path):
     assert reviewer_md.read_text().strip()[:80] in prompt
     assert "Review the implementation for: Fix the epics archive" in prompt
     assert "Plan:\n" in prompt
-    assert "# Reviewer inputs\n# review-diff.patch" in prompt
+    assert "--- Reviewer inputs (assembled by mini-ork-execute) ---" in prompt
+    assert "\n# review-diff.patch\n" in prompt
+    assert "--- End reviewer inputs ---" in prompt
     assert "--- a/mini_ork/cli/epics.py" in prompt
     assert "resolved" in prompt
     assert "review.json" in prompt

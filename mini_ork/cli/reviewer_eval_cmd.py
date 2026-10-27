@@ -1,12 +1,13 @@
 """``mini-ork reviewer-eval`` — score the framework-edit reviewer.
 
-Five verbs:
+Six verbs:
 
-    list        one line per eval case
-    add-case    add a case from a run's diff or a landed commit
-    run         dispatch the reviewer over the cases and append a results file
-    status      compare the current reviewer fingerprint with the last result
-    score FILE  print the summary row of a results file
+    list              one line per eval case
+    add-case          add a case from a run's diff or a landed commit
+    refresh-evidence  (re)copy the run evidence for existing cases
+    run               dispatch the reviewer over the cases and append a results file
+    status            compare the current reviewer fingerprint with the last result
+    score FILE        print the summary row of a results file
 
 The harness never calls a real lane unless ``run`` is asked to (and
 ``--dry-run`` dispatches nothing at all). Results are keyed by
@@ -86,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="substring a finding issue must contain (repeatable)")
     add.add_argument("--summary", default="", help="one-sentence defect summary")
     add.add_argument("--notes", default="", help="free-form notes")
+
+    refresh = sub.add_parser(
+        "refresh-evidence", help="(re)copy the run evidence for existing cases")
+    refresh.add_argument("--case", action="append", dest="cases", default=[],
+                         metavar="ID", help="refresh only this case (repeatable)")
 
     run = sub.add_parser("run", help="run the reviewer over cases")
     run.add_argument("--lane", help="override the recipe reviewer lane")
@@ -245,7 +251,40 @@ def _cmd_add_case(args, root: Path, home: Path) -> int:
     (case_dir / "case.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     (case_dir / "kickoff.md").write_text(kickoff, encoding="utf-8")
     (case_dir / "diff.patch").write_text(diff, encoding="utf-8")
+    if args.run:
+        # The real reviewer saw the run's verifier evidence as well as the diff;
+        # store it so the eval can show the reviewer the same block.
+        rev.copy_evidence(home / "runs" / args.run, case_dir / rev.EVIDENCE_DIR)
     sys.stdout.write(f"added {args.id} ({args.kind})\n")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh-evidence
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _cmd_refresh_evidence(args, root: Path, home: Path) -> int:
+    cases = rev.load_cases(_cases_dir(root))
+    if args.cases:
+        wanted = set(args.cases)
+        known = {case.id for case in cases}
+        missing = wanted - known
+        if missing:
+            raise _Refused(f"unknown case id(s): {', '.join(sorted(missing))}")
+        cases = [case for case in cases if case.id in wanted]
+
+    for case in cases:
+        run_id = str((case.source or {}).get("run") or "")
+        if not run_id:
+            sys.stdout.write(f"{case.id}: commit case, no evidence\n")
+            continue
+        run_dir = home / "runs" / run_id
+        if not run_dir.is_dir():
+            sys.stdout.write(f"{case.id}: no run dir\n")
+            continue
+        count = rev.copy_evidence(run_dir, Path(case.path) / rev.EVIDENCE_DIR)
+        sys.stdout.write(f"{case.id}: {count} evidence file(s)\n")
     return 0
 
 
@@ -410,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_list(root)
         if args.command == "add-case":
             return _cmd_add_case(args, root, home)
+        if args.command == "refresh-evidence":
+            return _cmd_refresh_evidence(args, root, home)
         if args.command == "run":
             return _cmd_run(args, root, home)
         if args.command == "status":

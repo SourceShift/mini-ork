@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,30 @@ from pathlib import Path
 _KICKOFF_CAP = 40_000
 _DIFF_CAP = 120_000
 _TRUNCATION_MARKER = "[truncated]"
+
+# A case may carry the evidence a real run showed its reviewer under this
+# directory, one file per run-dir name (implementer summary, verifier_*.json,
+# verdict, …). ``render_reviewer_inputs`` reads it; ``add-case --run`` and
+# ``refresh-evidence`` populate it.
+EVIDENCE_DIR = "evidence"
+
+# Bumped whenever the eval starts feeding the reviewer different inputs, so a
+# score taken under the old inputs is never compared with one taken under the
+# new ones. It is hashed into the fingerprint id but NOT exposed as a returned
+# field: ``status``/``garden`` only read ``id`` and the existing tests pin the
+# returned key shape.
+_EVAL_INPUTS_VERSION = 2
+
+# Every run-dir name the eval copies into ``<case>/evidence/`` (§kickoff 1.1).
+# ``verifier_*.json`` is matched by prefix; the rest are exact names.
+_EVIDENCE_FIXED_NAMES = (
+    "implementer-summary.json",
+    "verdict.json",
+    "pre-retirement-parity.json",
+    "integration-map.json",
+    "static-feature-ledger.json",
+    "self-migrate.diff",
+)
 
 _PASS_VERDICTS = frozenset({"pass", "approve", "approved"})
 _BLOCK_VERDICTS = frozenset(
@@ -270,8 +295,13 @@ def fingerprint(root: Path, lane: str, home: str = "") -> dict:
         "model": "",  # filled below; placeholder keeps the key order obvious
     }
     fields["model"] = _model_for(fields["resolved_lane"], root)
+    # ``eval_inputs`` rides in the hashed payload only: the eval now feeds the
+    # reviewer the same evidence block a real run does, so the old score must
+    # never be compared with a new one. The returned dict keeps its five-field
+    # shape (``status``/``garden`` only read ``id``).
+    hashed = {**fields, "eval_inputs": _EVAL_INPUTS_VERSION}
     digest = hashlib.sha256(
-        json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        json.dumps(hashed, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return {**fields, "id": digest}
 
 
@@ -300,6 +330,54 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Evidence copied from a run into the case
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def is_evidence_name(name: str) -> bool:
+    """True for a run-dir file the eval mirrors into ``<case>/evidence/``.
+
+    The set is exactly kickoff §1.1: the named reports plus every
+    ``verifier_*.json``. Generated review artifacts (``review-diff.patch``,
+    ``review-tree.txt``, ``review-diff-noop.json``) are deliberately excluded —
+    the eval supplies the diff separately.
+    """
+    return (name in _EVIDENCE_FIXED_NAMES
+            or (name.startswith("verifier_") and name.endswith(".json")))
+
+
+def evidence_files(run_dir: Path) -> list[str]:
+    """The evidence file names present in ``run_dir``, sorted (files only)."""
+    try:
+        names = os.listdir(run_dir)
+    except OSError:
+        return []
+    return sorted(
+        name for name in names
+        if is_evidence_name(name) and os.path.isfile(os.path.join(run_dir, name)))
+
+
+def copy_evidence(run_dir: Path, dest_dir: Path) -> int:
+    """Copy every evidence file from ``run_dir`` into ``dest_dir``; return count.
+
+    Bytes are copied verbatim (never re-serialised): the drift test pins the
+    rendered block to the real assembler byte-for-byte.
+    """
+    run_dir = Path(run_dir)
+    dest_dir = Path(dest_dir)
+    names = evidence_files(run_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    # The evidence set mirrors the run exactly: a file the run no longer has
+    # must not keep being rendered to the reviewer (reviewer finding on R4b).
+    for stale in sorted(dest_dir.iterdir()):
+        if stale.is_file() and stale.name not in names:
+            stale.unlink()
+    for name in names:
+        shutil.copyfile(run_dir / name, dest_dir / name)
+    return len(names)
+
+
 def _case_dir(case: Case, root: Path) -> Path:
     """The directory holding ``case``'s data files: ``case.path``, nothing else.
 
@@ -309,6 +387,83 @@ def _case_dir(case: Case, root: Path) -> Path:
     """
     del root
     return Path(case.path)
+
+
+def render_reviewer_inputs(evidence_dir: Path, diff_text: str) -> str:
+    """The reviewer input block a real run assembles, built from stored evidence.
+
+    This is a transcription of ``mini_ork.cli.execute._assemble_reviewer_inputs``
+    (the real block), with the two run-dir inputs swapped for an evidence
+    directory and a pre-read diff. ``tests/unit/test_reviewer_eval_inputs.py``
+    pins it byte-for-byte to the real assembler on a fixture run.
+
+    Section order: summary → the two fixed verifiers (always emitted) →
+    ``pre-retirement-parity.json`` when present → the other ``verifier_*.json``
+    (sorted) → the optional reports → the diff → the end marker + NOTE.
+    """
+    from mini_ork.context_assembler import cap_block
+
+    evidence_dir = Path(evidence_dir)
+
+    def _read(path: Path) -> str:
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    def _sec(title: str) -> str:
+        path = evidence_dir / title
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return f"\n# {title}\n{cap_block(_read(path), label=title)}\n"
+        except OSError:
+            pass
+        return f"\n# {title}\n(not available)\n"
+
+    block = "--- Reviewer inputs (assembled by mini-ork-execute) ---\n"
+    block += _sec("implementer-summary.json")
+    fixed_verifiers = {"verifier_typecheck.json", "verifier_test.json"}
+    for name in sorted(fixed_verifiers):
+        block += _sec(name)
+    # Distinct name, emitted before the discovered verifiers (kickoff §1.2 /
+    # execute.py:4162-4169): the legacy fork's pre-retirement report.
+    parity = evidence_dir / "pre-retirement-parity.json"
+    try:
+        if parity.is_file() and parity.stat().st_size > 0:
+            block += _sec("pre-retirement-parity.json")
+    except OSError:
+        pass
+    try:
+        recipe_verifiers = sorted(
+            name for name in os.listdir(evidence_dir)
+            if name.startswith("verifier_") and name.endswith(".json")
+            and name not in fixed_verifiers
+        )
+    except OSError:
+        recipe_verifiers = []
+    for name in recipe_verifiers:
+        block += _sec(name)
+    for name in ("integration-map.json", "static-feature-ledger.json",
+                 "verdict.json", "self-migrate.diff"):
+        path = evidence_dir / name
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                block += _sec(name)
+        except OSError:
+            pass
+    if diff_text:
+        block += (f"\n# review-diff.patch\n"
+                  f"{cap_block(diff_text, label='review-diff.patch')}\n")
+    else:
+        # The no-op branch never applies to an eval case: a case's diff comes
+        # from the run, not from a live worktree comparison.
+        block += "\n# review-diff.patch\n(no diff)\n"
+    block += ("\n--- End reviewer inputs ---\n\n"
+              "REVIEWER NOTE: The assembled inputs above are required for a real verdict. If any "
+              "input is marked '(not available)' or '(no diff)', review what IS present. Only "
+              "hard-abstain (verdict=needs_revision with reason 'inputs missing') when BOTH the "
+              "diff and the summary are absent — that is the only genuine no-op case. An empty "
+              "diff against declared files_changed is NOT that case: the implementer claimed work "
+              "the tree does not contain, which is a real failure, never a pass. A missing "
+              "verifier verdict is a real failure signal, not an abstention excuse.\n")
+    return block
 
 
 def build_prompt(case: Case, *, root: Path, review_file: str) -> str:
@@ -335,7 +490,10 @@ def build_prompt(case: Case, *, root: Path, review_file: str) -> str:
         "\n--- /recipe prompt ---\n\n",
         "Review the implementation for: ", heading,
         "\n\nPlan:\n", _cap(kickoff, _KICKOFF_CAP),
-        "\n\n# Reviewer inputs\n# review-diff.patch\n", _cap(diff, _DIFF_CAP),
+        # Keep the legacy pre-cap: it is what the pinned truncation test
+        # (``test_build_prompt_truncates_huge_diff_and_kickoff``) asserts, and it
+        # only diverges from the runtime block for diffs over ``_DIFF_CAP``.
+        "\n\n", render_reviewer_inputs(case_dir / EVIDENCE_DIR, _cap(diff, _DIFF_CAP)),
         "\n", reviewer_envelope(review_file),
     ])
 
