@@ -635,12 +635,8 @@ def test_grade_false_then_true_after_fix(git_root, monkeypatch, tmp_path):
     t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
     oracle = _sidecar(root)
     assert ps._grade_git_oracle(str(t), oracle) is False
-    blob = subprocess.run(
-        ["git", "-C", str(root), "show", f"{fix_sha}:tests/test_calc.py"],
-        capture_output=True,
-        check=True,
-    ).stdout
-    assert (t / "tests" / "test_calc.py").read_bytes() == blob
+    # Grading runs in its own snapshot: the solver's tree is never written.
+    assert not (t / "tests" / "test_calc.py").exists()
     (t / "calc.py").write_text(FIXED_CALC)
     assert ps._grade_git_oracle(str(t), oracle) is True
 
@@ -651,7 +647,9 @@ def test_grade_overlay_beats_tampered_test(git_root, monkeypatch, tmp_path):
     (t / "tests").mkdir()
     (t / "tests" / "test_calc.py").write_text("def test_add():\n    assert True\n")
     assert ps._grade_git_oracle(str(t), _sidecar(root)) is False
-    assert (t / "tests" / "test_calc.py").read_text() == TEST_CALC_SRC
+    # The solver's copy is left as written; only the grading tree has the
+    # hidden test.
+    assert (t / "tests" / "test_calc.py").read_text() == "def test_add():\n    assert True\n"
 
 
 def test_grade_overlay_creates_parent_dirs(git_root, monkeypatch, tmp_path):
@@ -666,7 +664,63 @@ def test_grade_overlay_creates_parent_dirs(git_root, monkeypatch, tmp_path):
         "pass_to_pass": [],
     }
     assert ps._grade_git_oracle(str(t), nested) is True
-    assert (t / "tests" / "nested" / "test_deep.py").read_text() == TEST_DEEP_SRC
+    assert not (t / "tests" / "nested" / "test_deep.py").exists()
+
+
+_FORGE_CONFTEST = (
+    "import pytest\n"
+    "@pytest.hookimpl(hookwrapper=True)\n"
+    "def pytest_runtest_makereport(item, call):\n"
+    "    outcome = yield\n"
+    "    outcome.get_result().outcome = 'passed'\n"
+)
+
+
+@pytest.mark.parametrize("where", ["conftest.py", "tests/conftest.py"])
+def test_grade_ignores_a_solver_conftest_that_forges_passes(git_root, monkeypatch, tmp_path, where):
+    # Review fix (pre-push review 52d7820e / ff65de07): a solver-written conftest
+    # must not reach the grading run, or it can turn the hidden tests green.
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    (t / where).parent.mkdir(parents=True, exist_ok=True)
+    (t / where).write_text(_FORGE_CONFTEST)
+    assert ps._grade_git_oracle(str(t), _sidecar(root)) is False
+
+
+def test_grade_ignores_solver_pytest_config(git_root, monkeypatch, tmp_path):
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    (t / "pytest.ini").write_text("[pytest]\naddopts = -p no:python\n")
+    assert ps._grade_git_oracle(str(t), _sidecar(root)) is False
+
+
+def test_grade_never_writes_through_a_solver_symlink(git_root, monkeypatch, tmp_path):
+    # Review fix (ff65de07 sibling): the overlay must not follow a solver symlink
+    # out of the tree.
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (t / "tests").symlink_to(outside, target_is_directory=True)
+    assert ps._grade_git_oracle(str(t), _sidecar(root)) is False
+    assert list(outside.iterdir()) == []
+
+
+def test_grade_leaves_the_solver_tree_untouched(git_root, monkeypatch, tmp_path):
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    (t / "calc.py").write_text(FIXED_CALC)
+    before = sorted(str(p.relative_to(t)) for p in t.rglob("*") if ".git" not in p.parts)
+    assert ps._grade_git_oracle(str(t), _sidecar(root)) is True
+    after = sorted(str(p.relative_to(t)) for p in t.rglob("*") if ".git" not in p.parts)
+    assert after == before
+
+
+def test_grade_fails_closed_when_target_is_not_a_repo(git_root, tmp_path):
+    root, _, _ = git_root
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert ps._grade_git_oracle(str(plain), _sidecar(root)) is False
 
 
 def test_grade_missing_test_file_returns_false(git_root, monkeypatch, tmp_path):

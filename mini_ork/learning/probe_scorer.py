@@ -821,29 +821,130 @@ def run_pytest_junit(target: str, test_files: list[str], *,
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# Files the solver may NOT bring into the grading tree: anything that steers
+# pytest or Python startup (a forged conftest/plugin/config can turn every test
+# green), plus the solver's own tests. Base-snapshot versions are kept instead.
+_GRADE_PROTECTED_NAMES = frozenset({
+    "conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg",
+    "pyproject.toml", "sitecustomize.py", "usercustomize.py",
+})
+
+
+def _grade_protected(rel: str, hidden_dirs: set[str]) -> bool:
+    """Whether a solver-changed path stays at its base-snapshot version."""
+    base = os.path.basename(rel)
+    if base in _GRADE_PROTECTED_NAMES or rel.endswith(".pth"):
+        return True
+    if base.endswith(".py") and (base.startswith("test_") or base.endswith("_test.py")):
+        return True
+    return base == "__init__.py" and os.path.dirname(rel) in hidden_dirs
+
+
+def _solver_changes(target: str) -> tuple[list[str], list[str]] | None:
+    """``(changed_or_new, deleted)`` paths in the solver's tree vs its first commit.
+
+    ``target`` is the one-commit repo ``_make_target_repo`` built from the base
+    snapshot (the run may add commits on top). ``None`` when git cannot answer,
+    which the caller treats as "cannot grade" (fail closed).
+    """
+    def _git_lines(*args: str) -> list[str] | None:
+        proc = subprocess.run(["git", "-C", target, *args],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            return None
+        return [line for line in proc.stdout.splitlines() if line.strip()]
+
+    roots = _git_lines("rev-list", "--max-parents=0", "HEAD")
+    if not roots:
+        return None
+    first = roots[-1]
+    changed = _git_lines("diff", "--name-only", "--diff-filter=d", first)
+    deleted = _git_lines("diff", "--name-only", "--diff-filter=D", first)
+    untracked = _git_lines("ls-files", "--others", "--exclude-standard")
+    if changed is None or deleted is None or untracked is None:
+        return None
+    return sorted(set(changed) | set(untracked)), sorted(set(deleted))
+
+
+def _inside_tree(tree: str, rel: str) -> str | None:
+    """``tree/rel`` when its parent resolves inside ``tree``, else None."""
+    dest = os.path.join(tree, rel)
+    real_tree = os.path.realpath(tree)
+    parent = os.path.realpath(os.path.dirname(dest))
+    if parent != real_tree and not parent.startswith(real_tree + os.sep):
+        return None
+    return dest
+
+
 def _grade_git_oracle(target: str, oracle: dict, *,
                       timeout: float | None = None) -> bool:
     """Whether the run's result passes the hidden tests from ``fix_sha``.
 
-    The hidden test files are overlaid onto ``target`` from ``_root()``'s git
-    object store BEFORE pytest runs, so whatever the solver wrote at those paths
-    is discarded — the tests it can see are never the tests it is graded on.
+    Grading never runs in the solver's tree, so nothing the solver wrote can
+    steer the test run:
+
+    1. a fresh history-free snapshot of ``base_sha`` is materialized;
+    2. the solver's changed regular files are copied in, except the protected
+       ones (``_grade_protected``: conftest/pytest/tox/setup/pyproject config,
+       site/usercustomize, ``.pth`` files, the solver's own tests); symlinks are
+       never followed or copied, and solver deletions are replayed;
+    3. the hidden test files from ``fix_sha`` are overlaid;
+    4. pytest runs there, and the snapshot is removed.
+
+    The solver's tree is left untouched. Any failure to build the grading tree
+    fails closed (``False``).
     """
     if timeout is None:
         timeout = float(os.environ.get("MO_APPLY_PROBE_GRADE_TIMEOUT_S", "600"))
+    hidden: dict[str, bytes] = {}
     for path in oracle["test_files"]:
         shown = subprocess.run(
             ["git", "-C", _root(), "show", f"{oracle['fix_sha']}:{path}"],
             capture_output=True)
         if shown.returncode != 0:
             return False
-        dest = os.path.join(target, path)
-        parent = os.path.dirname(dest)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(dest, "wb") as fh:
-            fh.write(shown.stdout)
-    results = run_pytest_junit(target, oracle["test_files"], timeout=timeout)
+        hidden[path] = shown.stdout
+    changes = _solver_changes(target)
+    if changes is None:
+        return False
+    changed, deleted = changes
+    hidden_dirs = {os.path.dirname(p) for p in hidden}
+    try:
+        tree = materialize_git_tree(oracle["base_sha"])
+    except Exception:  # noqa: BLE001 — an unbuildable grading tree is a fail
+        return False
+    try:
+        for rel in changed:
+            if rel in hidden or _grade_protected(rel, hidden_dirs):
+                continue
+            src = os.path.join(target, rel)
+            if os.path.islink(src) or not os.path.isfile(src):
+                continue
+            dest = _inside_tree(tree, rel)
+            if dest is None:
+                return False
+            os.makedirs(os.path.dirname(dest) or tree, exist_ok=True)
+            if os.path.islink(dest):
+                os.unlink(dest)
+            shutil.copyfile(src, dest)
+        for rel in deleted:
+            if rel in hidden or _grade_protected(rel, hidden_dirs):
+                continue
+            dest = _inside_tree(tree, rel)
+            if dest is not None and os.path.isfile(dest) and not os.path.islink(dest):
+                os.unlink(dest)
+        for rel, blob in hidden.items():
+            dest = _inside_tree(tree, rel)
+            if dest is None:
+                return False
+            os.makedirs(os.path.dirname(dest) or tree, exist_ok=True)
+            if os.path.islink(dest):
+                os.unlink(dest)
+            with open(dest, "wb") as fh:
+                fh.write(blob)
+        results = run_pytest_junit(tree, oracle["test_files"], timeout=timeout)
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
     if results is None:
         return False
     expected = set(oracle["fail_to_pass"]) | set(oracle["pass_to_pass"])
