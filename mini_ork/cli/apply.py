@@ -735,6 +735,55 @@ def _directive_block(new_prompt: str, *, source_ref: str = "",
         lines.append(f"- Observation: {context.strip()}")
     lines.append(f"- Directive: {new_prompt.strip()}")
     return "\n".join(lines)
+
+
+def _frozen_target(target_file: str) -> list[str]:
+    """Return the frozen-kernel paths ``target_file`` resolves to.
+
+    ``[]`` when the target is empty, when it resolves outside the engine tree
+    (nothing to refuse — the operator is not editing this repo), or when it is
+    not frozen. Resolution uses ``realpath`` on both sides, so a symlink inside
+    the tree that points at a frozen file is caught. ``_resolve_root`` is
+    deliberately NOT called: it writes ``MINI_ORK_ROOT`` into the process
+    environment, and a read-only containment check must not mutate env.
+    """
+    if not target_file:
+        return []
+    root = os.environ.get("MINI_ORK_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(target_file)
+    rel = os.path.relpath(real, real_root).replace(os.sep, "/")
+    if rel == ".." or rel.startswith("../"):
+        return []
+    from mini_ork.vcs.repo_integrity_guard import (
+        enforced_frozen_paths,
+        frozen_hits,
+    )
+    return frozen_hits([rel], enforced_frozen_paths(real_root))
+
+
+def _record_frozen_refusal(paths: list[str], *, candidate_id: str = "",
+                           db: str | None = None) -> bool:
+    """Emit the ``frozen-kernel-edit`` safety event for an apply refusal.
+
+    Fail-open in the only direction that matters here: this is audit evidence,
+    so a missing table, an unset ``MINI_ORK_DB`` (``_db_path`` raises), or any
+    other fault returns ``False`` — it never raises into a call site that has
+    already decided to refuse the edit.
+    """
+    try:
+        from mini_ork.stores import safety_events
+        res = safety_events.emit(
+            "frozen-kernel-edit", "high",
+            json.dumps({"run_id": "", "paths": list(paths),
+                        "boundary": "apply", "candidate_id": candidate_id}),
+            db=_db_path(db))
+        return bool(res.get("id"))
+    except Exception:
+        return False
+
+
 def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
                    db: str | None = None, *, source_ref: str = "",
                    context: str = "", source_id: str = "", scorer: str = "",
@@ -761,6 +810,16 @@ def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
             f"apply_apply_mutation: dry-run (apply_enabled={apply_enabled} "
             f"dry_run={dry_run}); no file write\n"
         )
+        return ""
+
+    hits = _frozen_target(target_file)
+    if hits:
+        sys.stderr.write(
+            f"apply_apply_mutation: refusing frozen path(s) {', '.join(hits)} "
+            f"(config/kernel-frozen.yaml); the apply loop never edits the "
+            f"frozen kernel\n"
+        )
+        _record_frozen_refusal(hits, candidate_id=candidate_id, db=db)
         return ""
 
     mode = os.environ.get("MO_APPLY_MODE", "append")
@@ -1036,6 +1095,31 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     apply_enabled = os.environ.get("MO_APPLY_ENABLED", "0")
     dry_run = os.environ.get("MO_APPLY_DRY_RUN", "0")
     dry_flag = "1" if dry_run == "1" else "0"
+
+    # 0. Frozen-kernel containment. The apply loop is autonomous: it never edits
+    #    a path in config/kernel-frozen.yaml ∪ FROZEN_PATHS_DEFAULT. The check
+    #    runs whatever MO_APPLY_ENABLED / MO_APPLY_DRY_RUN say — a refusal is
+    #    recorded even in a dry run — and it precedes pick_candidate so no
+    #    pattern is consumed (and no candidate materialized) for a target the
+    #    loop can never write. The operator's frozen-edit token deliberately
+    #    does not apply here: it is for a person's deliberate edit through a
+    #    run, not for the loop.
+    frozen = _frozen_target(target_file)
+    if frozen:
+        rationale = (
+            f"frozen path: {', '.join(frozen)} is in the frozen kernel "
+            f"(config/kernel-frozen.yaml); the apply loop never edits it")
+        aid = attempt_record(
+            task_class, target_kind, target_name,
+            "none", "", "", "", "", "", "", "", "rejected",
+            rationale, dry_flag, apply_enabled, db=db)
+        _record_frozen_refusal(frozen, db=db)
+        sys.stdout.write(aid + "\n")
+        sys.stdout.write(
+            f'{{"decision":"rejected","task_class":"{task_class}",'
+            f'"target":"{target_name}","reason":"frozen_path"}}\n'
+        )
+        return 0
 
     # 1. Pick the source pattern. If nothing *fresh* qualifies, re-pick
     #    including edit-memory-blocked sources so the unchanged
@@ -1391,6 +1475,15 @@ def _recipe_dir_for(task_class: str) -> str:
     return ""
 
 
+def _inside(path: str, base: str) -> bool:
+    """True when ``path`` resolves strictly inside ``base``.
+
+    ``realpath`` on both sides, so ``prompts/../verifiers/x.md`` and a symlink
+    escaping the directory are rejected alike. The base itself is not
+    "inside" itself — target resolution must land on a file below it."""
+    return os.path.realpath(path).startswith(os.path.realpath(base) + os.sep)
+
+
 def _prompt_file_for(recipe_dir: str, target: str) -> str:
     """Gradient target → an existing recipe prompt path.
 
@@ -1399,19 +1492,26 @@ def _prompt_file_for(recipe_dir: str, target: str) -> str:
     target is already a recipe-relative path; ``harness.<recipe>.<node>``
     (kickoff rsi-i5-harness-sweep G02-T01) maps to the node's ``prompt_ref``
     in ``recipes/<recipe>/workflow.yaml``. No match → '' (target skipped,
-    never guessed)."""
+    never guessed).
+
+    Resolution is confined: a ``prompts/`` or ``agent.`` target must resolve
+    inside ``<recipe_dir>/prompts`` (so ``prompts/../verifiers/static-check.py``
+    can never resolve to a frozen verifier), and a harness ``prompt_ref`` must
+    resolve inside ``recipe_dir``. The returned value is the joined path, not
+    the realpath — callers depend on the on-disk spelling."""
     if not recipe_dir:
         return ""
+    prompts_dir = os.path.join(recipe_dir, "prompts")
     if target.startswith("agent.") and target.endswith(".prompt"):
         role = target[len("agent."):-len(".prompt")]
         for name in sorted({role, role.replace("-", "_"), role.replace("_", "-")}):
             path = os.path.join(recipe_dir, "prompts", name + ".md")
-            if os.path.isfile(path):
+            if os.path.isfile(path) and _inside(path, prompts_dir):
                 return path
         return ""
     if target.startswith("prompts/"):
         path = os.path.join(recipe_dir, target)
-        return path if os.path.isfile(path) else ""
+        return path if (os.path.isfile(path) and _inside(path, prompts_dir)) else ""
     if target.startswith("harness."):
         return _harness_target_file_for(recipe_dir, target)
     return ""
@@ -1479,7 +1579,7 @@ def _harness_target_file_for(recipe_dir: str, target: str) -> str:
     # against recipe_dir and only return when the file actually exists — same
     # "no guess" policy as the agent.* branch.
     cand = os.path.join(recipe_dir, prompt_ref)
-    return cand if os.path.isfile(cand) else ""
+    return cand if (os.path.isfile(cand) and _inside(cand, recipe_dir)) else ""
 
 
 def auto_sweep(task_class: str, db: str | None = None,
