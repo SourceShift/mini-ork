@@ -47,6 +47,14 @@
 #   MO_ALLOW_TEST_CHANGES           set to 1 to disable the test-weakening guard
 #   MO_TEST_LEGACY_RED_BASE         set to 1 to restore the old red-base blanket pass
 #   MO_TEST_CERTIFY_ON_IMPROVEMENT  set to 1 to certify a strict red-base improvement
+#   MO_CODEFIX_CERTIFY              shadow|0|gate, default shadow — run the
+#                                   certify relations/differential vetoes in shadow
+#   MO_CODEFIX_CERTIFY_LANE_TIMEOUT_S  per-lane-call timeout for those terms (default 90)
+#   MO_CODEFIX_CERTIFY_PROBE_TIMEOUT_S per-probe pytest timeout for those terms
+#                                   (default 120; a non-numeric value falls back)
+#   MO_CODEFIX_CERTIFY_BUDGET_S     total wall budget for the certify pass (default 300)
+#   MO_CODEFIX_CERTIFY_PYTHON       interpreter for the certify probe runs
+#                                   (default: the verifier's interpreter)
 
 from __future__ import annotations
 import json
@@ -75,6 +83,13 @@ try:
     from mini_ork.gates import suite_adequacy as _suite_adequacy
 except Exception:                       # pragma: no cover — defensive only
     _suite_adequacy = None              # type: ignore[assignment]
+
+try:
+    # Late import — the shadow certify terms (relations ① + differential ②).
+    # Same seam again: a target repo without mini_ork keeps its verifier.
+    from mini_ork.certify import codefix_terms as _codefix_terms
+except Exception:                       # pragma: no cover — defensive only
+    _codefix_terms = None               # type: ignore[assignment]
 
 try:
     # Late import — same seam as the two above. `scrubbed_test_env` lives
@@ -1233,6 +1248,12 @@ BASE_RC = ""
 # level deriver can say WHY `target` is unproven, and — only with an explicit
 # operator waiver — publish with that fact recorded instead of abstaining.
 TARGET_WAIVER = ""
+# The shadow certify record (relations ① + differential ②), or None. Set by
+# `_record_certify` on a green replay; emitted into the payload as `certify`.
+# It NEVER changes `pass` or the exit code — the gating consumer is a separate
+# change that reads this block from the level vector.
+CERTIFY = None
+CERTIFY_REPORT = os.path.join(LOG_DIR, "certify_terms.json")
 
 
 def run_suite(log, env=None):  # returns the exit code, never raises
@@ -1264,6 +1285,8 @@ def emit(passed, reason, post_rc, replay=None, adequacy=None):
         payload["replay"] = replay
     if adequacy is not None:
         payload["suite_adequacy"] = adequacy
+    if CERTIFY is not None:
+        payload["certify"] = CERTIFY
     if TARGET_WAIVER:
         payload["target_waiver"] = TARGET_WAIVER
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
@@ -1297,6 +1320,8 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
         payload["replay"] = replay
     if adequacy is not None:
         payload["suite_adequacy"] = adequacy
+    if CERTIFY is not None:
+        payload["certify"] = CERTIFY
     payload["status"] = "unverified"
     payload["suite_green"] = post_rc == 0
     if replay_applicable is False:
@@ -1337,6 +1362,122 @@ def _revise_rounds_remain():
     return n < min(m, cap)
 
 
+def _git_toplevel(cwd: str) -> str:
+    """The repo root for ``cwd``, or ``cwd`` when it is not a git checkout."""
+    proc = subprocess.run(
+        ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return cwd
+    return proc.stdout.strip() or cwd
+
+
+def _certify_probe_timeout() -> float:
+    """Per-probe pytest timeout for the certify terms (default 120 s).
+
+    A malformed or non-positive value falls back to the default rather than
+    raising: the certify block must never break a verifier run.
+    """
+    raw = os.environ.get("MO_CODEFIX_CERTIFY_PROBE_TIMEOUT_S", "").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 120.0
+    return value if value > 0 else 120.0
+
+
+def _certify_budget() -> float:
+    """Total wall budget for one shadow certify pass (default 300 s).
+
+    Probes and lane calls past it abstain without running, so the instrument
+    can never push this verifier past its own node timeout. A malformed or
+    non-positive value falls back to the default.
+    """
+    raw = os.environ.get("MO_CODEFIX_CERTIFY_BUDGET_S", "").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    return value if value > 0 else 300.0
+
+
+def _record_certify(replay) -> None:
+    """Run the shadow certify terms for a green replay; never raises.
+
+    Records the result in ``CERTIFY_REPORT`` and, unless the terms skipped, in
+    the module global ``CERTIFY`` so `emit`/`emit_unverified` carry it. The
+    record NEVER changes `pass` or the exit code.
+    """
+    global CERTIFY
+    try:
+        if _codefix_terms is None or not isinstance(replay, dict):
+            return
+        mode = _codefix_terms.mode()
+        if mode == "off":
+            return
+        # A `MINI_ORK_RUN_DIR` inherited from a parent process (the executor's
+        # acceptance-command env, a nested fixture) is not necessarily THIS
+        # verifier's run dir — `_kickoff_text` would read a foreign kickoff and
+        # the terms would dispatch a real lane call for a tree they do not
+        # describe. Only trust it when it agrees with the run namespace this
+        # verifier writes evidence into (`MINI_ORK_HOME/runs/<RUN_ID>`); when
+        # MINI_ORK_HOME is relative (the verifier's own default) the comparison
+        # is not meaningful, so the run dir is used as given.
+        run_dir = os.environ.get("MINI_ORK_RUN_DIR", "").strip()
+        home = os.environ.get("MINI_ORK_HOME", "").strip()
+        run_id = os.environ.get("MINI_ORK_RUN_ID", "").strip()
+        if run_dir and os.path.isabs(home) and run_id:
+            own_run_dir = os.path.normpath(os.path.join(home, "runs", run_id))
+            if os.path.normpath(run_dir) != own_run_dir:
+                sys.stderr.write(
+                    "[test] certify: skipped (run dir is not this verifier's)\n"
+                )
+                return
+        issue = _kickoff_text(_git_toplevel(os.getcwd()))
+        if not issue:
+            sys.stderr.write("[test] certify: skipped (no kickoff text)\n")
+            return
+        poc, poc_file, why = _codefix_terms.poc_from_replay(replay, os.getcwd())
+        if poc is None:
+            sys.stderr.write(f"[test] certify: skipped ({why})\n")
+            return
+        base_ref = _run_dir_base_ref()
+        wt = _attach_git_worktree_base(base_ref)
+        if wt is None:
+            sys.stderr.write("[test] certify: skipped (no base worktree)\n")
+            return
+        try:
+            rec = _codefix_terms.evaluate(
+                issue=issue, poc=poc, poc_file=poc_file,
+                base_dir=wt, candidate_dir=os.getcwd(), base_ref=base_ref,
+                mode=mode,
+                python=os.environ.get("MO_CODEFIX_CERTIFY_PYTHON") or sys.executable,
+                timeout_s=_certify_probe_timeout(),
+                budget_s=_certify_budget(),
+            )
+        except Exception as exc:
+            rec = {
+                "mode": mode, "status": "error",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "poc_file": poc_file, "relations": None, "differential": None,
+                "verdict": None, "vetoed_by": [], "would_block": False,
+            }
+        finally:
+            _detach_git_worktree(wt)
+        try:
+            with open(CERTIFY_REPORT, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, indent=2))
+        except OSError:
+            pass
+        if rec.get("status") != "skipped":
+            CERTIFY = rec
+    except Exception:
+        # The certify block is an instrument, not a gate: it must never break
+        # a verifier run.
+        return
+
+
 def _green_pass(reason, post_rc, replay=None, require_adequate=False):
     """Route a green post-patch suite through the adequacy audit (default ON).
 
@@ -1357,6 +1498,8 @@ def _green_pass(reason, post_rc, replay=None, require_adequate=False):
     the survivors so the implementer can strengthen the assertions; with rounds
     exhausted it falls back to today's ``adequacy_unverified`` abstention.
     """
+    if replay is not None:
+        _record_certify(replay)
     if os.environ.get("MO_SUITE_ADEQUACY", "1") != "1":
         if require_adequate:
             return emit_unverified(

@@ -6,6 +6,11 @@ each built by a mini-ork `framework-edit` run with RSI on and proven by a real
 mini-ork run. Each is on by default **where it runs**, but most do not run
 in a plain `mini-ork run`; see "Where each instrument runs today" below.*
 
+*Scope of ① and ② specifically: they are ON in `mini-ork certify`, and in
+`mini-ork run code-fix` they run in **shadow** — the verifier executes both
+terms and records their verdict, but never lets them change `pass` or the exit
+code (section ⑮).*
+
 *A second review on 2026-10-18 (`verify-agentic-20261018-215339`, 2000 arXiv
 papers) added eight more instruments — sections ⑦–⑭ — also each built by a
 mini-ork `framework-edit` run and merged after a scoped green test gate.*
@@ -78,8 +83,8 @@ at promotion, or when a recipe opts in, or they have no producer yet.
 
 | # | Instrument | Runs in | State |
 |---|---|---|---|
-| ① | Metamorphic relations | `mini-ork certify` only (the code-fix verifier imports just `certify.replay_check`) | on inside certify |
-| ② | Differential check | `mini-ork certify` only | on inside certify |
+| ① | Metamorphic relations | `mini-ork certify`; `mini-ork run code-fix` in shadow (section ⑮) | on inside certify; shadow in code-fix |
+| ② | Differential check | `mini-ork certify`; `mini-ork run code-fix` in shadow (section ⑮) | on inside certify; shadow in code-fix |
 | ③ | Suite adequacy | every code-fix run (`recipes/code-fix/verifiers/test.py`) | **live** |
 | ④ | Level vector | the publisher, for recipes that declare levels (code_fix) | **live** |
 | ⑤ | Gate hackability | read by the promotion gate; records come only from a manual `mini-ork gate-fuzz --hackability` | consumer on, producer manual |
@@ -399,6 +404,72 @@ The split-conformal gate (`gates/conformal_gate.py`) and the calibrated `abstain
 - `MO_HIDDEN_CHECK_SECRET` (unset): key material for hidden-check variants.
 
 **Evidence.** The certificate carries `hidden_check_commitment` and `hidden_trials` when supplied.
+
+## ⑮ Certify terms in code-fix (shadow): `mini_ork/certify/codefix_terms.py`, `recipes/code-fix/verifiers/test.py`
+
+**What it checks.** The code-fix test verifier now calls the two certify veto
+terms — ① metamorphic relations and ② differential — directly, using the
+replay's proven fail-to-pass test as the PoC. `mini-ork certify` reached them
+only through `oracle.judge`, after a PROVEN delta and invariant verdict; the
+verifier has the candidate tree, the base worktree, the proven test ids, and the
+kickoff all at once, so it can run the same vetoes without the oracle's other
+gates. Discrimination and hidden checks are deliberately omitted: code-fix has
+no pool of known-bad patches, and the PoC is the implementer's own test.
+
+**Trigger.** A green replay whose overlap contains a Python test file (that file
+becomes the PoC), a kickoff in `run_profile.json`, and a non-empty candidate
+change set. The change set is `git diff <base>` *plus every untracked file*, so a
+fix delivered as new files (the replay's own test overlay supports exactly that
+shape) runs the terms rather than abstaining on an empty diff. A run without the
+first two is byte-identical to today's payload — no `certify` key, no report
+file.
+
+**How it decides.** The terms run in **veto mode** and are recorded, never
+obeyed:
+- **Shadow** (default) — `verdict`, `vetoed_by` and `would_block` are recorded;
+  `pass` and the exit code are unchanged.
+- **Gate** — `MO_CODEFIX_CERTIFY=gate` records the same block with `mode: "gate"`,
+  still inert. The level-vector consumer that withholds publish on
+  `would_block` lands in a separate change; until it exists, gate refuses
+  nothing.
+- **Off** — `MO_CODEFIX_CERTIFY=0` (or `off`/`false`/`no`) skips the terms and
+  keeps every payload byte-identical to the pre-feature verifier.
+- **Abstention.** No kickoff, no Python fail-to-pass test, no base worktree, an
+  empty candidate diff, or a runner that is not up → `status: "skipped"` (the
+  record goes to `certify_terms.json`, but not to the payload). A term that
+  raises gets an `{"error": …}` slot; the verifier still passes.
+
+**Knobs.**
+- `MO_CODEFIX_CERTIFY` (`shadow|0|gate`, default shadow): the mode. A typo never
+  gates.
+- `MO_CODEFIX_CERTIFY_LANE_TIMEOUT_S` (90): per-lane-call timeout; also caps the
+  two lane calls to `MO_CERTIFY_LANE_RETRIES=0`.
+- `MO_CODEFIX_CERTIFY_PROBE_TIMEOUT_S` (120): per-probe pytest timeout. A
+  non-numeric or non-positive value falls back to 120.
+- `MO_CODEFIX_CERTIFY_PYTHON` (the verifier's interpreter): interpreter for the
+  probe pytest runs.
+
+It respects the terms' own knobs: `MO_ASSAY_RELATIONS`, `MO_ASSAY_RELATIONS_K`,
+`MO_ASSAY_RELATIONS_VETO_MIN`, `MO_ASSAY_DIFFERENTIAL`, `MO_ASSAY_DIFFERENTIAL_N`
+and `MO_ASSAY_DIFFERENTIAL_VETO_MIN`. With a term's master knob at `0` that slot
+is `null` and no call is made.
+
+**Evidence.** `verifier_test.json` key `certify` (directly after
+`suite_adequacy`) and `<run dir>/certify_terms.json`. Both carry the nine-key
+record: `mode`, `status`, `reason`, `poc_file`, `relations`, `differential`,
+`verdict`, `vetoed_by`, `would_block`. Per-record `src`/`detail` and the
+top-level `src` are stripped, so the evidence is the counts and the reason, not
+the generated probe source.
+
+**Cost.** At most 4 lane calls (2 relations × ≤2 tries, 1 differential suite ×
+≤2 tries), each bounded by `MO_CODEFIX_CERTIFY_LANE_TIMEOUT_S` (90 s) with
+`MO_CERTIFY_LANE_RETRIES=0`. The probe pytest runs are a separate budget: `2k`
+for the relations (patch + base per relation) and `2N + 2p` for the differential
+(base + head per selected input, plus a base+head confirm re-run for each of the
+`p ≤ N` diverging preserve inputs), each run a single file bounded by
+`MO_CODEFIX_CERTIFY_PROBE_TIMEOUT_S` (120 s). With the default `k=3`, `N=6` the
+pathological ceiling is 30 single-file runs (if every preserve input diverges)
+at ≤120 s each — the lane knobs bound the lane calls, not the probes.
 
 ## Fixes the live runs found
 
