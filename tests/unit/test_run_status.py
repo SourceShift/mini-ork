@@ -24,6 +24,14 @@ MIGRATIONS = Path(__file__).resolve().parents[2] / "db" / "migrations"
 _CHECK_RE = re.compile(
     r"CHECK\s*\(\s*status\s+IN\s*\((?P<values>[^)]*)\)", re.IGNORECASE
 )
+# Only a CHECK inside a task_runs table definition counts: other tables carry
+# their own `status` CHECKs (0085's review findings: open/fixed/dismissed/
+# pre_existing), and the last one in filename order is not the run status set.
+# The rebuild idiom names the new table `task_runs_new`, so match the prefix.
+_TASK_RUNS_TABLE_RE = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"`]?task_runs\w*[\"`]?\s*\(",
+    re.IGNORECASE,
+)
 
 
 def _schema_statuses() -> set[str]:
@@ -36,7 +44,11 @@ def _schema_statuses() -> set[str]:
     """
     newest: tuple[str, set[str]] | None = None
     for path in sorted(MIGRATIONS.glob("*.sql")):
-        match = _CHECK_RE.search(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        table = _TASK_RUNS_TABLE_RE.search(text)
+        if table is None:
+            continue
+        match = _CHECK_RE.search(text, table.end())
         if match is None:
             continue
         values = {v.strip().strip("'\"").lower() for v in match.group("values").split(",")}
