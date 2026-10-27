@@ -1456,6 +1456,12 @@ class ServiceManager:
         for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
             dirnames.sort()
             for fname in sorted(filenames):
+                # A dotfile in a volume is a write in progress, not data this
+                # node put there: ``write_volume_file`` stages under
+                # ``.<name>.import-<uuid>`` in the same directory. Listing one
+                # would invite the caller to ship a half-written file.
+                if fname.startswith("."):
+                    continue
                 path = Path(dirpath) / fname
                 try:
                     if path.is_symlink() or not path.is_file():

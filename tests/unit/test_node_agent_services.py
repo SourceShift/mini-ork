@@ -2316,3 +2316,46 @@ def test_writing_a_path_that_escapes_the_volume_is_refused(client, tmp_path, pat
 
     assert r.status_code in (400, 404)
     assert not (tmp_path / "escape").exists()
+
+
+def test_a_staging_file_is_never_listed(client, tmp_path):
+    _volume_file(tmp_path, rel=f"wal/{WAL_SEGMENT}").write_bytes(b"segment")
+    # The same shape ``write_volume_file`` stages under while a body streams in.
+    _volume_file(tmp_path, rel=f"wal/.{WAL_SEGMENT}.import-abc123").write_bytes(b"half")
+
+    r = client.get("/v1/services/db/volumes/wal-archive/files", headers=AUTH)
+
+    assert [f["path"] for f in r.json()["files"]] == [f"wal/{WAL_SEGMENT}"]
+
+
+def test_a_file_above_the_size_bound_is_refused_on_read_and_write(tmp_path):
+    import asyncio
+    import hashlib
+
+    from mini_ork.remote.node_agent.services import (
+        ServiceManager,
+        VolumeFileTooLargeError,
+    )
+
+    manager = ServiceManager(tmp_path, volume_file_max_bytes=8)
+    large = _volume_file(tmp_path)
+    large.write_bytes(b"0123456789")
+
+    with pytest.raises(VolumeFileTooLargeError):
+        manager.volume_file("db", "wal-archive", f"wal/{WAL_SEGMENT}")
+
+    async def _body():
+        yield b"0123456789"
+
+    async def _write():
+        await manager.write_volume_file(
+            "db",
+            "wal-archive",
+            "wal/00000001000000000000000B",
+            _body(),
+            sha256=hashlib.sha256(b"0123456789").hexdigest(),
+        )
+
+    with pytest.raises(VolumeFileTooLargeError):
+        asyncio.run(_write())
+    assert not (tmp_path / "volumes" / "db" / "wal-archive" / "wal" / "00000001000000000000000B").exists()
