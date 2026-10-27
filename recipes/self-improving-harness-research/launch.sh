@@ -17,9 +17,18 @@ RECOVER_FROM="${MO_RECOVER_FROM:-}"
 HOME_DIR="${MINI_ORK_HOME:-$PWD/.mini-ork}"
 RUN_DIR="$HOME_DIR/runs/$RUN_ID"
 mkdir -p "$RUN_DIR/config"
+# providers.yaml / agents.yaml live in the HOME config on an initialized home,
+# but in a plain checkout (e.g. a git worktree) they are at the repo-root
+# config/. Use whichever actually has them so the launcher is portable.
+SRC_CONFIG="$HOME_DIR/config"
+if [ ! -f "$SRC_CONFIG/providers.yaml" ] || [ ! -f "$SRC_CONFIG/agents.yaml" ]; then
+  SRC_CONFIG="$PWD/config"
+fi
+[ -f "$SRC_CONFIG/providers.yaml" ] && [ -f "$SRC_CONFIG/agents.yaml" ] || {
+  echo "no agents.yaml+providers.yaml in $HOME_DIR/config or $PWD/config" >&2; exit 2; }
 if [ -z "$RECOVER_FROM" ]; then
 
-python3 - "$HOME_DIR/config" "$RUN_DIR/config" <<'PY'
+python3 - "$SRC_CONFIG" "$RUN_DIR/config" <<'PY'
 import sys, yaml
 src, dst = sys.argv[1], sys.argv[2]
 allowed = ["glm", "minimax", "deepseek"]
