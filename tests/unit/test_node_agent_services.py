@@ -46,7 +46,11 @@ class _Docker:
         self.networks: set[str] = set()
         self.network_creates: list[list[str]] = []
         self.network_removes: list[list[str]] = []
+        self.network_connects: list[list[str]] = []
         self.fail_network: str | None = None
+        #: Non-null makes every ``docker network connect`` fail with this
+        #: daemon message — the extra-network analogue of ``fail_network``.
+        self.fail_network_connect: str | None = None
         #: ``"in_use"`` reproduces Docker refusing a network with containers
         #: attached; ``"daemon"`` a daemon-level refusal. Both are exit 1, so
         #: the manager has to read the reason rather than the code.
@@ -113,6 +117,16 @@ class _Docker:
             self.networks.add(argv[-1])
             self.network_creates.append(argv)
             r.stdout = argv[-1]
+            return r
+
+        if argv[:3] == ["docker", "network", "connect"]:
+            if self.fail_network_connect:
+                r.returncode = 1
+                r.stderr = (
+                    f"Error response from daemon: {self.fail_network_connect}"
+                )
+                return r
+            self.network_connects.append(argv)
             return r
 
         if argv[:3] == ["docker", "network", "rm"]:
@@ -1817,6 +1831,148 @@ def test_aliases_survive_the_state_file(client, tmp_path):
     data = json.loads((tmp_path / "services.json").read_text(encoding="utf-8"))
     assert data["services"][0]["network"] == NETWORK
     assert data["services"][0]["network_aliases"] == ALIASES
+
+
+PAIR = "attestia-pair-1f2a3b4c-9d8e7f60"
+PAIR_ALIASES = ["db", "db-1f2a3b4c.internal"]
+
+
+def test_extra_networks_are_created_then_attached_after_start(client, docker):
+    r = client.post(
+        "/v1/services",
+        json=_spec(
+            network=NETWORK,
+            network_aliases=["db"],
+            additional_networks=[{"name": PAIR, "aliases": PAIR_ALIASES}],
+        ),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+
+    # Both networks exist before the first container, so a connect can never
+    # race the create.
+    assert [c[-1] for c in docker.network_creates] == [NETWORK, PAIR]
+    assert docker.network_connects == [
+        ["docker", "network", "connect", "--alias", PAIR_ALIASES[0], "--alias",
+         PAIR_ALIASES[1], PAIR, "mo-svc-web-0"],
+        ["docker", "network", "connect", "--alias", PAIR_ALIASES[0], "--alias",
+         PAIR_ALIASES[1], PAIR, "mo-svc-web-1"],
+    ]
+    # ``docker run`` still carries exactly one --network: the primary.
+    argv = docker.run_argv()[0]
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--network"] == [NETWORK]
+
+
+def test_extra_networks_survive_the_state_file(client, tmp_path):
+    r = client.post(
+        "/v1/services",
+        json=_spec(
+            network=NETWORK,
+            additional_networks=[{"name": PAIR, "aliases": ["db"]}],
+        ),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+
+    data = json.loads((tmp_path / "services.json").read_text(encoding="utf-8"))
+    assert data["services"][0]["additional_networks"] == [
+        {"name": PAIR, "aliases": ["db"]}
+    ]
+
+
+def test_a_failed_attach_removes_the_replicas_already_started(client, docker):
+    # A replica on only some of its networks is either reachable by a peer the
+    # policy excludes or unreachable by one it names; neither is a half-served
+    # service, so the create fails closed.
+    docker.fail_network_connect = "network not found"
+
+    r = client.post(
+        "/v1/services",
+        json=_spec(
+            service_id="db",
+            network=NETWORK,
+            additional_networks=[{"name": PAIR, "aliases": ["db"]}],
+        ),
+        headers=AUTH,
+    )
+
+    assert r.status_code == 500
+    assert "docker network connect failed" in r.json()["detail"]
+    assert PAIR in r.json()["detail"]
+    # The first attach already failed, so only the first replica existed to
+    # remove — and leaving it running would be the half-connected service.
+    assert docker.removed == ["cid-mo-svc-db-0"]
+    assert client.get("/v1/services/db", headers=AUTH).status_code == 404
+
+
+def test_extra_networks_without_a_primary_network_are_refused(client):
+    r = client.post(
+        "/v1/services",
+        json=_spec(additional_networks=[{"name": PAIR}]),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "requires network" in r.json()["detail"]
+
+
+def test_the_primary_network_cannot_be_repeated_as_an_extra_one(client):
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, additional_networks=[{"name": NETWORK}]),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "repeats the primary network" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("name", ["Pair_Network", "-pair", "pair network", "p" * 64])
+def test_a_malformed_extra_network_name_is_refused(client, name):
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, additional_networks=[{"name": name}]),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "additional network name" in r.json()["detail"]
+
+
+def test_duplicate_extra_networks_are_refused(client):
+    r = client.post(
+        "/v1/services",
+        json=_spec(
+            network=NETWORK,
+            additional_networks=[{"name": PAIR}, {"name": PAIR}],
+        ),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "duplicate additional network" in r.json()["detail"]
+
+
+def test_at_most_eight_extra_networks(client):
+    r = client.post(
+        "/v1/services",
+        json=_spec(
+            network=NETWORK,
+            additional_networks=[{"name": f"pair-{i}"} for i in range(9)],
+        ),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "at most 8 additional networks" in r.json()["detail"]
+
+
+def test_a_malformed_alias_on_an_extra_network_is_refused(client):
+    r = client.post(
+        "/v1/services",
+        json=_spec(
+            network=NETWORK,
+            additional_networks=[{"name": PAIR, "aliases": ["Bad_Name"]}],
+        ),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "network alias" in r.json()["detail"]
 
 
 def test_delete_network_removes_an_empty_network(client, docker):

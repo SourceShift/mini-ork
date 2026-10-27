@@ -537,6 +537,16 @@ class ServiceSpec:
     #: stable name for a service lives here; they are meaningless without a
     #: network, so validation refuses the combination.
     network_aliases: list[str] = field(default_factory=list)
+    #: Further networks this service joins, each ``{"name": ..., "aliases":
+    #: [...]}``. ``docker run`` takes one ``--network``, so these are attached
+    #: after the container starts with ``docker network connect``.
+    #:
+    #: This is how a per-pair allow-list is enforced without a host firewall:
+    #: two services that may talk to each other share one network, and a
+    #: service the policy does not name is not on that network at all. The node
+    #: does not decide membership — it only attaches what the control plane
+    #: asked for, and fails the create if an attachment does not happen.
+    additional_networks: list[dict[str, Any]] = field(default_factory=list)
     user: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -564,6 +574,13 @@ class ServiceSpec:
             healthcheck=dict(data["healthcheck"]) if data.get("healthcheck") else None,
             network=str(data["network"]) if data.get("network") else None,
             network_aliases=[str(a) for a in data.get("network_aliases") or []],
+            additional_networks=[
+                {
+                    "name": str(n["name"]),
+                    "aliases": [str(a) for a in n.get("aliases") or []],
+                }
+                for n in data.get("additional_networks") or []
+            ],
             user=str(data["user"]) if data.get("user") else None,
             created_at=float(data.get("created_at") or time.time()),
             updated_at=float(data.get("updated_at") or time.time()),
@@ -683,6 +700,50 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
     if network_aliases and network is None:
         raise ServiceError("network_aliases requires network")
 
+    # Extra networks: each is an identity the node has to create, and each
+    # alias means something only inside its own network. Refusals here are
+    # cheap; a container attached to the wrong network is a policy hole that
+    # nothing downstream would notice.
+    additional_networks: list[dict[str, Any]] = []
+    raw_networks = payload.get("additional_networks") or []
+    if not isinstance(raw_networks, (list, tuple)):
+        raise ServiceError("additional_networks must be a list of objects")
+    if len(raw_networks) > 8:
+        raise ServiceError("at most 8 additional networks are supported")
+    seen_networks: set[str] = set()
+    for raw in raw_networks:
+        if not isinstance(raw, Mapping):
+            raise ServiceError("additional_networks must be a list of objects")
+        extra_name = str(raw.get("name") or "").strip()
+        if not _NETWORK_NAME_RE.match(extra_name):
+            raise ServiceError(
+                "additional network name must match "
+                f"^[a-z0-9][a-z0-9_-]{{0,62}}$: {extra_name!r}"
+            )
+        if extra_name == network:
+            raise ServiceError(
+                f"additional network repeats the primary network: {extra_name!r}"
+            )
+        if extra_name in seen_networks:
+            raise ServiceError(f"duplicate additional network: {extra_name!r}")
+        seen_networks.add(extra_name)
+        extra_aliases: list[str] = []
+        for raw_alias in raw.get("aliases") or []:
+            alias = str(raw_alias).strip()
+            if len(alias) > 253 or not _NETWORK_ALIAS_RE.match(alias):
+                raise ServiceError(f"network alias is not a DNS name: {alias!r}")
+            if alias not in extra_aliases:
+                extra_aliases.append(alias)
+        if len(extra_aliases) > 32:
+            raise ServiceError("at most 32 network aliases are supported")
+        additional_networks.append({"name": extra_name, "aliases": extra_aliases})
+    if additional_networks and network is None:
+        # Without a primary network ``docker run`` would put the container on
+        # the daemon's default bridge, where peers it was never granted can
+        # still reach it by address. Requiring the primary keeps "which
+        # networks am I on" a single, reviewable list.
+        raise ServiceError("additional_networks requires network")
+
     resources = payload.get("resources") or {}
     cpus_raw = resources.get("cpus", payload.get("cpus"))
     memory_raw = resources.get("memory", payload.get("memory"))
@@ -727,6 +788,7 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
         healthcheck=dict(healthcheck) if healthcheck else None,
         network=network,
         network_aliases=network_aliases,
+        additional_networks=additional_networks,
         user=str(payload["user"]) if payload.get("user") else None,
         created_at=now,
         updated_at=now,
@@ -1408,6 +1470,8 @@ class ServiceManager:
 
         if spec.network:
             self._ensure_network(spec.network)
+        for extra in spec.additional_networks:
+            self._ensure_network(extra["name"])
         self._prepare_volumes(spec)
 
         cids: dict[int, str] = {}
@@ -1425,6 +1489,18 @@ class ServiceManager:
                     f"docker run failed ({result.returncode}): {stderr or stdout}"
                 )
             cids[replica] = (getattr(result, "stdout", "") or "").strip()[:64]
+            if spec.additional_networks:
+                try:
+                    self._connect_networks(spec, replica)
+                except RuntimeError:
+                    # A replica attached to only some of its networks is
+                    # either reachable by a peer the policy excludes or
+                    # unreachable by one it names. Both are policy failures,
+                    # so the create fails and takes the started replicas with
+                    # it rather than leaving a half-connected service running.
+                    for started in cids.values():
+                        self._run(["docker", "rm", "-f", started])
+                    raise
 
         self._specs[spec.service_id] = spec
         self._cids[spec.service_id] = cids
@@ -1452,6 +1528,30 @@ class ServiceManager:
         self._cids.pop(service_id, None)
         self._save()
         return True
+
+    def _connect_networks(self, spec: ServiceSpec, replica: int) -> None:
+        """Attach the extra private networks to one running replica.
+
+        ``docker run`` accepts a single ``--network``, so everything past the
+        first is connected after the container exists. Connecting by the
+        derived container name (not the id) keeps this working when the run
+        output was truncated, and nothing here comes from a caller: the names
+        and aliases were validated in ``_validate``.
+        """
+        name = self._name(spec, replica)
+        for extra in spec.additional_networks:
+            argv = ["docker", "network", "connect"]
+            for alias in extra.get("aliases") or []:
+                argv += ["--alias", alias]
+            argv += [extra["name"], name]
+            result = self._run(argv)
+            if int(getattr(result, "returncode", 1)) != 0:
+                stderr = (getattr(result, "stderr", "") or "").strip()
+                stdout = (getattr(result, "stdout", "") or "").strip()
+                raise RuntimeError(
+                    f"docker network connect failed for {extra['name']!r} "
+                    f"({result.returncode}): {stderr or stdout}"
+                )
 
     def remove_network(self, name: str) -> bool:
         """Remove an environment network this node no longer needs.

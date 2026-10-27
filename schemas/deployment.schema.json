@@ -138,6 +138,34 @@
       "uniqueItems": true,
       "default": []
     },
+    "additional_networks": {
+      "type": "array",
+      "description": "Further networks to join besides `network`, each `{name, aliases}`. `docker run` takes one network, so these are attached with `docker network connect` right after the container starts; a failure to attach fails the create and removes the replicas already started. Refused without `network`. This is how a per-pair private allow-list is enforced: two services that may talk share one network, and a service the policy does not name never joins it.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+            },
+            "maxItems": 32,
+            "uniqueItems": true,
+            "default": []
+          }
+        }
+      },
+      "maxItems": 8,
+      "default": []
+    },
     "user": {
       "type": "string",
       "description": "user[:group] or uid[:gid] the container runs as. The control plane is expected to require a non-root value."

@@ -586,10 +586,22 @@ Rules:
 - **Aliases are DNS names, not paths.** `[a-z0-9.-]`, no empty label (`a..b`),
   no trailing dot, at most 253 characters, 32 per service. The short label is
   the name peers use (`db`); the FQDN is what the platform shows tenants.
+- **A service can join more than one network.** `additional_networks` is a
+  list of `{name, aliases}`, at most 8, each validated like the primary one
+  and refused if it repeats it. `docker run` takes a single `--network`, so
+  the node creates every named network first and attaches the rest with
+  `docker network connect --alias …` after each replica starts. If an attach
+  fails, the create removes the replicas it already started and fails: a
+  container on only some of its networks is either reachable by a peer the
+  policy excludes or unreachable by one it names, and both are worse than a
+  deploy that did not happen. Extra networks are meaningless without a
+  primary one — a container left on the daemon's default bridge is reachable
+  by anything that can guess its address.
 - **Scoping is the platform's job.** The node enforces shape, not tenancy: two
   tenants that send the same network name land on the same network. The
   control plane derives the name from the environment, so a tenant cannot
-  choose it.
+  choose it. Membership is the same kind of decision: the node attaches the
+  networks it was handed and never decides who belongs on one.
 - **Cross-node reachability is a fleet property.** Bridge networks stop at the
   host boundary; `overlay` crosses swarm nodes. The node reports the truth by
   failing the create when the driver cannot be honoured. A fleet that has not
