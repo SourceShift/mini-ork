@@ -1,0 +1,85 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k4-remove-dead-chain-20261025-105927/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k4-remove-dead-chain-20261025-105927/spec-tests",
+  "files": [
+    "test_spec_content_ids.py",
+    "test_spec_dead_chain_removed.py",
+    "test_spec_keep_constraints_and_docs.py",
+    "test_spec_survivors_and_catalogue.py"
+  ],
+  "selected": [
+    "test_spec_content_ids.py::test_content_ids_module_and_function_exist",
+    "test_spec_content_ids.py::test_content_ids_signature_and_git_helper",
+    "test_spec_content_ids.py::test_content_ids_module_docstring_is_one_paragraph",
+    "test_spec_content_ids.py::test_content_ids_matches_git_on_tmp_repo",
+    "test_spec_content_ids.py::test_content_ids_missing_branch_returns_empty_pair",
+    "test_spec_content_ids.py::test_self_improve_imports_cleanly",
+    "test_spec_content_ids.py::test_self_improve_imports_content_ids_from_new_module",
+    "test_spec_dead_chain_removed.py::test_dead_module_is_gone",
+    "test_spec_dead_chain_removed.py::test_dead_chain_unit_test_files_are_deleted",
+    "test_spec_dead_chain_removed.py::test_new_dead_chain_test_file_exists",
+    "test_spec_dead_chain_removed.py::test_no_dead_chain_strings_under_mini_ork_package",
+    "test_spec_dead_chain_removed.py::test_success_criteria_grep_returns_nothing",
+    "test_spec_keep_constraints_and_docs.py::test_mini_orch_sessions_table_and_migration_0002_kept",
+    "test_spec_keep_constraints_and_docs.py::test_sessions_table_consumers_import_cleanly",
+    "test_spec_keep_constraints_and_docs.py::test_auto_repair_replacement_survives",
+    "test_spec_keep_constraints_and_docs.py::test_healer_lane_role_kept_in_configs",
+    "test_spec_keep_constraints_and_docs.py::test_review_gates_doc_drops_auto_merge_auto_pr_cleaner_text",
+    "test_spec_keep_constraints_and_docs.py::test_recursive_multi_epic_doc_drops_env_knob_instructions",
+    "test_spec_keep_constraints_and_docs.py::test_parity_ports_marks_healer_cleaner_rows_removed",
+    "test_spec_keep_constraints_and_docs.py::test_features_md_not_touched",
+    "test_spec_survivors_and_catalogue.py::test_lane_helpers_loses_aggregate_cache_stats",
+    "test_spec_survivors_and_catalogue.py::test_lane_helpers_test_file_drops_cases_g_and_h",
+    "test_spec_survivors_and_catalogue.py::test_settings_catalogue_has_no_auto_merge_entry",
+    "test_spec_survivors_and_catalogue.py::test_merge_hold_file_keeps_only_content_ids_tests",
+    "test_spec_survivors_and_catalogue.py::test_agent_session_isolation_deletes_only_cleaner_case"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_dead_chain_removed.py",
+    "test_spec_content_ids.py",
+    "test_spec_survivors_and_catalogue.py",
+    "test_spec_keep_constraints_and_docs.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792923288.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 6 file(s) predate spec_test_author node_end 1792923288; all 4 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "25 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

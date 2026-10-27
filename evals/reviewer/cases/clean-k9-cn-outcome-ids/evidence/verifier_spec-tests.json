@@ -1,0 +1,72 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k9-cn-outcome-ids-20261025-111837/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k9-cn-outcome-ids-20261025-111837/spec-tests",
+  "files": [
+    "test_spec_cn_prefetch.py"
+  ],
+  "selected": [
+    "test_spec_cn_prefetch.py::test_persist_prefetch_writes_block_and_returns_path",
+    "test_spec_cn_prefetch.py::test_persist_prefetch_appends_not_overwrites",
+    "test_spec_cn_prefetch.py::test_persist_prefetch_sanitizes_label",
+    "test_spec_cn_prefetch.py::test_persist_prefetch_empty_block_writes_nothing",
+    "test_spec_cn_prefetch.py::test_persist_prefetch_unset_or_empty_run_dir_env",
+    "test_spec_cn_prefetch.py::test_persist_prefetch_absent_run_dir_writes_nothing",
+    "test_spec_cn_prefetch.py::test_persist_prefetch_run_dir_is_file_returns_none",
+    "test_spec_cn_prefetch.py::test_persist_prefetch_oserror_returns_none",
+    "test_spec_cn_prefetch.py::test_atoms_block_lands_in_run_dir",
+    "test_spec_cn_prefetch.py::test_settle_finds_persisted_atom_id",
+    "test_spec_cn_prefetch.py::test_capsule_path_persists_capsule_without_retrieval",
+    "test_spec_cn_prefetch.py::test_no_run_dir_no_write_return_unchanged",
+    "test_spec_cn_prefetch.py::test_persist_routes_through_client_attribute",
+    "test_spec_cn_prefetch.py::test_cn_disabled_returns_empty_and_writes_nothing",
+    "test_spec_cn_prefetch.py::test_planner_path_writes_engine_planner_md",
+    "test_spec_cn_prefetch.py::test_planner_path_block_settles",
+    "test_spec_cn_prefetch.py::test_planner_no_run_dir_no_write",
+    "test_spec_cn_prefetch.py::test_planner_never_raises_even_if_persist_raises"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_cn_prefetch.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792924659.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 4 file(s) predate spec_test_author node_end 1792924659; all 1 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "18 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

@@ -1,0 +1,66 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k6-web-control-local-caller-20261025-105933/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k6-web-control-local-caller-20261025-105933/spec-tests",
+  "files": [
+    "test_spec_control_local_caller.py"
+  ],
+  "selected": [
+    "test_spec_control_local_caller.py::test_stop_foreign_origin_403_and_no_sentinel",
+    "test_spec_control_local_caller.py::test_stop_no_origin_not_403_and_sentinel_written",
+    "test_spec_control_local_caller.py::test_stop_no_origin_missing_run_is_409",
+    "test_spec_control_local_caller.py::test_stop_loopback_origin_not_403",
+    "test_spec_control_local_caller.py::test_kill_foreign_origin_403_and_kill_run_never_called",
+    "test_spec_control_local_caller.py::test_kill_no_origin_reaches_kill_run",
+    "test_spec_control_local_caller.py::test_answers_foreign_origin_403_and_nothing_written",
+    "test_spec_control_local_caller.py::test_answers_no_origin_still_persists",
+    "test_spec_control_local_caller.py::test_control_module_imports_require_local_caller_from_agent_server",
+    "test_spec_control_local_caller.py::test_module_docstring_documents_the_guard",
+    "test_spec_control_local_caller.py::test_cost_routes_keep_require_token_not_the_origin_guard",
+    "test_spec_control_local_caller.py::test_require_local_caller_itself_is_unchanged"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_control_local_caller.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792923168.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 3 file(s) predate spec_test_author node_end 1792923168; all 1 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "12 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

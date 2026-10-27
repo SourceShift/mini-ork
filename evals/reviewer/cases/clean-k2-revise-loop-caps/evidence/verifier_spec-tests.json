@@ -1,0 +1,77 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k2-revise-loop-caps-20261025-105921/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k2-revise-loop-caps-20261025-105921/spec-tests",
+  "files": [
+    "test_spec_coba_removal.py",
+    "test_spec_recursion_caps_e2e.py",
+    "test_spec_round_cap.py"
+  ],
+  "selected": [
+    "test_spec_coba_removal.py::test_revise_value_module_and_its_test_are_deleted",
+    "test_spec_coba_removal.py::test_execute_py_text_contains_neither_revise_value_nor_coba_stop",
+    "test_spec_coba_removal.py::test_migration_0081_and_revise_rounds_table_stay",
+    "test_spec_recursion_caps_e2e.py::test_budget_cap_total_usd_blocks_the_revise_round",
+    "test_spec_recursion_caps_e2e.py::test_budget_message_names_target_spent_and_cap",
+    "test_spec_recursion_caps_e2e.py::test_under_cap_spend_grants_round_one",
+    "test_spec_recursion_caps_e2e.py::test_unset_env_grants_more_than_two_rounds",
+    "test_spec_recursion_caps_e2e.py::test_none_spend_fails_open_and_grants_the_round",
+    "test_spec_recursion_caps_e2e.py::test_env_override_still_caps_a_recursion_edge",
+    "test_spec_recursion_caps_e2e.py::test_retries_edge_without_recursion_block_keeps_min_cap",
+    "test_spec_recursion_caps_e2e.py::test_zero_revise_rounds_disables_the_loop_even_for_recursion",
+    "test_spec_round_cap.py::test_retries_edge_max_rounds_two_cap_two_returns_two",
+    "test_spec_round_cap.py::test_retries_edge_max_rounds_five_cap_two_returns_two",
+    "test_spec_round_cap.py::test_recursion_edge_unset_env_returns_declared_max_rounds",
+    "test_spec_round_cap.py::test_recursion_edge_env_three_returns_three",
+    "test_spec_round_cap.py::test_recursion_edge_empty_string_env_counts_as_not_set",
+    "test_spec_round_cap.py::test_zero_cap_disables_loop_for_recursion_edge_too",
+    "test_spec_round_cap.py::test_non_recursion_edge_keeps_today_min_rule",
+    "test_spec_round_cap.py::test_recursion_edge_env_above_declared_max_still_bounded_by_edge"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_coba_removal.py",
+    "test_spec_round_cap.py",
+    "test_spec_recursion_caps_e2e.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792923608.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 5 file(s) predate spec_test_author node_end 1792923608; all 3 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "19 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

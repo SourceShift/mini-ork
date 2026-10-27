@@ -1,0 +1,85 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k10-otel-export-live-20261025-120700/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k10-otel-export-live-20261025-120700/spec-tests",
+  "files": [
+    "test_spec_otel_live.py"
+  ],
+  "selected": [
+    "test_spec_otel_live.py::test_vault_environment_is_a_module_level_name",
+    "test_spec_otel_live.py::test_credentials_both_keys_return_triple",
+    "test_spec_otel_live.py::test_credentials_endpoint_falls_back_to_default",
+    "test_spec_otel_live.py::test_credentials_neither_key_returns_none_silently",
+    "test_spec_otel_live.py::test_credentials_one_key_fails_closed_visibly",
+    "test_spec_otel_live.py::test_credentials_one_secret_key_only_also_fails_closed",
+    "test_spec_otel_live.py::test_credentials_vault_unavailable_prints_class_name_only",
+    "test_spec_otel_live.py::test_credentials_explicit_environment_skips_vault_environment",
+    "test_spec_otel_live.py::test_deliver_dry_run_prints_payload_without_credentials",
+    "test_spec_otel_live.py::test_deliver_posts_with_credentials_from_environment_param",
+    "test_spec_otel_live.py::test_deliver_without_credentials_returns_false_no_post",
+    "test_spec_otel_live.py::test_export_after_run_both_keys_one_delivery_with_root_span",
+    "test_spec_otel_live.py::test_export_after_run_neither_key_no_build_no_post",
+    "test_spec_otel_live.py::test_export_after_run_one_key_no_post_and_stderr_line",
+    "test_spec_otel_live.py::test_export_after_run_opt_out_env_zero",
+    "test_spec_otel_live.py::test_export_after_run_never_raises_on_deliver_oserror",
+    "test_spec_otel_live.py::test_export_after_run_catches_build_errors",
+    "test_spec_otel_live.py::test_post_run_learning_calls_export_after_run_once",
+    "test_spec_otel_live.py::test_post_run_learning_swallows_a_raising_export",
+    "test_spec_otel_live.py::test_dead_modules_are_gone",
+    "test_spec_otel_live.py::test_jsonl_helpers_are_gone",
+    "test_spec_otel_live.py::test_deleted_unit_test_files_are_gone",
+    "test_spec_otel_live.py::test_main_rejects_from_jsonl_and_requires_run_id",
+    "test_spec_otel_live.py::test_export_manual_path_unchanged",
+    "test_spec_otel_live.py::test_setup_both_keys_green_export_line",
+    "test_spec_otel_live.py::test_setup_one_key_warns_nothing_exported",
+    "test_spec_otel_live.py::test_setup_neither_key_not_configured_dot",
+    "test_spec_otel_live.py::test_setup_vault_error_reads_as_not_configured",
+    "test_spec_otel_live.py::test_docs_otel_langfuse_status_block_rewritten",
+    "test_spec_otel_live.py::test_docs_otel_langfuse_states_the_live_path",
+    "test_spec_otel_live.py::test_docs_parity_row_marks_mapper_removed"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_otel_live.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792927401.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 3 file(s) predate spec_test_author node_end 1792927401; all 1 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "31 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

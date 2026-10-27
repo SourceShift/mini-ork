@@ -1,0 +1,79 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k11-post-publish-verify-20261025-114133/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k11-post-publish-verify-20261025-114133/spec-tests",
+  "files": [
+    "test_spec_post_publish_verify.py",
+    "test_spec_step_rules.py"
+  ],
+  "selected": [
+    "test_spec_post_publish_verify.py::test_v1_partial_after_publish_escalates",
+    "test_spec_post_publish_verify.py::test_v2_fail_after_publish_escalates",
+    "test_spec_post_publish_verify.py::test_v3_twice_one_inbox_row_one_note",
+    "test_spec_post_publish_verify.py::test_v4_not_published_no_flag",
+    "test_spec_post_publish_verify.py::test_v5_pass_writes_nothing",
+    "test_spec_post_publish_verify.py::test_v6_db_without_task_runs_does_not_raise",
+    "test_spec_post_publish_verify.py::test_v7_crash_verdict_never_overwritten",
+    "test_spec_post_publish_verify.py::test_v8_gate_context_carries_run_dir",
+    "test_spec_post_publish_verify.py::test_v9_failing_gates_row_names_them",
+    "test_spec_post_publish_verify.py::test_v10_default_gates_row_shape_unchanged",
+    "test_spec_post_publish_verify.py::test_m1_unflagged_verdicts_return_none",
+    "test_spec_step_rules.py::test_run_dir_var_expands_and_relative_finds_run_dir",
+    "test_spec_step_rules.py::test_missing_expanded_path_fails_without_the_var_name",
+    "test_spec_step_rules.py::test_root_var_expands",
+    "test_spec_step_rules.py::test_placeholder_and_glob_words_defer",
+    "test_spec_step_rules.py::test_unset_run_id_var_defers",
+    "test_spec_step_rules.py::test_glob_in_recipe_pattern_defers",
+    "test_spec_step_rules.py::test_redirect_and_assign_targets_are_outputs_not_inputs",
+    "test_spec_step_rules.py::test_relative_token_resolves_under_run_dir_only",
+    "test_spec_step_rules.py::test_absent_named_test_fails_and_is_named",
+    "test_spec_step_rules.py::test_evaluate_passes_run_dir_from_context",
+    "test_spec_step_rules.py::test_expand_refs_replaces_only_resolvable_refs",
+    "test_spec_step_rules.py::test_no_root_defer_requires_all_three_empty"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_step_rules.py",
+    "test_spec_post_publish_verify.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792926589.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 4 file(s) predate spec_test_author node_end 1792926589; all 2 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "23 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

@@ -1,0 +1,69 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k8-routemoa-slice-stats-20261025-114130/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k8-routemoa-slice-stats-20261025-114130/spec-tests",
+  "files": [
+    "test_spec_route_screening_pick.py",
+    "test_spec_slice_stats_store.py"
+  ],
+  "selected": [
+    "test_spec_route_screening_pick.py::test_pick_screens_on_slice_outcomes_not_apm_groups_won",
+    "test_spec_route_screening_pick.py::test_opting_out_still_works",
+    "test_spec_route_screening_pick.py::test_pick_survives_a_missing_trace_table",
+    "test_spec_route_screening_pick.py::test_screening_docstring_names_the_new_source",
+    "test_spec_slice_stats_store.py::test_trace_node_type_parses_like_recompute",
+    "test_spec_slice_stats_store.py::test_real_successes_for_the_slice",
+    "test_spec_slice_stats_store.py::test_empty_filters_widen_the_slice",
+    "test_spec_slice_stats_store.py::test_node_type_parsing_matches_recompute",
+    "test_spec_slice_stats_store.py::test_missing_validity_column_is_fine",
+    "test_spec_slice_stats_store.py::test_missing_trace_table_raises",
+    "test_spec_slice_stats_store.py::test_fetch_does_not_read_agent_performance_memory",
+    "test_spec_slice_stats_store.py::test_fetch_lane_capabilities_stays_on_apm",
+    "test_spec_slice_stats_store.py::test_fetch_docstring_states_why_the_source_changed"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_slice_stats_store.py",
+    "test_spec_route_screening_pick.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792925694.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 4 file(s) predate spec_test_author node_end 1792925694; all 2 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "13 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

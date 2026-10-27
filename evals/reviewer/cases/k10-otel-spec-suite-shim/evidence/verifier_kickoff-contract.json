@@ -1,0 +1,43 @@
+{
+  "verifier": "kickoff-contract",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k10-otel-export-live-20261025-120700/verifier-kickoff-contract.log",
+  "measures": [
+    {
+      "command": "python3.11 -m pytest -q -p no:asyncio tests/unit/test_eco6_k10_otel_live.py --junitxml=\"${MINI_ORK_RUN_DIR}/eco6-k10-junit.xml\"",
+      "rc": 0,
+      "timed_out": false,
+      "pass": true
+    }
+  ],
+  "artifacts": {
+    "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k10-otel-export-live-20261025-120700/eco6-k10-junit.xml": true
+  },
+  "missing": [],
+  "escaped": [],
+  "kickoff_source": "snapshot",
+  "checks": [
+    {
+      "name": "measure-1",
+      "expected": "the kickoff's measure command exits 0",
+      "actual": "python3.11 -m pytest -q -p no:asyncio tests/unit/test_eco6_k10_otel_live.py --junitxml=\"${MINI_ORK_RUN_DIR}/eco6-k10-junit.xml\" \u2192 rc=0",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "required-artifacts",
+      "expected": "every declared run-local artifact exists and is non-empty",
+      "actual": "all present",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "measure-1",
+    "required-artifacts"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

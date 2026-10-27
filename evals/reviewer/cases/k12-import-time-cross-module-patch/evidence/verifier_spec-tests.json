@@ -1,0 +1,65 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k12-epics-archive-20261025-111840/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k12-epics-archive-20261025-111840/spec-tests",
+  "files": [
+    "test_spec_epics_archive.py"
+  ],
+  "selected": [
+    "test_spec_epics_archive.py::test_archive_happy_path",
+    "test_spec_epics_archive.py::test_archive_hides_epic_from_list",
+    "test_spec_epics_archive.py::test_archive_removes_epic_from_pick_ready",
+    "test_spec_epics_archive.py::test_archive_done_epic_stays_done",
+    "test_spec_epics_archive.py::test_archive_in_progress_refused",
+    "test_spec_epics_archive.py::test_archive_note_required",
+    "test_spec_epics_archive.py::test_archive_unknown_epic",
+    "test_spec_epics_archive.py::test_archive_twice_is_noop",
+    "test_spec_epics_archive.py::test_archive_unknown_arguments",
+    "test_spec_epics_archive.py::test_archive_requires_epic_id",
+    "test_spec_epics_archive.py::test_usage_documents_archive"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_epics_archive.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792924276.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 3 file(s) predate spec_test_author node_end 1792924276; all 1 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "11 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}

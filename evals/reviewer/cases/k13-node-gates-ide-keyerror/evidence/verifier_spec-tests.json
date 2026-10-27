@@ -1,0 +1,87 @@
+{
+  "verifier": "spec-tests",
+  "pass": true,
+  "verdict": "pass",
+  "evidence_path": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k13-remove-node-gates-20261025-130443/verifier-spec-tests.log",
+  "spec_dir": "/Volumes/docker-ssd/ps/mini-ork/.mini-ork/runs/eco6-k13-remove-node-gates-20261025-130443/spec-tests",
+  "files": [
+    "test_spec_codemod.py",
+    "test_spec_recipes_and_schema.py",
+    "test_spec_types_ui_docs.py",
+    "test_spec_validate.py"
+  ],
+  "selected": [
+    "test_spec_codemod.py::test_codemod_script_exists",
+    "test_spec_codemod.py::test_codemod_byte_preserving",
+    "test_spec_codemod.py::test_codemod_yaml_level_nodes_equal_minus_gates",
+    "test_spec_codemod.py::test_codemod_leaves_top_level_keys_alone",
+    "test_spec_codemod.py::test_codemod_output_still_loads",
+    "test_spec_recipes_and_schema.py::test_recipe_corpus_present",
+    "test_spec_recipes_and_schema.py::test_no_recipe_node_declares_gates",
+    "test_spec_recipes_and_schema.py::test_recipe_validates_against_workflow_schema",
+    "test_spec_recipes_and_schema.py::test_recipe_still_compiles",
+    "test_spec_recipes_and_schema.py::test_schema_node_definition_has_neither_key",
+    "test_spec_recipes_and_schema.py::test_recipes_diff_is_workflow_yaml_deletions_only",
+    "test_spec_types_ui_docs.py::test_nodespec_has_no_gates_attribute",
+    "test_spec_types_ui_docs.py::test_nodespec_serialization_omits_gates",
+    "test_spec_types_ui_docs.py::test_web_recipes_drops_gates_entry",
+    "test_spec_types_ui_docs.py::test_web_agents_drops_gates_entry",
+    "test_spec_types_ui_docs.py::test_web_dispatch_route_drops_gates_entry",
+    "test_spec_types_ui_docs.py::test_recipe_view_drops_gates_field_and_loop",
+    "test_spec_types_ui_docs.py::test_ide_run_page_drops_node_gates_field_parsing_and_display",
+    "test_spec_types_ui_docs.py::test_extension_md_has_no_node_gates_example_lines",
+    "test_spec_types_ui_docs.py::test_extension_md_documents_python_gate_api_not_bash",
+    "test_spec_types_ui_docs.py::test_extension_md_drops_declaration_order_claim",
+    "test_spec_types_ui_docs.py::test_extension_md_states_real_gate_flow",
+    "test_spec_validate.py::test_validate_flags_stale_recipe_with_gates",
+    "test_spec_validate.py::test_validate_error_message_names_recipe_and_node",
+    "test_spec_validate.py::test_validate_error_hint_quotes_gate_registry",
+    "test_spec_validate.py::test_validate_reports_one_error_per_recipe",
+    "test_spec_validate.py::test_validate_clean_recipe_still_passes"
+  ],
+  "deselected": [],
+  "deselected_reported": 0,
+  "tampered": [],
+  "manifest": [
+    "test_spec_codemod.py",
+    "test_spec_recipes_and_schema.py",
+    "test_spec_validate.py",
+    "test_spec_types_ui_docs.py"
+  ],
+  "missing": [],
+  "failures": [],
+  "author_node_end": 1792931181.0,
+  "rc": 0,
+  "timed_out": false,
+  "checks": [
+    {
+      "name": "tamper-detection",
+      "expected": "no spec test file was modified after the author node ended",
+      "actual": "all 6 file(s) predate spec_test_author node_end 1792931181; all 4 file(s) in the author's manifest are present",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "kickoff-docstrings",
+      "expected": "every executed spec test declares a Kickoff: clause",
+      "actual": "27 selected, 0 deselected",
+      "pass": true,
+      "gating": true
+    },
+    {
+      "name": "spec-tests-pass",
+      "expected": "pytest exits 0 over the selected spec tests",
+      "actual": "rc=0",
+      "pass": true,
+      "gating": true
+    }
+  ],
+  "checks_run": [
+    "tamper-detection",
+    "kickoff-docstrings",
+    "spec-tests-pass"
+  ],
+  "failed_checks": [],
+  "reasons": [],
+  "reason": "all checks passed"
+}
