@@ -445,6 +445,15 @@ def _insert_event(
         return 0
     finally:
         con.close()
+    # The row is committed: fire the simple-tier push hook. Lazy import +
+    # broad catch so a broken hook (or a missing module) can never break
+    # the insert, and never fires on the error paths above.
+    try:
+        from mini_ork.observability.emit_hook import mo_emit_hook
+        mo_emit_hook(event_type, run_id,
+                     json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        pass
     return 0
 
 

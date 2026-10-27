@@ -270,6 +270,53 @@ def finalize_passed(db_path: str | Path, run_id: str, note: str, *, now: int | N
         con.close()
 
 
+_RUN_FINISHED_MARKER = ".run-finished-emitted"
+
+
+def _emit_run_finished(run_id: str, status: str, verdict: str | None,
+                       run_dir: Path | None = None) -> None:
+    """Push a ``run_finished`` event through the simple-tier hook, once per run.
+
+    A marker in the run dir makes it once-only: the publisher usually writes
+    ``published`` mid-workflow, so the teardown finds the row already terminal
+    and must still emit; a second teardown must not emit again.
+
+    Lazy import + broad catch: teardown must never break because a hook is
+    broken or missing.
+    """
+    try:
+        if run_dir is not None:
+            marker = Path(run_dir) / _RUN_FINISHED_MARKER
+            if marker.exists():
+                return
+            try:
+                marker.write_text(f"{status}\n", encoding="utf-8")
+            except OSError:
+                pass
+        from mini_ork.observability.emit_hook import mo_emit_hook
+        mo_emit_hook("run_finished", run_id,
+                     json.dumps({"status": status, "verdict": verdict}))
+    except Exception:
+        pass
+
+
+def _read_verdict(db_path: str | Path, run_id: str) -> str | None:
+    """The run's ``task_runs.verdict`` on a read-only connection, or ``None``."""
+    try:
+        from mini_ork.sqlite_read import connect_readonly
+        con = connect_readonly(db_path)
+    except Exception:
+        return None
+    try:
+        row = con.execute(
+            "SELECT verdict FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
 def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
                      crashed: bool, rc: int | None = None, now: int | None = None) -> str | None:
     """Lifecycle teardown: a run that exits non-terminal gets a terminal status.
@@ -301,7 +348,7 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
     con = sqlite3.connect(str(db_path), timeout=15.0)
     try:
         con.execute("PRAGMA busy_timeout = 15000")
-        row = con.execute("SELECT status, notes FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        row = con.execute("SELECT status, notes, verdict FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
             return None
         if row[0] in TERMINAL:
@@ -313,6 +360,9 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
             # the terminal transitions below. A missing row stays untouched:
             # there is no run whose lock this could be.
             clear_stale_run_lock(run_dir)
+            # Same reason for the event: the usual published path ends here,
+            # so run_finished still fires (once, by the run-dir marker).
+            _emit_run_finished(run_id, row[0], row[2], run_dir)
             return None
         # Human-review-paused: the executor parked it and set ``reviewing``;
         # ``mini-ork approvals`` is the next move, so the status stays. The
@@ -329,6 +379,10 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
             # ``finalize_passed`` only ever moves a non-terminal row, so the run
             # is terminal now either way — no lock may outlive it.
             clear_stale_run_lock(run_dir)
+            if done:
+                # The connection is closed here; read the verdict read-only.
+                _emit_run_finished(run_id, "published",
+                                   _read_verdict(db_path, run_id), run_dir)
             return row[0] if done else None
         if _verdict_passed(run_dir) and not crashed and rc is None:
             return None  # outcome unknown: never fail finished work (bf2805dd)
@@ -348,6 +402,9 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
             # provision lock. Not on the ``not changed`` path — there the row
             # moved on to something we cannot claim is terminal.
             clear_stale_run_lock(run_dir)
+            # ``row`` is still the row we read, and its verdict is untouched by
+            # the failed transition. Emit once per terminal transition.
+            _emit_run_finished(run_id, "failed", row[2], run_dir)
         return row[0] if changed else None
     finally:
         con.close()

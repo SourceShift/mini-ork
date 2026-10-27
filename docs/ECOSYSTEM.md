@@ -361,8 +361,9 @@ Still dashed, by design:
   an allow-list once rsi-e8 is scoped.
 - **Waiting for traffic:** collapse history (fed per promotion), lesson conflicts
   (a guard on new lessons), the diagnosis ledger (writer fixed).
-- **Known gap found later:** `MINI_ORK_ON_EVENT` (`observability/emit_hook.py`) is
-  documented but nothing calls `mo_emit_hook`.
+- **`MINI_ORK_ON_EVENT` is live:** every node/run/child event plus
+  `run_finished` fires the configured hook command (argv, no shell),
+  non-blocking with a 5 s kill.
 
 ## 7. Drawing guide
 

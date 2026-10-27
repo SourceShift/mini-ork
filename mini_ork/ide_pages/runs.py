@@ -325,9 +325,8 @@ def _hooks(home: Path, now: int) -> list[dict[str, Any]]:
     if sources:
         items = [S.ok(f"{head}", f"MINI_ORK_ON_EVENT · {where}") for where, head in sources]
     else:
-        items = [S.dot("No handler configured",
-                       "Set MINI_ORK_ON_EVENT to a command; it is called with event_type, run_id, "
-                       "payload_json after every event (5 s cap, failures ignored).", doc_acts)]
+        hint = "Set MINI_ORK_ON_EVENT to a command (an executable plus its arguments, no shell); it is run with event_type, run_id, payload_json after each event."
+        items = [S.dot("No handler configured", hint, doc_acts)]
     handlers = S.lst("MINI_ORK_ON_EVENT handlers", items, full=True,
                      note="Node lifecycle events pushed to external observers. Pair a watcher "
                           "with steering to close the supervisor loop.")

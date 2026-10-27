@@ -343,7 +343,7 @@ def _health(home: Path) -> list[dict[str, Any]]:
     exports = [S.dot("Web UI", f"mini-ork serve · {_SERVE_URL}", [S.btn("Open", S.url(_SERVE_URL))])]
     exports.append(_otel_status())
     if os.environ.get("MINI_ORK_ON_EVENT"):
-        exports.append(S.ok("Event hook", "MINI_ORK_ON_EVENT is set — node lifecycle events go to its command"))
+        exports.append(S.ok("Event hook", "MINI_ORK_ON_EVENT is set — every run/node event runs it (heartbeats only with MINI_ORK_ON_EVENT_HEARTBEATS=1)"))
     else:
         exports.append(S.dot("Event hook", "not configured · MINI_ORK_ON_EVENT"))
     out.append(S.lst("Exports", exports, full=True))

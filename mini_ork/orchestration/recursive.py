@@ -164,6 +164,13 @@ def mo_recursive_emit_event(
         con.commit()
     finally:
         con.close()
+    # Committed: fire the simple-tier push hook. Never on the validation or
+    # insert error paths (those raise before the commit), and never raise.
+    try:
+        from mini_ork.observability.emit_hook import mo_emit_hook
+        mo_emit_hook(event_type, run_id, payload_json)
+    except Exception:
+        pass
     return event_id
 
 
