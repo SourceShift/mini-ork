@@ -28,8 +28,10 @@ import sqlite3
 import sys
 import time
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from mini_ork import cn_client
+from mini_ork.learning import layer_routing
 from mini_ork.stores import pattern_store
 
 __all__ = [
@@ -704,6 +706,28 @@ def _list_distinct_cluster_ids(db_path: str) -> list[str]:
 
 # ── Public reflection functions ──────────────────────────────────────────────
 
+def _layer_check(gradient_json: str, trace_id: str) -> dict | None:
+    """Route one gradient JSON line to the layer that can fix its run.
+
+    Returns the layer verdict with the resolved home directory under ``_home``
+    (the caller pops it before logging), or ``None`` when the gate cannot decide.
+    The gate fails OPEN: a bug in it must never stop reflection.
+    """
+    db = os.environ.get("MINI_ORK_DB", "")
+    if not db:
+        return None
+    home = os.environ.get("MINI_ORK_HOME") or str(Path(db).parent)
+    try:
+        obj = json.loads(gradient_json)
+        if not isinstance(obj, dict):
+            return None
+        verdict = layer_routing.check_gradient(obj, trace_id=trace_id, db=db, home=home)
+        verdict["_home"] = home
+        return verdict
+    except Exception:  # noqa: BLE001 - the layer gate must never stop reflection
+        return None
+
+
 def reflection_extract_gradients(since_ts: int = 0) -> None:
     """Extract and persist gradients for eligible traces.
 
@@ -729,6 +753,8 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
     skipped_watermark = 0
     dispatch_failed = 0
     circuit_open = 0
+    lr_mode = layer_routing.mode()
+    layer_refused = 0
     from mini_ork.learning import gradient_extractor as _ge
 
     for tid in trace_ids:
@@ -769,6 +795,20 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
         for gradient in grads:
             if not gradient:
                 continue
+            if lr_mode != "off":
+                verdict = _layer_check(gradient, tid)
+                if verdict is not None and not verdict["admit"]:
+                    layer_refused += 1
+                    home = verdict.pop("_home")
+                    record = dict(verdict, mode=lr_mode, ts=int(time.time()))
+                    layer_routing.record_refusal(home, verdict["run_id"], record)
+                    print(
+                        f"reflection_extract_gradients: layer-refused "
+                        f"{verdict['target']} from {tid}: {verdict['reason']}",
+                        file=sys.stderr,
+                    )
+                    if lr_mode == "on":
+                        continue
             try:
                 _gradient_store(gradient)
             except Exception:
@@ -787,6 +827,12 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
             "reflection_extract_gradients: "
             f"{dispatch_failed} trace(s) skipped on dispatch failure"
             + (f" ({circuit_open} cost_circuit_open)" if circuit_open else ""),
+            file=sys.stderr,
+        )
+    if layer_refused:
+        print(
+            f"reflection_extract_gradients: {layer_refused} gradient(s) layer-refused "
+            f"(MO_LAYER_ROUTING={lr_mode})",
             file=sys.stderr,
         )
     print(
