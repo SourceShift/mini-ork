@@ -1,0 +1,12 @@
+{
+  "topic": "The Self-Improving Agent Harness: Building LLM Agents That Refine Their Own Prompts, Tools, Memory, and Skills Online",
+  "anchor_paper": "arxiv:2605.09998 — Continual Harness: Online Adaptation for Self-Improving Foundation Agents",
+  "target_audience": "intermediate",
+  "audience_label": "practitioners and engineers building LLM agent systems",
+  "scope": "comprehensive",
+  "target_language": "en",
+  "publisher_style": "oreilly-hands-on",
+  "domain": "Artificial Intelligence",
+  "intro_title": "Introduction: Why the Harness Is the Unit That Learns",
+  "conclusion_title": "Building Your Own Continual Harness: A Practitioner's Blueprint"
+}

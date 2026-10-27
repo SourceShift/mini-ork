@@ -1,0 +1,38 @@
+name: self_improving_harness_research
+version: "0.1.0"
+description: >
+  Literature-to-book pipeline for self-improving agent harnesses: collect at
+  least 2000 distinct 2026 arXiv papers on agents that refine their own prompts,
+  tools, memory, skills, sub-agents, verifiers, or routing (or adapt online),
+  cluster their techniques into ten mechanism families, distill each family into
+  implementable, practitioner-facing techniques, and emit a clustered
+  provenance-bound technique compendium plus a product-agnostic book outline
+  (one chapter per family). Anchored on arXiv:2605.09998 (Continual Harness).
+
+matches:
+  keywords:
+    - self-improving harness
+    - agent harness techniques
+    - continual harness
+    - self-improving agents book
+    - harness evolution survey
+    - agent self-improvement technique set
+    - literature to book
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 8
+  max_usd: 60
+  per_lens_usd: 2.0
+
+runtime_model:
+  min_minutes: 45
+  max_minutes: 300

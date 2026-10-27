@@ -1,0 +1,318 @@
+# Ten shard extractors and ten group extractors rotate glm_lens / minimax_lens /
+# deepseek_lens so each provider carries a third of the fan-out; the run-scoped
+# agents.yaml (launch.sh) gives each lens the other two as fallback. The only
+# model stages are the extractors and the single clusterer; everything else is a
+# deterministic verifier node, so the run is cost-governable and replayable.
+# Budget is enforced by the task-class default_gates (budget_gate), not per node.
+version: "0.1.0"
+task_class: self_improving_harness_research
+description: >
+  Collect at least 2000 distinct 2026 arXiv papers on self-improving agent
+  harnesses (agents that refine their own prompts, tools, memory, skills,
+  sub-agents, verifiers, routing, or adapt online), extract per-paper techniques
+  in ten shards, cluster them into ten mechanism families, distill each family
+  into implementable techniques for practitioners, assemble one clustered
+  provenance-bound technique compendium, and emit a product-agnostic book
+  outline with one chapter per family.
+
+nodes:
+  - name: libwit_source_collector
+    type: verifier
+    verifier_ref: verifiers/collect.py
+    dispatch_mode: serial
+    outputs: [{ name: source_corpus, kind: json, path: source-corpus.json }]
+
+  - name: corpus_sharder
+    type: verifier
+    verifier_ref: verifiers/shard.py
+    dispatch_mode: serial
+    inputs: { source_corpus: { required: true } }
+    outputs:
+      - { name: source_shard_01, kind: json, path: shards/source-shard-01.json }
+      - { name: source_shard_02, kind: json, path: shards/source-shard-02.json }
+      - { name: source_shard_03, kind: json, path: shards/source-shard-03.json }
+      - { name: source_shard_04, kind: json, path: shards/source-shard-04.json }
+      - { name: source_shard_05, kind: json, path: shards/source-shard-05.json }
+      - { name: source_shard_06, kind: json, path: shards/source-shard-06.json }
+      - { name: source_shard_07, kind: json, path: shards/source-shard-07.json }
+      - { name: source_shard_08, kind: json, path: shards/source-shard-08.json }
+      - { name: source_shard_09, kind: json, path: shards/source-shard-09.json }
+      - { name: source_shard_10, kind: json, path: shards/source-shard-10.json }
+
+  - name: extract_shard_01
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_01, kind: json, path: extractions/shard-01.json }]
+  - name: extract_shard_02
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_02, kind: json, path: extractions/shard-02.json }]
+  - name: extract_shard_03
+    type: researcher
+    model_lane: deepseek_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_03, kind: json, path: extractions/shard-03.json }]
+  - name: extract_shard_04
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_04, kind: json, path: extractions/shard-04.json }]
+  - name: extract_shard_05
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_05, kind: json, path: extractions/shard-05.json }]
+  - name: extract_shard_06
+    type: researcher
+    model_lane: deepseek_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_06, kind: json, path: extractions/shard-06.json }]
+  - name: extract_shard_07
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_07, kind: json, path: extractions/shard-07.json }]
+  - name: extract_shard_08
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_08, kind: json, path: extractions/shard-08.json }]
+  - name: extract_shard_09
+    type: researcher
+    model_lane: deepseek_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_09, kind: json, path: extractions/shard-09.json }]
+  - name: extract_shard_10
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/extract-shard.md
+    dispatch_mode: parallel
+    inputs: { source_shard: { required: true } }
+    outputs: [{ name: shard_extraction_10, kind: json, path: extractions/shard-10.json }]
+
+  - name: technique_catalog
+    type: verifier
+    verifier_ref: verifiers/catalog.py
+    dispatch_mode: serial
+    inputs:
+      shard_extractions: { required: true, many: true }
+      source_corpus: { required: true }
+    outputs:
+      - { name: technique_catalog, kind: json, path: technique-catalog.json }
+      - { name: paper_index, kind: json, path: paper-index.json }
+
+  - name: technique_clusterer
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/cluster-techniques.md
+    dispatch_mode: serial
+    inputs: { technique_catalog: { required: true } }
+    outputs: [{ name: technique_clusters, kind: json, path: clusters.json }]
+
+  - name: cluster_splitter
+    type: verifier
+    verifier_ref: verifiers/split.py
+    dispatch_mode: serial
+    inputs:
+      technique_clusters: { required: true }
+      technique_catalog: { required: true }
+      paper_index: { required: true }
+    outputs:
+      - { name: technique_group_01, kind: json, path: groups/group-01.json }
+      - { name: technique_group_02, kind: json, path: groups/group-02.json }
+      - { name: technique_group_03, kind: json, path: groups/group-03.json }
+      - { name: technique_group_04, kind: json, path: groups/group-04.json }
+      - { name: technique_group_05, kind: json, path: groups/group-05.json }
+      - { name: technique_group_06, kind: json, path: groups/group-06.json }
+      - { name: technique_group_07, kind: json, path: groups/group-07.json }
+      - { name: technique_group_08, kind: json, path: groups/group-08.json }
+      - { name: technique_group_09, kind: json, path: groups/group-09.json }
+      - { name: technique_group_10, kind: json, path: groups/group-10.json }
+
+  - name: extract_group_01
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_01, kind: json, path: group-techniques/group-01.json }]
+  - name: extract_group_02
+    type: researcher
+    model_lane: deepseek_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_02, kind: json, path: group-techniques/group-02.json }]
+  - name: extract_group_03
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_03, kind: json, path: group-techniques/group-03.json }]
+  - name: extract_group_04
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_04, kind: json, path: group-techniques/group-04.json }]
+  - name: extract_group_05
+    type: researcher
+    model_lane: deepseek_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_05, kind: json, path: group-techniques/group-05.json }]
+  - name: extract_group_06
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_06, kind: json, path: group-techniques/group-06.json }]
+  - name: extract_group_07
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_07, kind: json, path: group-techniques/group-07.json }]
+  - name: extract_group_08
+    type: researcher
+    model_lane: deepseek_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_08, kind: json, path: group-techniques/group-08.json }]
+  - name: extract_group_09
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_09, kind: json, path: group-techniques/group-09.json }]
+  - name: extract_group_10
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/extract-group.md
+    dispatch_mode: parallel
+    inputs: { technique_group: { required: true } }
+    outputs: [{ name: group_extraction_10, kind: json, path: group-techniques/group-10.json }]
+
+  - name: technique_compendium
+    type: verifier
+    verifier_ref: verifiers/compendium.py
+    dispatch_mode: serial
+    inputs:
+      group_extractions: { required: true, many: true }
+      source_corpus: { required: true }
+    outputs:
+      - { name: technique_compendium, kind: markdown, path: technique-compendium.md }
+      - { name: techniques, kind: json, path: techniques.json }
+
+  - name: book_spec_builder
+    type: verifier
+    verifier_ref: verifiers/book_spec.py
+    dispatch_mode: serial
+    inputs:
+      techniques: { required: true }
+      source_corpus: { required: true }
+    outputs:
+      - { name: book_outline, kind: json, path: book-outline.json }
+      - { name: book_brief, kind: markdown, path: book-brief.md }
+
+  - name: research_completeness
+    type: verifier
+    verifier_ref: verifiers/verify.py
+    dispatch_mode: serial
+    inputs:
+      book_outline: { required: true }
+      technique_compendium: { required: true }
+      source_corpus: { required: true }
+
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: libwit_source_collector, to: corpus_sharder, edge_type: depends_on, from_output: source_corpus, to_input: source_corpus }
+  - { from: corpus_sharder, to: extract_shard_01, edge_type: depends_on, from_output: source_shard_01, to_input: source_shard }
+  - { from: extract_shard_01, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_01, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_02, edge_type: depends_on, from_output: source_shard_02, to_input: source_shard }
+  - { from: extract_shard_02, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_02, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_03, edge_type: depends_on, from_output: source_shard_03, to_input: source_shard }
+  - { from: extract_shard_03, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_03, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_04, edge_type: depends_on, from_output: source_shard_04, to_input: source_shard }
+  - { from: extract_shard_04, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_04, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_05, edge_type: depends_on, from_output: source_shard_05, to_input: source_shard }
+  - { from: extract_shard_05, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_05, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_06, edge_type: depends_on, from_output: source_shard_06, to_input: source_shard }
+  - { from: extract_shard_06, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_06, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_07, edge_type: depends_on, from_output: source_shard_07, to_input: source_shard }
+  - { from: extract_shard_07, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_07, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_08, edge_type: depends_on, from_output: source_shard_08, to_input: source_shard }
+  - { from: extract_shard_08, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_08, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_09, edge_type: depends_on, from_output: source_shard_09, to_input: source_shard }
+  - { from: extract_shard_09, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_09, to_input: shard_extractions }
+  - { from: corpus_sharder, to: extract_shard_10, edge_type: depends_on, from_output: source_shard_10, to_input: source_shard }
+  - { from: extract_shard_10, to: technique_catalog, edge_type: depends_on, from_output: shard_extraction_10, to_input: shard_extractions }
+  - { from: libwit_source_collector, to: technique_catalog, edge_type: depends_on, from_output: source_corpus, to_input: source_corpus }
+  - { from: technique_catalog, to: technique_clusterer, edge_type: depends_on, from_output: technique_catalog, to_input: technique_catalog }
+  - { from: technique_clusterer, to: cluster_splitter, edge_type: depends_on, from_output: technique_clusters, to_input: technique_clusters }
+  - { from: technique_catalog, to: cluster_splitter, edge_type: depends_on, from_output: technique_catalog, to_input: technique_catalog }
+  - { from: technique_catalog, to: cluster_splitter, edge_type: depends_on, from_output: paper_index, to_input: paper_index }
+  - { from: cluster_splitter, to: extract_group_01, edge_type: depends_on, from_output: technique_group_01, to_input: technique_group }
+  - { from: extract_group_01, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_01, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_02, edge_type: depends_on, from_output: technique_group_02, to_input: technique_group }
+  - { from: extract_group_02, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_02, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_03, edge_type: depends_on, from_output: technique_group_03, to_input: technique_group }
+  - { from: extract_group_03, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_03, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_04, edge_type: depends_on, from_output: technique_group_04, to_input: technique_group }
+  - { from: extract_group_04, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_04, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_05, edge_type: depends_on, from_output: technique_group_05, to_input: technique_group }
+  - { from: extract_group_05, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_05, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_06, edge_type: depends_on, from_output: technique_group_06, to_input: technique_group }
+  - { from: extract_group_06, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_06, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_07, edge_type: depends_on, from_output: technique_group_07, to_input: technique_group }
+  - { from: extract_group_07, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_07, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_08, edge_type: depends_on, from_output: technique_group_08, to_input: technique_group }
+  - { from: extract_group_08, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_08, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_09, edge_type: depends_on, from_output: technique_group_09, to_input: technique_group }
+  - { from: extract_group_09, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_09, to_input: group_extractions }
+  - { from: cluster_splitter, to: extract_group_10, edge_type: depends_on, from_output: technique_group_10, to_input: technique_group }
+  - { from: extract_group_10, to: technique_compendium, edge_type: depends_on, from_output: group_extraction_10, to_input: group_extractions }
+  - { from: libwit_source_collector, to: technique_compendium, edge_type: depends_on, from_output: source_corpus, to_input: source_corpus }
+  - { from: technique_compendium, to: book_spec_builder, edge_type: depends_on, from_output: techniques, to_input: techniques }
+  - { from: libwit_source_collector, to: book_spec_builder, edge_type: depends_on, from_output: source_corpus, to_input: source_corpus }
+  - { from: book_spec_builder, to: research_completeness, edge_type: depends_on, from_output: book_outline, to_input: book_outline }
+  - { from: technique_compendium, to: research_completeness, edge_type: depends_on, from_output: technique_compendium, to_input: technique_compendium }
+  - { from: libwit_source_collector, to: research_completeness, edge_type: depends_on, from_output: source_corpus, to_input: source_corpus }
+  - { from: libwit_source_collector, to: rollback, edge_type: escalates_to }
+  - { from: corpus_sharder, to: rollback, edge_type: escalates_to }
+  - { from: technique_catalog, to: rollback, edge_type: escalates_to }
+  - { from: cluster_splitter, to: rollback, edge_type: escalates_to }
+  - { from: technique_compendium, to: rollback, edge_type: escalates_to }
+  - { from: book_spec_builder, to: rollback, edge_type: escalates_to }
+  - { from: research_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: retain_source_manifest_and_completed_shards
+source_artifact: book-outline.json

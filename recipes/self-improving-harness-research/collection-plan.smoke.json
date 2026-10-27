@@ -1,0 +1,14 @@
+{
+  "source": "arxiv",
+  "date_from": "2026-01-01",
+  "required_source_count": 20,
+  "results_per_query": 30,
+  "max_workers": 4,
+  "ranking_policy": "Smoke slice of the self-improving agent harness scan: a tiny corpus (20 papers) to validate the full collect -> shard -> extract -> catalog -> cluster -> split -> group-extract -> compendium -> book-spec graph end to end without paying for a 2000-paper run. Same ranking intent as collection-plan.json.",
+  "queries": [
+    {"topic": "agent-harness-evolution", "query": "agent harness evolution automatic optimization prompts tools memory frozen model"},
+    {"topic": "self-improving-agents", "query": "self-improving LLM agent recursive self-improvement modify own scaffold"},
+    {"topic": "online-adaptation", "query": "online test-time adaptation agent reset-free continual within single run"},
+    {"topic": "skill-libraries", "query": "skill library experience reuse agent skills procedural memory evolve"}
+  ]
+}

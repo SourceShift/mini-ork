@@ -1,0 +1,32 @@
+source_artifact: book-outline.json
+task_class: self_improving_harness_research
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/verify.py
+
+failure_policy: escalate
+rollback_policy: keep_all_source_and_summary_artifacts
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
+    mime: application/json
+    description: LibWit source manifest of >=2000 distinct 2026 arXiv papers with retrieval metadata.
+  - path: "${MINI_ORK_RUN_DIR}/technique-catalog.json"
+    mime: application/json
+    description: Validated canonical techniques with corpus-checked source ids and coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/clusters.json"
+    mime: application/json
+    description: Ten technique mechanism families covering the catalog.
+  - path: "${MINI_ORK_RUN_DIR}/techniques.json"
+    mime: application/json
+    description: Clustered, provenance-bound implementable technique set (structured, for the book outline).
+  - path: "${MINI_ORK_RUN_DIR}/technique-compendium.md"
+    mime: text/markdown
+    description: Human-readable clustered technique compendium; every technique cites only corpus arXiv ids.
+  - path: "${MINI_ORK_RUN_DIR}/book-outline.json"
+    mime: application/json
+    description: Product-agnostic book outline, one chapter per technique family, plus custom_requirements.
+  - path: "${MINI_ORK_RUN_DIR}/book-brief.md"
+    mime: text/markdown
+    description: Human-readable book brief with chapter plan and key papers per chapter.
