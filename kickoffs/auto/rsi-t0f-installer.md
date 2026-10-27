@@ -70,6 +70,9 @@ change:
 - `tests/unit/test_full_install_py.py::test_runtime_pointer_selects_a_custom_venv`
   pins today's `.resolve()` value. Change its expected value to
   `str(installer.venv_python(venv).absolute())`.
+- `tests/unit/test_full_install_py.py::test_package_declares_core_and_full_runtime_dependencies`
+  pins the `full` extra list. Change its `"verifiers>=0.2.0,<0.3"` entry to
+  `'verifiers>=0.2.0,<0.3; python_version < "3.14"'`, and nothing else.
 - **Shadow a real `python3.13`.** In `tests/unit/test_install_sh.py`, every
   existing test or fixture that calls `_make_fake_python(bin_dir, "python3.12", version_ok=False)`
   must also call `_make_fake_python(bin_dir, "python3.13", version_ok=False)`.

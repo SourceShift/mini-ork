@@ -47,14 +47,29 @@ All paths are relative to the repository root.
      `[{"epic_id": "", "action": "dispatch_refused", "reason": <reason>}]`
      and spawn nothing:
 
+     Let `t = os.path.realpath(target_root)` and `e = os.path.realpath(engine_root)`.
+     The first matching row wins:
+
      | Condition | `<reason>` |
      |---|---|
      | `target_root` is empty | `"dispatch_epics.target_root is required: a dispatched run edits its working tree, which must never be the engine checkout"` |
+     | `not os.path.isabs(target_root)` | `f"dispatch_epics.target_root must be an absolute path: {target_root}"` |
      | `os.path.isdir(target_root)` is false | `f"dispatch_epics.target_root does not exist: {target_root}"` |
-     | `os.path.realpath(target_root) == os.path.realpath(engine_root)` | `"dispatch_epics.target_root is the engine checkout"` |
+     | `t == e`, or `t.startswith(e + os.sep)` | `"dispatch_epics.target_root is inside the engine checkout"` |
+     | `e.startswith(t + os.sep)` | `"dispatch_epics.target_root contains the engine checkout"` |
+
+     These checks are what make setting `MO_ALLOW_FRAMEWORK_CWD=1` on the
+     child safe. That flag lifts the run's "do not edit the engine" guard, and
+     it is only correct because R8 has proven the target is not the engine,
+     not inside it, and does not contain it.
 
   2. **Reclaim stale epics.** Unless `dry_run`, call
-     `mini_ork.scheduler.reclaim_stale(db)`. When it returns a non-empty list,
+     `mini_ork.scheduler.reclaim_stale(db)`.
+     - This is safe outside scheduler startup. `reclaim_stale` never reclaims
+       an epic whose claiming scheduler is alive on this host or whose run is
+       live, and it waits out a grace window (`MO_SCHED_RECLAIM_AFTER_S`).
+     - The supervisor has no dispatch of its own in flight: the scheduler R8
+       spawned claims the epic under its own pid. When it returns a non-empty list,
      append `{"epic_id": "", "action": "reclaim_stale", "epic_ids": <list>}`
      to the actions this rule returns. A raised exception here becomes an
      action `{"epic_id": "", "action": "error", "reason": f"reclaim: {type(exc).__name__}: {exc}"}`,
@@ -81,6 +96,9 @@ Document `target_root`:
   `make worktree-merge`;
 - R8 reclaims stale `in progress` epics with the scheduler's own rules before
   it counts them.
+- If `docs/operator/self-driving.md` has a table of supervisor actions, add
+  rows for `dispatch_refused` (what each reason means and how to fix the
+  config) and `reclaim_stale`.
 
 ## Files in scope (touch ONLY these)
 
@@ -90,18 +108,34 @@ Document `target_root`:
 - `docs/operator/self-driving.md`
 - `tests/unit/test_supervisor_dispatch.py`
 
-Update the existing tests in `tests/unit/test_supervisor_dispatch.py` for the
-new required `target_root` and the 5-argument `dispatch_fn`:
-- pass `dispatch_target_root=<a tmp dir that is not the engine_root>`;
-- give spies 5 parameters.
+Update the existing tests in `tests/unit/test_supervisor_dispatch.py` (the
+only test file that references R8) for the new key and signature. These are
+the only permitted edits to existing tests:
+
+- **Sweep calls.** Every existing `sweep(..., dispatch_epics=True, ...)` call
+  passes `dispatch_target_root=<an absolute tmp dir, created, not containing or inside engine_root>`.
+- **Spies.** Every spy or `dispatch_fn` takes 5 parameters
+  `(engine_root, home, db, epic_id, target_root)`.
+- **Config dicts.** Every expected `_load_config(...)["dispatch_epics"]` dict
+  gains `"target_root": ""` (or the configured value).
+- **Signature checks.** Any existing test that inspects `sweep`'s or
+  `_rule_dispatch_epic`'s parameters accepts the new `dispatch_target_root` /
+  `target_root` parameter, which defaults to `""`.
 
 Do NOT modify any other file.
 
 ## Tests (add to `tests/unit/test_supervisor_dispatch.py`, hermetic, spy `dispatch_fn`, never a real spawn)
 
 - **Refusals.** With `dispatch_epics=True`, a ready epic, and
-  `dispatch_target_root` set to each of `""`, a missing path, and the same
-  directory as `engine_root`:
+  `dispatch_target_root` set to each of:
+  - `""`;
+  - a relative path `"rel/dir"`;
+  - a missing absolute path;
+  - the same directory as `engine_root`;
+  - an existing subdirectory of `engine_root`;
+  - the parent directory of `engine_root`;
+
+  then:
   - the action list contains one `dispatch_refused` action with the exact
     reason from the table;
   - the spy is never called.
