@@ -251,8 +251,20 @@ Follow-ups found while landing Tier 0 (corrected 2026-10-27):
 Each item went through one or more framework-edit runs
 (`kickoffs/auto/rsi-t1-*.md`, waves 196a3603 and f049dc4c). Every run was then
 reviewed by hand, checked by its kickoff suite and an importer gate, and passed
-the pre-push review. Everything new defaults to off or shadow unless noted.
-The matrix below still shows the 10-24 audit.
+the pre-push review. The matrix below still shows the 10-24 audit.
+
+Defaults, so nobody assumes a merged item is inert:
+
+- **On:**
+  - node reward (`MO_ARTIFACT_REWARD=0` disables);
+  - the MGM miner in reflect (`MO_MGM_MINER=0`);
+  - region routing (`MO_ROUTE_REGION=0`);
+  - frozen-refusal logging and the apply loop's frozen guard.
+- **Shadow (record, never decide):**
+  - layer routing (`MO_LAYER_ROUTING`);
+  - certify in the code-fix verifier;
+  - suite strengthening (`MO_SUITE_STRENGTHEN`).
+- **Opt-in:** git-oracle probes in the apply loop (`MO_APPLY_PROBE_GIT_ORACLE=1`).
 
 | # | Item | State | Commits |
 |---|---|---|---|
@@ -267,7 +279,7 @@ The matrix below still shows the 10-24 audit.
 | 9 | SWE-ABS suite strengthening for an INADEQUATE suite (shadow; one 240 s wall budget, `MO_SUITE_STRENGTHEN_BUDGET_S`) | merged | 564ce92f |
 | 10 | Region routing segment for unpinned implementers | merged | f4fffd5a |
 | 11 | RSI cycle C1–C5 | done by another session | 83bb253a … 785e91f7 |
-| 12 | Diversity / pass@k floor (report-only, `mini-ork collapse --floor`); the floor trips the liveness breaker once per breach (12b); GEPA prompt-bloat guard (12c) | floor merged; **12b awaiting approval** (`circuit_breaker.py` is frozen); 12c queued behind #2 | dad406e2 a2f3a0c9 · `wt/t1-collapse-floor-breaker` |
+| 12 | Diversity / pass@k floor (report-only, `mini-ork collapse-check --floor <task_class>`); the floor trips the liveness breaker once per breach (12b); GEPA prompt-bloat guard (12c) | floor merged; **12b awaiting approval** (`circuit_breaker.py` is frozen); 12c queued behind #2 | dad406e2 a2f3a0c9 · `wt/t1-collapse-floor-breaker` |
 
 Also landed in this window: R8 hardening (c6de292b). R8 refuses a
 `target_root` that is the engine checkout, inside it or containing it (compared
@@ -278,7 +290,7 @@ waiting for a person's approval.
 
 What the landing taught (2026-10-27):
 
-- **Three of four wave-4 runs failed on the kickoff, not on the code.** Two
+- **Three of the last four wave-3 runs failed on the kickoff, not on the code.** Two
   kickoffs changed a constant (`SUPPORTED_RECIPES`, the frozen floor's length)
   but left the test that pins it out of scope. The third run's blind spec tests
   had defects (stderr read after `capsys` had consumed it; a fixture default
