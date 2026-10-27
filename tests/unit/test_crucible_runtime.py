@@ -232,7 +232,8 @@ def test_the_engine_api_surface_survives_the_pinned_range():
     dependabot raised it `<0.3` -> `<0.5` on 2026-10-27 with nothing checking that the
     preview API had stayed put. This asserts the *shape* engine.py depends on, not a
     version, so it runs against whatever is installed; CI's `verifiers-pin` job runs it at
-    both ends of the range. Widening a pin is only safe while this test is green.
+    both ends of the range, and fails if this test *skips* there — a skipped guard is a
+    green job that verified nothing. Widening a pin is only safe while this test is green.
     """
     from verifiers.v1 import runtimes as R
 
@@ -240,8 +241,10 @@ def test_the_engine_api_surface_survives_the_pinned_range():
     for name in ("SubprocessConfig", "DockerConfig", "PrimeConfig", "ModalConfig"):
         assert hasattr(R, name), name
     assert callable(R.make_runtime)
-    # The Runtime protocol is async (start/run/read/stop/teardown) and owns one sync method.
-    for method in ("start", "run", "read", "stop", "teardown", "cleanup"):
+    # Only the protocol methods engine.py actually calls: `start` (:220), `run` (:342) and
+    # `cleanup` (:176, the one sync method). Asserting `read`/`stop`/`teardown` would red
+    # this job on surface we never touch, which is not what a broken call site looks like.
+    for method in ("start", "run", "cleanup"):
         assert hasattr(R.Runtime, method), method
 
     # Mirror `_runtime_config`, including the optional cpu/memory passthrough.

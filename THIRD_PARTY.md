@@ -16,8 +16,11 @@ contribute fixes back rather than forking. This file records what we use and why
   entire surface — `make_runtime`, the four `*Config` classes, and the Runtime protocol
   methods — was checked against **both ends**, `0.2.0` and `0.4.0`, and is unchanged. That
   check is now a test (`tests/unit/test_crucible_runtime.py::
-  test_the_engine_api_surface_survives_the_pinned_range`) and a CI job (`verifiers-pin`),
-  so the next automated bump is verified rather than merely merged.
+  test_the_engine_api_surface_survives_the_pinned_range`) and a CI job (`verifiers-pin`)
+  that installs the floor (`0.2.0`, py3.11) and the newest version the ceiling admits
+  (`>=0.4,<0.5`, py3.12). The test is `skipif`-guarded, so the job also asserts it
+  *ran* — a skipped guard would otherwise report success while verifying nothing. The
+  next automated bump is therefore verified rather than merely merged.
 - **Used by:** `mini_ork/runtime/` (Crucible — our verified-execution seam). This is the
   **only** import site; nothing else in mini-ork may import `verifiers`, so an upstream API
   change touches exactly one file.

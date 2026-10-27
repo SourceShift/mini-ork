@@ -112,29 +112,59 @@ jobs:
   # `mini_ork/runtime/engine.py` is the sole import site, so exercising it at BOTH
   # ends of the declared range is the whole test. Do not widen the range without
   # adding the new end here.
+  #
+  # The ceiling entry is a *range*, not `==0.4.0`: the newest 0.4.x is what a user
+  # actually installs under this pin, and it is the version most likely to break
+  # us. Likewise the two ends run on the two interpreters the package supports.
   verifiers-pin:
-    name: verifiers pin (${{ matrix.verifiers }})
+    name: verifiers pin (${{ matrix.req }} / py${{ matrix.python }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        verifiers: ["0.2.0", "0.4.0"]
+        include:
+          - req: "verifiers==0.2.0"      # floor of the declared range
+            python: "3.11"
+          - req: "verifiers>=0.4,<0.5"   # ceiling: newest 0.4.x the pin admits
+            python: "3.12"
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
 
       - name: Install the package and one end of the pin
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest "verifiers==${{ matrix.verifiers }}"
+          pip install pytest "${{ matrix.req }}"
 
       - name: Crucible runtime tests
-        run: python -m pytest -q -p no:cacheprovider tests/unit/test_crucible_runtime.py
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/pin.xml" tests/unit/test_crucible_runtime.py
+
+      # The API-surface test is `skipif(not _have_verifiers())`. If the pinned
+      # install failed to provide the `v1` namespace, pytest exits 0 having
+      # verified nothing and this job goes green on a broken pin — the exact
+      # failure it exists to catch. A skip is therefore a failure here.
+      - name: The API-surface test must RUN, not skip
+        run: |
+          python - "$RUNNER_TEMP/pin.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          name = "test_the_engine_api_surface_survives_the_pinned_range"
+          root = ET.parse(sys.argv[1]).getroot()
+          hits = [c for c in root.iter("testcase") if c.get("name") == name]
+          if not hits:
+              sys.exit(f"FAIL: {name} is absent from the junit report")
+          if hits[0].find("skipped") is not None:
+              sys.exit(f"FAIL: {name} SKIPPED — the pin guard verified nothing")
+          print(f"ok: {name} ran against ${{ matrix.req }}")
+          PY
 
   web-smoke:
     name: web smoke tests
