@@ -27,6 +27,10 @@ variable is unset.*
 | `MO_TRAJECTORY_TTL_DAYS` | `30` | turn_jsonl retention; 0 disables the run-end prune |
 | `MO_FALLBACK_CODING` | `"minimax,glm,deepseek_flash"` | Fallback lane chain for coding roles |
 | `MO_FALLBACK_REVIEW` | `"opus,glm,sonnet"` | Fallback lane chain for review roles |
+| `MO_FALLBACK_STOP_ON_CALLER_FAULT` | `"0"` | `1`: a `caller_fault` failure (prompt too long, a rejected request) stops the fallback walk instead of trying the next lane. Default walks on, since a prompt too long for one lane can fit another. Each failed `llm_calls` row records its typed class in `metadata_json.failure_class` (`mini_ork/dispatch/failure_class.py`); only a run-wide fault (a missing cwd, a confused target) always stops the walk, and its row is marked `:refused` so it never counts as a fuse strike |
+| `MO_DISPATCH_RETRY_MAX_SLEEP_S` | `"45"` | Cap on one retry's sleep. A provider that asks for a longer wait (`Retry-After`, `try again in …`, `try again at …`) is not retried on the same chain; the walk moves on |
+| `MO_LANE_AFFINITY` | `"1"` | A node's later rounds try first the lane that served its first success (`<run_dir>/.lane-affinity.json`), while the routing lead is unchanged; an operator remap always wins and a fused lane stays dropped. `0` disables |
+| `MO_MOCK_SEED` | *(unset)* | Seed for the probabilistic rules of `kind: mock` lanes; a lane's own `env.MO_MOCK_SEED` wins. See [mock-provider.md](mock-provider.md) |
 | `MINI_ORK_LEASE_TOKEN` | *(flag)* | Single-writer lease token passed through recovery |
 | `MINI_ORK_RECOVERY_CLOSURE` | `""` | Recovery closure node set (set by `mini-ork recover`) |
 | `MINI_ORK_WORKFLOW_VERSION_ID` | *(flag)* | Pin the workflow version stamped in traces |
@@ -119,6 +123,7 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_ROUTER_PER_NODE_CREDIT` | `"0"` | Per-node credit assignment in the router |
 | `MO_ROUTER_PER_NODE_CREDIT_GAMMA` | `"1.0"` | Credit-assignment decay |
 | `MINI_ORK_GRADIENT_EXTRACTOR_FN` | `""` | Override gradient extraction function |
+| `MINI_ORK_GRADIENT_TIMEOUT_S` | `"300"` | Timeout of one gradient-extraction dispatch (was a fixed 120 s, which cut a quarter of the calls just before they finished). A non-numeric, zero or negative value falls back to 300 with a stderr warning, never to no cap |
 | `MO_REFLECTION_EXTRACT_GRADIENTS` | `"1"` | Gradient extraction during reflect |
 | `MO_GRADIENT_DEDUP_SIM` | `"0.65"` | Gradient dedupe similarity threshold |
 | `MO_DEDUP_BATCH` | `10000` | Dedupe batch size |
@@ -295,6 +300,9 @@ both keys or none.
 | `MINI_ORK_ACTIVE_STALE_SECONDS` | `21600` (6h) | Fleet view staleness threshold |
 | `MINI_ORK_RUN_STALE_SECONDS` | `"1800"` | Run-detail staleness threshold |
 | `MINI_ORK_PROJECTS_FILE` | *(flag)* | Project registry file for the switcher |
+| `MINI_ORK_ON_EVENT` | `""` | A command (split with shlex, never a shell) run for each node and run event as `<cmd> <event_type> <run_id> <payload_json>`; non-blocking, killed after 5 s. The no-server tier of event push (the served tier is SSE on `mini-ork serve`). See [EVENT-HOOKS.md](../EVENT-HOOKS.md) |
+| `MINI_ORK_ON_EVENT_HEARTBEATS` | `"0"` | `1` also sends heartbeat events to `MINI_ORK_ON_EVENT` |
+| `MINI_ORK_ON_EVENT_MAX_INFLIGHT` | `"8"` | Hook processes allowed at once; an event that arrives while the cap is reached is dropped |
 
 ## The wizard and the controlled-feature registry
 
