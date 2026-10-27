@@ -59,6 +59,9 @@ Env contract (identical to bash):
                                   prompt is materialised via the probe
                                   scorer's temp-copy path so scoring never
                                   writes the live file.
+    MO_APPLY_CERTIFICATE=1  anytime-valid certificate + alpha ledger on the measured path (default OFF)
+    MO_APPLY_CERT_ALPHA  per-class error budget (default 0.05)
+    MO_APPLY_CERT_BET / MO_APPLY_CERT_LEDGER  bet λ (default 0.75) / spend|none (default spend)
 
 Exit code mapping (mirrors bash exactly):
     0  success (promote, quarantine, and no_candidate all exit 0 — a
@@ -423,7 +426,8 @@ def mcnemar_exact_p(gains: int, losses: int) -> float:
 
 def evaluate_gate(candidate_id: str, utility_before: float,
                   utility_after: float, pertask_json: str = "",
-                  control_n: int = 1) -> str:
+                  control_n: int = 1, *, task_class: str = "",
+                  db: str | None = None) -> str:
     """Apply the non-regression gate to a candidate with two utility numbers.
 
     Returns a JSON line: {"decision":"promoted"|"quarantined"|"rejected",
@@ -455,7 +459,6 @@ def evaluate_gate(candidate_id: str, utility_before: float,
     equivalent to the existing ``delta > dt`` rule for binary outcomes, so
     pre-change callers stay byte-identical.
     """
-    del candidate_id  # bash accepted it positionally but never used it
     ub = float(utility_before)
     ua = float(utility_after)
     dt = float(os.environ.get("MO_APPLY_NONREGRESSION_DELTA", "0.0"))
@@ -624,6 +627,79 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                      f"(delta={delta:+.4f} < threshold={dt:+.4f})")
         delta_margin = 0.0
 
+    # ── anytime-valid certificate overlay (opt-in, default OFF) ────────────
+    # Runs after the decision tree has produced a final `decision` and
+    # `rationale`, and before the result dict is built. It can only ever move
+    # a promote to a quarantine — a certificate never turns a quarantine or a
+    # rejection into a promote. A test with at least one discordant pair
+    # consumes an alpha-ledger slot even when the decision was already a
+    # quarantine (ledger soundness); only a misconfiguration or a missing
+    # per-task vector skips the ledger.
+    cert_payload = None
+    cert_enabled = False
+    from mini_ork.learning import promotion_certificate as _pc
+    cfg = _pc.resolve_config()
+    if cfg["enabled"]:
+        cert_enabled = True
+        if cfg["errors"]:
+            cert_payload = {
+                "error": "misconfigured: " + "; ".join(cfg["errors"])}
+            if decision == "promoted":
+                decision = "quarantined"
+                rationale = (
+                    f"certificate misconfigured: {'; '.join(cfg['errors'])}; "
+                    f"point-estimate gate said: {rationale}")
+        elif not (measured and len(before) == len(after)):
+            cert_payload = {"error": "no per-task vectors"}
+            if decision == "promoted":
+                decision = "quarantined"
+                rationale = (
+                    "no anytime-valid certificate: no per-task vectors to "
+                    f"certify; point-estimate gate said: {rationale}")
+        else:
+            try:
+                con = sqlite3.connect(_db_path(db))
+                try:
+                    cert = _pc.certify(
+                        con, task_class=task_class,
+                        candidate_id=str(candidate_id), before=before,
+                        after=after, alpha_total=cfg["alpha"],
+                        bet=cfg["bet"], ledger=cfg["ledger"],
+                        now=int(time.time()))
+                finally:
+                    con.close()
+            except Exception as exc:
+                cert_payload = {"error": f"{type(exc).__name__}: {exc}"}
+                if decision == "promoted":
+                    decision = "quarantined"
+                    rationale = (
+                        f"certificate unavailable: {type(exc).__name__}: "
+                        f"{exc}; point-estimate gate said: {rationale}")
+            else:
+                cert_payload = cert
+                if decision == "promoted":
+                    if cert["certified"]:
+                        rationale += (
+                            f"; certificate e={cert['e_value']:.4f} >= "
+                            f"{cert['threshold']:.4f} (slot {cert['slot']})")
+                    elif cert["threshold"] is None:
+                        decision = "quarantined"
+                        rationale = (
+                            "no anytime-valid certificate: no discordant "
+                            "probe pairs (gains=0, losses=0); point-estimate "
+                            f"gate said: {rationale}")
+                    else:
+                        decision = "quarantined"
+                        rationale = (
+                            "no anytime-valid certificate: "
+                            f"e={cert['e_value']:.4f} < "
+                            f"threshold={cert['threshold']:.4f} "
+                            f"(gains={cert['gains']}, losses={cert['losses']}, "
+                            f"slot={cert['slot']}, "
+                            f"alpha_k={cert['alpha_k']:.6g}, "
+                            f"bet={cert['bet']:g}); point-estimate gate "
+                            f"said: {rationale}")
+
     result = {
         "decision": decision,
         "rationale": rationale,
@@ -649,6 +725,8 @@ def evaluate_gate(candidate_id: str, utility_before: float,
         result["sig_alpha"] = sig_alpha
     if sig_alpha_error is not None:
         result["sig_alpha_error"] = sig_alpha_error
+    if cert_enabled:
+        result["cert"] = cert_payload
     return json.dumps(result)
 
 
@@ -1295,7 +1373,8 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
         gate_json = evaluate_gate(
             candidate_id, float(utility_before), float(utility_after),
             pertask_json,
-            control_n=probe_result.get("control_n", 1) if probe_result else 1)
+            control_n=probe_result.get("control_n", 1) if probe_result else 1,
+            task_class=task_class, db=db)
         gate = json.loads(gate_json)
         gate_decision = gate["decision"]
         gate_rationale = gate["rationale"]
