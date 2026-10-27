@@ -240,6 +240,25 @@ def next_stems(probes_dir: str, count: int) -> list[str]:
     return [f"{PROBE_STEM_PREFIX}{index:02d}" for index in range(start, start + count)]
 
 
+def _test_needles(candidate: dict) -> list[str]:
+    """Strings that would name the hidden tests in visible probe text.
+
+    Each test id (``<module>::<name>``) contributes itself, its function name and
+    its dotted module; each hidden test file contributes its path, basename and
+    stem. Over-redaction of a short name is acceptable: the probe text must not
+    point the solver at the oracle.
+    """
+    out: list[str] = []
+    for test_id in [*candidate.get("fail_to_pass", []), *candidate.get("pass_to_pass", [])]:
+        out.append(test_id)
+        module, _, name = test_id.rpartition("::")
+        out.extend([module, name])
+    for path in candidate.get("test_files", []):
+        base = path.rsplit("/", 1)[-1]
+        out.extend([path, base, base[:-3] if base.endswith(".py") else base])
+    return out
+
+
 def _scrub(text: str, candidate: dict) -> str:
     needles = [
         candidate["task_id"],
@@ -247,7 +266,7 @@ def _scrub(text: str, candidate: dict) -> str:
         candidate["base_sha"],
         candidate["fix_sha"][:10],
         candidate["base_sha"][:10],
-        *candidate.get("test_files", []),
+        *_test_needles(candidate),
     ]
     for needle in sorted({n for n in needles if n}, key=len, reverse=True):
         text = text.replace(needle, "[hidden]")
