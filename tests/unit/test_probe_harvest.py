@@ -170,7 +170,7 @@ class FakeDiagnose:
 
 def test_constants():
     assert probe_harvest.HARVESTER == "probe_harvest@1"
-    assert probe_harvest.SUPPORTED_RECIPES == ("code-fix",)
+    assert probe_harvest.SUPPORTED_RECIPES == ("code-fix", "framework-edit")
     assert probe_harvest.DEFAULT_MAX_NEW == 12
     assert probe_harvest.MAX_PER_CLUSTER == 6
     assert probe_harvest.HOLDOUT_FRACTION == 0.25

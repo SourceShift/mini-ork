@@ -23,13 +23,20 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 HARVESTER = "probe_harvest@1"
-SUPPORTED_RECIPES = ("code-fix",)
+
+
+SUPPORTED_RECIPES = ("code-fix", "framework-edit")
+MAX_SRC_FILES = 12
+DEFAULT_LANDING_REF = "origin/main"
+KICKOFF_TEST_RE = re.compile(r"(tests/(?:[\w-]+/)*test_\w+\.py)")
 DEFAULT_MAX_NEW = 12
 MAX_PER_CLUSTER = 6
 HOLDOUT_FRACTION = 0.25
@@ -259,15 +266,16 @@ def _test_needles(candidate: dict) -> list[str]:
     return out
 
 
-def _scrub(text: str, candidate: dict) -> str:
+def _scrub(text: str, candidate: dict, *, hide_tests: bool = True) -> str:
     needles = [
         candidate["task_id"],
         candidate["fix_sha"],
         candidate["base_sha"],
         candidate["fix_sha"][:10],
         candidate["base_sha"][:10],
-        *_test_needles(candidate),
     ]
+    if hide_tests:
+        needles.extend(_test_needles(candidate))
     for needle in sorted({n for n in needles if n}, key=len, reverse=True):
         text = text.replace(needle, "[hidden]")
     return text
@@ -282,19 +290,33 @@ def render_probe(
         frontmatter += "holdout: true\n"
     frontmatter += "---\n"
 
-    problem = _scrub(candidate["problem_statement"], candidate)
-    files = "".join(f"- {path}\n" for path in candidate["src_files"])
+    if candidate["source"] == "failed-run":
+        # A failed-run candidate IS already a kickoff. Its text is kept
+        # verbatim (test paths included — the grader overlays those same
+        # paths), so no Problem/Files/DoD scaffolding is synthesized.
+        body = _scrub(
+            candidate["problem_statement"], candidate, hide_tests=False
+        )
+        markdown = (
+            frontmatter
+            + f"# Frozen probe {stem} — {recipe} harvested task\n\n"
+            + _FROZEN_PARAGRAPH
+            + body
+        )
+    else:
+        problem = _scrub(candidate["problem_statement"], candidate)
+        files = "".join(f"- {path}\n" for path in candidate["src_files"])
 
-    markdown = (
-        frontmatter
-        + f"# Frozen probe {stem} — {recipe} harvested task\n\n"
-        + _FROZEN_PARAGRAPH
-        + f"## Problem\n\n{problem}\n\n"
-        + f"## Files in scope\n\n{files}\n"
-        + "## Definition of Done\n\n"
-        + "Fix the behaviour described above so the repository state at HEAD "
-        + "satisfies the spec.\n"
-    )
+        markdown = (
+            frontmatter
+            + f"# Frozen probe {stem} — {recipe} harvested task\n\n"
+            + _FROZEN_PARAGRAPH
+            + f"## Problem\n\n{problem}\n\n"
+            + f"## Files in scope\n\n{files}\n"
+            + "## Definition of Done\n\n"
+            + "Fix the behaviour described above so the repository state at HEAD "
+            + "satisfies the spec.\n"
+        )
 
     oracle = {
         "schema": 1,
@@ -396,6 +418,290 @@ def load_code_fix_inputs(
     return list(manifest), baseline, diagnoses
 
 
+def _git_ok(root: str, *args: str) -> bool:
+    """True when ``git -C root <args>`` exits zero (output discarded)."""
+    return subprocess.run(
+        ["git", "-C", root, *args], capture_output=True
+    ).returncode == 0
+
+
+def _git_out(root: str, *args: str) -> str | None:
+    """``git -C root <args>`` stdout as text, or ``None`` on a non-zero exit."""
+    proc = subprocess.run(
+        ["git", "-C", root, *args], capture_output=True, text=True
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _git_blob(root: str, spec: str) -> bytes | None:
+    """The bytes of ``<spec>`` (``<rev>:<path>``), or ``None`` if it is absent."""
+    proc = subprocess.run(
+        ["git", "-C", root, "show", spec], capture_output=True
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def validate_candidate(
+    candidate: dict, *, root: str, timeout: float = 600.0
+) -> tuple[bool, str, dict]:
+    """Re-check a candidate as fail-on-base, pass-on-fix in the local repo.
+
+    A probe mined months ago under another interpreter is not evidence today:
+    every candidate is re-graded here, and only a real fail-to-pass flip is
+    accepted. Any tree this creates is removed in a ``finally``.
+    """
+    from mini_ork.learning import probe_scorer
+
+    trees: list[str] = []
+    try:
+        try:
+            base = probe_scorer.materialize_git_tree(
+                candidate["base_sha"], root=root
+            )
+        except RuntimeError:
+            return False, "archive-failed", candidate
+        trees.append(base)
+
+        for path in candidate["test_files"]:
+            # A test path is written into the scratch tree: it must stay there.
+            parts = Path(path).parts
+            if os.path.isabs(path) or not parts or ".." in parts:
+                return False, "unsafe-test-path", candidate
+            blob = _git_blob(root, f"{candidate['fix_sha']}:{path}")
+            if blob is None:
+                return False, "fix-missing-test", candidate
+            target = os.path.join(base, path)
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(target, "wb") as fh:
+                fh.write(blob)
+
+        base_report = probe_scorer.run_pytest_junit(
+            base, candidate["test_files"], timeout=timeout
+        )
+        if base_report is None:
+            return False, "base-no-report", candidate
+
+        try:
+            fix = probe_scorer.materialize_git_tree(
+                candidate["fix_sha"], root=root
+            )
+        except RuntimeError:
+            return False, "archive-failed", candidate
+        trees.append(fix)
+
+        fix_report = probe_scorer.run_pytest_junit(
+            fix, candidate["test_files"], timeout=timeout
+        )
+        if fix_report is None:
+            return False, "fix-no-report", candidate
+
+        broken = sorted(
+            test_id
+            for test_id, outcome in fix_report.items()
+            if outcome in ("failed", "error")
+        )
+        if broken:
+            return False, f"fix-not-green:{len(broken)}", candidate
+
+        fail_to_pass = sorted(
+            test_id
+            for test_id, outcome in fix_report.items()
+            if outcome == "passed" and base_report.get(test_id) != "passed"
+        )
+        if not fail_to_pass:
+            return False, "no-fail-to-pass", candidate
+
+        pass_to_pass = sorted(
+            test_id
+            for test_id, outcome in fix_report.items()
+            if outcome == "passed" and base_report.get(test_id) == "passed"
+        )
+        return True, "", {
+            **candidate,
+            "fail_to_pass": fail_to_pass,
+            "pass_to_pass": pass_to_pass,
+        }
+    finally:
+        for tree in trees:
+            shutil.rmtree(tree, ignore_errors=True)
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Drop a leading YAML ``---`` block; text without one is untouched."""
+    match = re.match(r"---\n.*?\n---\n", text, re.S)
+    return text[match.end():] if match else text
+
+
+def failed_run_candidates(
+    home: str, root: str, *, landing_ref: str = DEFAULT_LANDING_REF
+) -> tuple[list[dict], list[dict]]:
+    """Candidates from failed framework-edit runs that landed a named test.
+
+    A run's pre-impl fixture names the base it started from; the kickoff names
+    the test file its spec-test author was to write. When that file landed on
+    ``landing_ref``, the landing commit's first parent is the base and the
+    landing commit itself is the fix — a ready-made git oracle. Runs sharing a
+    landing commit merge into one candidate. The first rule that fires gives the
+    rejection reason, so the order is load-bearing.
+    """
+    state_db = os.path.join(home, "state.db")
+    if not os.path.exists(state_db):
+        return [], []
+
+    # Local import so a monkeypatched ``diagnose`` is seen at call time.
+    from mini_ork.recovery import diagnose as _dg
+
+    conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT id, kickoff_path, created_at FROM task_runs"
+            " WHERE recipe = 'framework-edit' AND status = 'failed'"
+            " ORDER BY created_at, id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    candidates: list[dict] = []
+    by_fix_sha: dict[str, dict] = {}
+    rejections: list[dict] = []
+
+    for run_id, kickoff_path, _created_at in rows:
+        def reject(reason: str) -> None:
+            rejections.append({"task_id": run_id, "reason": reason})
+
+        manifest_path = os.path.join(
+            home, "runs", run_id, "pre-impl-fixture", "MANIFEST.json"
+        )
+        try:
+            with open(manifest_path, encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError):
+            reject("no-pre-impl-fixture")
+            continue
+        if not isinstance(manifest, dict):
+            reject("no-pre-impl-fixture")
+            continue
+
+        baseline_ref = manifest.get("baseline_ref")
+        if (
+            not isinstance(baseline_ref, str)
+            or not baseline_ref
+            or baseline_ref.startswith("-")
+            or not _git_ok(root, "cat-file", "-e", f"{baseline_ref}^{{commit}}")
+        ):
+            reject("baseline-unreachable")
+            continue
+
+        diagnosis = _dg.diagnose(Path(home), run_id, write=False)
+        if diagnosis.get("layer") != "change":
+            reject(f"layer:{diagnosis.get('layer')}")
+            continue
+
+        kickoff_group = None
+        match = re.search(
+            r"(?:^|/)(kickoffs/.*\.md)$", kickoff_path or ""
+        )
+        if match:
+            kickoff_group = match.group(1)
+
+        text = None
+        if kickoff_path and os.path.isfile(kickoff_path):
+            try:
+                with open(kickoff_path, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError:
+                text = None
+        elif kickoff_group:
+            blob = _git_blob(root, f"{baseline_ref}:{kickoff_group}")
+            if blob is not None:
+                text = blob.decode("utf-8", "replace")
+        if text is None:
+            reject("kickoff-unrecoverable")
+            continue
+
+        named_tests = sorted(set(KICKOFF_TEST_RE.findall(text)))
+        if not named_tests:
+            reject("no-test-named")
+            continue
+
+        landed: list[tuple[str, str]] = []
+        for test_path in named_tests:
+            if _git_ok(root, "cat-file", "-e", f"{baseline_ref}:{test_path}"):
+                continue
+            if not _git_ok(root, "cat-file", "-e", f"{landing_ref}:{test_path}"):
+                continue
+            log = _git_out(
+                root, "log", "--diff-filter=A", "--format=%H",
+                landing_ref, "--", test_path,
+            )
+            adds = [line for line in (log or "").splitlines() if line.strip()]
+            if adds:
+                # ``git log`` is newest-first; the landing commit is the
+                # OLDEST add, i.e. the last line.
+                landed.append((test_path, adds[-1]))
+        if not landed:
+            reject("test-not-landed")
+            continue
+
+        fix_sha = landed[0][1]
+        test_files = sorted(
+            test_path for test_path, add in landed if add == fix_sha
+        )
+
+        base_text = _git_out(root, "rev-parse", f"{fix_sha}^1")
+        if base_text is None:
+            reject("no-parent")
+            continue
+        base_sha = base_text.strip()
+
+        diff = _git_out(root, "diff", "--name-only", base_sha, fix_sha) or ""
+        src_files = sorted(
+            path for path in diff.splitlines()
+            if path and not re.search(r"(^|/)tests/", path)
+        )
+        if len(src_files) > MAX_SRC_FILES:
+            reject("landing-too-broad")
+            continue
+
+        # The kickoff that LANDED wins: the run's on-disk copy may predate the
+        # edit that shipped with the fix.
+        if kickoff_group:
+            blob = _git_blob(root, f"{fix_sha}:{kickoff_group}")
+            if blob is not None:
+                text = blob.decode("utf-8", "replace")
+        problem_statement = _strip_frontmatter(text)
+
+        candidate = {
+            "task_id": f"fe-{fix_sha[:10]}",
+            "source": "failed-run",
+            "base_sha": base_sha,
+            "fix_sha": fix_sha,
+            "test_files": test_files,
+            "src_files": src_files,
+            "problem_statement": problem_statement,
+            "cluster": cluster_key(diagnosis),
+            "baseline_outcome": 0.0,
+            "baseline_source": "task_runs.status=failed",
+            "holdout": is_holdout(fix_sha),
+            "run_ids": [run_id],
+            "fail_to_pass": [],
+            "pass_to_pass": [],
+        }
+
+        if fix_sha in by_fix_sha:
+            merged = by_fix_sha[fix_sha]
+            merged["run_ids"] = sorted(set(merged["run_ids"]) | {run_id})
+            merged["cluster"] = candidate["cluster"]
+            merged["problem_statement"] = candidate["problem_statement"]
+        else:
+            by_fix_sha[fix_sha] = candidate
+            candidates.append(candidate)
+
+    return candidates, rejections
+
+
 def _count_md(probes_dir: str) -> int:
     if not os.path.isdir(probes_dir):
         return 0
@@ -432,6 +738,7 @@ def harvest(
     write: bool = False,
     now: str | None = None,
     validate_fn=None,
+    landing_ref: str = DEFAULT_LANDING_REF,
 ) -> dict:
     """Harvest candidates for ``recipe`` and (optionally) write them.
 
@@ -441,8 +748,17 @@ def harvest(
         raise ValueError(f"unsupported recipe {recipe!r}")
 
     probes_dir = os.path.join(root, "recipes", recipe, "probes")
-    manifest, baseline, diagnoses = load_code_fix_inputs(root, home)
-    candidates, mined_rejected = mined_candidates(manifest, baseline, diagnoses)
+    if recipe == "framework-edit":
+        candidates, mined_rejected = failed_run_candidates(
+            home, root, landing_ref=landing_ref
+        )
+        diagnoses_available = os.path.exists(os.path.join(home, "state.db"))
+    else:
+        manifest, baseline, diagnoses = load_code_fix_inputs(root, home)
+        candidates, mined_rejected = mined_candidates(
+            manifest, baseline, diagnoses
+        )
+        diagnoses_available = bool(diagnoses)
     n_candidates = len(candidates)
 
     existing = existing_fix_shas(probes_dir)
@@ -517,7 +833,7 @@ def harvest(
         "rejected": rejected,
         "n_admitted_gate": sum(1 for c in admitted if not c["holdout"]),
         "n_admitted_holdout": sum(1 for c in admitted if c["holdout"]),
-        "diagnoses_available": bool(diagnoses),
+        "diagnoses_available": diagnoses_available,
         "written": written,
     }
 
@@ -533,6 +849,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=None)
     parser.add_argument("--home", default=None)
     parser.add_argument("--report", default=None)
+    parser.add_argument("--landing-ref", default=DEFAULT_LANDING_REF)
+    parser.add_argument("--no-validate", action="store_true")
+    parser.add_argument("--grade-timeout", type=float, default=600.0)
     args = parser.parse_args(argv)
 
     root = args.root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -542,12 +861,20 @@ def main(argv: list[str] | None = None) -> int:
         or os.path.join(root, ".mini-ork")
     )
 
+    validate_fn = None
+    if not args.no_validate:
+        validate_fn = lambda candidate: validate_candidate(  # noqa: E731
+            candidate, root=root, timeout=args.grade_timeout
+        )
+
     report = harvest(
         args.recipe,
         root=root,
         home=home,
         max_new=args.max_new,
         write=args.write,
+        landing_ref=args.landing_ref,
+        validate_fn=validate_fn,
     )
     payload = json.dumps(report)
     print(payload)
