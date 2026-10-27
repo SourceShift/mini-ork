@@ -318,6 +318,34 @@ def _parse_llm_output(raw: str, trace_id: str) -> list[dict[str, Any]]:
     return normalized
 
 
+_DEFAULT_TIMEOUT_S = 300
+
+
+def _timeout_s() -> int:
+    """Resolve the gradient-extraction dispatch timeout in seconds.
+
+    An unset or empty ``MINI_ORK_GRADIENT_TIMEOUT_S`` takes the default. A
+    positive integer overrides it. Anything else — non-numeric, zero, negative
+    — falls back to the default and warns on stderr (one line per dispatch),
+    so a typo can never silently remove the timeout.
+    """
+    raw = os.environ.get("MINI_ORK_GRADIENT_TIMEOUT_S", "")
+    if not raw:
+        return _DEFAULT_TIMEOUT_S
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        print(
+            f"[gradient] MINI_ORK_GRADIENT_TIMEOUT_S={raw} is not a positive "
+            f"integer; using {_DEFAULT_TIMEOUT_S}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_TIMEOUT_S
+    return value
+
+
 def _default_dispatch(
     prompt: str,
     *,
@@ -342,7 +370,7 @@ def _default_dispatch(
         "--model", lane,
         "--node-type", "gradient-extract",
         "--prompt-text", prompt,
-        "--timeout", "120",
+        "--timeout", str(_timeout_s()),
         "--max-turns", "5",
     ]
     try:

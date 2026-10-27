@@ -290,7 +290,7 @@ def test_extract_default_uses_native_dispatch(db, monkeypatch):
     argv, root, seen_marker = calls[0]
     assert root == "/engine" and seen_marker is marker
     assert argv[:4] == ["--model", "glm_current", "--node-type", "gradient-extract"]
-    assert argv[-4:] == ["--timeout", "120", "--max-turns", "5"]
+    assert argv[-4:] == ["--timeout", "300", "--max-turns", "5"]
     assert "<<<TRACE_JSON>>>" not in argv[argv.index("--prompt-text") + 1]
 
 
@@ -465,3 +465,79 @@ def test_default_dispatch_reset_runs_before_rc_zero_path(db, monkeypatch):
     )
     assert rc == 0
     assert ge._last_dispatch_error == ""
+
+
+# --- Gradient extraction timeout (bif-g1) -----------------------------------
+#
+# The dispatch cap was a hard-coded 120 s, which crowded the measured p95 of
+# 113 s and timed out 20-35% of extractions per day. It is now configurable via
+# MINI_ORK_GRADIENT_TIMEOUT_S, defaulting to 300 s. An unusable value must fall
+# back to the default *with* a warning, never to an uncapped dispatch.
+
+
+def _record_native_dispatch(monkeypatch):
+    """Replace the native dispatcher with one that records argv and returns 0."""
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
+
+    calls: list[list[str]] = []
+
+    def fake(argv, *, root, dispatch_fn):
+        calls.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake)
+    monkeypatch.setenv("MINI_ORK_GRADIENT_MODEL", "codex")
+    return calls
+
+
+def _flag_value(argv: list[str], flag: str) -> str:
+    indices = [i for i, tok in enumerate(argv) if tok == flag]
+    assert len(indices) == 1, f"expected exactly one {flag}, argv={argv!r}"
+    return argv[indices[0] + 1]
+
+
+def test_gradient_timeout_default_is_300(monkeypatch):
+    monkeypatch.delenv("MINI_ORK_GRADIENT_TIMEOUT_S", raising=False)
+    calls = _record_native_dispatch(monkeypatch)
+
+    rc, _ = ge._default_dispatch("say ok", repo_root="/engine")
+
+    assert rc == 0 and len(calls) == 1
+    assert _flag_value(calls[0], "--timeout") == "300"
+    assert _flag_value(calls[0], "--max-turns") == "5"
+    assert _flag_value(calls[0], "--node-type") == "gradient-extract"
+
+
+def test_gradient_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("MINI_ORK_GRADIENT_TIMEOUT_S", "450")
+    calls = _record_native_dispatch(monkeypatch)
+
+    ge._default_dispatch("say ok", repo_root="/engine")
+
+    assert _flag_value(calls[0], "--timeout") == "450"
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-5"])
+def test_gradient_timeout_invalid_falls_back_with_warning(monkeypatch, capsys, raw):
+    monkeypatch.setenv("MINI_ORK_GRADIENT_TIMEOUT_S", raw)
+    calls = _record_native_dispatch(monkeypatch)
+    capsys.readouterr()  # discard any earlier output
+
+    ge._default_dispatch("say ok", repo_root="/engine")
+
+    assert _flag_value(calls[0], "--timeout") == "300"
+    # An unusable value must never remove the cap: it stays a positive integer.
+    assert _flag_value(calls[0], "--timeout").isdigit()
+    err = capsys.readouterr().err
+    assert (
+        f"[gradient] MINI_ORK_GRADIENT_TIMEOUT_S={raw} is not a positive "
+        f"integer; using 300" in err
+    ), f"stderr={err!r}"
+
+
+def test_gradient_timeout_empty_uses_default_without_warning(monkeypatch, capsys):
+    monkeypatch.setenv("MINI_ORK_GRADIENT_TIMEOUT_S", "")
+    capsys.readouterr()
+
+    assert ge._timeout_s() == 300
+    assert capsys.readouterr().err == ""
