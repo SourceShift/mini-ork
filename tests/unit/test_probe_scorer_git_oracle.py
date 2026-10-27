@@ -608,9 +608,13 @@ def test_run_pytest_junit_invocation_contract(tmp_path, monkeypatch):
     assert got is None  # no junit.xml was ever written
     cmd = captured["cmd"]
     assert cmd[0] == sys.executable
-    assert cmd[1:6] == ["-m", "pytest", "-q", "-p", "no:cacheprovider"]
-    assert cmd[6].startswith("--junitxml=")
-    assert cmd[7:] == test_files
+    # Isolated bootstrap: -I keeps cwd/PYTHONPATH off sys.path and pytest is
+    # imported before the target tree is inserted (review fix 4b5a74d5).
+    assert cmd[1:5] == ["-I", "-B", "-c", ps._PYTEST_BOOTSTRAP]
+    assert cmd[5] == str(tgt)
+    assert cmd[6:9] == ["-q", "-p", "no:cacheprovider"]
+    assert cmd[9].startswith("--junitxml=")
+    assert cmd[10:] == test_files
     kwargs = captured["kwargs"]
     assert kwargs.get("cwd") == str(tgt)
     assert kwargs.get("capture_output") is True
@@ -721,6 +725,71 @@ def test_grade_fails_closed_when_target_is_not_a_repo(git_root, tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     assert ps._grade_git_oracle(str(plain), _sidecar(root)) is False
+
+
+_FORGE_PYTEST = (
+    "import sys\n"
+    "def main(args=None):\n"
+    "    args = list(args if args is not None else sys.argv[1:])\n"
+    "    report = [a.split('=', 1)[1] for a in args if a.startswith('--junitxml=')][0]\n"
+    "    open(report, 'w').write(\n"
+    "        '<testsuites><testsuite>'\n"
+    "        '<testcase classname=\"tests.test_calc\" name=\"test_add\"/>'\n"
+    "        '<testcase classname=\"tests.test_calc\" name=\"test_add_zero\"/>'\n"
+    "        '</testsuite></testsuites>')\n"
+    "    return 0\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main())\n"
+)
+
+
+def test_grade_ignores_a_solver_pytest_module(git_root, monkeypatch, tmp_path):
+    # Review fix (4b5a74d5 / 7e112f41): a solver-planted top-level pytest.py must
+    # never stand in for the runner and write a forged all-pass report.
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    (t / "pytest.py").write_text(_FORGE_PYTEST)
+    assert ps._grade_git_oracle(str(t), _sidecar(root)) is False
+
+
+def test_shadows_runtime_rule(git_root, monkeypatch, tmp_path):
+    root, base_sha, _ = git_root
+    tree = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    # A real base snapshot already has its tests/ directory; a NEW top-level
+    # `tests` package would itself be judged as a possible shadow.
+    (tree / "tests").mkdir()
+    hidden = {"tests"}
+    assert ps._shadows_runtime("pytest.py", str(tree), hidden) is True
+    assert ps._shadows_runtime("json.py", str(tree), hidden) is True
+    assert ps._shadows_runtime("pluggy/__init__.py", str(tree), hidden) is True
+    assert ps._shadows_runtime("tests/json.py", str(tree), hidden) is True
+    # The project's own module (present in the base snapshot) is kept, and so
+    # is a new module name nothing else provides.
+    assert ps._shadows_runtime("calc.py", str(tree), hidden) is False
+    assert ps._shadows_runtime("calc_helpers_zz.py", str(tree), hidden) is False
+    assert ps._shadows_runtime("tests/helpers_zz.py", str(tree), hidden) is False
+
+
+_TAMPER_CALC = (
+    "import _pytest.reports\n"
+    "_orig = _pytest.reports.TestReport.from_item_and_call\n"
+    "def _forged(item, call):\n"
+    "    rep = _orig(item, call)\n"
+    "    rep.outcome = 'passed'\n"
+    "    return rep\n"
+    "_pytest.reports.TestReport.from_item_and_call = staticmethod(_forged)\n"
+    "def add(a, b):\n"
+    "    return a - b\n"
+)
+
+
+def test_grade_fails_closed_on_in_process_harness_tampering(git_root, monkeypatch, tmp_path):
+    # The hidden tests import the solver's modules inside pytest; a module that
+    # patches pytest's reports at import time must not grade as a pass.
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    (t / "calc.py").write_text(_TAMPER_CALC)
+    assert ps._grade_git_oracle(str(t), _sidecar(root)) is False
 
 
 def test_grade_missing_test_file_returns_false(git_root, monkeypatch, tmp_path):

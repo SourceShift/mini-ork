@@ -770,6 +770,18 @@ def _make_target_repo(dst: str) -> None:
         )
 
 
+# The grading runner. `python -I` keeps the working directory and PYTHONPATH off
+# sys.path, and pytest (with pluggy and _pytest) is imported BEFORE the target
+# tree is inserted, so a module the solver planted (a fake `pytest.py`) can never
+# stand in for the runner. `-B` replaces PYTHONDONTWRITEBYTECODE, which -I ignores.
+_PYTEST_BOOTSTRAP = (
+    "import sys\n"
+    "import pytest\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "sys.exit(pytest.main(sys.argv[2:]))\n"
+)
+
+
 def run_pytest_junit(target: str, test_files: list[str], *,
                      timeout: float) -> dict[str, str] | None:
     """Run ``test_files`` inside ``target`` and return ``{id: outcome}``.
@@ -792,8 +804,9 @@ def run_pytest_junit(target: str, test_files: list[str], *,
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         try:
             subprocess.run(
-                [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                 f"--junitxml={report}", *test_files],
+                [sys.executable, "-I", "-B", "-c", _PYTEST_BOOTSTRAP, target,
+                 "-q", "-p", "no:cacheprovider", f"--junitxml={report}",
+                 *test_files],
                 cwd=target, capture_output=True, timeout=timeout, env=env,
             )
         except subprocess.TimeoutExpired:
@@ -840,6 +853,37 @@ def _grade_protected(rel: str, hidden_dirs: set[str]) -> bool:
     return base == "__init__.py" and os.path.dirname(rel) in hidden_dirs
 
 
+def _shadows_runtime(rel: str, tree: str, hidden_dirs: set[str]) -> bool:
+    """Whether a solver path would add a module that shadows the runtime.
+
+    Two places reach sys.path during grading: the tree root, and (pytest's
+    default import mode) each hidden test's directory. A NEW top-level name in
+    either place that matches a stdlib module or anything importable in this
+    interpreter (pytest, pluggy, an installed package) could replace that module
+    for the test run, so it stays out. Names that already exist in the base
+    snapshot are the project's own and are kept.
+    """
+    import importlib.util
+
+    homes = [""] + sorted(d for d in hidden_dirs if d and rel.startswith(d + "/"))
+    for home in homes:
+        rest = rel[len(home) + 1:] if home else rel
+        seg = rest.split("/", 1)[0]
+        if not seg or os.path.lexists(os.path.join(tree, home, seg)):
+            continue
+        name = seg[:-3] if seg.endswith(".py") else seg
+        if not name.isidentifier():
+            continue
+        if name in getattr(sys, "stdlib_module_names", ()):
+            return True
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return True
+        except (ImportError, ValueError):
+            return True
+    return False
+
+
 def _solver_changes(target: str) -> tuple[list[str], list[str]] | None:
     """``(changed_or_new, deleted)`` paths in the solver's tree vs its first commit.
 
@@ -866,6 +910,40 @@ def _solver_changes(target: str) -> tuple[list[str], list[str]] | None:
     return sorted(set(changed) | set(untracked)), sorted(set(deleted))
 
 
+def _solver_games_the_harness(tree: str) -> bool:
+    """Whether the solver's code, as copied into the grading tree, reaches into
+    the test harness.
+
+    The hidden tests import the solver's modules inside the pytest process, so
+    code that probes or patches pytest at import time could forge results that
+    no file-level guard sees. ``mini_ork.verify.gaming_scan`` checks the diff the
+    snapshot will actually run (base → base + solver files) for those patterns
+    (pytest/_pytest probes, MonkeyPatch, frame inspection, writes on imported
+    modules); any finding, or a diff that cannot be produced, fails closed.
+    """
+    from mini_ork.verify import gaming_scan
+
+    add = subprocess.run(["git", "-C", tree, "add", "-A"], capture_output=True)
+    if add.returncode != 0:
+        return True
+    diff = subprocess.run(["git", "-C", tree, "diff", "--cached", "--no-renames"],
+                          capture_output=True, text=True)
+    if diff.returncode != 0:
+        return True
+
+    def _read(rel: str) -> str | None:
+        try:
+            with open(os.path.join(tree, rel), encoding="utf-8") as fh:
+                return fh.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    try:
+        return bool(gaming_scan.scan_diff(diff.stdout, read_file=_read))
+    except Exception:  # noqa: BLE001 — a scan that cannot run is a fail
+        return True
+
+
 def _inside_tree(tree: str, rel: str) -> str | None:
     """``tree/rel`` when its parent resolves inside ``tree``, else None."""
     dest = os.path.join(tree, rel)
@@ -887,9 +965,12 @@ def _grade_git_oracle(target: str, oracle: dict, *,
     2. the solver's changed regular files are copied in, except the protected
        ones (``_grade_protected``: conftest/pytest/tox/setup/pyproject config,
        site/usercustomize, ``.pth`` files, the solver's own tests); symlinks are
-       never followed or copied, and solver deletions are replayed;
-    3. the hidden test files from ``fix_sha`` are overlaid;
-    4. pytest runs there, and the snapshot is removed.
+       never followed or copied, new modules that would shadow the runtime
+       (``_shadows_runtime``) are dropped, and solver deletions are replayed;
+    3. the solver's diff is screened by ``mini_ork.verify.gaming_scan``
+       (code that probes or patches the harness in-process fails closed);
+    4. the hidden test files from ``fix_sha`` are overlaid;
+    5. pytest runs there, and the snapshot is removed.
 
     The solver's tree is left untouched. Any failure to build the grading tree
     fails closed (``False``).
@@ -915,7 +996,8 @@ def _grade_git_oracle(target: str, oracle: dict, *,
         return False
     try:
         for rel in changed:
-            if rel in hidden or _grade_protected(rel, hidden_dirs):
+            if (rel in hidden or _grade_protected(rel, hidden_dirs)
+                    or _shadows_runtime(rel, tree, hidden_dirs)):
                 continue
             src = os.path.join(target, rel)
             if os.path.islink(src) or not os.path.isfile(src):
@@ -933,6 +1015,8 @@ def _grade_git_oracle(target: str, oracle: dict, *,
             dest = _inside_tree(tree, rel)
             if dest is not None and os.path.isfile(dest) and not os.path.islink(dest):
                 os.unlink(dest)
+        if _solver_games_the_harness(tree):
+            return False
         for rel, blob in hidden.items():
             dest = _inside_tree(tree, rel)
             if dest is None:
