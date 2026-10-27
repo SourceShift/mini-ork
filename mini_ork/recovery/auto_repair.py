@@ -962,6 +962,7 @@ def _failing_verifier_sections(run_dir: Path) -> list[str]:
     """One section per failing verifier: checks + the real captured error text."""
     from mini_ork.cli import execute as execute_mod
     from mini_ork.verify import levels as _levels  # noqa: PLC0415
+    from mini_ork.verify.check_log import failing_sections  # noqa: PLC0415
 
     sections: list[str] = []
     for path in sorted(run_dir.glob("verifier_*.json")):
@@ -983,50 +984,73 @@ def _failing_verifier_sections(run_dir: Path) -> list[str]:
         summary = data.get("error_summary") or data.get("reason") or data.get("reasons")
         if summary:
             lines.append(f"error summary: {summary}")
-        checks = data.get("failed_checks") or data.get("checks")
+        # ``failed_checks`` is a list of check NAMES in the artifacts this
+        # reads; only ``checks`` holds the dicts. Treating the name list as
+        # the dict list skipped every entry as a non-dict, so the round never
+        # named the failing check and fell back to the log's error-shaped
+        # lines (a passing check's by-design failures among them).
+        raw_names = data.get("failed_checks")
+        failed_names = [name for name in raw_names if isinstance(name, str)] \
+            if isinstance(raw_names, list) else []
+        checks = data.get("checks")
         if isinstance(checks, list):
             for c in checks:
                 if not isinstance(c, dict):
                     continue
-                if not (c.get("pass") is False or str(c.get("status") or "").upper() in ("FAIL", "REFUTED")):
+                cid = c.get("id") or c.get("name")
+                if not (c.get("pass") is False
+                        or str(c.get("status") or "").upper() in ("FAIL", "REFUTED")
+                        or (cid is not None and cid in failed_names)):
                     continue
-                cid = c.get("id") or c.get("name") or "check"
-                lines.append(f"failing check: {cid}")
+                lines.append(f"failing check: {cid or 'check'}")
                 log = c.get("log") or c.get("output")
                 if isinstance(log, str) and log.strip():
                     lines.extend(log.splitlines()[:8])
-        real = []
         declared = _declared_evidence_path(data, run_dir)
         logs = list(execute_mod._verifier_log_candidates(str(run_dir), stem))
         if declared:
             # The verifier's declared log is the tool output; a stem-derived
             # sibling may be only a summary of it. Prefer the declaration.
             logs = [declared] + [path for path in logs if path != declared]
+        # Lead with the FAILED checks' own sections; a passing check's lines
+        # (a forward apply-check fails by design) must never reach the round.
+        failing_lines: list[str] = []
+        failing_log = ""
         for candidate in logs:
-            real = _real_error_lines(candidate)
-            if real:
-                lines.append(f"verifier errors ({os.path.basename(candidate)}):")
-                lines.extend(real)
+            failing_lines = failing_sections(candidate, failed_names or None)
+            if failing_lines:
+                failing_log = candidate
                 break
-        if not real:
-            shown, tail = _log_tail(logs)
-            if tail:
-                # The log exists and has content, but no line is error-shaped:
-                # the command died before reaching source errors — a toolchain
-                # or environment wall. Saying "nothing was captured" here sent
-                # the implementer to re-run a command that cannot succeed, so
-                # the round made no progress and auto-repair gave up with "the
-                # same failure signature repeats" (run-1791821930-72687,
-                # 2026-10-12: the npm `EBADDEVENGINES` refusal sat unread in
-                # `evidence_path` while the round claimed no output existed).
-                lines.append(f"the verification command reported no source-level "
-                             f"error lines; raw tail of {os.path.basename(shown)}:")
-                lines.extend(tail)
-            else:
-                lines.append(
-                    "the build/test output was not captured; re-run the verification "
-                    "command first and read its errors"
-                )
+        if failing_lines:
+            lines.append(f"failing checks ({os.path.basename(failing_log)}):")
+            lines.extend(failing_lines)
+        else:
+            real = []
+            for candidate in logs:
+                real = _real_error_lines(candidate)
+                if real:
+                    lines.append(f"verifier errors ({os.path.basename(candidate)}):")
+                    lines.extend(real)
+                    break
+            if not real:
+                shown, tail = _log_tail(logs)
+                if tail:
+                    # The log exists and has content, but no line is error-shaped:
+                    # the command died before reaching source errors — a toolchain
+                    # or environment wall. Saying "nothing was captured" here sent
+                    # the implementer to re-run a command that cannot succeed, so
+                    # the round made no progress and auto-repair gave up with "the
+                    # same failure signature repeats" (run-1791821930-72687,
+                    # 2026-10-12: the npm `EBADDEVENGINES` refusal sat unread in
+                    # `evidence_path` while the round claimed no output existed).
+                    lines.append(f"the verification command reported no source-level "
+                                 f"error lines; raw tail of {os.path.basename(shown)}:")
+                    lines.extend(tail)
+                else:
+                    lines.append(
+                        "the build/test output was not captured; re-run the verification "
+                        "command first and read its errors"
+                    )
         sections.append("\n".join(lines))
     return sections
 

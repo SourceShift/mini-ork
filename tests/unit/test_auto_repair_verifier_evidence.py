@@ -142,3 +142,46 @@ def test_log_tail_reads_the_first_readable_file(tmp_path):
     path, tail = ar._log_tail([str(log)], max_lines=3)
     assert path == str(log)
     assert tail == ["line27", "line28", "line29"]
+
+
+_STATIC_CHECK_LOG = """\
+[ok-lint] files under mini_ork/ pass ruff F,E9
+  0 issues
+  ok
+[no-test-gaming] diff adds no test-harness detection or cross-module patching to production code
+  mini_ork/cli/execute_handlers.py:1715: pytest-env-probe: 'that detects a test run (PYTEST_CURRENT_TEST, ...'
+  mini_ork/cli/execute_handlers.py:1742: cross-module patch: monkeypatches mini_ork.gates.gate_registry
+  FAIL
+[diff-apply-check-clean] reverse apply of the diff is clean
+  error: patch failed: mini_ork/cli/execute_handlers.py: No such file or directory
+  ok
+"""
+
+
+def test_failing_static_check_is_named_and_its_lines_shown(tmp_path):
+    """``failed_checks`` is a list of NAMES; it must not shadow the ``checks``
+    dicts, and the FAILED section's own lines must lead — not a passing
+    check's by-design ``error: patch failed``."""
+    run_dir = tmp_path / "runs" / "run-static"
+    run_dir.mkdir(parents=True)
+    log = run_dir / "verifier-static-check.log"
+    log.write_text(_STATIC_CHECK_LOG, encoding="utf-8")
+    (run_dir / "verifier_static-check.json").write_text(json.dumps({
+        "pass": False,
+        "failed_checks": ["no-test-gaming"],
+        "evidence_path": str(log),
+        "checks": [
+            {"name": "no-test-gaming", "id": "no-test-gaming",
+             "pass": False, "status": "FAIL"},
+            {"name": "diff-apply-check-clean", "id": "diff-apply-check-clean",
+             "pass": True, "status": "ok"},
+        ],
+    }), encoding="utf-8")
+
+    section = ar._failing_verifier_sections(run_dir)[0]
+
+    assert "failing check: no-test-gaming" in section
+    assert "failing checks (verifier-static-check.log):" in section
+    assert "pytest-env-probe" in section
+    assert "patch failed" not in section
+    assert "failing check: diff-apply-check-clean" not in section

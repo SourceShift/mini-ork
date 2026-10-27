@@ -99,6 +99,7 @@ from mini_ork.recovery.condition import evaluate_condition
 from mini_ork.recovery.dag import CompiledRetryEdge
 from mini_ork.stores import revise_rounds
 from mini_ork.verify import levels as _levels
+from mini_ork.verify.check_log import failing_sections
 from mini_ork.workflow import review_ledger
 
 # Sentinel finish_reason set when a `retries` edge fires from its `condition:`
@@ -5292,12 +5293,21 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
             except OSError:
                 body = ""
         summary = ""
+        data = None
+        failed_check_names: list[str] | None = None
         if body:
             try:
                 data = json.loads(body)
             except Exception:
                 data = None
             if isinstance(data, dict):
+                # A name list is the check ids the verifier itself deemed
+                # failing; a non-string entry (some artifacts put dicts here)
+                # is no filter at all, not a filter nothing can match.
+                raw_names = data.get("failed_checks")
+                if (isinstance(raw_names, list) and raw_names
+                        and all(isinstance(name, str) for name in raw_names)):
+                    failed_check_names = raw_names
                 for key in ("error_summary", "reasons", "failed_checks", "verdict"):
                     value = data.get(key)
                     if value:
@@ -5338,22 +5348,38 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
         # needs. A round file carrying only the JSON verdict ("post-patch
         # failing; see log") makes the next attempt fix blind (issue #13), so
         # pull the real diagnostics from whichever log convention this run used.
+        #
+        # A sectioned static-check log leads with the FAILED checks: the
+        # log's error-shaped lines include a passing check's by-design failures
+        # (the forward apply-check), which sent three repair rounds to fix a
+        # check that had passed. Verdict-first selection beats text heuristics.
         candidates = _verifier_log_candidates(run_dir, stem)
+        failing_lines: list[str] = []
+        failing_log = ""
         for candidate in candidates:
-            errors = _error_lines(candidate)
-            if errors:
-                lines.append(f"verifier errors ({os.path.basename(candidate)}):")
-                lines.extend(errors)
+            failing_lines = failing_sections(candidate, failed_check_names)
+            if failing_lines:
+                failing_log = candidate
                 break
+        if failing_lines:
+            lines.append(f"failing checks ({os.path.basename(failing_log)}):")
+            lines.extend(failing_lines)
         else:
-            # No error-looking line: fall back to a bounded tail so a
-            # non-error diagnostic (e.g. a summary block) is still visible.
             for candidate in candidates:
-                tail = _tail_lines(candidate, 40)
-                if tail:
-                    lines.append(f"evidence tail ({os.path.basename(candidate)}):")
-                    lines.extend(line.rstrip("\n") for line in tail)
+                errors = _error_lines(candidate)
+                if errors:
+                    lines.append(f"verifier errors ({os.path.basename(candidate)}):")
+                    lines.extend(errors)
                     break
+            else:
+                # No error-looking line: fall back to a bounded tail so a
+                # non-error diagnostic (e.g. a summary block) is still visible.
+                for candidate in candidates:
+                    tail = _tail_lines(candidate, 40)
+                    if tail:
+                        lines.append(f"evidence tail ({os.path.basename(candidate)}):")
+                        lines.extend(line.rstrip("\n") for line in tail)
+                        break
     elif node_type == "reviewer":
         # A reviewer's evidence file depends on its node class (see
         # _reviewer_evidence_candidates); the first candidate that parses to a

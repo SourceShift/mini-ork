@@ -114,3 +114,40 @@ def test_falls_back_to_a_tail_when_no_error_lines(tmp_path):
     assert "evidence tail" in section
     assert "step 99 ok" in section            # the tail end
     assert "step 0 ok" not in section          # bounded, not the whole log
+
+
+# ``[<check-id>] <description>`` static-check log: one passing check, one
+# FAILED check, and a passing check whose body carries a by-design
+# ``error: patch failed`` line.
+_STATIC_CHECK_LOG = """\
+[ok-lint] files under mini_ork/ pass ruff F,E9
+  0 issues
+  ok
+[no-test-gaming] diff adds no test-harness detection or cross-module patching to production code
+  mini_ork/cli/execute_handlers.py:1715: pytest-env-probe: 'that detects a test run (PYTEST_CURRENT_TEST, ...'
+  FAIL
+[diff-apply-check-clean] reverse apply of the diff is clean
+  error: patch failed: mini_ork/cli/execute_handlers.py: No such file or directory
+  ok
+"""
+
+_STATIC_FIELD = ("static-check", "verifier")
+
+
+def test_revise_leads_with_the_failing_check_not_passing_check_noise(tmp_path):
+    """A static-check revise round surfaces the FAILED section's own lines and
+    never a passing check's error-shaped line."""
+    run_dir = _run_dir(tmp_path)
+    (run_dir / "verifier-static-check.log").write_text(_STATIC_CHECK_LOG)
+    (run_dir / "verifier_static-check.json").write_text(json.dumps({
+        "pass": False,
+        "failed_checks": ["no-test-gaming"],
+    }))
+
+    section = ex._revise_failure_section(
+        str(run_dir), _STATIC_FIELD, "failed")
+
+    assert "failing checks (verifier-static-check.log):" in section
+    assert "[no-test-gaming] diff adds no test-harness detection" in section
+    assert "pytest-env-probe" in section
+    assert "patch failed" not in section
