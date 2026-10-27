@@ -22,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from ..context import context_env, context_env_snapshot
+from . import mock_provider
 from .core import dispatch
 from .models import (
     DispatchRequest,
@@ -850,6 +851,30 @@ def _build_uhp(name, entry, root, extra_env, model_id) -> ProviderSpec:
     )
 
 
+def _build_mock(name, entry, root, extra_env, model_id) -> ProviderSpec:
+    """Deterministic ``kind: mock`` lane (B6): no command, only a rules file.
+
+    The rules path is required and resolved against ``mini_ork_root(root)``
+    unless absolute. Loading it here (not at dispatch time) means a bad rules
+    file fails lane preflight with the file's name and rule index instead of
+    surfacing halfway through a retry walk.
+    """
+    del model_id
+    rules_value = entry.get("rules")
+    if not isinstance(rules_value, str) or not rules_value:
+        raise ValueError(f"provider {name!r} missing required field 'rules'")
+    rules_path = Path(rules_value)
+    if not rules_path.is_absolute():
+        rules_path = mini_ork_root(root) / rules_path
+    mock_provider.load_rules(rules_path)
+    return ProviderSpec(
+        model=name,
+        command=(),
+        env={**extra_env, "MO_MOCK_RULES": str(rules_path)},
+        kind="mock",
+    )
+
+
 def _codex_transport_command() -> tuple[str, ...]:
     return (
         sys.executable,
@@ -907,6 +932,7 @@ PROVIDER_KIND_BUILDERS: dict[str, Callable[..., ProviderSpec]] = {
     "openai-compat": _build_openai_compat,
     "openai-chat": _build_openai_chat,
     "uhp": _build_uhp,
+    "mock": _build_mock,
     "codex-native": _build_codex_native,
     "opencode-native": _build_opencode_native,
     "executable": _build_executable_script,
@@ -1408,7 +1434,7 @@ def cwd_guard(
 # lane would burn a session slot without any tree-bound work. Sourced from
 # the same literal the registry uses to declare them
 # (``required_secret_envs`` / ``lane_health``).
-_LOCAL_ONLY_LANE_KINDS = frozenset({"openai-chat", "uhp"})
+_LOCAL_ONLY_LANE_KINDS = frozenset({"openai-chat", "uhp", "mock"})
 
 
 def _placement_is_remote(env: Mapping[str, str]) -> bool:
@@ -2482,11 +2508,36 @@ class UhpEngine(HarnessEngine):
         )
 
 
+class MockEngine(HarnessEngine):
+    """Deterministic mock engine (B6).
+
+    Its dispatch backend is ``mock_provider.dispatch`` — pure Python, no
+    subprocess, no network. Every capability axis is accepted so a test lane
+    carrying MCP/skills/agent-doc env is never rejected with rc 66; the mock
+    answers deterministically regardless of the envelope.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            capabilities=Capabilities(
+                tool_grants=True,
+                resume=True,
+                session_capture=True,
+                byo_endpoint=True,
+                mcp_servers=True,
+                skills=True,
+                agent_doc=True,
+            ),
+            dispatch_backend=mock_provider.dispatch,
+        )
+
+
 ENGINES: dict[str, HarnessEngine] = {
     'claude': ClaudeEngine(),
     'codex': SidecarTelemetryEngine(byo_endpoint=True),
     'opencode': SidecarTelemetryEngine(),
     'uhp': UhpEngine(),
+    'mock': MockEngine(),
 }
 _DEFAULT_ENGINE = ENGINES['claude']
 
