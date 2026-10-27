@@ -2144,6 +2144,108 @@ def test_volume_file_listing_honours_the_limit_and_says_it_truncated(client, tmp
     assert r.json()["truncated"] is True
 
 
+def test_volume_file_listing_pages_with_a_cursor(client, tmp_path):
+    """A caller walks a long archive by echoing back the last path it saw.
+
+    Without the cursor a flat listing of a directory that outgrew one page
+    returns its oldest files forever, so the newest segments — the ones a
+    caller is trying to protect — are the ones that never appear.
+    """
+    names = [f"wal/0000000100000000000000{i:02X}" for i in range(5)]
+    for name in names:
+        _volume_file(tmp_path, rel=name).write_bytes(b"x")
+
+    seen: list[str] = []
+    cursor = ""
+    for _page in range(10):
+        r = client.get(
+            "/v1/services/db/volumes/wal-archive/files",
+            params={"limit": 2, "start_after": cursor},
+            headers=AUTH,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["files"]) <= 2
+        paths = [f["path"] for f in body["files"]]
+        # A page never repeats the file it resumed after.
+        assert cursor not in paths
+        seen.extend(paths)
+        if not body["truncated"]:
+            break
+        cursor = paths[-1]
+
+    assert seen == names
+
+
+def test_paging_sorts_the_whole_tree_before_it_slices(client, tmp_path):
+    """A page is the lexically-first files, not the first files walked.
+
+    ``os.walk`` yields a directory's files before descending into its
+    subdirectories, so `wal/Z1` is visited before `wal/A/file` even though the
+    second sorts first. Slicing before sorting would put `wal/Z1` on a page
+    whose cursor (`wal/Z1`) then skips `wal/A/file` forever.
+    """
+    _volume_file(tmp_path, rel="wal/Z1").write_bytes(b"x")
+    _volume_file(tmp_path, rel="wal/Z2").write_bytes(b"x")
+    _volume_file(tmp_path, rel="wal/Z3").write_bytes(b"x")
+    _volume_file(tmp_path, rel="wal/A/file").write_bytes(b"x")
+
+    first = client.get(
+        "/v1/services/db/volumes/wal-archive/files",
+        params={"limit": 2},
+        headers=AUTH,
+    ).json()
+
+    assert [f["path"] for f in first["files"]] == ["wal/A/file", "wal/Z1"]
+    assert first["truncated"] is True
+
+    rest = client.get(
+        "/v1/services/db/volumes/wal-archive/files",
+        params={"limit": 10, "start_after": "wal/Z1"},
+        headers=AUTH,
+    ).json()
+
+    assert [f["path"] for f in rest["files"]] == ["wal/Z2", "wal/Z3"]
+    assert rest["truncated"] is False
+
+
+def test_a_listing_above_the_scan_guard_says_it_truncated(client, tmp_path, monkeypatch):
+    """The scan guard is reported, never silent."""
+    from mini_ork.remote.node_agent import services as services_module
+
+    for i in range(4):
+        _volume_file(tmp_path, rel=f"wal/0000000100000000000000{i:02X}").write_bytes(b"x")
+    monkeypatch.setattr(services_module, "_VOLUME_FILE_SCAN_MAX", 2)
+
+    body = client.get(
+        "/v1/services/db/volumes/wal-archive/files", headers=AUTH
+    ).json()
+
+    assert len(body["files"]) == 2
+    assert body["truncated"] is True
+
+
+def test_a_cursor_is_compared_against_the_whole_path(client, tmp_path):
+    """Cursor order is lexical over the full relative path, not the basename.
+
+    `base/` sorts before `wal/`, so a cursor inside the archive excludes the
+    base backups rather than interleaving them with the next page.
+    """
+    _volume_file(tmp_path, rel="base/0123/PG_VERSION").write_bytes(b"16")
+    _volume_file(tmp_path, rel="wal/00000001000000000000000A").write_bytes(b"x")
+    _volume_file(tmp_path, rel="wal/00000001000000000000000B").write_bytes(b"x")
+
+    r = client.get(
+        "/v1/services/db/volumes/wal-archive/files",
+        params={"start_after": "wal/00000001000000000000000A"},
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200
+    assert [f["path"] for f in r.json()["files"]] == ["wal/00000001000000000000000B"]
+    assert r.json()["truncated"] is False
+
+
 def test_listing_an_unmaterialized_volume_is_404(client):
     r = client.get("/v1/services/db/volumes/wal-archive/files", headers=AUTH)
     assert r.status_code == 404

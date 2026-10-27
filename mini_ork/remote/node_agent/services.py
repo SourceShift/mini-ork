@@ -176,6 +176,13 @@ _DEFAULT_VOLUME_FILE_MAX_BYTES = 256 * 1024**2
 #: that streams it all would be a memory answer to a paging question.
 _VOLUME_FILE_LIST_MAX = 1000
 
+#: Most paths one listing examines before slicing. A listing has to sort the
+#: whole candidate set to page it by path, so this is the memory guard on that
+#: sort: 100k files is ~1.6 TiB of 16 MiB WAL segments, far past any archive
+#: volume the platform allocates, and a caller nearing it should scope the
+#: listing with ``parent``.
+_VOLUME_FILE_SCAN_MAX = 100_000
+
 #: A Docker network name. The platform sends an environment-scoped network so
 #: services of one environment reach each other by name; the node may have to
 #: create it. Held to a leaf shape (no dots, no slashes) even though it is
@@ -1428,12 +1435,21 @@ class ServiceManager:
         volume_name: str,
         parent: str = "",
         limit: int = 500,
+        start_after: str = "",
     ) -> dict[str, Any]:
         """Every regular file under ``parent``, relative to the volume root.
 
         Digests are deliberately absent: hashing a tree on every listing would
         read every byte the control plane is trying to avoid copying. A caller
         that needs the digest reads the file, and the read reports it.
+
+        ``start_after`` is a resumption cursor over the returned ``path``
+        values: only paths strictly greater than it are listed. A directory
+        holding a long-lived archive grows past one page, and a flat listing
+        truncated at its oldest end would hide exactly the newest files a
+        caller wants — the cursor is how the caller walks to them. Passing the
+        last ``path`` of a page never repeats it, and ``truncated: false`` on
+        a response means it reached the end.
         """
         root = self._volume_dir(service_id, volume_name)
         if not root.is_dir():
@@ -1450,12 +1466,22 @@ class ServiceManager:
         except (TypeError, ValueError) as exc:
             raise ServiceError(f"limit must be an integer, got {limit!r}") from exc
         limit = max(1, min(limit, _VOLUME_FILE_LIST_MAX))
+        # Comparison only, never path resolution: a cursor is a value a caller
+        # echoes back from a listing, not something this method reads through.
+        cursor = start_after if isinstance(start_after, str) else ""
 
+        # The whole tree is scanned before anything is sliced. Cutting the walk
+        # short at the first page would slice a set ordered by directory
+        # traversal, not by path: a file visited late can sort before one
+        # already on the page, and when the next page resumes after the page's
+        # last path such a file is skipped forever. Sorting first is what makes
+        # the cursor exact. The scan is metadata only -- nothing is hashed --
+        # and the guard below bounds it even for a volume left to grow without
+        # limits.
         found: list[dict[str, Any]] = []
-        truncated = False
-        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
-            dirnames.sort()
-            for fname in sorted(filenames):
+        overflow = False
+        for dirpath, _dirnames, filenames in os.walk(base, followlinks=False):
+            for fname in filenames:
                 # A dotfile in a volume is a write in progress, not data this
                 # node put there: ``write_volume_file`` stages under
                 # ``.<name>.import-<uuid>`` in the same directory. Listing one
@@ -1463,6 +1489,12 @@ class ServiceManager:
                 if fname.startswith("."):
                     continue
                 path = Path(dirpath) / fname
+                rel = path.relative_to(root).as_posix()
+                if rel <= cursor:
+                    continue
+                if len(found) >= _VOLUME_FILE_SCAN_MAX:
+                    overflow = True
+                    break
                 try:
                     if path.is_symlink() or not path.is_file():
                         continue
@@ -1471,18 +1503,22 @@ class ServiceManager:
                     continue
                 found.append(
                     {
-                        "path": path.relative_to(root).as_posix(),
+                        "path": rel,
                         "bytes": stat.st_size,
                         "mtime": _iso_from_timestamp(stat.st_mtime),
                     }
                 )
-                if len(found) > limit:
-                    truncated = True
-                    break
-            if truncated:
+            if overflow:
                 break
         found.sort(key=lambda item: item["path"])
-        return {"files": found[:limit], "count": min(len(found), limit), "truncated": truncated}
+        return {
+            "files": found[:limit],
+            "count": min(len(found), limit),
+            # `overflow` is a resource guard, not a cursor end: the caller can
+            # still page on, but a scan this large wants to be scoped with
+            # `parent` rather than walked from the root.
+            "truncated": overflow or len(found) > limit,
+        }
 
     def volume_file(self, service_id: str, volume_name: str, rel_path: object) -> tuple[Path, dict[str, Any]]:
         """One file plus the digest and size it was served as.
@@ -2510,9 +2546,10 @@ def make_router(
 
     @router.get("/v1/services/{sid}/volumes/{name}/files")
     def list_volume_files_route(sid: str, name: str, parent: str = "", limit: int = 500,
+                                start_after: str = "",
                                 _: None = Depends(bearer)) -> dict:
         try:
-            return services.list_volume_files(sid, name, parent, limit)
+            return services.list_volume_files(sid, name, parent, limit, start_after)
         except VolumeNotMaterializedError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ServiceError as exc:
