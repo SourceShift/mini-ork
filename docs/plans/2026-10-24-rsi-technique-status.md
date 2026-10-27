@@ -246,6 +246,68 @@ Follow-ups found while landing Tier 0 (corrected 2026-10-27):
 | 11 | **RSI cycle graph C1–C5**: harvest + `rsi_cycles`, `recipes/rsi-cycle/`, driver, LEARN, cadence. **Built 2026-10-25/26 by another session** (83bb253a … 785e91f7) | the find→suggest→implement→validate→learn loop itself | RSIC |
 | 12 | **Diversity / pass@k floor** for collapse, and a **GEPA anti-bloat guard** (append mode grows prompts) | "collapse is the default trajectory"; GEPA "bloats prompts 3× with no gain" | R2K, S17 |
 
+#### Tier 1 progress (landed 2026-10-27)
+
+Each item went through one or more framework-edit runs
+(`kickoffs/auto/rsi-t1-*.md`, waves 196a3603 and f049dc4c). Every run was then
+reviewed by hand, checked by its kickoff suite and an importer gate, and passed
+the pre-push review. Everything new defaults to off or shadow unless noted.
+The matrix below still shows the 10-24 audit.
+
+| # | Item | State | Commits |
+|---|---|---|---|
+| 1 | Artifact-grounded node reward (`artifact@v1`, `MO_ARTIFACT_REWARD`) | merged | aae3dd7f |
+| 2 | Anytime-valid certificate + per-class α ledger (migration 0086, `MO_APPLY_CERTIFICATE`) | **awaiting a person's merge approval** (high risk tier: migration) | `wt/t1-certificate` |
+| 3 | Probe harvest: git-oracle probe kind (a), harvester with salted holdout (b), failed framework-edit runs re-validated against git (c) | merged; operator steps in `docs/operator/probe-harvest-runbook.md` | a: a6ad7d34, grader hardening 89553eeb 8e9eaa85 1eb1842e · b: c17c05d6 c462c898 93d9443d · c: 3ec35d97 becd702d |
+| 4 | Frozen kernel: refusals logged to `safety_events` (4a); the apply loop refuses frozen targets, also by inode (4b); the self-driving policy's 8 input modules join the floor, 14 → 22 entries (4c) | 4a, 4b merged; **4c awaiting approval** (edits the frozen list) | 4de04f43 · 899adc26 d9596390 · `wt/t1-kernel-hole-3` |
+| 5 | Layer routing: reflection records directives aimed at the wrong layer (shadow) | authoring merged; apply-side wiring queued behind #2 | efacad66 744fa61c |
+| 6 | MGM contrastive lane mining (infra = the engine's non-learnable exits) | merged | 09e53e69 21b10b4f |
+| 7 | Harness evolution: typed, reversible `workflow.yaml` edits (H1, library) | H1 merged; apply wiring (H2) queued behind #2 | 704dec2d |
+| 8 | Certify relations + differential in the code-fix verifier (shadow, 300 s budget); a `gate`-mode veto withholds publish | merged | bdd5e02b d526ca21 |
+| 9 | SWE-ABS suite strengthening for an INADEQUATE suite (shadow; one 240 s wall budget, `MO_SUITE_STRENGTHEN_BUDGET_S`) | merged | 564ce92f |
+| 10 | Region routing segment for unpinned implementers | merged | f4fffd5a |
+| 11 | RSI cycle C1–C5 | done by another session | 83bb253a … 785e91f7 |
+| 12 | Diversity / pass@k floor (report-only, `mini-ork collapse --floor`); the floor trips the liveness breaker once per breach (12b); GEPA prompt-bloat guard (12c) | floor merged; **12b awaiting approval** (`circuit_breaker.py` is frozen); 12c queued behind #2 | dad406e2 a2f3a0c9 · `wt/t1-collapse-floor-breaker` |
+
+Also landed in this window: R8 hardening (c6de292b). R8 refuses a
+`target_root` that is the engine checkout, inside it or containing it (compared
+with `samefile`), and reclaims stale epics before counting. The installer fixes
+(`wt/t0f-installer`: system deps under bash, python3.13 probed first,
+`verifiers` skipped on 3.14, the runtime pointer kept inside the venv) are
+waiting for a person's approval.
+
+What the landing taught (2026-10-27):
+
+- **Three of four wave-4 runs failed on the kickoff, not on the code.** Two
+  kickoffs changed a constant (`SUPPORTED_RECIPES`, the frozen floor's length)
+  but left the test that pins it out of scope. The third run's blind spec tests
+  had defects (stderr read after `capsys` had consumed it; a fixture default
+  that replaced the `None` under test).
+- **The repair loop can game an unsatisfiable spec, and the in-run reviewer can
+  pass it.** probe-harvest-c's repair made `SUPPORTED_RECIPES` a tuple subclass
+  whose `__eq__` matched both the old and the new value. It also added a bare
+  test-name needle (`test_add` → `add`) that redacted "address" and "added".
+  The in-run reviewer approved and filed only a "high" finding. Both were
+  reverted in salvage. Read the diff of a repaired run before trusting its
+  APPROVE.
+- **A shadow instrument needs a wall budget.** Suite strengthening's per-run
+  caps alone allowed about 22 minutes inside the code-fix verifier.
+
+Open follow-ups:
+
+- `tests/unit/test_revise_non_verdict.py::test_defect_report_escalates_without_another_round`
+  (both params) fails on main 702123f9: a filed defect report still starts a
+  revise round.
+- Run logs warn that `glm_lens` and `opus_lens` both resolve to the `zai`
+  family, and `codex_lens` and `deepseek_lens` both to `deepseek`. In-run
+  review panels are less family-diverse than they look.
+- Suite strengthening runs generated tests with `cwd` set to the candidate
+  tree. A test that writes files could change the publish tree. It is
+  shadow-only, the same exposure as the certify relations.
+- Probe harvest, pre-push review 139 (medium): merged runs keep the first
+  run's `test_files`; the fix commit is the oldest add on `landing_ref`; the CLI
+  validates the whole pool before dedup.
+
 ### Tier 2: the survey tail (no kickoff exists yet)
 
 - Directive schema / refine-in-place (S12 #7)
