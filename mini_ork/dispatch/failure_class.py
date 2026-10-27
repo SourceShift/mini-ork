@@ -36,11 +36,11 @@ CLASSES = ("transient", "rate_limit", "credential", "quota", "model_access",
 # moves on (or halts) instead of burning the same wall-clock again.
 RETRYABLE_CLASSES = frozenset({"transient", "rate_limit", "shape"})
 
-# The only classes a stdout tail may PROMOTE an otherwise-unknown failure to.
-# These are phrases a provider emits in a structured rejection envelope, so a
-# tail carrying one is provider output rather than model prose. Everything else
-# stays ``unknown``: RB-10 is model prose saying "401"/"forbidden" fusing a
-# healthy lane for the run, and ``credential`` is fuse-terminal.
+# The only classes a stdout tail may PROMOTE an otherwise-unknown failure to,
+# for the retry decision and ``metadata_json.failure_class``. The row's
+# ``error_category`` (what the lane fuse reads) never comes from the tail: the
+# tail can be model prose, and RB-10 is prose saying "401"/"forbidden" fusing a
+# healthy lane for the run.
 TAIL_PROMOTABLE = frozenset({"quota", "model_access", "rate_limit"})
 
 
@@ -73,7 +73,7 @@ _SHAPE_RE = re.compile(r"failed shape check|shape reject")
 # from being read as a model name.
 _MODEL_ACCESS_RE = re.compile(
     r"model_not_found|model is not supported"
-    r"|(model|deployment)(?!s\b)[^\n]{0,120}does not exist"
+    r"|(model|deployment)\s+[`'\"]?[\w.:/@-]+[`'\"]?\s+does not exist"
     r"|do(es)? not have access to (the )?model")
 
 _RETRY_AFTER_RE = re.compile(r"retry-after[:=\s]+(\d+)", re.IGNORECASE)
@@ -161,6 +161,17 @@ def classify(text: str, rc: int | str = "") -> tuple[str, str]:
     return ("unknown", "unknown")
 
 
+def is_run_wide(failure_class_name: str, text: str = "") -> bool:
+    """True when the failure belongs to the run, not to the lane that hit it.
+
+    Only an ``environment`` fault naming a missing cwd or a confused target
+    qualifies: every lane spawns there, so the walk stops, and the row must not
+    count as a strike against the lane (``llm_dispatch`` marks it ``:refused``).
+    """
+    return (failure_class_name == "environment"
+            and bool(_RUN_WIDE_RE.search((text or "").lower())))
+
+
 def retryable(failure_class_name: str) -> int:
     """1 when the class is worth retrying the same chain, else 0."""
     return 1 if failure_class_name in RETRYABLE_CLASSES else 0
@@ -180,7 +191,7 @@ def action(failure_class_name: str, text: str = "",
     if failure_class_name == "environment":
         # A missing cwd or a confused target affects every lane alike: stop.
         # A missing binary or key affects this lane only: walk on.
-        if _RUN_WIDE_RE.search((text or "").lower()):
+        if is_run_wide(failure_class_name, text):
             return Action(False, False, True, None)
         return Action(False, True, False, None)
     if failure_class_name == "shape":

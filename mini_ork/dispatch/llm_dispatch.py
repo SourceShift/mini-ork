@@ -1126,13 +1126,22 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 out_tail = (getattr(result, "text", "") or "")[-1000:]
                 if out_tail:
                     tail_text = raw_err + "\n" + out_tail
-                    tail_cls, tail_category = failure_class.classify(
+                    tail_cls, _tail_category = failure_class.classify(
                         tail_text, result_rc)
                     if tail_cls in failure_class.TAIL_PROMOTABLE:
-                        cls, category, class_text = (
-                            tail_cls, tail_category, tail_text)
+                        # The promoted class steers the retry and lands in
+                        # metadata only. ``error_category`` (what the fuse
+                        # reads) stays the error-only verdict: the tail is
+                        # still text a model may have written ("quota
+                        # exceeded" in prose), and quota/config are 1-strike.
+                        cls, class_text = tail_cls, tail_text
             hint = failure_class.wait_hint(class_text)
             row_actor = actor
+            if failure_class.is_run_wide(cls, class_text):
+                # A missing cwd or a confused target: nothing ran on this
+                # lane, so the row is not its verdict. ``:refused`` keeps it
+                # out of the fuse's streak (the RB-24 convention below).
+                row_actor = actor + ":refused"
             if _is_prespawn_guard_refusal(raw_err):
                 # RB-24: a remote pre-spawn guard refused this lane before
                 # anything ran. Mark the row ``:refused`` so the fuse never
@@ -1345,6 +1354,9 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     if hint is not None:
         metadata["wait_hint_s"] = hint
     row_actor = actor
+    if failure_class.is_run_wide(cls, class_text):
+        # Run-wide (missing cwd, confused target): not this lane's verdict.
+        row_actor = actor + ":refused"
     if _is_prespawn_guard_refusal(err_full) or _is_prespawn_guard_refusal(provider_err):
         # RB-24: nothing ran under this lane — the remote secret guard refused
         # it before the spawn. Keep a visible row, but ``:refused`` keeps it

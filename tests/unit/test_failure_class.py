@@ -370,3 +370,56 @@ def test_non_retryable_timeout_calls_the_chain_once(hermetic, tmp_path):
     fake, calls = _make_fake([(124, "timeout after 5.0s", "")])
     assert _dispatch(fake, tmp_path) != 0
     assert len(calls) == 1
+
+
+# ── review 123: nothing a lane did not decide may become a fuse strike ──────
+
+def test_model_phrase_with_a_same_line_path_is_not_model_access():
+    # Bounded to one line was not enough: a same-line file path is not a model.
+    assert failure_class.classify(
+        "model glm: cache /x/model.bin does not exist", 1)[0] != "model_access"
+    assert failure_class.classify(
+        "The model 'gpt-x' does not exist or you do not have access to it.",
+        1)[0] == "model_access"
+
+
+def _rows_with_actor(db):
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(
+            "SELECT actor, error_category, metadata_json FROM llm_calls"
+            " ORDER BY id").fetchall()]
+    finally:
+        con.close()
+
+
+def test_stdout_prose_quota_steers_the_retry_but_never_the_fuse(hermetic, tmp_path):
+    # Prose quoting a quota phrase may promote failure_class (retry decision,
+    # diagnosis) but the row's error_category, which the fuse reads, stays the
+    # error-only verdict: quota is a 1-strike terminal category.
+    fake, _calls = _make_fake_stdout(QUOTA_TEXT)
+    assert _dispatch(fake, tmp_path) != 0
+    rows = _rows_with_actor(hermetic)
+    attempts = [r for r in rows if "dispatch_attempt" in (r["metadata_json"] or "")]
+    assert attempts
+    for row in attempts:
+        assert json.loads(row["metadata_json"])["failure_class"] == "quota"
+    assert all(r["error_category"] not in ("quota", "auth", "config") for r in rows)
+
+
+@pytest.mark.parametrize("error, fused", [
+    (SPAWN_NO_CWD, False),
+    ("… likely cwd-confusion (a target-repo lane landing in mini-ork) …", False),
+    (SPAWN_NO_BINARY, True),
+])
+def test_only_a_lane_local_fault_is_a_fuse_strike(hermetic, tmp_path, error, fused):
+    from mini_ork.dispatch import llm_dispatch as mod
+
+    fake, _calls = _make_fake([(127, error, "")])
+    assert _dispatch(fake, tmp_path) != 0
+    rows = _rows_with_actor(hermetic)
+    assert rows
+    refused = [r for r in rows if (r["actor"] or "").endswith(":refused")]
+    assert bool(refused) is (not fused), rows
+    assert mod.check_lane_fuse(hermetic, "codex", "config", strikes=1) is fused
