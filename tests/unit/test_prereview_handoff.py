@@ -100,7 +100,7 @@ def test_ambient_prechecked_patch_is_scrubbed_from_the_gate_env(monkeypatch, tmp
     monkeypatch.setenv("MO_REVIEW_PRECHECKED_PATCH", "abc")
     driver, wt, recorder = _prepare(
         monkeypatch, tmp_path,
-        cache={"PID42": {"at": int(time.time())}},
+        cache={"PID42": {"review_id": 1, "mode": "hybrid", "target": "main", "at": int(time.time())}},
     )
 
     assert driver._prereview(wt) == "PID42"
@@ -115,7 +115,7 @@ def test_ambient_prechecked_patch_is_scrubbed_from_the_gate_env(monkeypatch, tmp
 def test_exit0_with_fresh_cache_returns_the_patch_id(monkeypatch, tmp_path):
     driver, wt, _recorder = _prepare(
         monkeypatch, tmp_path,
-        cache={"PID42": {"at": int(time.time())}},
+        cache={"PID42": {"review_id": 1, "mode": "hybrid", "target": "main", "at": int(time.time())}},
     )
     assert driver._prereview(wt) == "PID42"
 
@@ -132,7 +132,7 @@ def test_exit0_with_a_stale_cache_returns_empty(monkeypatch, tmp_path):
     stale_at = int(time.time()) - 8 * 86400
     driver, wt, _recorder = _prepare(
         monkeypatch, tmp_path,
-        cache={"PID42": {"at": stale_at}},
+        cache={"PID42": {"review_id": 1, "mode": "hybrid", "target": "main", "at": stale_at}},
     )
     assert driver._prereview(wt) == ""
 
@@ -146,7 +146,7 @@ def test_exit0_with_a_malformed_cache_returns_empty(monkeypatch, tmp_path):
 def test_exit0_with_empty_patch_id_returns_empty(monkeypatch, tmp_path):
     driver, wt, _recorder = _prepare(
         monkeypatch, tmp_path, pid="",
-        cache={"PID42": {"at": int(time.time())}},
+        cache={"PID42": {"review_id": 1, "mode": "hybrid", "target": "main", "at": int(time.time())}},
     )
     assert driver._prereview(wt) == ""
 
@@ -154,7 +154,7 @@ def test_exit0_with_empty_patch_id_returns_empty(monkeypatch, tmp_path):
 def test_exit0_with_a_cache_for_another_patch_returns_empty(monkeypatch, tmp_path):
     driver, wt, _recorder = _prepare(
         monkeypatch, tmp_path,
-        cache={"SOME-OTHER-PATCH": {"at": int(time.time())}},
+        cache={"SOME-OTHER-PATCH": {"review_id": 1, "mode": "hybrid", "target": "main", "at": int(time.time())}},
     )
     assert driver._prereview(wt) == ""
 
@@ -165,6 +165,33 @@ def test_exit0_with_a_cache_for_another_patch_returns_empty(monkeypatch, tmp_pat
 def test_reviewer_error_does_not_hand_off_a_patch_id(monkeypatch, tmp_path):
     driver, wt, _recorder = _prepare(
         monkeypatch, tmp_path, gate_rc=3,
-        cache={"PID42": {"at": int(time.time())}},
+        cache={"PID42": {"review_id": 1, "mode": "hybrid", "target": "main", "at": int(time.time())}},
     )
     assert driver._prereview(wt) == ""
+
+
+# ── review 147 ──────────────────────────────────────────────────────────────
+
+
+def test_a_cached_review_for_another_target_is_not_handed_off(monkeypatch, tmp_path):
+    driver, wt, _ = _prepare(
+        monkeypatch, tmp_path,
+        cache={"PID42": {"review_id": 1, "mode": "hybrid", "target": "develop",
+                         "at": int(time.time())}},
+    )
+    assert driver._prereview(wt) == ""
+
+
+def test_a_cache_entry_without_a_review_id_is_not_handed_off(monkeypatch, tmp_path):
+    driver, wt, _ = _prepare(
+        monkeypatch, tmp_path,
+        cache={"PID42": {"mode": "hybrid", "target": "main", "at": int(time.time())}},
+    )
+    assert driver._prereview(wt) == ""
+
+
+def test_push_env_drops_an_ambient_precheck(monkeypatch, tmp_path):
+    driver = _load_driver(monkeypatch, tmp_path)
+    monkeypatch.setenv("MO_REVIEW_PRECHECKED_PATCH", "AMBIENT")
+    assert "MO_REVIEW_PRECHECKED_PATCH" not in driver._push_env("")
+    assert driver._push_env("PID42")["MO_REVIEW_PRECHECKED_PATCH"] == "PID42"

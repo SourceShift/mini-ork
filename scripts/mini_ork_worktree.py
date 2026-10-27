@@ -711,6 +711,12 @@ def _review_cached(pid: str) -> bool:
     entry = data.get(pid)
     if not isinstance(entry, dict):
         return False
+    # Mirror the gate's own reuse check (``_cache_review_id``) as far as the
+    # driver can: a review of this patch for main, with a real review id. The
+    # review mode is the gate's to judge; the in-lock hook runs with the same
+    # environment, so it resolves the same mode.
+    if entry.get("target") != "main" or not isinstance(entry.get("review_id"), int):
+        return False
     at = entry.get("at")
     if not isinstance(at, int):
         return False
@@ -770,6 +776,19 @@ def _prereview(wt: str) -> str:
     return ""
 
 
+def _push_env(reviewed: str) -> dict:
+    """The in-lock push's environment.
+
+    An ambient ``MO_REVIEW_PRECHECKED_PATCH`` never reaches the in-lock hook
+    (review 147): only the patch-id this merge just had reviewed may let the
+    hook skip the panel.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "MO_REVIEW_PRECHECKED_PATCH"}
+    if reviewed:
+        env["MO_REVIEW_PRECHECKED_PATCH"] = reviewed
+    return env
+
+
 def merge_worktree(args: list[str]) -> None:
     if args:
         slug = sanitize_slug(args[0])
@@ -811,9 +830,7 @@ def merge_worktree(args: list[str]) -> None:
     # unavailable review is not evidence one happened, so it hands off ``""``
     # and the in-lock hook runs the panel itself.
     reviewed = _prereview(wt)
-    push_env = None
-    if reviewed:
-        push_env = {**os.environ, "MO_REVIEW_PRECHECKED_PATCH": reviewed}
+    push_env = _push_env(reviewed)
     # The gate above runs for minutes, so origin/main has moved since the fetch
     # at the top: pushing now is rejected as non-fast-forward whenever any peer
     # landed during the gate. The tree is green; only the base is stale. Rebase
