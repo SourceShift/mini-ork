@@ -75,9 +75,18 @@ All paths are relative to the repository root.
   - **The master gate.** When `MO_APPLY_DRY_RUN == "1"` or
     `MO_APPLY_ENABLED != "1"`, it writes a one-line stderr note starting
     `apply_workflow_mutation: dry-run` and returns `""`.
-  - **The write.** With `workflow_edit` imported locally, when
-    `workflow_edit.apply_to_file(target_file, result)` returns `False`, it
-    writes a stderr note containing `changed since scoring` and returns `""`.
+  - **The write.** With `workflow_edit` imported locally, it calls
+    `workflow_edit.apply_to_file(target_file, result, allow_reformat=reformat)`,
+    where `reformat` is `os.environ.get("MO_APPLY_WORKFLOW_REFORMAT", "0") == "1"`.
+    - **Comments would be lost.** The whole-document re-render drops every YAML
+      comment, and the real recipes carry 13–17 comment lines. When
+      `apply_to_file` raises `workflow_edit.WorkflowEditError` (a commented
+      file with `reformat` false), the function writes a stderr note
+      containing `would drop` and `MO_APPLY_WORKFLOW_REFORMAT` and returns
+      `""` without writing.
+    - **Stale result.** When `apply_to_file` returns `False`, the function
+      writes a stderr note containing `changed since scoring` and returns
+      `""`.
   - **The version row.** It calls
     `version_registry.register("workflow", json.dumps(payload), db=db)`.
     `payload` has EXACTLY these keys:
@@ -304,6 +313,15 @@ Tests:
     It returns `0` with `kind == "workflow_node"` and `tfile` ending in
     `recipes/fw-edit/workflow.yaml`.
   - The target `"harness.nope.workflow.yaml"` returns `2`.
+- **A commented workflow is not rewritten without the reformat opt-in.**
+  - Write a workflow file whose text starts with `# operator note\n` followed
+    by the fixture YAML. Materialize a `lane_pin` edit on it with
+    `workflow_edit.materialize`.
+  - With `MO_APPLY_ENABLED=1` and `MO_APPLY_WORKFLOW_REFORMAT` unset,
+    `ap.apply_workflow_mutation("c1", path, result, db=db)` returns `""`, the
+    file bytes are unchanged, and stderr contains `would drop`.
+  - With `MO_APPLY_WORKFLOW_REFORMAT=1` the same call returns a non-empty
+    version id, and the file now equals `result["after_text"]`.
 - **The helpers.**
   - `_is_workflow_target` is `True` for `T`. It is `False` for
     `"harness.fw-edit.implementer"`, `"harness..workflow.yaml"` and
