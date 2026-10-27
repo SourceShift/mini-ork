@@ -2638,6 +2638,7 @@ def dispatch_with_fallback(
     """
     import sys
 
+    from mini_ork.dispatch import failure_class
     from mini_ork.dispatch.predicates import SHAPE_REJECT_RC
 
     last: DispatchResult | None = None
@@ -2684,6 +2685,16 @@ def dispatch_with_fallback(
                     f"[dispatch] lane fallback: {'/'.join(tried[:-1])} failed → "
                     f"served by {lane}\n"
                 )
+            return result
+        # One action table: some failures are run-wide, not lane-specific (a
+        # deleted target cwd, a confused placement). Walking the remaining
+        # lanes spends a timeout each to learn the same fact — stop here.
+        failure_cls, _db_category = failure_class.classify(
+            result.error or "", result.rc)
+        if failure_class.action(failure_cls, result.error or "").stop_walk:
+            sys.stderr.write(
+                f"[dispatch] lane {lane} failed with {failure_cls}; "
+                f"no other lane can help — stopping the walk\n")
             return result
         if result.rc == SHAPE_REJECT_RC:
             sys.stderr.write(

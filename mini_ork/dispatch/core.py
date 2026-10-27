@@ -396,6 +396,12 @@ def spawn_local(
             start_new_session=True,
         )
     except OSError as exc:
+        # ``[Errno 2]`` reads the same for a missing cwd and a missing binary.
+        # A missing cwd fails every lane alike; a missing binary fails only
+        # this one. Say which, so the fallback walk can stop for the first and
+        # walk on for the second (failure_class.action).
+        if cwd and not os.path.isdir(cwd):
+            return 127, "", f"spawn failed: cwd does not exist: {cwd} ({exc})"
         return 127, "", f"spawn failed: {exc}"
 
     # Record the group so the run reaper can stop it if this dispatcher dies

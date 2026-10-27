@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 
 from mini_ork.context import context_env
-from mini_ork.dispatch import lane_affinity
+from mini_ork.dispatch import failure_class, lane_affinity
 from mini_ork.dispatch.predicates import (
     SHAPE_REJECT_RC,
     looks_like_json,
@@ -1102,8 +1102,22 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             if ok and text:
                 return
             raw_err = getattr(result, "error", "") or "empty output"
+            result_rc = getattr(result, "rc", 1)
             err = redact_secrets(raw_err[:200])
-            category = classify_error(err, getattr(result, "rc", 1))
+            # Classify the FULL error text, not the 200-char ``error_message``
+            # slice: Codex prints a generic rc=1 header first and the real
+            # provider rejection (quota, model access) in the tail. The stdout
+            # tail is model prose, so it is only consulted when the error alone
+            # is unclassifiable and only for a non-shape attempt (RB-10: prose
+            # mentioning "401"/"forbidden" must not fuse a lane).
+            class_text = raw_err
+            if (str(result_rc) != str(SHAPE_REJECT_RC)
+                    and failure_class.classify(class_text, result_rc)[0] == "unknown"):
+                out_tail = (getattr(result, "text", "") or "")[-1000:]
+                if out_tail:
+                    class_text = class_text + "\n" + out_tail
+            cls, category = failure_class.classify(class_text, result_rc)
+            hint = failure_class.wait_hint(class_text)
             row_actor = actor
             if _is_prespawn_guard_refusal(raw_err):
                 # RB-24: a remote pre-spawn guard refused this lane before
@@ -1113,7 +1127,11 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 category = "config"
                 retryable = 0
             else:
-                retryable = int(error_retryable(category))
+                retryable = failure_class.retryable(cls)
+            metadata = {"dispatch_attempt": attempt, "chain": str(model),
+                        "failure_class": cls}
+            if hint is not None:
+                metadata["wait_hint_s"] = hint
             usage = getattr(result, "usage", None)
             in_tok = int(getattr(usage, "input_tokens", 0) or 0)
             out_tok = int(getattr(usage, "output_tokens", 0) or 0)
@@ -1125,7 +1143,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 db, provider_for_model(lane), lane, tier, feature, row_actor, "failed",
                 int(getattr(result, "duration_ms", 0) or 0), f"{cost_usd:.6f}", err,
                 in_tok, out_tok,
-                metadata_json=json.dumps({"dispatch_attempt": attempt, "chain": str(model)}),
+                metadata_json=json.dumps(metadata),
                 error_category=category, retryable=retryable,
                 cached_input_tokens=cached_in,
                 cache_creation_input_tokens=cache_create,
@@ -1185,8 +1203,12 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             except OSError:
                 pass
         probe = probe[-2000:]
+        # One action table decides the retry: the class (not the legacy category)
+        # says whether the same chain can recover, and whether the provider told
+        # us how long to wait.
+        cls, _db_category = failure_class.classify(probe, rc)
+        act = failure_class.action(cls, probe)
         fair_usage = glm_fair_usage_retryable(model, probe, attempt, max_attempts)
-        throttled = throttle_retryable(model, probe, rc, attempt, max_attempts)
         # A wrong-SHAPE reply is a stochastic model-formatting miss, not a terminal
         # failure: the lane produced output, it was merely unusable. Retry it in
         # the same backoff loop (bounded by max_attempts) so a transient
@@ -1194,14 +1216,31 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         # artifact is known JSON (``accept_fn``), so prose nodes are unaffected.
         shape_reject = (accept_fn is not None and rc == SHAPE_REJECT_RC
                         and attempt < max_attempts)
-        if fair_usage or throttled or shape_reject:
-            sleep_s = backoff_seconds(attempt)
+        hint = act.wait_hint_s
+        sleep_cap = _int_or(os.environ.get("MO_DISPATCH_RETRY_MAX_SLEEP_S"), 45)
+        if hint is not None and hint > sleep_cap:
+            # Asking for a longer wait than the caller will tolerate: do not
+            # re-run this chain. This outranks the glm fair-usage and shape
+            # rules, which would otherwise re-retry the same wall.
+            sys.stderr.write(
+                f"[dispatch] {model} asks to wait {hint:g}s (above the "
+                f"{sleep_cap}s cap); not retrying\n")
+            break
+        retry_chain = act.retry_chain and attempt < max_attempts
+        if cls == "shape" and accept_fn is None:
+            # A "shape" word in the probe of a node with NO shape contract is
+            # just text (often the walk's own reject line echoed into
+            # .err.log). Today's shape retry is scoped to nodes whose artifact
+            # is known JSON; keep that scope.
+            retry_chain = False
+        if retry_chain or fair_usage or shape_reject:
+            sleep_s = min(hint, sleep_cap) if hint is not None else backoff_seconds(attempt)
             if fair_usage:
                 reason = "fair_usage"
-            elif shape_reject and not throttled:
+            elif shape_reject and not retry_chain:
                 reason = "shape_reject"
             else:
-                reason = classify_error(probe, rc)
+                reason = cls
             sys.stderr.write(f"[llm_dispatch RETRY model={model} reason={reason} "
                              f"attempt={attempt}/{max_attempts} sleep={sleep_s}s]\n")
             time.sleep(sleep_s)
@@ -1278,8 +1317,19 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     if provider_err:
         err = provider_err
     err = redact_secrets(err)
-    category = classify_error(err, rc)
-    retryable = int(error_retryable(category))
+    # Classify the FULL text (stderr plus the structured provider rejection),
+    # not the 200-char tail kept above for ``error_message``. ``provider_err``
+    # is a parsed provider ``result`` object, not free-form stdout prose, so it
+    # is safe to add here (RB-10 guards against the raw stdout tail, not this).
+    class_text = err_full
+    if provider_err:
+        class_text = f"{class_text}\n{provider_err}" if class_text else provider_err
+    cls, category = failure_class.classify(class_text, rc)
+    hint = failure_class.wait_hint(class_text)
+    retryable = failure_class.retryable(cls)
+    metadata = {"failure_class": cls}
+    if hint is not None:
+        metadata["wait_hint_s"] = hint
     row_actor = actor
     if _is_prespawn_guard_refusal(err_full) or _is_prespawn_guard_refusal(provider_err):
         # RB-24: nothing ran under this lane — the remote secret guard refused
@@ -1305,7 +1355,8 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         in_tok = out_tok = cached_in = cache_create = 0
         thinking = None
     write_llm_calls_row(db, provider, selected_model, tier, feature, row_actor, "failed",
-                        duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create,
+                        duration_ms, cost_usd, err, in_tok, out_tok,
+                        json.dumps(metadata), cached_in, cache_create,
                         error_category=category, retryable=retryable, thinking_tokens=thinking)
     sys.stderr.write(f"[llm_dispatch FAIL model={model} rc={rc}]\n")
     for side in (out_file + ".tokens", out_file + ".model"):
