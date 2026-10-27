@@ -558,6 +558,51 @@ def test_harvest_framework_edit(tmp_path):
     assert report["diagnoses_available"] is True
 
 
+
+def test_harvest_framework_edit_unvalidated_writes_no_oracle_less_probe(tmp_path):
+    # Review 138: without a validate_fn a failed-run candidate has an empty
+    # fail_to_pass, i.e. no oracle; it must never be written as a probe.
+    root, c1, _c2, _ = _build_repo(tmp_path)
+    k1 = tmp_path / "k1.md"
+    k1.write_text(K1_TEXT)
+    home = _home(
+        tmp_path, [_row("fe-ok-1", kickoff=str(k1), created=1, baseline_ref=c1)]
+    )
+
+    report = probe_harvest.harvest(
+        "framework-edit",
+        root=root,
+        home=home,
+        write=True,
+        landing_ref="HEAD",
+        now="2026-10-27T00:00:00Z",
+    )
+
+    probes = Path(root) / "recipes" / "framework-edit" / "probes"
+    assert not probes.exists() or not list(probes.glob("*.md"))
+    assert report["admitted"] == []
+    assert [r["reason"] for r in report["rejected"]] == ["no-oracle"]
+
+
+@pytest.mark.parametrize("key", ["base_sha", "fix_sha"])
+def test_validate_candidate_refuses_option_like_revision(tmp_path, key):
+    root, c1, c2, _ = _build_repo(tmp_path)
+    cand = {"base_sha": c1, "fix_sha": c2, "test_files": ["tests/test_calc.py"]}
+    cand[key] = "--output=" + str(tmp_path / "pwned")
+    ok, reason, _ = probe_harvest.validate_candidate(cand, root=root)
+    assert (ok, reason) == (False, "unsafe-revision")
+    assert not (tmp_path / "pwned").exists()
+    assert _scratch_is_empty(tmp_path)
+
+
+def test_failed_run_candidates_refuses_option_like_landing_ref(tmp_path):
+    root, *_ = _build_repo(tmp_path)
+    with pytest.raises(ValueError, match="landing_ref"):
+        probe_harvest.failed_run_candidates(
+            str(tmp_path / "home"), root, landing_ref="--output=x"
+        )
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 

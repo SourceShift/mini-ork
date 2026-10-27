@@ -29,3 +29,15 @@ def test_scrub_hides_test_ids_names_modules_and_files():
 
 def test_scrub_leaves_unrelated_text():
     assert probe_harvest._scrub("Make add() return a + b.", _cand()) == "Make add() return a + b."
+
+
+def test_scrub_hides_parametrized_and_class_qualified_test_names():
+    # Review 138: a parametrized / class-qualified id hid only as a whole, so
+    # its bare function name, class and module stayed readable.
+    cand = {**_cand(), "fail_to_pass": [
+        "tests.unit.test_router_lanes::TestPick::test_prefers_cheap[cheap-1]"]}
+    text = ("TestPick.test_prefers_cheap fails; see "
+            "tests.unit.test_router_lanes::TestPick.")
+    out = probe_harvest._scrub(text, cand)
+    for leaked in ("test_prefers_cheap", "TestPick", "tests.unit.test_router_lanes"):
+        assert leaked not in out, (leaked, out)

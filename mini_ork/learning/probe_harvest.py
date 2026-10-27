@@ -36,6 +36,7 @@ HARVESTER = "probe_harvest@1"
 SUPPORTED_RECIPES = ("code-fix", "framework-edit")
 MAX_SRC_FILES = 12
 DEFAULT_LANDING_REF = "origin/main"
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 KICKOFF_TEST_RE = re.compile(r"(tests/(?:[\w-]+/)*test_\w+\.py)")
 DEFAULT_MAX_NEW = 12
 MAX_PER_CLUSTER = 6
@@ -251,8 +252,10 @@ def _test_needles(candidate: dict) -> list[str]:
     """Strings that would name the hidden tests in visible probe text.
 
     Each test id (``<module>::<name>``) contributes itself, its function name and
-    its dotted module; each hidden test file contributes its path, basename and
-    stem. Over-redaction of a short name is acceptable: the probe text must not
+    its dotted module; a parametrized or class-qualified id (``m::Cls::t[1]``)
+    also contributes its bare function name, its class and its module, which
+    the whole-id needles alone would leave readable. Each hidden test file
+    contributes its path, basename and stem. Over-redaction of a short name is acceptable: the probe text must not
     point the solver at the oracle.
     """
     out: list[str] = []
@@ -260,6 +263,8 @@ def _test_needles(candidate: dict) -> list[str]:
         out.append(test_id)
         module, _, name = test_id.rpartition("::")
         out.extend([module, name])
+        out.append(name.split("[", 1)[0])
+        out.extend(module.split("::"))
     for path in candidate.get("test_files", []):
         base = path.rsplit("/", 1)[-1]
         out.extend([path, base, base[:-3] if base.endswith(".py") else base])
@@ -452,6 +457,12 @@ def validate_candidate(
     """
     from mini_ork.learning import probe_scorer
 
+    # The revisions reach ``git`` as arguments: anything but a hex SHA (a
+    # ``-``-prefixed string would parse as an option) is refused up front.
+    for key in ("base_sha", "fix_sha"):
+        if not _SHA_RE.fullmatch(str(candidate.get(key) or "")):
+            return False, "unsafe-revision", candidate
+
     trees: list[str] = []
     try:
         try:
@@ -546,6 +557,8 @@ def failed_run_candidates(
     landing commit merge into one candidate. The first rule that fires gives the
     rejection reason, so the order is load-bearing.
     """
+    if landing_ref.startswith("-"):
+        raise ValueError(f"landing_ref must be a ref, not an option: {landing_ref!r}")
     state_db = os.path.join(home, "state.db")
     if not os.path.exists(state_db):
         return [], []
@@ -792,6 +805,16 @@ def harvest(
         # A top-up where every mined candidate is already represented by a
         # written sidecar: duplicate-ness is the only decision left.
         rejected = []
+
+    # A probe is graded by its fail_to_pass list. A candidate without one (a
+    # framework-edit candidate that was never validated) has no oracle and
+    # would grade any solver as solved, so it is never admitted.
+    no_oracle = [c for c in candidates if not c.get("fail_to_pass")]
+    if no_oracle:
+        rejected.extend(
+            {"task_id": c["task_id"], "reason": "no-oracle"} for c in no_oracle
+        )
+        candidates = [c for c in candidates if c.get("fail_to_pass")]
 
     admitted, select_rejected = select(
         candidates,
