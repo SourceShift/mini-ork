@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 
 from mini_ork.context import context_env
+from mini_ork.dispatch import lane_affinity
 from mini_ork.dispatch.predicates import (
     SHAPE_REJECT_RC,
     looks_like_json,
@@ -977,6 +978,32 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     if not model_override and node_type:
         model = resolve_lane_model(node_type, root, home)
 
+    # B3 lane affinity: a revise round / `recover` re-enters here and re-runs
+    # routing, so the chain starts from its lead again — even when a fallback
+    # lane actually served the previous round, discarding the provider prompt
+    # cache that lane had warmed. Move the lane that served this node's first
+    # successful round to the front, but ONLY while the routing lead is
+    # unchanged: a remapped lead (operator, `recover --lane`, agents.yaml) makes
+    # `preferred` return None and the operator's choice wins. Both fuse passes
+    # below still run on the reordered chain, so a fused lane stays dropped.
+    # `_aff_lead` is bound unconditionally (pre-reorder chain[0]) because the
+    # success path records against it and must never NameError into the guard.
+    _aff_run_dir = context_env("MINI_ORK_RUN_DIR")
+    _aff_node = context_env("MO_NODE_ID")
+    _aff_lead = str(model).split(",", 1)[0].strip()
+    if _aff_run_dir and _aff_node and lane_affinity.enabled():
+        try:
+            _aff_lanes = [m.strip() for m in str(model).split(",") if m.strip()]
+            _aff_served = lane_affinity.preferred(_aff_run_dir, _aff_node, _aff_lead)
+            _aff_reordered = lane_affinity.apply(_aff_lanes, _aff_served)
+            if _aff_reordered != _aff_lanes:
+                model = ",".join(_aff_reordered)
+                sys.stderr.write(
+                    f"[lane_affinity] {_aff_node}: {_aff_served} first "
+                    f"(served an earlier round; lead {_aff_lead})\n")
+        except Exception:  # noqa: BLE001 — affinity must never change dispatch
+            pass
+
     # lane fuse — on by default, because a fuse that is off by default is not a
     # safety system. Keyed on the LANE (llm_calls.model_id), not the node role:
     # a fallback tail lane's failures are recorded against the lane, so a
@@ -1203,6 +1230,16 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "success",
                             duration_ms, cost_usd, "", in_tok, out_tok, "{}", cached_in, cache_create,
                             thinking_tokens=thinking)
+        # B3 lane affinity: only a SUCCESS may define the node's affinity, and
+        # only the first one does (``record`` never overwrites an existing
+        # entry). ``_aff_lead`` is the pre-reorder routing lead, the same value
+        # ``preferred`` keyed on above. Same guards as the reorder.
+        if _aff_run_dir and _aff_node and lane_affinity.enabled():
+            try:
+                lane_affinity.record(
+                    _aff_run_dir, _aff_node, _aff_lead, selected_model)
+            except Exception:  # noqa: BLE001 — affinity must never change dispatch
+                pass
         run_dir = context_env("MINI_ORK_RUN_DIR")
         if os.path.isfile(out_file + ".cost") and run_dir:
             try:
