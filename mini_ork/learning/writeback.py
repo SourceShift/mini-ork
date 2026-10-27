@@ -31,6 +31,11 @@ _REWARD_VETO_VERDICTS = ("reject", "needs_revision", "request_changes",
 _REWARD_APPROVE_VERDICTS = ("approve", "approved", "pass", "passed",
                             "success", "ok")
 
+ARTIFACT_REWARD_SOURCE = "artifact@v1"
+ARTIFACT_REWARD_METRIC = "verifier_pass_rate"
+ARTIFACT_REWARD_NODE_TYPES = ("implementer",)
+_EXIT_CODE_REWARD_SOURCES = ("", "verifier@v1", ARTIFACT_REWARD_SOURCE)
+
 
 def reward_from_status(status: str = "", verdict: str = "") -> str:
     s = (status or "").lower()
@@ -562,5 +567,137 @@ def stamp_impl_run_verified(db, run_id: str, verified: bool) -> int:
         return 0
     finally:
         con.close()
+
+
+def artifact_window_counts(con: sqlite3.Connection, run_id,
+                           start_epoch: int,
+                           end_epoch: int | None = None) -> tuple[int, int]:
+    """Count (passes, fails) among a run's verifier rows in ``[start, end)``.
+
+    A **pass** is ``verdict == 'pass'`` with ``is_false_positive`` 0 or NULL.
+    A **fail** is ``verdict == 'fail'``, or ``verdict == 'pass'`` with
+    ``is_false_positive == 1`` (the evidence contradicted the verdict).
+    ``indeterminate`` and ``vacuous`` rows count as neither.
+
+    ``run_id`` is bound as ``str(run_id)``. A missing ``verifier_results``
+    table yields ``(0, 0)``. It never commits and never closes ``con``.
+    """
+    query = ("SELECT verdict, is_false_positive FROM verifier_results "
+             "WHERE run_id=? AND created_at>=?")
+    params: list = [str(run_id), int(start_epoch)]
+    if end_epoch is not None:
+        query += " AND created_at<?"
+        params.append(int(end_epoch))
+    try:
+        rows = con.execute(query, params).fetchall()
+    except sqlite3.OperationalError:
+        return (0, 0)
+    passes = fails = 0
+    for row in rows:
+        verdict, false_positive = row[0], row[1]
+        if verdict == "fail":
+            fails += 1
+        elif verdict == "pass":
+            if false_positive == 1:
+                fails += 1
+            else:
+                passes += 1
+    return (passes, fails)
+
+
+def artifact_reward(passes: int, fails: int) -> float | None:
+    """The pass rate ``passes / (passes + fails)``; ``None`` when no evidence."""
+    total = passes + fails
+    if total == 0:
+        return None
+    return passes / total
+
+
+def stamp_artifact_rewards(db, run_id) -> int:
+    """Re-stamp a run's successful implementer traces with verifier pass rate.
+
+    Post-run grounding of the exit-code stamp: a ``success`` row whose reward
+    still comes from the exit code (``reward_source`` empty / ``verifier@v1``
+    / ``artifact@v1``) gets ``reward_value`` = the pass rate of the run's
+    ``verifier_results`` rows recorded during its own attempt window, with
+    ``reward_anchor=0.5``, ``reward_g=(v-0.5)/0.5`` and
+    ``reward_source='artifact@v1'``.
+
+    The window for the i-th implementer trace (ordered by ``created_at``,
+    ``trace_id``) runs from its own epoch to the next implementer trace's
+    epoch, exclusive; the last trace's window is open-ended. Every
+    implementer row bounds a window whether or not it is eligible. Rows with
+    no evidence in their window are left untouched, so a failure's reward can
+    never be raised. Idempotent; never raises (``sqlite3.Error`` -> 0).
+    """
+    if not db or not run_id or not os.path.isfile(db):
+        return 0
+    con = None
+    try:
+        con = sqlite3.connect(db, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        cols = {r[1] for r in con.execute(
+            "PRAGMA table_info(execution_traces)").fetchall()}
+        required = {"run_id", "status", "verifier_output", "created_at",
+                    "reward_value", "reward_anchor", "reward_g", "reward_source"}
+        if not required <= cols:
+            return 0
+
+        validity_expr = ("COALESCE(validity, 'valid')" if "validity" in cols
+                         else "'valid'")
+        node_placeholders = ", ".join("?" for _ in ARTIFACT_REWARD_NODE_TYPES)
+        query = (
+            "SELECT trace_id, status, COALESCE(reward_source, ''), "
+            f"{validity_expr}, CAST(strftime('%s', created_at) AS INTEGER) "
+            "FROM execution_traces "
+            "WHERE run_id=? AND json_extract(verifier_output, '$.node_type') "
+            f"IN ({node_placeholders}) "
+            "ORDER BY created_at, trace_id"
+        )
+        rows = con.execute(
+            query, (str(run_id), *ARTIFACT_REWARD_NODE_TYPES)).fetchall()
+        rows = [r for r in rows if r[4] is not None]
+        if not rows:
+            return 0
+
+        extra_cols = [c for c in ("reward_primary_metric", "reward_direction")
+                      if c in cols]
+        set_parts = ["reward_value=?", "reward_anchor=?", "reward_g=?",
+                     "reward_source=?"]
+        set_parts.extend(f"{c}=?" for c in extra_cols)
+        update_sql = ("UPDATE execution_traces SET " + ", ".join(set_parts)
+                      + " WHERE trace_id=?")
+
+        stamped = 0
+        for i, row in enumerate(rows):
+            _trace_id, status, reward_source, validity, start = row[:5]
+            end = rows[i + 1][4] if i + 1 < len(rows) else None
+            if status != "success":
+                continue
+            if reward_source not in _EXIT_CODE_REWARD_SOURCES:
+                continue
+            if str(validity).strip().lower() not in ("", "valid"):
+                continue
+            value = artifact_reward(
+                *artifact_window_counts(con, run_id, start, end))
+            if value is None:
+                continue
+            params = [float(value), 0.5, (value - 0.5) / 0.5,
+                      ARTIFACT_REWARD_SOURCE]
+            for col in extra_cols:
+                params.append(ARTIFACT_REWARD_METRIC
+                              if col == "reward_primary_metric"
+                              else "higher_is_better")
+            params.append(row[0])
+            con.execute(update_sql, params)
+            stamped += 1
+        if stamped:
+            con.commit()
+        return stamped
+    except sqlite3.Error:
+        return 0
+    finally:
+        if con is not None:
+            con.close()
 
 

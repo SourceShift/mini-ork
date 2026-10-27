@@ -19,6 +19,7 @@ variable is unset.*
 | `MO_PRM_SCORE` | `"1"` | Process-reward heuristic scoring on traces |
 | `MO_REWARD_ANCHOR` | `"0.5"` | Reward anchor for the graded stamp normalization |
 | `MO_REWARD_STAMP` | `"1"` | Stamp reward on execution traces |
+| `MO_ARTIFACT_REWARD` | `"1"` | Post-run: re-stamp each successful implementer trace with the pass rate of the run's `verifier_results` rows recorded during that attempt (`reward_source='artifact@v1'`). `0` keeps the exit-code stamp |
 | `MO_HEARTBEAT_TIMEOUT_S` | `"300"` | Stale-heartbeat watchdog threshold |
 | `MO_DISPATCH_TIMEOUT` | `"1500"` | Dispatch-level timeout (trace store) |
 | `MO_MAX_TRANSCRIPT_BYTES` | `"1048576"` | Transcript cap per node |

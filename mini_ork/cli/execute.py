@@ -2105,6 +2105,14 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
        and step 3's advantage recompute sees the stamped values in the same
        run. If ``fail_count`` is None the stamp is skipped (the call site
        was made before the dispatch loop finished counting).
+    0b. artifact pass-rate stamp (default ON, opt out with
+       MO_ARTIFACT_REWARD=0). Re-stamps each successful implementer trace
+       that still carries the exit-code stamp with the pass rate of the
+       run's ``verifier_results`` rows recorded during that attempt
+       (``reward_source='artifact@v1'``). Runs after 0 so the
+       ``run_verified`` opt-in wins, and before the rubric fill + advantage
+       recompute so they read the grounded value. Rows with no evidence are
+       left untouched; failures are never re-stamped.
     1. rubric grading — fill-ONLY: a per-node reward already on the row
        (status-anchored stamp or eval@v1) encodes within-run lane
        differentiation a uniform rubric value would erase.
@@ -2135,6 +2143,12 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
             from mini_ork.learning import writeback as _wb_impl_reward  # noqa: PLC0415
             _wb_impl_reward.stamp_impl_run_verified(
                 db, run_id, verified=(fail_count == 0))
+        except Exception:
+            pass
+    if os.environ.get("MO_ARTIFACT_REWARD", "1") != "0":
+        try:
+            from mini_ork.learning import writeback as _wb_artifact  # noqa: PLC0415
+            _wb_artifact.stamp_artifact_rewards(db, run_id)
         except Exception:
             pass
     if os.environ.get("MO_GRADE_RUN_REWARD", "1") == "1":
