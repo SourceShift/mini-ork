@@ -511,6 +511,31 @@ def main(argv: list[str] | None = None) -> int:
             patterns_written = 0
         sys.stdout.write(f"  [pattern_miner] wrote {patterns_written or 0} pattern_records rows\n")
 
+    # ── side-channel: contrastive lane mining (MO_MGM_MINER) ───────────────
+    # Mines one run/node where lane W succeeded and lane L failed into
+    # pattern_records, so the existing induction → promotion → verify path can
+    # author and approve a lesson in the same pass. Infra failures are
+    # report-only. Placed after the pattern_store miner and before induction so
+    # a freshly-mined row is eligible for a lesson immediately.
+    mgm_report = None
+    if os.environ.get("MO_MGM_MINER", "1") != "0":
+        try:
+            from mini_ork.learning import contrastive_lanes
+            mgm_report = contrastive_lanes.mine_into_patterns(
+                db_path=db_path,
+                window=os.environ.get("MO_MGM_MINER_WINDOW") or None,
+                min_runs=os.environ.get("MO_MGM_MINER_MIN_RUNS", "3"),
+            )
+        except Exception as exc:  # a side-channel must never crash reflect
+            sys.stderr.write(f"  [mgm_miner] skipped: {exc}\n")
+            mgm_report = None
+    if mgm_report is not None:
+        sys.stdout.write(
+            f"  [mgm_miner] {mgm_report.get('pairs', 0)} contrastive pair(s), "
+            f"wrote {mgm_report.get('written', 0)} pattern_records row(s), "
+            f"{len(mgm_report.get('routing') or [])} routing-only key(s)\n"
+        )
+
     # ── side-channel: pattern induction (MO_PATTERN_INDUCE) ────────────────
     # The miner above names clusters; it does not understand them. This is the
     # step that reads the member traces and authors the lesson, following
