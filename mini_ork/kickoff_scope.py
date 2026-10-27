@@ -195,7 +195,7 @@ def kickoff_scope(text: str) -> dict:
     seen_allow: set[str] = set()
     seen_deny: set[str] = set()
     current: str | None = None
-    for line in _logical_lines(text, keep_marker=True):
+    for line in _logical_lines(text, keep_marker=True, break_before_negative=True):
         m = _HEADING_RE.match(line)
         if m:
             current = heading_kind(m.group(2))
@@ -208,7 +208,7 @@ def kickoff_scope(text: str) -> dict:
                     seen_deny.add(p)
                     deny.append(p)
             continue
-        for clause in _SENTENCE_SPLIT_RE.split(line):
+        for clause in _scope_clauses(line):
             bucket, seen = ((deny, seen_deny) if _negative_clause(clause)
                             else (allow, seen_allow))
             for p in paths_in_line(clause):
@@ -278,7 +278,22 @@ def _starts_with_trigger(sentence: str) -> bool:
     return any(t.startswith(w) for w in _TRIGGERS)
 
 
-def _logical_lines(text: str, *, keep_marker: bool = False) -> list[str]:
+def _scope_clauses(line: str) -> list[str]:
+    """The clauses of one logical scope line, its list marker kept on the first.
+
+    ``_SENTENCE_SPLIT_RE`` splits after any ``.``, so a numbered item's ``1.``
+    used to become a clause of its own and its bare bullet head was lost.
+    """
+    m = _LIST_MARKER_RE.match(line)
+    marker, body = (line[:m.end()], line[m.end():]) if m else ("", line)
+    parts = _SENTENCE_SPLIT_RE.split(body)
+    if parts:
+        parts[0] = marker + parts[0]
+    return parts
+
+
+def _logical_lines(text: str, *, keep_marker: bool = False,
+                   break_before_negative: bool = False) -> list[str]:
     """Paragraphs and list items, each one line, heading and fences aside.
 
     A list item swallows its continuation lines — indented, or flush-left
@@ -291,6 +306,10 @@ def _logical_lines(text: str, *, keep_marker: bool = False) -> list[str]:
     raw line stripped (marker included) instead of the text after the marker,
     so ``paths_in_line`` can still read a bare bullet head. Continuation
     joining, headings, blank lines and fences are unchanged.
+
+    With ``break_before_negative=True`` a continuation line that opens a
+    negative clause (``_negative_clause``) is joined with ``"; "`` so it
+    stays a clause of its own.
     """
     out: list[str] = []
     buf = ""
@@ -321,7 +340,11 @@ def _logical_lines(text: str, *, keep_marker: bool = False) -> list[str]:
             flush()
             buf = raw.strip() if keep_marker else raw[m.end():].strip()
             continue
-        buf = f"{buf} {raw.strip()}" if buf else raw.strip()
+        # A physical line that itself opens a "do not" rule starts a new
+        # clause: joining it into an unterminated line ("Files you may
+        # touch:") would bury its trigger mid-clause and allow its paths.
+        sep = "; " if break_before_negative and _negative_clause(raw.strip()) else " "
+        buf = f"{buf}{sep}{raw.strip()}" if buf else raw.strip()
     flush()
     return out
 

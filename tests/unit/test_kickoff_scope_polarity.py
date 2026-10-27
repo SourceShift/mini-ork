@@ -171,3 +171,32 @@ def test_logical_lines_default_strips_the_list_marker():
     assert _logical_lines(text) == ["a b", "c"]
     assert _logical_lines(text, keep_marker=False) == ["a b", "c"]
     assert _logical_lines(text, keep_marker=True) == ["- a b", "1. c"]
+
+
+# ── review 130 ───────────────────────────────────────────────────────────────
+
+_SCOPE_H = "## Files in scope (touch ONLY these)\n\n"
+
+
+def test_a_do_not_line_after_an_unterminated_line_still_denies():
+    scope = kickoff_scope(
+        _SCOPE_H + "Files you may touch: `a.py`\nDo not modify `docs/`.\n")
+    assert scope["allow"] == ["a.py"]
+    assert "docs/" in scope["deny"]
+
+
+def test_a_wrapped_positive_line_does_not_flip_to_deny():
+    scope = kickoff_scope(_SCOPE_H + "Edit `a.py` and\n`b.py` together.\n")
+    assert scope["allow"] == ["a.py", "b.py"] and scope["deny"] == []
+
+
+def test_numbered_items_keep_their_bare_head():
+    scope = kickoff_scope(_SCOPE_H + "1. mini_ork/foo.py\n2. `mini_ork/bar.py`\n")
+    assert scope["allow"] == ["mini_ork/foo.py", "mini_ork/bar.py"]
+
+
+def test_do_not_sentences_default_joining_is_unchanged():
+    from mini_ork.kickoff_scope import _logical_lines
+
+    assert _logical_lines("Files you may touch:\nDo not modify `docs/`.\n") == [
+        "Files you may touch: Do not modify `docs/`."]
