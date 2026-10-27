@@ -610,11 +610,11 @@ def test_run_pytest_junit_invocation_contract(tmp_path, monkeypatch):
     assert cmd[0] == sys.executable
     # Isolated bootstrap: -I keeps cwd/PYTHONPATH off sys.path and pytest is
     # imported before the target tree is inserted (review fix 4b5a74d5).
-    assert cmd[1:5] == ["-I", "-B", "-c", ps._PYTEST_BOOTSTRAP]
-    assert cmd[5] == str(tgt)
-    assert cmd[6:9] == ["-q", "-p", "no:cacheprovider"]
-    assert cmd[9].startswith("--junitxml=")
-    assert cmd[10:] == test_files
+    assert cmd[1:6] == ["-E", "-P", "-B", "-c", ps._PYTEST_BOOTSTRAP]
+    assert cmd[6] == str(tgt)
+    assert cmd[7:10] == ["-q", "-p", "no:cacheprovider"]
+    assert cmd[10].startswith("--junitxml=")
+    assert cmd[11:] == test_files
     kwargs = captured["kwargs"]
     assert kwargs.get("cwd") == str(tgt)
     assert kwargs.get("capture_output") is True
@@ -790,6 +790,30 @@ def test_grade_fails_closed_on_in_process_harness_tampering(git_root, monkeypatc
     t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
     (t / "calc.py").write_text(_TAMPER_CALC)
     assert ps._grade_git_oracle(str(t), _sidecar(root)) is False
+
+
+def test_grade_never_runs_git_in_the_solver_repo(git_root, monkeypatch, tmp_path):
+    # Review follow-up (pre-push review 114): the solver controls its repo's
+    # .git/config, and settings like core.fsmonitor make git execute commands.
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    marker = tmp_path / "fsmonitor-ran"
+    with open(t / ".git" / "config", "a") as fh:
+        fh.write(f"[core]\n\tfsmonitor = touch {marker}\n")
+    (t / "calc.py").write_text(FIXED_CALC)
+    assert ps._grade_git_oracle(str(t), _sidecar(root)) is True
+    assert not marker.exists()
+
+
+def test_grade_never_copies_bytecode(git_root, monkeypatch, tmp_path):
+    root, base_sha, _ = git_root
+    t = Path(_snapshot(tmp_path, monkeypatch, base_sha))
+    (t / "__pycache__").mkdir()
+    (t / "__pycache__" / "calc.cpython-313.pyc").write_bytes(b"not bytecode")
+    (t / "stray.pyc").write_bytes(b"not bytecode")
+    tree = Path(_snapshot(tmp_path / "base2", monkeypatch, base_sha))
+    changed, _deleted = ps._solver_changes(str(t), str(tree))
+    assert all(not p.endswith(".pyc") and "__pycache__" not in p for p in changed)
 
 
 def test_grade_missing_test_file_returns_false(git_root, monkeypatch, tmp_path):

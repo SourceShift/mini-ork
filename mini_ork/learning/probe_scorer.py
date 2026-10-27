@@ -770,10 +770,12 @@ def _make_target_repo(dst: str) -> None:
         )
 
 
-# The grading runner. `python -I` keeps the working directory and PYTHONPATH off
-# sys.path, and pytest (with pluggy and _pytest) is imported BEFORE the target
-# tree is inserted, so a module the solver planted (a fake `pytest.py`) can never
-# stand in for the runner. `-B` replaces PYTHONDONTWRITEBYTECODE, which -I ignores.
+# The grading runner. `-P` keeps the working directory off sys.path and `-E`
+# ignores PYTHON* variables (PYTHONPATH), while user site-packages stay
+# importable (`-I` would drop them, and with them a user-installed pytest).
+# pytest (with pluggy and _pytest) is imported BEFORE the target tree is
+# inserted, so a module the solver planted (a fake `pytest.py`) can never stand
+# in for the runner. `-B` replaces PYTHONDONTWRITEBYTECODE, which -E ignores.
 _PYTEST_BOOTSTRAP = (
     "import sys\n"
     "import pytest\n"
@@ -804,7 +806,7 @@ def run_pytest_junit(target: str, test_files: list[str], *,
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         try:
             subprocess.run(
-                [sys.executable, "-I", "-B", "-c", _PYTEST_BOOTSTRAP, target,
+                [sys.executable, "-E", "-P", "-B", "-c", _PYTEST_BOOTSTRAP, target,
                  "-q", "-p", "no:cacheprovider", f"--junitxml={report}",
                  *test_files],
                 cwd=target, capture_output=True, timeout=timeout, env=env,
@@ -884,30 +886,58 @@ def _shadows_runtime(rel: str, tree: str, hidden_dirs: set[str]) -> bool:
     return False
 
 
-def _solver_changes(target: str) -> tuple[list[str], list[str]] | None:
-    """``(changed_or_new, deleted)`` paths in the solver's tree vs its first commit.
+# Never copied from, or compared in, the solver's tree: VCS internals, caches
+# (a forged .pyc could inject code), run state and environments.
+_GRADE_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".mini-ork", "node_modules", ".venv", "venv",
+})
+_GRADE_SKIP_SUFFIXES = (".pyc", ".pyo")
 
-    ``target`` is the one-commit repo ``_make_target_repo`` built from the base
-    snapshot (the run may add commits on top). ``None`` when git cannot answer,
-    which the caller treats as "cannot grade" (fail closed).
+
+def _regular_files(root: str) -> set[str] | None:
+    """Repo-relative regular files under ``root`` (symlinks never followed or
+    listed; skip dirs pruned). ``None`` when the walk fails."""
+    out: set[str] = set()
+    errors: list[OSError] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False,
+                                                onerror=errors.append):
+        dirnames[:] = [d for d in dirnames if d not in _GRADE_SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(_GRADE_SKIP_SUFFIXES):
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            out.add(os.path.relpath(full, root).replace(os.sep, "/"))
+    return None if errors else out
+
+
+def _solver_changes(target: str, tree: str) -> tuple[list[str], list[str]] | None:
+    """``(changed_or_new, deleted)``: the solver's tree vs the base snapshot.
+
+    Computed by walking files, never by running git in ``target``: the solver
+    controls that repo's ``.git/config``, and settings such as
+    ``core.fsmonitor``, ``diff.external`` or filter drivers make git execute
+    commands. A file is changed when it is new or its bytes differ from the
+    base snapshot's; a base file absent from the solver's tree is deleted.
+    ``None`` (fail closed) when either walk fails.
     """
-    def _git_lines(*args: str) -> list[str] | None:
-        proc = subprocess.run(["git", "-C", target, *args],
-                              capture_output=True, text=True)
-        if proc.returncode != 0:
-            return None
-        return [line for line in proc.stdout.splitlines() if line.strip()]
+    import filecmp
 
-    roots = _git_lines("rev-list", "--max-parents=0", "HEAD")
-    if not roots:
+    solver = _regular_files(target)
+    base = _regular_files(tree)
+    if solver is None or base is None:
         return None
-    first = roots[-1]
-    changed = _git_lines("diff", "--name-only", "--diff-filter=d", first)
-    deleted = _git_lines("diff", "--name-only", "--diff-filter=D", first)
-    untracked = _git_lines("ls-files", "--others", "--exclude-standard")
-    if changed is None or deleted is None or untracked is None:
-        return None
-    return sorted(set(changed) | set(untracked)), sorted(set(deleted))
+    changed = []
+    for rel in sorted(solver):
+        theirs = os.path.join(tree, rel)
+        if (rel not in base or os.path.islink(theirs)
+                or not filecmp.cmp(os.path.join(target, rel), theirs, shallow=False)):
+            changed.append(rel)
+    deleted = sorted(rel for rel in base - solver
+                     if not os.path.lexists(os.path.join(target, rel)))
+    return changed, deleted
 
 
 def _solver_games_the_harness(tree: str) -> bool:
@@ -985,16 +1015,16 @@ def _grade_git_oracle(target: str, oracle: dict, *,
         if shown.returncode != 0:
             return False
         hidden[path] = shown.stdout
-    changes = _solver_changes(target)
-    if changes is None:
-        return False
-    changed, deleted = changes
     hidden_dirs = {os.path.dirname(p) for p in hidden}
     try:
         tree = materialize_git_tree(oracle["base_sha"])
     except Exception:  # noqa: BLE001 — an unbuildable grading tree is a fail
         return False
     try:
+        changes = _solver_changes(target, tree)
+        if changes is None:
+            return False
+        changed, deleted = changes
         for rel in changed:
             if (rel in hidden or _grade_protected(rel, hidden_dirs)
                     or _shadows_runtime(rel, tree, hidden_dirs)):
