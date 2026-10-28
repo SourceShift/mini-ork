@@ -1540,6 +1540,87 @@ def _materialize_lens_json(run_dir: str, node_id: str, text: str) -> None:
         pass
 
 
+def _atomic_write_json(path: str, obj: dict) -> None:
+    """Rewrite ``path`` atomically (tmp in the same dir + ``os.replace``)."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".lane-stamp-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _node_lens_json(run_dir: str, node_id: str) -> str | None:
+    """The ``lens-<family>.json`` ``_materialize_lens_json`` writes for a node."""
+    if not node_id.endswith(("_lens", "-lens")):
+        return None
+    return os.path.join(run_dir, f"lens-{node_id[:-5]}.json")
+
+
+def _stamp_served_lane(run_dir: str, node_id: str, out_file: str) -> None:
+    """Overwrite the LLM's self-reported lane with the harness-known served lane.
+
+    The panel prompts ask a judge to name "the model id that actually answered".
+    That is model prose: run ``run-1791725633-31802``'s ``context-opus_judge.json``
+    said ``lane=opus`` while ``llm_calls`` showed ``opus_lens`` served by ``glm``.
+    The dispatcher writes ``<run_dir>/.lane-<node_id>.json`` from
+    ``selected_model``; this copies it into the artifact as ``served_lane``,
+    ``requested_lane`` and ``served_family`` so a reader of the artifacts can
+    tell which model judged. ``lane``/``model`` (the LLM's own labels) are left
+    alone; the harness-authored keys win on conflict.
+
+    Never raises: this runs inside the researcher handler after a successful
+    dispatch and must not turn an artifact into a node failure. A missing or
+    unreadable lane record stamps nothing (older dispatches have none).
+    """
+    try:
+        from mini_ork.verify.panel_heterogeneity import lane_family
+
+        record_path = os.path.join(run_dir, f".lane-{node_id}.json")
+        with open(record_path, encoding="utf-8") as handle:
+            record = json.load(handle)
+        if not isinstance(record, dict):
+            return
+        served = record.get("served")
+        if not served:
+            return
+        stamp = {
+            "served_lane": served,
+            "requested_lane": record.get("requested"),
+            "served_family": lane_family(served),
+        }
+
+        json_artifact_seen = False
+        candidates = [os.path.join(run_dir, f"context-{node_id}.json")]
+        lens_json = _node_lens_json(run_dir, node_id)
+        if lens_json:
+            candidates.append(lens_json)
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    obj = json.load(handle)
+            except (OSError, ValueError):
+                continue  # unreadable/non-JSON: nothing to stamp here
+            if not isinstance(obj, dict):
+                continue
+            json_artifact_seen = True
+            obj.update(stamp)
+            _atomic_write_json(path, obj)
+
+        if not json_artifact_seen and out_file and not str(out_file).endswith(".json"):
+            _atomic_write_json(f"{out_file}.lane.json", dict(stamp))
+    except Exception:  # noqa: BLE001 — stamping must never fail a node
+        pass
+
+
 def _declared_node_output_paths(ctx: NodeDispatch) -> list[str]:
     """Absolute paths of the node's per-node workflow ``outputs`` ([] if none)."""
     if ctx.artifact_ledger is None or ctx.compiled_workflow is None:
@@ -1626,6 +1707,7 @@ def _handle_researcher(ctx: NodeDispatch):
     else:
         ctx.write_preserving_agent(out_file, marker, result)
     _materialize_lens_json(ctx.run_dir, ctx.node_id, result)
+    _stamp_served_lane(ctx.run_dir, ctx.node_id, out_file)
     try:
         os.remove(marker)
     except OSError:

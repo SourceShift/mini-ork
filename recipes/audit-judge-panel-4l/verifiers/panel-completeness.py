@@ -339,7 +339,10 @@ def _expected_models() -> dict[str, set[str]]:
     return out
 
 
-def check_served_models(fail, ev) -> None:
+_NODE_BY_ALIAS = {alias: node for _lane, node, alias in LANES}
+
+
+def check_served_models(fail, ev) -> dict | None:
     """The four judges must be four different model FAMILIES.
 
     Reads the judge calls of THIS run from ``llm_calls`` (``actor`` = the
@@ -351,17 +354,74 @@ def check_served_models(fail, ev) -> None:
     lens onto another judge's lane) are a same-family failure. Every problem is
     a gate failure prefixed ``served_models:``. No DB, no table, or no rows for
     this run is recorded as skipped — tests and dry runs have none — but any
-    rows present are enforced."""
+    rows present are enforced. Returns the ``check_panel`` result (None when
+    skipped) so the verdict JSON can report the per-judge lanes."""
     run_id = os.environ.get("MINI_ORK_RUN_ID") or os.path.basename(RUN_DIR.rstrip("/"))
     aliases = [alias for _l, _n, alias in LANES]
     result = panel_heterogeneity.check_panel(run_id, aliases, expect=_expected_models())
     if result["skipped"]:
         ev.write(f"served_models: skipped ({result['skipped']})\n")
-        return
+        return None
     ev.write(f"served_models: served={json.dumps(result['served'])} "
              f"families={json.dumps(result['families'])}\n")
     for problem in result["problems"]:
         fail(f"served_models:{problem}")
+    return result
+
+
+def _node_served_maps(result: dict | None,
+                      sidecars: dict[str, dict]) -> tuple[dict, dict]:
+    """Alias-keyed ``check_panel`` output → node-keyed ``served``/``families``.
+
+    An artifact's harness-stamped ``served_lane`` fills in a node the ledger
+    cannot speak for (a dry run or a hand-built test with no DB), so the
+    verdict still names every judge the artifacts account for.
+    """
+    served: dict = {}
+    families: dict = {}
+    if result:
+        for alias, lanes in (result.get("served") or {}).items():
+            node = _NODE_BY_ALIAS.get(alias)
+            if node:
+                served[node] = lanes
+        for alias, fams in (result.get("families") or {}).items():
+            node = _NODE_BY_ALIAS.get(alias)
+            if node:
+                families[node] = fams
+    for lane, node, _alias in LANES:
+        obj = sidecars.get(lane)
+        stamped = obj.get("served_lane") if isinstance(obj, dict) else None
+        if stamped and node not in served:
+            served[node] = stamped
+            families[node] = panel_heterogeneity.lane_family(stamped)
+    return served, families
+
+
+def check_sidecar_served_lanes(sidecars: dict[str, dict], result: dict | None,
+                               fail) -> None:
+    """Gate an artifact's stamped lane against the lane ``llm_calls`` served.
+
+    ``served_lane`` is written by the harness from the dispatch's
+    ``selected_model``; a disagreement with the ledger is a gating failure
+    ``sidecar_served_mismatch:<node>``. When either side is unknown (older run
+    with no stamp, or no ledger row for the judge) there is no mismatch —
+    missing evidence is not contradictory evidence.
+    """
+    if not result:
+        return
+    served_by_alias = result.get("served") or {}
+    for lane, node, alias in LANES:
+        obj = sidecars.get(lane)
+        stamped = obj.get("served_lane") if isinstance(obj, dict) else None
+        if isinstance(stamped, list) and len(stamped) == 1:
+            stamped = stamped[0]
+        if not stamped:
+            continue
+        lanes = [str(item) for item in (served_by_alias.get(alias) or [])]
+        if not lanes:
+            continue
+        if str(stamped) not in lanes:
+            fail(f"sidecar_served_mismatch:{node}")
 
 
 # ── synthesis ───────────────────────────────────────────────────────────────
@@ -407,10 +467,13 @@ def main() -> int:
             extra = sorted(set(sidecars[lane]) - REQUIRED_TOP)
             if extra:
                 ev.write(f"{lane}: extra sidecar keys (allowed): {extra}\n")
-        check_served_models(fail, ev)
+        panel = check_served_models(fail, ev)
+        check_sidecar_served_lanes(sidecars, panel, fail)
+        served, families = _node_served_maps(panel, sidecars)
         check_synthesis(f_ids, s_ids, fail)
     print(json.dumps({"verifier": "panel-completeness", "pass": not missing,
-                      "evidence_path": EVIDENCE, "missing": missing}, indent=2))
+                      "evidence_path": EVIDENCE, "missing": missing,
+                      "served": served, "families": families}, indent=2))
     return 0 if not missing else 1
 
 

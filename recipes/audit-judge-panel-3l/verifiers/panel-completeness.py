@@ -343,6 +343,40 @@ else:
     for _problem in _panel["problems"]:
         fail(f"served_models:{_problem}")
 
+# ── per-judge served lanes in the verdict, and the harness stamp gate ───────
+# ``check_panel`` keys its output by the llm_calls actor alias; the verdict
+# promises node → lane, so translate through the same LANES row order.
+_NODE_BY_ALIAS = {alias: node for (_lane, node, _report, _src), alias
+                  in zip(LANES, JUDGE_ALIASES)}
+_ALIAS_BY_LANE = {lane: alias for (lane, _node, _report, _src), alias
+                  in zip(LANES, JUDGE_ALIASES)}
+_served: dict = {}
+_families: dict = {}
+for _by_alias, _into in ((_panel["served"], _served),
+                         (_panel["families"], _families)):
+    for _alias, _value in _by_alias.items():
+        _node = _NODE_BY_ALIAS.get(_alias)
+        if _node:
+            _into[_node] = _value
+for _lane, _node, _report, _src in LANES:
+    _obj = sidecars.get(_lane)
+    _stamped = _obj.get("served_lane") if isinstance(_obj, dict) else None
+    if isinstance(_stamped, list) and len(_stamped) == 1:
+        _stamped = _stamped[0]
+    # An artifact's stamped lane fills in a judge the ledger cannot speak for
+    # (no DB in a test/dry run), so the verdict still names it.
+    if _stamped and _node not in _served:
+        _served[_node] = _stamped
+        _families[_node] = panel_heterogeneity.lane_family(_stamped)
+    # Gate: a harness stamp that disagrees with the lane llm_calls served is a
+    # real contradiction. Either side unknown (no stamp, no ledger row) is not.
+    if _panel["skipped"] or not _stamped:
+        continue
+    _lanes = [str(_item)
+              for _item in (_panel["served"].get(_ALIAS_BY_LANE[_lane]) or [])]
+    if _lanes and str(_stamped) not in _lanes:
+        fail(f"sidecar_served_mismatch:{_node}")
+
 ev.close()
 
 print(json.dumps({
@@ -350,6 +384,8 @@ print(json.dumps({
     "pass": not missing,
     "evidence_path": EVIDENCE,
     "missing": missing,
+    "served": _served,
+    "families": _families,
 }, indent=2))
 
 # rc IS the verdict — see the module header. The runner reads rc, not the JSON.

@@ -247,3 +247,49 @@ def test_distinct_or_unlogged_models_pass(tmp_path, rows):
     _make_panel(tmp_path)
     rc, out = _run(tmp_path, _calls_db(tmp_path / "state.db", rows))
     assert rc == 0, out["missing"]
+
+
+# ── Gap N1: the harness-stamped served lane ─────────────────────────────────
+
+DISTINCT_CALLS = [("opus_lens", "opus"), ("glm_lens", "glm"),
+                  ("deepseek_lens", "deepseek"), ("minimax_lens", "minimax")]
+
+
+def _stamp_sidecars(run_dir: Path, served_lane_by_node: dict[str, str]) -> None:
+    for _lane, node in LANES:
+        path = run_dir / f"context-{node}.json"
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if node in served_lane_by_node:
+            obj["served_lane"] = served_lane_by_node[node]
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+
+def test_verdict_reports_served_lanes_and_families(tmp_path):
+    from mini_ork.verify.panel_heterogeneity import lane_family
+
+    _make_panel(tmp_path)
+    served = {node: lane for lane, node in LANES}
+    _stamp_sidecars(tmp_path, served)
+    rc, out = _run(tmp_path, _calls_db(tmp_path / "state.db", DISTINCT_CALLS))
+    assert rc == 0, out["missing"]
+    for lane, node in LANES:
+        assert out["served"][node] == [lane]
+        assert out["families"][node] == [lane_family(lane)]
+
+
+def test_sidecar_served_lane_mismatch_fails(tmp_path):
+    _make_panel(tmp_path)
+    served = {node: lane for lane, node in LANES}
+    served["opus_judge"] = "glm"  # the artifact claims glm; llm_calls says opus
+    _stamp_sidecars(tmp_path, served)
+    rc, out = _run(tmp_path, _calls_db(tmp_path / "state.db", DISTINCT_CALLS))
+    assert rc == 1
+    assert "sidecar_served_mismatch:opus_judge" in out["missing"]
+
+
+def test_unstamped_sidecar_is_not_a_mismatch(tmp_path):
+    # An older run has no harness stamp; missing evidence is not a mismatch.
+    _make_panel(tmp_path)
+    rc, out = _run(tmp_path, _calls_db(tmp_path / "state.db", DISTINCT_CALLS))
+    assert rc == 0, out["missing"]
+    assert not any("sidecar_served_mismatch" in str(item) for item in out["missing"])

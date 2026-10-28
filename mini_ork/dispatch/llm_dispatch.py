@@ -1320,7 +1320,8 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             continue
         break
 
-    selected_model = str(model).split(",", 1)[0].strip()
+    requested_model = str(model).split(",", 1)[0].strip()
+    selected_model = requested_model
     try:
         selected_model = open(out_file + ".model", encoding="utf-8").read().strip() or selected_model
     except OSError:
@@ -1329,6 +1330,12 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     _write_lane_sidecar(selected_model)
 
     if rc == 0:
+        # Per-node record of the lane that ACTUALLY served this node. The
+        # run-wide ``.last-llm-lane`` cannot be used for this: parallel lenses
+        # share one run dir and overwrite each other. Written only on success
+        # (a fallback chain ending in failure has no serving lane to report)
+        # and fail-soft — it must never change a dispatch outcome.
+        _write_node_lane_record(requested_model, selected_model)
         duration_ms = int(time.time() * 1000) - start_ms
         _write_duration_ms(duration_ms)
         strip_protocol_blocks(out_file)
@@ -1490,6 +1497,46 @@ def _write_lane_sidecar(lane):
     try:
         open(os.path.join(rd, ".last-llm-lane"), "w").write(str(lane))
     except OSError:
+        pass
+
+
+# A node id becomes part of a file name, so it must not be able to leave the
+# run dir (``/``, ``..``) or smuggle in a path separator.
+_SAFE_NODE_ID = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _write_node_lane_record(requested: str, served: str) -> None:
+    """Persist ``<run_dir>/.lane-<MO_NODE_ID>.json`` for this node.
+
+    The panel gate can already read ``llm_calls`` for the serving lane, but the
+    judge's own artifact still carries only the LLM's self-reported label. This
+    per-node record is what lets ``_stamp_served_lane`` write the harness-truth
+    lane over that label; the run-wide ``.last-llm-lane`` races between parallel
+    lenses and cannot be attributed to one node.
+
+    Both ``MINI_ORK_RUN_DIR`` and ``MO_NODE_ID`` must be set, the node id must
+    be safe as a file-name component, and every error is swallowed: this is
+    evidence for a verifier, never a dispatch outcome.
+    """
+    run_dir = context_env("MINI_ORK_RUN_DIR")
+    node = context_env("MO_NODE_ID")
+    if not run_dir or not node or not served:
+        return
+    if _SAFE_NODE_ID.fullmatch(node) is None:
+        return
+    try:
+        record = {
+            "requested": requested,
+            "served": served,
+            "fallback": served != requested,
+            "at": int(time.time()),
+        }
+        path = os.path.join(run_dir, f".lane-{node}.json")
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 — never change a dispatch outcome
         pass
 
 
