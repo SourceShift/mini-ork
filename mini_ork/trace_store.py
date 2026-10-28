@@ -320,6 +320,14 @@ def enrich_stage_trace(payload: dict, *, node_type: str, verdict: str = "") -> d
             p["reward_value"] = float(rv)
             p["reward_anchor"] = float(os.environ.get("MO_REWARD_ANCHOR", "0.5"))
             p["reward_direction"] = "higher_is_better"
+            # This reward came from the node's exit status, not from verifier
+            # evidence (the verifiers run later). Label it so a reader cannot
+            # mistake it for a real verdict. A caller that already declared its
+            # own source (verify.py's verifier@v1) keeps it — and keeps its
+            # metric unset rather than inheriting exit_status.
+            if not p.get("reward_source"):
+                p["reward_source"] = "exit_status@v1"
+                p.setdefault("reward_primary_metric", "exit_status")
         except (TypeError, ValueError):
             pass
     return p

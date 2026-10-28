@@ -1550,6 +1550,21 @@ def test_trace_fn_objective_domain_defaults(tmp_path, monkeypatch):
                     "WHERE run_id='run-d';").stdout.strip() == "code-delivery"
 
 
+def test_trace_fn_labels_exit_status_and_node_id(tmp_path, monkeypatch):
+    # Every node trace is stamped from its exit status; the verifiers run
+    # later, so the reward must not claim verifier@v1 evidence. The node id
+    # travels in verifier_output so post-run grounding can window per node.
+    db = _seed_db(tmp_path, "exitlabel"); _seed_task_run(db, rid="run-el", status="executing")
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MO_REWARD_STAMP", "1")
+    tf = ex._make_trace_fn("code_fix", db, "run-el")
+    tf("impl_x", "success", "implementer", finish_reason="done")
+    row = _sql(db, "SELECT reward_source, reward_primary_metric, "
+                   "json_extract(verifier_output, '$.node_id') "
+                   "FROM execution_traces WHERE run_id='run-el';").stdout.strip()
+    assert row == "exit_status@v1|exit_status|impl_x"
+
+
 def test_trace_fn_merges_tool_summary_sidecar_and_lane(tmp_path, monkeypatch):
     # MO_TRACE_RICH fidelity: when the "${output_file}.tool-summary" sidecar exists
     # (emitted by llm-dispatch stream-json post-process), the trace_fn must parse it

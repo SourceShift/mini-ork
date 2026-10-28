@@ -8,6 +8,7 @@ Hermetic temp DB (``db/init.sh``), no network, no dispatch.
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import sqlite3
 import subprocess
@@ -46,9 +47,13 @@ def _sql(db, s):
 
 
 def _insert_trace(db, tid, *, node_type="implementer", created_at=T0, run_id="r1",
-                  status="success", validity=None, reward_source=None):
+                  status="success", validity=None, reward_source=None,
+                  node_id=None):
     cols = "trace_id,run_id,task_class,verifier_output,status,created_at"
-    vals = (f"'{tid}','{run_id}','code_fix','{{\"node_type\":\"{node_type}\"}}',"
+    vo = {"node_type": node_type}
+    if node_id is not None:
+        vo["node_id"] = node_id
+    vals = (f"'{tid}','{run_id}','code_fix','{json.dumps(vo)}',"
             f"'{status}','{created_at}'")
     if validity is not None:
         cols += ",validity"
@@ -87,6 +92,7 @@ def _row(db, tid):
 def _reward_env_clean(monkeypatch):
     monkeypatch.delenv("MO_ARTIFACT_REWARD", raising=False)
     monkeypatch.delenv("MO_IMPL_REWARD", raising=False)
+    monkeypatch.delenv("MO_ARTIFACT_REWARD_NODE_TYPES", raising=False)
 
 
 @pytest.fixture()
@@ -108,7 +114,8 @@ def test_module_constants():
     assert wb.ARTIFACT_REWARD_SOURCE == "artifact@v1"
     assert wb.ARTIFACT_REWARD_METRIC == "verifier_pass_rate"
     assert wb.ARTIFACT_REWARD_NODE_TYPES == ("implementer",)
-    assert wb._EXIT_CODE_REWARD_SOURCES == ("", "verifier@v1", "artifact@v1")
+    assert wb._EXIT_CODE_REWARD_SOURCES == (
+        "", "verifier@v1", "exit_status@v1", "artifact@v1")
 
 
 # -------------------------------------------------------------- stamping
@@ -142,6 +149,84 @@ def test_each_attempt_gets_its_own_window(tmp_path):
     assert _row(db, "a1")["reward_g"] == -1.0
     assert _row(db, "a2")["reward_value"] == 1.0
     assert _row(db, "a2")["reward_g"] == 1.0
+
+
+def test_parallel_implementers_windowed_per_node(tmp_path):
+    # Two implementer nodes trace 2 s apart. Under the old per-type window
+    # impl_a's window was cut at impl_b's trace (2 s), so the failing verifier
+    # at +10 s never grounded it. Per-node windows keep impl_a open until its
+    # own retry at +15 s.
+    db = _seed_db(tmp_path, "pernode")
+    _insert_trace(db, "tr-implementer-impl_a-1a2b3c4d", node_id="impl_a",
+                  created_at="2026-07-01T00:00:00Z")
+    _insert_trace(db, "tr-implementer-impl_b-2b3c4d5e", node_id="impl_b",
+                  created_at="2026-07-01T00:00:02Z")
+    _insert_trace(db, "tr-implementer-impl_a-3c4d5e6f", node_id="impl_a",
+                  created_at="2026-07-01T00:00:15Z")
+    _insert_vr(db, verdict="fail", created_at=E0 + 10)
+    _insert_vr(db, verdict="pass", created_at=E0 + 22)
+    assert wb.stamp_artifact_rewards(db, "r1") == 3
+    assert _row(db, "tr-implementer-impl_a-1a2b3c4d")["reward_value"] == 0.0
+    assert _row(db, "tr-implementer-impl_b-2b3c4d5e")["reward_value"] == 0.5
+    assert _row(db, "tr-implementer-impl_a-3c4d5e6f")["reward_value"] == 1.0
+
+
+def test_legacy_trace_id_windowed_by_parsed_node(tmp_path):
+    # No $.node_id: the node must come from tr-<node_type>-<node_id>-<hex8>.
+    db = _seed_db(tmp_path, "legacynode")
+    _insert_trace(db, "tr-implementer-impl_a-1a2b3c4d",
+                  created_at="2026-07-01T00:00:00Z")
+    _insert_trace(db, "tr-implementer-impl_b-2b3c4d5e",
+                  created_at="2026-07-01T00:00:02Z")
+    _insert_trace(db, "tr-implementer-impl_a-9f8e7d6c",
+                  created_at="2026-07-01T00:00:15Z")
+    _insert_vr(db, verdict="fail", created_at=E0 + 10)
+    _insert_vr(db, verdict="pass", created_at=E0 + 22)
+    writeback_stamped = wb.stamp_artifact_rewards(db, "r1")
+    assert writeback_stamped == 3
+    assert _row(db, "tr-implementer-impl_a-1a2b3c4d")["reward_value"] == 0.0
+    assert _row(db, "tr-implementer-impl_b-2b3c4d5e")["reward_value"] == 0.5
+    assert _row(db, "tr-implementer-impl_a-9f8e7d6c")["reward_value"] == 1.0
+
+
+def test_node_types_override_restamps_researcher(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "widened")
+    _insert_trace(db, "tr-researcher-r1-51d47c9a", node_type="researcher",
+                  node_id="r1")
+    _insert_vr(db, verdict="pass", created_at=E0 + 10)
+    # Unset: the default implementer-only set leaves a researcher untouched.
+    assert wb.stamp_artifact_rewards(db, "r1") == 0
+    assert _row(db, "tr-researcher-r1-51d47c9a")["reward_source"] \
+        == "verifier@v1"
+    monkeypatch.setenv("MO_ARTIFACT_REWARD_NODE_TYPES",
+                       "implementer,researcher")
+    assert wb.stamp_artifact_rewards(db, "r1") == 1
+    row = _row(db, "tr-researcher-r1-51d47c9a")
+    assert row["reward_source"] == "artifact@v1"
+    assert row["reward_value"] == 1.0
+
+
+def test_node_types_override_never_grounds_verifier(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "noverifier")
+    _insert_trace(db, "tr-verifier-v1-7c31a05b", node_type="verifier",
+                  node_id="v1")
+    _insert_vr(db, verdict="pass", created_at=E0 + 10)
+    monkeypatch.setenv("MO_ARTIFACT_REWARD_NODE_TYPES",
+                       "implementer,verifier")
+    assert wb.stamp_artifact_rewards(db, "r1") == 0
+    assert _row(db, "tr-verifier-v1-7c31a05b")["reward_source"] \
+        == "verifier@v1"
+
+
+def test_exit_status_source_is_eligible(tmp_path):
+    db = _seed_db(tmp_path, "exitstatus")
+    _insert_trace(db, "a1", reward_source="exit_status@v1")
+    _insert_vr(db, verdict="pass", created_at=E0 + 10)
+    assert wb.stamp_artifact_rewards(db, "r1") == 1
+    row = _row(db, "a1")
+    assert row["reward_source"] == "artifact@v1"
+    assert row["reward_value"] == 1.0
+    assert row["reward_primary_metric"] == "verifier_pass_rate"
 
 
 def test_earlier_rows_do_not_count(tmp_path):

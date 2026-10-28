@@ -4506,7 +4506,15 @@ def _make_trace_fn(task_class, db, run_id):
             # default code-delivery ONLY when unset, matching trace_store's fallback.
             "objective_domain": (os.environ.get("MINI_ORK_OBJECTIVE_DOMAIN")
                                  or os.environ.get("MO_OBJECTIVE_DOMAIN") or "code-delivery"),
-            "verifier_output": {"node_type": node_type, "finish_reason": finish_reason or None},
+            "verifier_output": {"node_type": node_type, "node_id": node_id,
+                                "finish_reason": finish_reason or None},
+            # Every node trace is stamped from its exit status, and the
+            # verifiers that produce real evidence run later in the DAG. Label
+            # the reward for what it is instead of letting it inherit the
+            # verifier@v1 default; set it unconditionally so MO_REWARD_STAMP=0
+            # rows do not fall back to that false claim either.
+            "reward_source": "exit_status@v1",
+            "reward_primary_metric": "exit_status",
         }
         # agent_version_id = the resolved dispatch lane (bash passes ${dispatch_lane:-}
         # into the payload, :1878). Without it lane attribution is lost on every trace,

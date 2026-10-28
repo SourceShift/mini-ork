@@ -95,6 +95,22 @@ def test_enrich_failure_status_and_verdict_veto(tmp_path, monkeypatch):
     assert p2["reward_value"] == 0.0
 
 
+def test_enrich_labels_status_reward_as_exit_status(tmp_path, monkeypatch):
+    # A status-derived stage reward is an exit-code stamp, not verifier
+    # evidence; it must say so instead of inheriting verifier@v1.
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.setenv("MO_REWARD_STAMP", "1")
+    p = enrich_stage_trace({"status": "success"}, node_type="planner")
+    assert p["reward_source"] == "exit_status@v1"
+    assert p["reward_primary_metric"] == "exit_status"
+    # An explicit source (verify.py's real verdict) is never relabelled.
+    p2 = enrich_stage_trace(
+        {"status": "success", "reward_source": "verifier@v1"},
+        node_type="verifier")
+    assert p2["reward_source"] == "verifier@v1"
+    assert p2.get("reward_primary_metric") is None
+
+
 def test_enrich_skips_reward_when_disabled(tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
     monkeypatch.setenv("MO_REWARD_STAMP", "0")

@@ -723,6 +723,10 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             "task_class": task_class,
             "status": status,
             "verifier_output": {"verdict": verdict},
+            # This reward is grounded in a real verifier verdict, unlike the
+            # exit-status stamps every node trace carries. Declare it before
+            # enrich_stage_trace so it is not relabelled exit_status@v1.
+            "reward_source": "verifier@v1",
         }
         if verdict == "partial":
             payload["reward_value"] = 0.5

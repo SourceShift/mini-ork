@@ -11,7 +11,9 @@ import datetime
 import json
 import math
 import os
+import re
 import sqlite3
+import sys
 
 from mini_ork import cn_client
 from mini_ork.learning import reward_audit
@@ -34,7 +36,38 @@ _REWARD_APPROVE_VERDICTS = ("approve", "approved", "pass", "passed",
 ARTIFACT_REWARD_SOURCE = "artifact@v1"
 ARTIFACT_REWARD_METRIC = "verifier_pass_rate"
 ARTIFACT_REWARD_NODE_TYPES = ("implementer",)
-_EXIT_CODE_REWARD_SOURCES = ("", "verifier@v1", ARTIFACT_REWARD_SOURCE)
+_EXIT_CODE_REWARD_SOURCES = ("", "verifier@v1", "exit_status@v1",
+                             ARTIFACT_REWARD_SOURCE)
+
+
+def _artifact_reward_node_types() -> tuple[str, ...]:
+    """Resolve which node types the artifact re-stamp may ground.
+
+    ``MO_ARTIFACT_REWARD_NODE_TYPES`` (comma-separated) overrides the default
+    ``ARTIFACT_REWARD_NODE_TYPES``. It is read at call time, not import time,
+    so a run can widen credit assignment without a process restart. ``verifier``
+    is always excluded — a verifier's own trace must never be graded by the
+    verdict it produced. An empty or unusable value (none of the tokens usable)
+    falls back to the default with one stderr line; ``None`` is the normal
+    unset case and is silent.
+    """
+    raw = os.environ.get("MO_ARTIFACT_REWARD_NODE_TYPES")
+    if raw is None:
+        return ARTIFACT_REWARD_NODE_TYPES
+    resolved: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token or token == "verifier" or token in resolved:
+            continue
+        resolved.append(token)
+    if not resolved:
+        print(
+            "mini-ork: MO_ARTIFACT_REWARD_NODE_TYPES is empty or unusable; "
+            "falling back to " + ",".join(ARTIFACT_REWARD_NODE_TYPES),
+            file=sys.stderr,
+        )
+        return ARTIFACT_REWARD_NODE_TYPES
+    return tuple(resolved)
 
 
 def reward_from_status(status: str = "", verdict: str = "") -> str:
@@ -614,21 +647,29 @@ def artifact_reward(passes: int, fails: int) -> float | None:
 
 
 def stamp_artifact_rewards(db, run_id) -> int:
-    """Re-stamp a run's successful implementer traces with verifier pass rate.
+    """Re-stamp a run's successful traces with verifier pass rate.
 
     Post-run grounding of the exit-code stamp: a ``success`` row whose reward
     still comes from the exit code (``reward_source`` empty / ``verifier@v1``
-    / ``artifact@v1``) gets ``reward_value`` = the pass rate of the run's
-    ``verifier_results`` rows recorded during its own attempt window, with
-    ``reward_anchor=0.5``, ``reward_g=(v-0.5)/0.5`` and
+    / ``exit_status@v1`` / ``artifact@v1``) gets ``reward_value`` = the pass
+    rate of the run's ``verifier_results`` rows recorded during its own
+    attempt window, with ``reward_anchor=0.5``, ``reward_g=(v-0.5)/0.5`` and
     ``reward_source='artifact@v1'``.
 
-    The window for the i-th implementer trace (ordered by ``created_at``,
-    ``trace_id``) runs from its own epoch to the next implementer trace's
-    epoch, exclusive; the last trace's window is open-ended. Every
-    implementer row bounds a window whether or not it is eligible. Rows with
-    no evidence in their window are left untouched, so a failure's reward can
-    never be raised. Idempotent; never raises (``sqlite3.Error`` -> 0).
+    Node types default to ``ARTIFACT_REWARD_NODE_TYPES`` (implementers only);
+    ``MO_ARTIFACT_REWARD_NODE_TYPES`` widens the set, with ``verifier`` always
+    excluded. See ``_artifact_reward_node_types``.
+
+    Attempt windows are **per node**, not per node type: a trace (ordered by
+    ``created_at``, ``trace_id``) runs from its own epoch to the next trace of
+    the *same* node, exclusive; the last trace of a node is open-ended. The
+    node is ``verifier_output.node_id`` when present, else parsed from the
+    ``tr-<node_type>-<node_id>-<hex8>`` trace id; rows where neither yields a
+    node fall back to the next trace of the same node type (the old
+    behaviour). Every trace bounds its node's window whether or not it is
+    eligible; rows with no evidence in their window are left untouched, so a
+    failure's reward can never be raised. Idempotent; never raises
+    (``sqlite3.Error`` -> 0).
     """
     if not db or not run_id or not os.path.isfile(db):
         return 0
@@ -645,20 +686,50 @@ def stamp_artifact_rewards(db, run_id) -> int:
 
         validity_expr = ("COALESCE(validity, 'valid')" if "validity" in cols
                          else "'valid'")
-        node_placeholders = ", ".join("?" for _ in ARTIFACT_REWARD_NODE_TYPES)
+        node_types = _artifact_reward_node_types()
+        node_placeholders = ", ".join("?" for _ in node_types)
         query = (
             "SELECT trace_id, status, COALESCE(reward_source, ''), "
-            f"{validity_expr}, CAST(strftime('%s', created_at) AS INTEGER) "
+            f"{validity_expr}, CAST(strftime('%s', created_at) AS INTEGER), "
+            "json_extract(verifier_output, '$.node_type'), "
+            "json_extract(verifier_output, '$.node_id') "
             "FROM execution_traces "
             "WHERE run_id=? AND json_extract(verifier_output, '$.node_type') "
             f"IN ({node_placeholders}) "
             "ORDER BY created_at, trace_id"
         )
         rows = con.execute(
-            query, (str(run_id), *ARTIFACT_REWARD_NODE_TYPES)).fetchall()
+            query, (str(run_id), *node_types)).fetchall()
         rows = [r for r in rows if r[4] is not None]
         if not rows:
             return 0
+
+        def _node_key(trace_id, node_type, recorded):
+            """The node a trace belongs to, or None when it cannot be known."""
+            if recorded:
+                return str(recorded)
+            if not node_type:
+                return None
+            match = re.fullmatch(
+                rf"tr-{re.escape(str(node_type))}-(.+)-[0-9a-f]{{8}}",
+                str(trace_id or ""))
+            return match.group(1) if match else None
+
+        keys = [_node_key(r[0], r[5], r[6]) for r in rows]
+        # A node's window ends at its own next trace; unkeyed rows keep the
+        # historical per-type window so legacy stage/executor rows still bound
+        # one another.
+        ends: list[int | None] = []
+        for i in range(len(rows)):
+            end = None
+            node_type, key = rows[i][5], keys[i]
+            for j in range(i + 1, len(rows)):
+                if rows[j][5] != node_type:
+                    continue
+                if key is None or keys[j] == key:
+                    end = rows[j][4]
+                    break
+            ends.append(end)
 
         extra_cols = [c for c in ("reward_primary_metric", "reward_direction")
                       if c in cols]
@@ -671,7 +742,7 @@ def stamp_artifact_rewards(db, run_id) -> int:
         stamped = 0
         for i, row in enumerate(rows):
             _trace_id, status, reward_source, validity, start = row[:5]
-            end = rows[i + 1][4] if i + 1 < len(rows) else None
+            end = ends[i]
             if status != "success":
                 continue
             if reward_source not in _EXIT_CODE_REWARD_SOURCES:
