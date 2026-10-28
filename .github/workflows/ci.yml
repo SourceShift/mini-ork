@@ -58,7 +58,10 @@ jobs:
   python-tests:
     name: python tests (${{ matrix.python-version }} / ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # The unit shards run 22-33 min and drift with every added test file (the
+    # odd/even split reshuffles); 35 cancelled a passing 3.12/unit-a at 35.4
+    # min on 2026-10-28 (a re-run took 28.6). Headroom, not a ceiling to aim at.
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
