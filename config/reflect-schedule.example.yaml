@@ -1,0 +1,66 @@
+# Scheduled reflect config (copy to `<home>/config/reflect-schedule.yaml`, or
+# name a path with `mini-ork reflect --scheduled --config PATH`).
+#
+# Reflect normally runs post-run and as an in-workflow node; this schedules a
+# catch-up pass for traces a killed post-run pass, or a cost-circuit-open
+# window, never reflected. It starts paid LLM calls, so it ships OFF.
+#
+# One config file serves both delivery tiers:
+#
+#   Simple tier — no server, no daemon, no cloud account. Run one pass from
+#   cron or launchd against the local SQLite home:
+#
+#       mini-ork reflect --scheduled
+#
+#   crontab:
+#       # every hour at :17 (off the hour, so it never collides with a sweep)
+#       17 * * * * cd /path/to/project && mini-ork reflect --scheduled
+#
+#   launchd (StartInterval is in seconds):
+#       <key>ProgramArguments</key>
+#       <array>
+#         <string>/usr/local/bin/mini-ork</string>
+#         <string>reflect</string>
+#         <string>--scheduled</string>
+#       </array>
+#       <key>StartInterval</key>
+#       <integer>3600</integer>
+#
+#   All scheduled passes share one `__reflect_schedule__` lease row in the
+#   state DB, so a cron overlap is a no-op (exit 0), not a double spend. The
+#   window's upper bound is `now - settle_s`, so a scheduled pass never touches
+#   traces a fresh run's own post-run pass may still be reflecting.
+#
+#   Service tier — a long-running process against the shared DB (a fleet of
+#   nodes, one owner):
+#
+#       mini-ork reflect --scheduled --interval
+#
+#   It loops `run_once` and sleeps `interval_s` between passes; Ctrl-C exits 0.
+#   Each pass is still individually leased, so a manual `--scheduled` run from
+#   cron alongside the service is safe.
+#
+# Every pass spends LLM budget under the existing `MO_DAILY_BUDGET_USD` cap —
+# the schedule adds no budget of its own.
+#
+# A path named by --config that is missing or unparseable is a hard error
+# (exit 2), never a silent fallback to these values.
+
+reflect_schedule:
+  # Off by default: enabling this starts paid reflect passes.
+  enabled: false
+
+  # Seconds between passes in the service tier (`--scheduled --interval`).
+  interval_s: 3600
+
+  # SIGALRM bound on one pass (MO_REFLECT_DEADLINE_S). A pass that hits it
+  # exits 124, keeps the old state, and the window is retried next tick. The
+  # lease TTL is derived from this, so it always outlives a full-length pass.
+  deadline_s: 900
+
+  # Traces younger than this are left to their run's own post-run reflect pass
+  # (the upper bound is now - settle_s). Raise it for long runs.
+  settle_s: 1800
+
+  # Oldest look-back when no prior successful window is recorded (7 days).
+  max_window_s: 604800

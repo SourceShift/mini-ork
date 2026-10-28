@@ -93,8 +93,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task-class", type=str, default="")
     p.add_argument("--lane", type=str, default="")
     p.add_argument("--dry-run", action="store_true")
+    # Scheduled cadence (see docs/operator/reflect-schedule.md). Deliberately
+    # absent from _usage(): the help text is a byte-pinned golden.
+    p.add_argument("--scheduled", action="store_true")
+    p.add_argument("--config", type=str, default="")
+    p.add_argument("--interval", action="store_true")
     p.add_argument("--help", "-h", action="store_true")
     return p
+
+
+def _run_scheduled(args) -> int:
+    """Dispatch the scheduled cadence tiers; never touch the reflect pipeline's
+    own env/trace setup (this process is the scheduler, not a reflect pass)."""
+    from mini_ork.learning import reflect_schedule  # noqa: PLC0415
+
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    try:
+        cfg = reflect_schedule.load_config(home, args.config or None)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+
+    if args.interval:
+        return reflect_schedule.run_forever(home, db, cfg)
+    return reflect_schedule.run_once(home, db, cfg)
 
 
 # ── Trace writes (native trace_store; bash lib/trace_store.sh retired) ──────
@@ -287,6 +309,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.help:
         sys.stdout.write(_usage())
         return 0
+
+    # Scheduled cadence: branch before any reflect-pass side effect (deadline
+    # alarm, __reflect__ trace write, atexit registration) — the scheduler is
+    # not itself a pass. --config/--interval without --scheduled stay unknown
+    # flags so the historical CLI surface is unchanged.
+    if not args.scheduled and (args.config or args.interval):
+        flag = "--config" if args.config else "--interval"
+        sys.stderr.write(f"Unknown flag: {flag}. Try --help\n")
+        return 2
+    if args.scheduled:
+        return _run_scheduled(args)
 
     # A detached post-run pass has no parent timeout; arm the child's own
     # deadline before any work that could block. Disarmed at every normal

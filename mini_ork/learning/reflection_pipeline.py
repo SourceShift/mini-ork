@@ -137,19 +137,47 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
 # ── Private SQL helpers (lifted from bash heredocs) ─────────────────────────
 
+def _reflection_until_ts() -> int | None:
+    """Read ``MO_REFLECTION_UNTIL_TS``; only a positive integer caps the window.
+
+    The scheduled reflect pass sets it to ``now - settle_s`` so it stays off
+    traces a fresh run's own post-run pass is still reflecting. Unset, invalid,
+    or non-positive → no upper bound (unchanged behaviour).
+    """
+    raw = os.environ.get("MO_REFLECTION_UNTIL_TS", "")
+    try:
+        until = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return until if until > 0 else None
+
+
 def _extract_trace_ids_sql(db_path: str, since_ts: int, batch: int) -> list[str]:
     """Mirror bash heredoc: SELECT trace_id FROM execution_traces
     WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?
-    ORDER BY created_at LIMIT ?."""
+    ORDER BY created_at LIMIT ?.
+
+    When ``MO_REFLECTION_UNTIL_TS`` is a positive integer, an upper bound
+    (``<= until``) narrows the window. The env is read here, at call time, so
+    the function keeps its 3-arg signature (both callers — the pipeline and
+    reflect's run-scoped selector — stay intact)."""
+    until = _reflection_until_ts()
+    sql = (
+        "SELECT trace_id FROM execution_traces "
+        "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+    )
+    params: list = [int(since_ts)]
+    if until is not None:
+        sql += "AND CAST(strftime('%s', created_at) AS INTEGER) <= ? "
+        params.append(until)
+    sql += (
+        "AND (task_class IS NULL OR substr(task_class, 1, 2) != '__') "
+        "ORDER BY created_at LIMIT ?"
+    )
+    params.append(int(batch))
     con = _connect(db_path)
     try:
-        rows = con.execute(
-            "SELECT trace_id FROM execution_traces "
-            "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
-            "AND (task_class IS NULL OR substr(task_class, 1, 2) != '__') "
-            "ORDER BY created_at LIMIT ?",
-            (int(since_ts), int(batch)),
-        ).fetchall()
+        rows = con.execute(sql, params).fetchall()
     finally:
         con.close()
     return [r[0] for r in rows]
