@@ -767,6 +767,12 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
     circuit_open = 0
     lr_mode = layer_routing.mode()
     layer_refused = 0
+    # Traces this pass could act on: selected, minus the ones skipped because
+    # they were already processed (watermark / prior layer refusal). A pass
+    # where every trace was already handled must record inputs=0, never look
+    # stalled to `ledger.stage_health`.
+    attempted = 0
+    last_dispatch_error = ""
     from mini_ork.learning import gradient_extractor as _ge
 
     for tid in trace_ids:
@@ -788,6 +794,7 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
         # reflection for the entire run — silently — so the learning loop read as
         # "nothing to learn" instead of "budget exhausted", and the gradient hole
         # was invisible for hours. Count it, surface it, and continue.
+        attempted += 1
         try:
             grads = list(_gradient_extract(tid))
         except (SystemExit, Exception) as exc:  # noqa: BLE001
@@ -795,6 +802,7 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
             last_err = str(getattr(_ge, "_last_dispatch_error", "") or "")
             if "cost_circuit_open" in last_err:
                 circuit_open += 1
+                last_dispatch_error = last_err
                 print(
                     "reflection_extract_gradients: dispatch halted "
                     f"({last_err.strip()[:160]}) — aborting batch after "
@@ -804,6 +812,7 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
                 break
             if not last_err:
                 last_err = f"{type(exc).__name__}: {exc}"
+            last_dispatch_error = last_err
             print(
                 f"reflection_extract_gradients: dispatch failed for {tid} "
                 f"({last_err.strip()[:160]}) — skipping",
@@ -859,6 +868,33 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
         f"reflection_extract_gradients: extracted {extracted} gradients since {since_ts}",
         file=sys.stderr,
     )
+
+    # Pass-stats producer: one `gradient_extract` row per live reflect pass so
+    # `ledger.stage_health` (and the IDE Learn overview) can tell a stalled
+    # stage from a healthy empty window. Gated on the pass id reflect.main
+    # scopes around the pipeline call; a stage with no pass id, or a dry run,
+    # writes nothing.
+    pass_id = os.environ.get("MO_REFLECT_PASS_ID", "")
+    if pass_id and os.environ.get("MINI_ORK_DRY_RUN") != "1":
+        try:
+            from mini_ork.learning.ledger import record_pass_stat
+
+            # A cost-circuit refusal is already counted in dispatch_failed
+            # (it increments both before the batch aborts); adding
+            # circuit_open again would report more failures than inputs.
+            failures = dispatch_failed
+            record_pass_stat(
+                pass_id,
+                "gradient_extract",
+                inputs=attempted,
+                outputs=extracted,
+                failures=failures,
+                lane=os.environ.get("MINI_ORK_GRADIENT_MODEL", "") or "",
+                last_error=last_dispatch_error if failures > 0 else "",
+                db=os.environ.get("MINI_ORK_DB") or None,
+            )
+        except Exception:  # noqa: BLE001 — a ledger error must never stop reflection
+            pass
 
 
 def reflection_apply_per_node_credit(db_path: str | None = None) -> int:

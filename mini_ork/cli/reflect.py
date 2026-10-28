@@ -31,6 +31,8 @@ import sys
 import time
 from pathlib import Path
 
+from mini_ork.context import scoped_environ
+
 __all__ = ["main", "_resolve_reflect_model"]
 
 
@@ -484,13 +486,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     run_stdout = io.StringIO()
-    if run_id:
-        with _run_scoped_trace_selection(rp, run_id):
+    # Name this pass for its pipeline stages (the gradient_extract pass-stats
+    # row reads it back). Scoped so the variable cannot leak into a caller's
+    # environment; `scoped_environ` is the only sanctioned way to change
+    # process env.
+    with scoped_environ({"MO_REFLECT_PASS_ID": trace_id}):
+        if run_id:
+            with _run_scoped_trace_selection(rp, run_id):
+                with contextlib.redirect_stdout(run_stdout):
+                    suggestions_json = rp.reflection_run(since_int)
+        else:
             with contextlib.redirect_stdout(run_stdout):
                 suggestions_json = rp.reflection_run(since_int)
-    else:
-        with contextlib.redirect_stdout(run_stdout):
-            suggestions_json = rp.reflection_run(since_int)
     sys.stdout.write(f"{suggestions_json.rstrip(chr(10))}\n")
 
     # ── side-channel: pattern_store (MO_PATTERN_MINER) ──────────────────────
@@ -579,6 +586,38 @@ def main(argv: list[str] | None = None) -> int:
                     f"{skipped.get('model', '?')}: {err}\n"
                 )
                 break
+
+    # Record this pass's induction health for `ledger.stage_health` and the
+    # IDE Learn overview. A report of None means the stage was turned off or
+    # raised, so there is nothing honest to record. Fail-soft like every other
+    # side-channel: a ledger error must never fail reflect.
+    if induce_report is not None and not dry_run:
+        try:
+            from mini_ork.learning.ledger import record_pass_stat
+
+            skipped_entries = induce_report.get("skipped") or []
+            induced = int(induce_report.get("induced", 0) or 0)
+            failing = [
+                s for s in skipped_entries
+                if s.get("reason") == "dispatch failed"
+            ]
+            lane = ""
+            last_error = ""
+            if failing:
+                lane = failing[-1].get("model") or ""
+                last_error = failing[-1].get("error") or ""
+            record_pass_stat(
+                trace_id,
+                "pattern_induction",
+                inputs=induced + len(skipped_entries),
+                outputs=induced,
+                failures=len(failing),
+                lane=lane,
+                last_error=last_error,
+                db=db_path,
+            )
+        except Exception:  # a side-channel must never crash reflect
+            pass
 
     # ── side-channel: lesson themes (MO_THEMES) ───────────────────────────
     # Group gradient_records into themes so the prompt block stops carrying
