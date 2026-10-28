@@ -232,12 +232,18 @@ for lane, node, _report in LANES:
 # keyed on one lane must see the other two. Compare the key sets, not the
 # values — pairwise over all three lanes so any one schema drift is caught
 # twice, naming both drift partners.
+# The harness stamps served_lane / requested_lane / served_family into a judge's
+# artifact only when its dispatch left a lane record, so one judge can carry them
+# while another cannot. They are harness provenance, not the shared judge schema:
+# parity compares the judge-authored keys only.
+_HARNESS_KEYS = {"served_lane", "requested_lane", "served_family"}
 if len(sidecars) == 3:
     for a_lane, b_lane in itertools.combinations(sorted(sidecars), 2):
         a, b = sidecars[a_lane], sidecars[b_lane]
         tag = f"{a_lane}~{b_lane}"
-        if set(a) != set(b):
-            fail(f"cross_lane_{tag}_top_level_keys_differ:{sorted(set(a) ^ set(b))}")
+        ka, kb = set(a) - _HARNESS_KEYS, set(b) - _HARNESS_KEYS
+        if ka != kb:
+            fail(f"cross_lane_{tag}_top_level_keys_differ:{sorted(ka ^ kb)}")
         at, bt = a.get("tasks") or [], b.get("tasks") or []
         if at and bt and set(at[0]) != set(bt[0]):
             fail(f"cross_lane_{tag}_task_keys_differ:{sorted(set(at[0]) ^ set(bt[0]))}")

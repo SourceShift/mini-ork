@@ -257,10 +257,16 @@ for lane, node, _report in LANES:
 
 # Cross-lane parity: the WHOLE point of the shared schema. A mechanical merge
 # keyed on one lane must see the other. Compare the key sets, not the values.
+# The harness stamps served_lane / requested_lane / served_family into a judge's
+# artifact only when its dispatch left a lane record, so one judge can carry them
+# while another cannot. They are harness provenance, not the shared judge schema:
+# parity compares the judge-authored keys only.
+_HARNESS_KEYS = {"served_lane", "requested_lane", "served_family"}
 if len(sidecars) == 2:
     a, b = sidecars["opus"], sidecars["minimax"]
-    if set(a) != set(b):
-        fail(f"cross_lane_top_level_keys_differ:{sorted(set(a) ^ set(b))}")
+    ka, kb = set(a) - _HARNESS_KEYS, set(b) - _HARNESS_KEYS
+    if ka != kb:
+        fail(f"cross_lane_top_level_keys_differ:{sorted(ka ^ kb)}")
     af = a.get("findings") or []
     bf = b.get("findings") or []
     if af and bf and set(af[0]) != set(bf[0]):
@@ -269,7 +275,7 @@ if len(sidecars) == 2:
     bx = b.get("fixes") or []
     if ax and bx and set(ax[0]) != set(bx[0]):
         fail(f"cross_lane_fix_keys_differ:{sorted(set(ax[0]) ^ set(bx[0]))}")
-    ev.write(f"cross_lane_parity: top={set(a) == set(b)} "
+    ev.write(f"cross_lane_parity: top={ka == kb} "
              f"finding={bool(af and bf and set(af[0]) == set(bf[0]))} "
              f"fix={bool(ax and bx and set(ax[0]) == set(bx[0]))}\n")
 
