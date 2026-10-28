@@ -1173,3 +1173,64 @@ def test_no_ledger_leaves_the_stored_cost_alone(tmp_path, monkeypatch, capsys):
     con.close()
     assert row[0] == 3.25, row
     assert row[1] == 1010, row  # a published row keeps its end when we add none
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Gap N3 — verify ignores a failed verifier's verdict on upstream nodes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _seed_attempt(db, run_id: str, node_id: str, *, result: str,
+                  failure_class: str | None = None,
+                  ended_at: int = 1_000_001) -> None:
+    """Append one ``node_attempts`` row (id order = recency order)."""
+    con = sqlite3.connect(db)
+    try:
+        attempt_no = con.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM node_attempts"
+            " WHERE run_id=? AND node_id=?",
+            (run_id, node_id),
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO node_attempts"
+            " (run_id, node_id, attempt_no, node_type, started_at, ended_at,"
+            "  result, failure_class, checkpoint_used, checkpoint_produced)"
+            " VALUES (?, ?, ?, 'verifier', ?, ?, ?, ?, 0, 0)",
+            (run_id, node_id, attempt_no, ended_at - 1, ended_at,
+             result, failure_class),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_verify_strategy_ignores_failed_verifier_attempt(tmp_path, monkeypatch):
+    """Kickoff Gap N3 test 7: a failed first verifier must NOT turn
+    ``--strategy verify`` into a refusal (or invalidate the upstream
+    implementer). The verifier-failure reuse check is suppressed for
+    verify, so the implementer stays reusable and the entry is the first
+    verifier in topo order.
+    """
+    db, run_dir, recipe, _ = _setup_db(tmp_path)
+    _set_run_dir(monkeypatch, run_dir)
+    run_id = "run-verify-gap-n3"
+    tc = "framework_edit"
+    for nid in ("lens_a", "lens_b", "synth", "implementer"):
+        _seed_success(db, run_id, nid, recipe, tc, run_dir)
+    Path(run_dir, "plan.json").write_text(json.dumps({"objective": "x"}))
+    # The implementer has no checkpoint-producing attempt row, so the
+    # recency fallback would count this failure as newer — only the
+    # verify-strategy suppression keeps the implementer reusable.
+    _seed_attempt(db, run_id, "gate", result="failure",
+                  failure_class="terminal")
+
+    wf = tmp_path / "wf.yaml"
+    _verify_workflow(wf)
+
+    plan = rp.plan_recovery(
+        str(wf), run_id, db, run_dir,
+        recipe=recipe, task_class=tc, strategy="verify",
+    )
+    assert "implementer" in plan.reuse
+    assert plan.closure == {"gate", "smoke"}
+    assert plan.first_node == "gate"

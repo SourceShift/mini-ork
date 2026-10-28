@@ -174,6 +174,37 @@ def _seed_task_run(db_path: str, run_id: str) -> None:
         con.close()
 
 
+def _seed_attempt_row(db_path: str, run_id: str, node_id: str, *,
+                      result: str, failure_class: str | None = None,
+                      checkpoint_produced: int = 0,
+                      ended_at: int = 1000001) -> None:
+    """Append one ``node_attempts`` ledger row (id order = recency order).
+
+    ``_seed_success_row`` writes ``created_at=1000000``; the default
+    ``ended_at`` here is one second later so a verifier row seeded after
+    it is "newer" than the checkpoint.
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        attempt_no = con.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM node_attempts"
+            " WHERE run_id=? AND node_id=?",
+            (run_id, node_id),
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO node_attempts"
+            " (run_id, node_id, attempt_no, node_type, started_at,"
+            "  ended_at, result, failure_class, checkpoint_used,"
+            "  checkpoint_produced)"
+            " VALUES (?, ?, ?, '', ?, ?, ?, ?, 0, ?)",
+            (run_id, node_id, attempt_no, ended_at - 1, ended_at,
+             result, failure_class, checkpoint_produced),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def _write_workflow_yaml(path: Path, *, nodes: list[dict], edges: list[dict]) -> None:
     """Write a workflow.yaml compatible with the planner's loader.
 
@@ -710,3 +741,178 @@ def test_escalates_to_edge_excluded_from_closure(
     assert plan.failed_node == "B"
     assert plan.closure == {"B", "C"}
     assert "R" not in plan.closure, "R must not be pulled into the closure"
+
+
+# ─── Gap N3: a failed direct verifier invalidates its parent's reuse ───────
+
+def _verifier_workflow(workflow_path: Path) -> None:
+    """The kickoff's DAG: implementer → {verifier_a, verifier_b} → reviewer."""
+    _write_workflow_yaml(workflow_path, nodes=[
+        {"name": "implementer", "type": "implementer", "model_lane": "minimax_lens"},
+        {"name": "verifier_a", "type": "verifier", "model_lane": "verifier"},
+        {"name": "verifier_b", "type": "verifier", "model_lane": "verifier"},
+        {"name": "reviewer", "type": "reviewer", "model_lane": "opus_lens"},
+    ], edges=[
+        {"from": "implementer", "to": "verifier_a", "edge_type": "verifies"},
+        {"from": "implementer", "to": "verifier_b", "edge_type": "verifies"},
+        {"from": "verifier_a", "to": "reviewer", "edge_type": "depends_on"},
+        {"from": "verifier_b", "to": "reviewer", "edge_type": "depends_on"},
+    ])
+
+
+def _seed_reused_implementer(db_path: str, run_id: str, *,
+                             recipe: str, task_class: str, run_dir: str,
+                             ended_at: int = 1000000) -> None:
+    """Checkpoint + the checkpoint-producing attempt row recency compares to."""
+    art = _seed_artifact(run_dir, "implementer.md", b"out-implementer")
+    _seed_success_row(db_path, run_id, "implementer", recipe=recipe,
+                      task_class=task_class, run_dir=run_dir,
+                      artifact_rel=art)
+    _seed_attempt_row(db_path, run_id, "implementer", result="success",
+                      checkpoint_produced=1, ended_at=ended_at)
+
+
+def test_failed_direct_verifier_invalidates_reuse(
+    tmp_path: Path, db_path: str, run_dir: str,
+) -> None:
+    """Kickoff test 1: a newer terminal verifier failure un-reuses the
+    implementer and pulls the whole branch into the closure."""
+    run_id = "run-n3-invalidate-001"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    workflow = tmp_path / "wf.yaml"
+    _verifier_workflow(workflow)
+    _seed_reused_implementer(db_path, run_id, recipe=recipe,
+                             task_class=tc, run_dir=run_dir)
+    _seed_attempt_row(db_path, run_id, "verifier_a", result="failure",
+                      failure_class="terminal")
+    _seed_attempt_row(db_path, run_id, "verifier_b", result="success")
+
+    plan = rp.plan_recovery(
+        str(workflow), run_id, db_path, run_dir,
+        recipe=recipe, task_class=tc, strategy="resume",
+    )
+    assert "implementer" not in plan.reuse
+    assert plan.reason["implementer"] == "verifier_failed:verifier_a"
+    assert plan.closure == {"implementer", "verifier_a", "verifier_b", "reviewer"}
+    assert plan.failed_node == "implementer"
+    assert plan.first_node == "implementer"
+
+
+def test_null_failure_class_abstain_keeps_reuse(
+    tmp_path: Path, db_path: str, run_dir: str,
+) -> None:
+    """Kickoff test 2: a NULL failure_class is an abstain, not a verdict."""
+    run_id = "run-n3-abstain-001"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    workflow = tmp_path / "wf.yaml"
+    _verifier_workflow(workflow)
+    _seed_reused_implementer(db_path, run_id, recipe=recipe,
+                             task_class=tc, run_dir=run_dir)
+    _seed_attempt_row(db_path, run_id, "verifier_a", result="failure",
+                      failure_class=None)
+
+    plan = rp.plan_recovery(
+        str(workflow), run_id, db_path, run_dir,
+        recipe=recipe, task_class=tc, strategy="resume",
+    )
+    assert "implementer" in plan.reuse
+    assert plan.reason["implementer"] == "reusable"
+
+
+def test_infra_interrupt_class_keeps_reuse(
+    tmp_path: Path, db_path: str, run_dir: str,
+) -> None:
+    """Kickoff test 3: an infra interruption says nothing about the output."""
+    run_id = "run-n3-infra-001"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    workflow = tmp_path / "wf.yaml"
+    _verifier_workflow(workflow)
+    _seed_reused_implementer(db_path, run_id, recipe=recipe,
+                             task_class=tc, run_dir=run_dir)
+    _seed_attempt_row(db_path, run_id, "verifier_a", result="failure",
+                      failure_class="infra_interrupt")
+
+    plan = rp.plan_recovery(
+        str(workflow), run_id, db_path, run_dir,
+        recipe=recipe, task_class=tc, strategy="resume",
+    )
+    assert "implementer" in plan.reuse
+    assert plan.reason["implementer"] == "reusable"
+
+
+def test_older_failure_than_newer_checkpoint_keeps_reuse(
+    tmp_path: Path, db_path: str, run_dir: str,
+) -> None:
+    """Kickoff test 4: the implementer re-ran after the failure, so the
+    failure is stale; recency is compared by attempt id, not wall clock."""
+    run_id = "run-n3-older-001"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    workflow = tmp_path / "wf.yaml"
+    _verifier_workflow(workflow)
+    # Failure first (lower id, later clock), then the implementer's
+    # checkpoint-producing attempt (higher id) supersedes it.
+    _seed_attempt_row(db_path, run_id, "verifier_a", result="failure",
+                      failure_class="terminal", ended_at=1000005)
+    _seed_reused_implementer(db_path, run_id, recipe=recipe,
+                             task_class=tc, run_dir=run_dir, ended_at=1000000)
+
+    plan = rp.plan_recovery(
+        str(workflow), run_id, db_path, run_dir,
+        recipe=recipe, task_class=tc, strategy="resume",
+    )
+    assert "implementer" in plan.reuse
+    assert plan.reason["implementer"] == "reusable"
+    assert "implementer" not in plan.closure
+
+
+def test_from_node_skips_verifier_invalidation(
+    tmp_path: Path, db_path: str, run_dir: str,
+) -> None:
+    """Kickoff test 5: --from-node is the operator's choice and wins."""
+    run_id = "run-n3-from-node-001"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    workflow = tmp_path / "wf.yaml"
+    _verifier_workflow(workflow)
+    _seed_reused_implementer(db_path, run_id, recipe=recipe,
+                             task_class=tc, run_dir=run_dir)
+    _seed_attempt_row(db_path, run_id, "verifier_a", result="failure",
+                      failure_class="terminal")
+
+    plan = rp.plan_recovery(
+        str(workflow), run_id, db_path, run_dir,
+        recipe=recipe, task_class=tc, from_node="verifier_a",
+        strategy="resume",
+    )
+    assert "implementer" in plan.reuse
+    assert plan.reason["implementer"] == "reusable"
+    assert plan.closure == {"verifier_a", "reviewer"}
+    assert plan.failed_node == "verifier_a"
+
+
+def test_both_verifiers_passed_keeps_reuse(
+    tmp_path: Path, db_path: str, run_dir: str,
+) -> None:
+    """Kickoff test 6: passing verifiers leave today's behaviour intact."""
+    run_id = "run-n3-pass-001"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    workflow = tmp_path / "wf.yaml"
+    _verifier_workflow(workflow)
+    _seed_reused_implementer(db_path, run_id, recipe=recipe,
+                             task_class=tc, run_dir=run_dir)
+    _seed_attempt_row(db_path, run_id, "verifier_a", result="success")
+    _seed_attempt_row(db_path, run_id, "verifier_b", result="success")
+
+    plan = rp.plan_recovery(
+        str(workflow), run_id, db_path, run_dir,
+        recipe=recipe, task_class=tc, strategy="resume",
+    )
+    assert plan.reuse == {"implementer"}
+    assert plan.reason["implementer"] == "reusable"
+    assert plan.closure == {"verifier_a", "verifier_b", "reviewer"}
+

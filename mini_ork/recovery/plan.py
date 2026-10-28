@@ -45,6 +45,7 @@ import dataclasses
 import hashlib
 import os
 import sqlite3
+import sys
 
 # E1 seam — read by is_node_reusable for the per-node reuse decision.
 # Importing at module top means a runtime absence of E1 surfaces
@@ -368,6 +369,118 @@ def _peek_row_status(db_path: str, run_id: str, node_id: str) -> str | None:
     return row[0] if row else None
 
 
+# Verifier failure classes that describe an interruption of the attempt
+# rather than a verdict on the upstream node's output: an infra cut, a
+# provider quota wall, or a question only the operator can answer. A
+# verifier that failed with one of these has not said the output is bad,
+# so the upstream node stays reusable. A NULL class is an abstain (rc 3,
+# finish ``done``) and is exempt for the same reason.
+_VERIFIER_FAILURE_EXEMPT_CLASSES = frozenset({
+    "infra_interrupt",
+    "provider_limit",
+    "input_required",
+})
+
+
+def _invalidate_on_failed_verifiers(
+    db: str,
+    run_id: str,
+    dag: DAG,
+    node_types: dict[str, str],
+    reuse: set[str],
+    reason: dict[str, str],
+) -> None:
+    """Drop reusable nodes whose direct verifier failed after their output.
+
+    Verifier nodes never write a ``node_checkpoints`` row (their handler
+    only writes ``node_attempts``), so ``is_node_reusable`` is blind to a
+    verifier rejecting a node's output: the node's success checkpoint
+    still looks reusable and recover re-runs only the verifier, against an
+    output already known to be bad. This helper closes that gap — read-only
+    on both tables, mutating ``reuse`` / ``reason`` in place.
+
+    For every ``P`` in ``reuse`` reusable through a real checkpoint
+    (``reason[P] == ""``; the planner ``plan_json`` shortcut has a
+    non-empty reason and is skipped), find each verifier-typed direct
+    child ``V`` (``P in dag.parents[V]``; ``dag`` already dropped
+    ``escalates_to`` / ``retries`` control edges) and read ``V``'s latest
+    ``node_attempts`` row for ``run_id`` (highest ``id``). It counts as a
+    real failure when ``result IN ('failure', 'error')`` and
+    ``failure_class`` is neither NULL nor exempt.
+
+    Recency is id-ordered, not clock-ordered: ``V``'s attempt id is
+    compared with the id of ``P``'s latest attempt row that produced a
+    checkpoint. When ``P`` has no such row, fall back to
+    ``V.ended_at >= node_checkpoints.created_at`` for ``P`` — a tie
+    counts as newer. When both hold, ``P`` leaves ``reuse`` and
+    ``reason[P]`` becomes ``f"verifier_failed:{V}"``.
+
+    Any DB error leaves ``reuse`` untouched (fail open to the legacy
+    behaviour) and writes one stderr line. Every read happens before the
+    first mutation, so a mid-scan error cannot leave a partial update.
+    """
+    if not db or not os.path.isfile(db):
+        return
+    try:
+        con = sqlite3.connect(db, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            invalidated: dict[str, str] = {}
+            for p in dag.node_ids:
+                if p not in reuse or reason.get(p, "") != "":
+                    continue
+                for v in dag.node_ids:
+                    if node_types.get(v) != "verifier":
+                        continue
+                    if p not in dag.parents.get(v, ()):
+                        continue
+                    vrow = con.execute(
+                        "SELECT id, ended_at, result, failure_class"
+                        " FROM node_attempts"
+                        " WHERE run_id=? AND node_id=?"
+                        " ORDER BY id DESC LIMIT 1",
+                        (run_id, v),
+                    ).fetchone()
+                    if vrow is None:
+                        continue
+                    v_id, v_ended_at, v_result, v_class = vrow
+                    if v_result not in ("failure", "error"):
+                        continue
+                    if (v_class is None
+                            or v_class in _VERIFIER_FAILURE_EXEMPT_CLASSES):
+                        continue
+                    prow = con.execute(
+                        "SELECT id FROM node_attempts"
+                        " WHERE run_id=? AND node_id=?"
+                        " AND checkpoint_produced=1"
+                        " ORDER BY id DESC LIMIT 1",
+                        (run_id, p),
+                    ).fetchone()
+                    if prow is not None:
+                        newer = v_id > prow[0]
+                    else:
+                        crow = con.execute(
+                            "SELECT created_at FROM node_checkpoints"
+                            " WHERE run_id=? AND node_id=?",
+                            (run_id, p),
+                        ).fetchone()
+                        if crow is None:
+                            continue
+                        newer = v_ended_at >= crow[0]
+                    if not newer:
+                        continue
+                    invalidated[p] = v
+                    break
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        sys.stderr.write(f"recovery plan: verifier-reuse check skipped: {e}\n")
+        return
+    for p, v in invalidated.items():
+        reuse.discard(p)
+        reason[p] = f"verifier_failed:{v}"
+
+
 def _sku(run_id: str, recipe: str, task_class: str) -> str:
     return hashlib.sha256(
         f"{run_id}|{recipe}|{task_class}".encode()
@@ -428,12 +541,16 @@ def compute_recovery(
     recipe: str = "",
     task_class: str = "generic",
     from_node: str | None = None,
+    check_verifiers: bool = True,
 ) -> RecoveryPlan:
     """Compute the dependency-closure recovery plan.
 
     Algorithm (deterministic, no LLM):
       1. Load the DAG from workflow.yaml.
-      2. For each node, ask ``is_node_reusable`` → reuse set.
+      2. For each node, ask ``is_node_reusable`` → reuse set. Then drop
+         nodes whose direct verifier failed after their output (the
+         verifier's verdict is not in ``node_checkpoints``), unless
+         ``from_node`` is set or ``check_verifiers`` is False.
       3. The earliest non-reusable node in topo order is the
          ``failed_node`` (reported to the operator as the root cause).
          It is the FIRST node whose upstream chain is still intact but
@@ -464,6 +581,19 @@ def compute_recovery(
         recipe=recipe_eff, task_class=tc_eff,
         node_types=node_types,
     )
+    # Verifier outcomes are invisible to ``is_node_reusable`` (verifiers
+    # write only a ``node_attempts`` row), so a node whose direct verifier
+    # rejected its output still looks reusable and recover would re-run
+    # just the verifier against known-bad output. Invalidate those nodes
+    # BEFORE the closure is computed so a rejected node becomes a rerun
+    # root. The operator's ``--from-node`` wins, and ``--strategy verify``
+    # deliberately keeps every upstream node reusable (re-running the
+    # verifier chain is its whole purpose) — ``plan_recovery`` passes
+    # ``check_verifiers=False`` for it.
+    if check_verifiers and not from_node:
+        _invalidate_on_failed_verifiers(
+            db_path, run_id, dag, node_types, reuse, reason,
+        )
     all_set = set(dag.node_ids)
 
     # A node may only be skipped when nothing downstream of it reruns.
@@ -598,6 +728,11 @@ def plan_recovery(
     plan = compute_recovery(
         workflow_yaml_path, run_id, db_path, run_dir,
         recipe=recipe, task_class=task_class, from_node=from_node,
+        # ``verify`` re-runs the verifier chain over upstream nodes that
+        # MUST stay reusable; suppressing the verifier-failure check is
+        # what keeps a failed first verifier from refusing its own
+        # strategy (kickoff N3 §Mechanism).
+        check_verifiers=(strategy != "verify"),
     )
 
     # ``verify`` strategy override (kickoff §3). Entry = first verifier in
