@@ -81,7 +81,13 @@ def test_migration_is_idempotent(tmp_path):
 
 def test_sorted_after_0083():
     names = sorted(p.name for p in (REPO / "db" / "migrations").glob("*.sql"))
-    assert names.index("0084_rsi_cycles.sql") == len(names) - 1
+    # NOT "0084 is the newest" — every later migration is the normal case and
+    # 0085 already exists, which made this a time-bomb. What matters is that
+    # 0084 still ships and still sorts after 0083, whose tables its foreign
+    # keys target.
+    assert "0084_rsi_cycles.sql" in names
+    assert (names.index("0084_rsi_cycles.sql")
+            > names.index("0083_lesson_conflicts.sql"))
 
 
 def test_require_tables_fails_closed_on_a_bare_db(tmp_path):

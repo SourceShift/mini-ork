@@ -288,6 +288,23 @@ def _defect_text():
 # ── Mechanism 1: a non-verdict finish never triggers a code revise ──────────
 
 
+def _revise_rounds(harness):
+    """Names of the revise *rounds* this run started, if any.
+
+    ``<run>/revise/`` is also where the R5a review ledger writes
+    ``findings.json`` (``mini_ork/workflow/review_ledger.py``), so the
+    directory existing says nothing about a round. A round is a
+    ``round-<n>.md`` file plus the ``current.json`` pointer.
+    """
+    revise = harness.run_dir / "revise"
+    if not revise.is_dir():
+        return []
+    names = [p.name for p in revise.glob("round-*.md")]
+    if (revise / "current.json").exists():
+        names.append("current.json")
+    return sorted(names)
+
+
 @pytest.mark.parametrize("reviewer_rc,finish", [(1, "error"), (124, "timeout")])
 def test_reviewer_non_verdict_does_not_revise(tmp_path, reviewer_rc, finish):
     harness = _Harness(tmp_path)
@@ -302,7 +319,7 @@ def test_reviewer_non_verdict_does_not_revise(tmp_path, reviewer_rc, finish):
     assert dispatch.implementer_calls == 1, (
         f"a reviewer finish_reason={finish!r} produced no verdict and must not "
         "revive the implementer")
-    assert not (harness.run_dir / "revise").exists(), (
+    assert _revise_rounds(harness) == [], (
         f"no revise round may start on finish_reason={finish!r}")
     assert "code_reviewer" in (out + err), (
         "the skip reason names the reviewer node")
@@ -342,7 +359,7 @@ def test_both_sides_pass_empty_diff_ends_not_needed(tmp_path):
         "base rc 0 + candidate rc 0 + an empty diff must end not_needed")
     assert "already satisfied at base" in (notes + out + err)
     assert dispatch.implementer_calls == 1
-    assert not (harness.run_dir / "revise").exists()
+    assert _revise_rounds(harness) == []
 
 
 def test_both_sides_pass_bytecode_only_diff_ends_not_needed(tmp_path):
@@ -367,7 +384,7 @@ def test_both_sides_pass_bytecode_only_diff_ends_not_needed(tmp_path):
         "a bytecode-only diff is the 'already satisfied at base' shape")
     assert "already satisfied at base" in (notes + out + err)
     assert dispatch.implementer_calls == 1
-    assert not (harness.run_dir / "revise").exists()
+    assert _revise_rounds(harness) == []
 
 
 def test_real_source_diff_is_not_already_satisfied(tmp_path):
@@ -411,7 +428,7 @@ def test_defect_report_escalates_without_another_round(tmp_path, defect_name):
     assert rc == 1, "an escalation fails the run; it does not quietly pass"
     assert dispatch.implementer_calls == 1, (
         f"{defect_name} present → no further implementer dispatch")
-    assert not (harness.run_dir / "revise").exists(), (
+    assert _revise_rounds(harness) == [], (
         "a filed defect report must not start another revise round")
     status, notes = harness.run_row()
     assert status == "failed"

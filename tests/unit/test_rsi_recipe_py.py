@@ -108,9 +108,11 @@ def _fake_run(monkeypatch, files: dict[str, object], *, rc: int = 0) -> dict:
     """Replace the dispatch with one that writes the given artifacts."""
     seen: dict = {}
 
-    def _run(req, recipe, brief, kickoff, *, timeout_s, brief_env):
+    def _run(req, recipe, brief, kickoff, *, timeout_s, brief_env,
+             node_wall_s=None):
         seen.update(recipe=recipe, brief=brief, kickoff=kickoff,
-                    timeout_s=timeout_s, brief_env=brief_env)
+                    timeout_s=timeout_s, brief_env=brief_env,
+                    node_wall_s=node_wall_s)
         home = req.home / "rsi" / req.cycle_id / recipe / "home"
         run_dir = home / "runs" / f"{req.cycle_id}-{recipe}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -629,7 +631,8 @@ def test_recipe_propose_still_accepts_a_proposal_from_a_clean_contract(tmp_path,
 
 
 def test_recipe_propose_rejects_an_artifact_that_is_not_json(tmp_path, monkeypatch):
-    def _run(req, recipe, brief, kickoff, *, timeout_s, brief_env):
+    def _run(req, recipe, brief, kickoff, *, timeout_s, brief_env,
+             node_wall_s=None):
         home = req.home / "rsi" / req.cycle_id / recipe / "home"
         run_dir = home / "runs" / f"{req.cycle_id}-{recipe}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -688,7 +691,8 @@ def test_recipe_critics_quarantines_instead_of_raising_when_the_run_fails(tmp_pa
 
 
 def test_recipe_critics_treats_an_unreadable_panel_as_unmeasured(tmp_path, monkeypatch):
-    def _run(req, recipe, brief, kickoff, *, timeout_s, brief_env):
+    def _run(req, recipe, brief, kickoff, *, timeout_s, brief_env,
+             node_wall_s=None):
         home = req.home / "rsi" / req.cycle_id / recipe / "home"
         run_dir = home / "runs" / f"{req.cycle_id}-{recipe}"
         run_dir.mkdir(parents=True, exist_ok=True)

@@ -21,7 +21,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ["python", "javascript-typescript"]
+        # Python only. The service has no JavaScript/TypeScript sources
+        # (`git ls-files '*.js' '*.ts' '*.jsx' '*.tsx'` is empty; the UI is a
+        # separate repo), so the JS job had nothing to build and failed as a
+        # CodeQL *configuration* error on every push. Add the language back
+        # together with the first JS/TS file that lands here.
+        language: ["python"]
     steps:
       - uses: actions/checkout@v7
 

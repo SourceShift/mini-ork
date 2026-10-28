@@ -202,7 +202,17 @@ def _load_wt_script():
 
 
 def _stub_git(*_a: Any, **_k: Any) -> types.SimpleNamespace:
-    return types.SimpleNamespace(stdout="", returncode=0)
+    return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+
+def _stub_proc(*_a: Any, **_k: Any) -> types.SimpleNamespace:
+    """A stand-in for ``subprocess.run(..., capture_output=True)``.
+
+    The merge driver forwards a guard's output with ``_forward(proc)``, which
+    reads ``proc.stdout`` and ``proc.stderr``. A stub without them is not a
+    CompletedProcess and crashes the driver instead of exercising it.
+    """
+    return types.SimpleNamespace(stdout="", stderr="", returncode=0)
 
 
 def test_merge_calls_supersede_once_after_push(
@@ -227,8 +237,7 @@ def test_merge_calls_supersede_once_after_push(
 
     monkeypatch.setattr(retry_notify, "supersede_gates_for_target", supersede)
     monkeypatch.setattr(mod, "git", git)
-    monkeypatch.setattr(mod.subprocess, "run",
-                        lambda *_a, **_k: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(mod.subprocess, "run", _stub_proc)
 
     mod.merge_worktree(["slug"])
 
@@ -251,8 +260,7 @@ def test_merge_survives_a_supersede_exception(
 
     monkeypatch.setattr(retry_notify, "supersede_gates_for_target", boom)
     monkeypatch.setattr(mod, "git", _stub_git)
-    monkeypatch.setattr(mod.subprocess, "run",
-                        lambda *_a, **_k: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(mod.subprocess, "run", _stub_proc)
 
     mod.merge_worktree(["slug"])  # must not raise — the push already landed
     assert "retry gates" in capsys.readouterr().err  # fail soft, but visibly
