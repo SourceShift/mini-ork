@@ -295,14 +295,20 @@ for lane, node, _report, src in LANES:
 # Cross-lane parity: the WHOLE point of the shared schema. A mechanical merge
 # keyed on one lane must see the others. Compare the key sets pairwise across
 # every lane present, not the values.
+# The harness stamps served_lane / requested_lane / served_family into an
+# artifact only when its dispatch left a lane record, so one judge can carry
+# them while another cannot. They are harness provenance, not the judges'
+# shared schema: parity compares the judge-authored keys only (review 151).
+_HARNESS_KEYS = {"served_lane", "requested_lane", "served_family"}
 if len(sidecars) >= 2:
     names = sorted(sidecars)
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             a, b = sidecars[names[i]], sidecars[names[j]]
             pair = f"{names[i]}|{names[j]}"
-            if set(a) != set(b):
-                fail(f"cross_lane_top_level_keys_differ:{pair}:{sorted(set(a) ^ set(b))}")
+            ka, kb = set(a) - _HARNESS_KEYS, set(b) - _HARNESS_KEYS
+            if ka != kb:
+                fail(f"cross_lane_top_level_keys_differ:{pair}:{sorted(ka ^ kb)}")
             af = a.get("findings") or []
             bf = b.get("findings") or []
             if af and bf and set(af[0]) != set(bf[0]):
@@ -311,7 +317,7 @@ if len(sidecars) >= 2:
             bx = b.get("fixes") or []
             if ax and bx and set(ax[0]) != set(bx[0]):
                 fail(f"cross_lane_fix_keys_differ:{pair}:{sorted(set(ax[0]) ^ set(bx[0]))}")
-            ev.write(f"cross_lane_parity {pair}: top={set(a) == set(b)} "
+            ev.write(f"cross_lane_parity {pair}: top={ka == kb} "
                      f"finding={bool(af and bf and set(af[0]) == set(bf[0]))} "
                      f"fix={bool(ax and bx and set(ax[0]) == set(bx[0]))}\n")
 
@@ -363,6 +369,8 @@ for _lane, _node, _report, _src in LANES:
     _stamped = _obj.get("served_lane") if isinstance(_obj, dict) else None
     if isinstance(_stamped, list) and len(_stamped) == 1:
         _stamped = _stamped[0]
+    if not isinstance(_stamped, str):
+        _stamped = None  # only a single harness-written lane name is evidence
     # An artifact's stamped lane fills in a judge the ledger cannot speak for
     # (no DB in a test/dry run), so the verdict still names it.
     if _stamped and _node not in _served:

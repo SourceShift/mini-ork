@@ -159,6 +159,28 @@ def test_unstamped_sidecar_is_not_a_mismatch(tmp_path):
     assert not any("sidecar_served_mismatch" in str(item) for item in out["missing"])
 
 
+def test_one_stamped_judge_keeps_cross_lane_parity(tmp_path):
+    """Only judges whose dispatch left a lane record get the harness keys, so
+    parity must ignore them (review 151)."""
+    served = {LANES[0][1]: LANES[0][0]}  # stamp the first judge only
+    _make_panel(tmp_path, served)
+    rc, out = _run(tmp_path, _calls_db(tmp_path / "state.db"))
+    assert rc == 0, out["missing"]
+    assert not any("cross_lane_top_level_keys_differ" in str(m) for m in out["missing"])
+
+
+def test_a_judge_written_key_difference_still_breaks_parity(tmp_path):
+    _make_panel(tmp_path, {})
+    node = LANES[1][1]
+    path = tmp_path / f"context-{node}.json"
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    obj["extra_judge_key"] = 1
+    path.write_text(json.dumps(obj), encoding="utf-8")
+    rc, out = _run(tmp_path, _calls_db(tmp_path / "state.db"))
+    assert rc == 1
+    assert any("cross_lane_top_level_keys_differ" in str(m) for m in out["missing"])
+
+
 def test_verifier_is_the_recipe_copy():
     assert mini_ork.__file__  # import sanity: the shim resolves the package
     assert VERIFIER.is_file()
