@@ -1,0 +1,30 @@
+name: coverage_planning_research
+version: "0.1.0"
+description: >
+  Literature-driven improvement planning for LibWit's book composer: collect
+  the 2023-2026 coverage-planning papers, cluster their techniques into families,
+  distill each family into implementable techniques, and rank them by impact
+  against what the composer already ships, using two independent reviewer lanes.
+matches:
+  keywords:
+    - coverage complete book planning
+    - composer coverage review
+    - corpus scale planning techniques
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 5
+  max_usd: 40
+  per_lens_usd: 1.5
+
+runtime_model:
+  min_minutes: 60
+  max_minutes: 300
