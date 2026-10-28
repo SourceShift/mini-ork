@@ -1973,6 +1973,42 @@ def test_direct_mode_run_streams_into_the_thread_not_a_run_session(tmp_path):
     assert [u.status for u in close] == ["failed"]  # rolled_back is not a success
 
 
+def test_direct_mode_close_re_emits_the_run_card_from_the_final_snapshot(tmp_path):
+    """The marker opens before any node ran, so its card carries no rows. The
+    close re-emits a card built from the final snapshot — node rows with their
+    lane and verdict, and the run's cost — so the live thread shows the
+    finished run, and the recorded close replays the same card."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    def launcher(rid: str, kickoff: str) -> dict:
+        return {"ok": True}
+
+    def reader(rid: str) -> dict:
+        return {"status": "rolled_back", "events": [
+            {"event_type": "node_start", "payload_json": json.dumps(
+                {"node_id": "n1", "node_type": "implementer", "model_lane": "sonnet"})},
+            {"event_type": "node_end", "payload_json": json.dumps(
+                {"node_id": "n1", "node_type": "implementer", "verdict": "refuted"})}],
+            "llm_calls": [{"cost_usd": 0.42, "total_tokens": 10}]}
+
+    agent, thread = _thread_agent(proj, launcher=launcher, reader=reader)
+    conn = _SidConn()
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/run fix the typo")]))
+    closes = [u for _, u in conn.sent if isinstance(u, ToolCallProgress)
+              and str(u.tool_call_id).endswith(":parent")]
+    assert [u.status for u in closes] == ["failed"]
+    card = (closes[0].field_meta or {}).get("mini_ork")
+    assert card is not None, "the close must carry the closing run card"
+    assert card["kind"] == "run" and card["status"] == "rolled_back"
+    (steps,) = [b for b in card["blocks"] if b.get("type") == "steps"]
+    assert [(s["id"], s["lane"], s["status"]) for s in steps["steps"]] == [
+        ("n1", "sonnet", "refuted")]
+    (kv,) = [b for b in card["blocks"] if b.get("type") == "kv"]
+    assert {r["k"]: r["v"] for r in kv["rows"]}["cost"] == "$0.42"
+
+
 def test_direct_mode_launch_failure_explains_and_keeps_the_thread(tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()

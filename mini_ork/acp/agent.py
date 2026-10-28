@@ -836,6 +836,9 @@ class MiniOrkAcpAgent:
         self._sessions: dict[str, str] = {}
         # session id → recipe (D2: honoured from the client's _meta).
         self._recipes: dict[str, str] = {}
+        # run id → the worktree its marker was opened with, so the card the
+        # close re-emits names the same branch the open did.
+        self._run_worktrees: dict[str, dict[str, str] | None] = {}
         # session id → set of already-emitted node transitions (D1: emit once).
         self._emitted: dict[str, set[str]] = {}
         # session id → launcher result dict (carries pid / log_path so
@@ -2237,14 +2240,7 @@ class MiniOrkAcpAgent:
         # buttons (handled via ``_skip_review`` already).
         for lane, rid, ws, result in launchable:
             ok = self._run_status.get(rid) == "published"
-            await self._emit(
-                session_id,
-                ToolCallProgress(
-                    session_update="tool_call_update",
-                    tool_call_id=f"{rid}:parent",
-                    status="completed" if ok else "failed",
-                ),
-            )
+            await self._emit(session_id, self._close_marker_update(rid, ok=ok))
 
         # Build rows for the table — cost / change / time per run.
         rows = self._collect_race_rows(specs)
@@ -3938,6 +3934,7 @@ class MiniOrkAcpAgent:
                 "mode": "this worktree" if adopted else "worktree",
                 "branch": worktree_branch,
             }
+        self._run_worktrees[run_id] = worktree
         try:
             cached_status = str(self._run_status.get(run_id) or "")
             card = run_card(
@@ -3958,6 +3955,36 @@ class MiniOrkAcpAgent:
         if card is not None:
             update = with_meta(update, card)
         await self._emit(thread_id, update)
+
+    def _closing_run_card(self, run_id: str) -> dict[str, Any] | None:
+        """The run card the marker's close carries.
+
+        The marker opened before any node ran, so its own card has no rows,
+        no cost and no verdicts. The close rebuilds the card from the final
+        snapshot with the same pure builder, and the close is recorded on the
+        thread like the open, so a replay shows the finished run too.
+        """
+        reader = self._reader or self._read_snapshot
+        try:
+            snapshot = reader(run_id) or {}
+            return run_card(
+                snapshot,
+                run_id=run_id,
+                recipe=self._recipes.get(run_id) or self._recipe,
+                worktree=self._run_worktrees.get(run_id),
+            )
+        except Exception:  # noqa: BLE001 — a card is best-effort
+            return None
+
+    def _close_marker_update(self, run_id: str, *, ok: bool) -> ToolCallProgress:
+        """The ``<run_id>:parent`` close, carrying the closing run card."""
+        update = ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id=f"{run_id}:parent",
+            status="completed" if ok else "failed",
+        )
+        card = self._closing_run_card(run_id)
+        return with_meta(update, card) if card is not None else update
 
     async def _follow_in_thread(self, thread_id: str, run_id: str) -> StopReason:
         """Project routed ``run_id`` until it ends, then close its marker.
@@ -3999,11 +4026,7 @@ class MiniOrkAcpAgent:
                 return "end_turn"
             ok = stop == "end_turn" and self._run_status.get(run_id) == "published"
             if ok and await self._deliver_to_zed(thread_id, run_id):
-                await self._emit(thread_id, ToolCallProgress(
-                    session_update="tool_call_update",
-                    tool_call_id=f"{run_id}:parent",
-                    status="completed",
-                ))
+                await self._emit(thread_id, self._close_marker_update(run_id, ok=True))
                 await self._reemit_title_after_review(run_id)
                 return stop
             if await self._offer_run_review(thread_id, run_id):
@@ -4084,14 +4107,7 @@ class MiniOrkAcpAgent:
                 # that never started: the follower moves on from this failure,
                 # so a later one offers a fresh prompt.
                 self._lane_repair_emitted.discard(run_id)
-            await self._emit(
-                thread_id,
-                ToolCallProgress(
-                    session_update="tool_call_update",
-                    tool_call_id=f"{run_id}:parent",
-                    status="completed" if ok else "failed",
-                ),
-            )
+            await self._emit(thread_id, self._close_marker_update(run_id, ok=ok))
             return stop
 
     async def _await_resume_started(self, run_id: str) -> bool:
