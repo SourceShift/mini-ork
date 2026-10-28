@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import runpy
 import shutil
 import stat
@@ -34,12 +35,20 @@ def test_package_declares_core_and_full_runtime_dependencies():
     project = metadata["project"]
     assert "PyYAML>=6.0" in project["dependencies"]
     assert project["optional-dependencies"]["yaml"] == []
-    assert project["optional-dependencies"]["full"] == [
-        "fastapi>=0.110",
-        "uvicorn[standard]>=0.29",
-        "verifiers>=0.2.0,<0.3",
-        "gepa>=0.1.4,<0.2",
-    ]
+    full = project["optional-dependencies"]["full"]
+    assert full[0] == "fastapi>=0.110"
+    assert full[1] == "uvicorn[standard]>=0.29"
+    assert full[-1] == "gepa>=0.1.4,<0.2"
+    # The `verifiers` *ceiling* is not this test's business: it moves on its own
+    # schedule (dependabot raised it `<0.3` -> `<0.5` on 2026-10-27).
+    # `tests/unit/test_crucible_runtime.py` and the CI `verifiers-pin` job hold
+    # the other end of it. This pins that exactly one `verifiers` requirement is
+    # present; the py3.14 marker becomes mandatory with the t0f installer fix.
+    verifiers = [req for req in full if req.startswith("verifiers>=")]
+    assert len(verifiers) == 1, full
+    assert re.fullmatch(
+        r'verifiers>=0\.2\.0,<0\.\d+(; python_version < "3\.14")?', verifiers[0]
+    ), verifiers[0]
 
 
 def test_full_install_command_sequence_uses_venv_and_full_extra(tmp_path):
