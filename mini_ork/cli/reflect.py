@@ -272,8 +272,12 @@ def _arm_reflect_deadline() -> int | None:
     def _on_deadline(_signum, _frame):
         sys.stderr.write(f"reflect: deadline {deadline}s reached; stopping\n")
         # SystemExit (not os._exit) so atexit handlers — in particular
-        # _trace_finalizer — still land a terminal trace row.
-        raise SystemExit(124)
+        # _trace_finalizer — still land a terminal trace row. Its own type so
+        # the pipeline's per-trace handler re-raises it instead of counting
+        # it as one more dispatch failure.
+        from mini_ork.learning.reflection_pipeline import ReflectDeadline  # noqa: PLC0415
+
+        raise ReflectDeadline()
 
     try:
         signal.signal(sigalrm, _on_deadline)
@@ -319,6 +323,18 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"Unknown flag: {flag}. Try --help\n")
         return 2
     if args.scheduled:
+        # The schedule owns the window and the filters. Silently dropping
+        # --dry-run here would start a PAID pass the operator asked to skip.
+        given = [flag for flag, value in (
+            ("--dry-run", args.dry_run), ("--since", args.since),
+            ("--run-id", args.run_id), ("--task-class", args.task_class),
+            ("--lane", args.lane)) if value]
+        if given:
+            sys.stderr.write(
+                f"reflect: --scheduled does not take {', '.join(given)}; the "
+                "window and filters come from the schedule config "
+                "(MINI_ORK_DRY_RUN=1 still makes the pass a dry run)\n")
+            return 2
         return _run_scheduled(args)
 
     # A detached post-run pass has no parent timeout; arm the child's own

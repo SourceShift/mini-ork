@@ -282,3 +282,96 @@ def test_unmigrated_db_fails_closed_instead_of_reading_as_a_held_lease(tmp_path,
     err = capsys.readouterr().err
     assert "no run_leases table" in err
     assert rs.LEASE_HELD_MESSAGE not in err
+
+
+# ── review 156 ──────────────────────────────────────────────────────────────
+
+
+def _add_traces(db: str, epochs: list[int]) -> None:
+    con = sqlite3.connect(db)
+    for i, ts in enumerate(epochs):
+        con.execute(
+            "INSERT INTO execution_traces(trace_id, run_id, task_class, status,"
+            " created_at) VALUES (?,?,?,?,?)",
+            (f"t-{i}", 1, "code-fix", "success", _iso(ts)),
+        )
+    con.commit()
+    con.close()
+
+
+def test_window_is_capped_at_one_batch_so_no_trace_is_skipped(home_db, monkeypatch):
+    home, db = home_db
+    monkeypatch.setenv("MO_REFLECTION_BATCH", "3")
+    _add_traces(db, [9_500_000, 9_500_100, 9_500_200, 9_500_300, 9_500_400])
+    reflect = RecordingReflect()
+    rc = rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                     reflect_fn=reflect)
+    assert rc == 0
+    # The 4th trace (9_500_300) is beyond the batch: the window ends just before it.
+    assert reflect.calls[0]["env"]["MO_REFLECTION_UNTIL_TS"] == str(9_500_299)
+    assert _state(home)["last_ok_until"] == 9_500_299
+    # The next tick starts there and reaches the rest.
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000, reflect_fn=reflect)
+    assert reflect.calls[1]["argv"] == ["--since", str(9_500_299)]
+
+
+def test_a_window_within_one_batch_is_not_capped(home_db, monkeypatch):
+    home, db = home_db
+    monkeypatch.setenv("MO_REFLECTION_BATCH", "10")
+    _add_traces(db, [9_500_000, 9_500_100])
+    reflect = RecordingReflect()
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000, reflect_fn=reflect)
+    assert reflect.calls[0]["env"]["MO_REFLECTION_UNTIL_TS"] == str(10_000_000 - 1800)
+
+
+def test_a_dry_run_never_advances_the_window(home_db, monkeypatch):
+    home, db = home_db
+    monkeypatch.setenv("MINI_ORK_DRY_RUN", "1")
+    reflect = RecordingReflect()
+    rc = rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                     reflect_fn=reflect)
+    assert rc == 0
+    assert not (home / "state" / "reflect-schedule.json").exists()
+
+
+@pytest.mark.parametrize("flags", [["--dry-run"], ["--since", "1"], ["--run-id", "r"],
+                                   ["--task-class", "x"], ["--lane", "glm"]])
+def test_scheduled_refuses_filters_it_would_ignore(flags, capsys):
+    from mini_ork.cli import reflect as reflect_cli
+
+    rc = reflect_cli.main(["--scheduled", *flags])
+    assert rc == 2
+    assert "--scheduled does not take" in capsys.readouterr().err
+
+
+def test_the_deadline_stops_gradient_extraction(monkeypatch, tmp_path):
+    """The per-trace handler must let the pass deadline through (review 156)."""
+    calls = []
+
+    def _extract(tid):
+        calls.append(tid)
+        raise reflection_pipeline.ReflectDeadline()
+
+    monkeypatch.setattr(reflection_pipeline, "_extract_trace_ids_sql",
+                        lambda *a, **k: ["t1", "t2", "t3"])
+    monkeypatch.setattr(reflection_pipeline, "_gradient_extract", _extract)
+    from mini_ork.learning import gradient_extractor as _ge
+    monkeypatch.setattr(_ge, "has_watermark", lambda tid: False)
+    monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "x.db"))
+    with pytest.raises(reflection_pipeline.ReflectDeadline) as exc:
+        reflection_pipeline.reflection_extract_gradients(0)
+    assert exc.value.code == 124
+    assert calls == ["t1"]
+
+
+def test_other_system_exits_are_still_counted_per_trace(monkeypatch, tmp_path):
+    def _extract(tid):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(reflection_pipeline, "_extract_trace_ids_sql",
+                        lambda *a, **k: ["t1", "t2"])
+    monkeypatch.setattr(reflection_pipeline, "_gradient_extract", _extract)
+    from mini_ork.learning import gradient_extractor as _ge
+    monkeypatch.setattr(_ge, "has_watermark", lambda tid: False)
+    monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "x.db"))
+    reflection_pipeline.reflection_extract_gradients(0)  # does not raise

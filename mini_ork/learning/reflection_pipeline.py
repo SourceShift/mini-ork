@@ -152,6 +152,19 @@ def _reflection_until_ts() -> int | None:
     return until if until > 0 else None
 
 
+class ReflectDeadline(SystemExit):
+    """Raised by reflect's ``SIGALRM`` handler when the pass deadline passes.
+
+    A ``SystemExit`` (code 124) so atexit finalizers still run, but its own
+    type so the per-trace ``except (SystemExit, Exception)`` in
+    ``reflection_extract_gradients`` can let it through: swallowing it there
+    counted the deadline as one more dispatch failure and the pass kept going.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(124)
+
+
 def _extract_trace_ids_sql(db_path: str, since_ts: int, batch: int) -> list[str]:
     """Mirror bash heredoc: SELECT trace_id FROM execution_traces
     WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?
@@ -825,6 +838,8 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
         attempted += 1
         try:
             grads = list(_gradient_extract(tid))
+        except ReflectDeadline:
+            raise  # the pass deadline, not this trace's failure
         except (SystemExit, Exception) as exc:  # noqa: BLE001
             dispatch_failed += 1
             last_err = str(getattr(_ge, "_last_dispatch_error", "") or "")

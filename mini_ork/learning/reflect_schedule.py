@@ -171,6 +171,44 @@ def _last_ok_until(state: dict) -> int | None:
         return None
 
 
+def _capped_until(db: str, since: int, until: int) -> int:
+    """``until``, lowered so the window holds at most one pipeline batch.
+
+    The pipeline selects at most ``MO_REFLECTION_BATCH`` traces (default 500)
+    per pass, oldest first. Advancing the state to ``until`` after a window
+    that held more would skip the rest for good, so the window ends at the
+    created_at of the batch-th trace instead and the next tick continues from
+    there (its ``since`` is inclusive, and the watermark skips traces already
+    reflected). Any read error keeps ``until``.
+    """
+    try:
+        batch = max(1, int(os.environ.get("MO_REFLECTION_BATCH", 500)))
+    except ValueError:
+        batch = 500
+    try:
+        import sqlite3  # noqa: PLC0415
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = con.execute(
+                "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM execution_traces "
+                "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+                "AND CAST(strftime('%s', created_at) AS INTEGER) <= ? "
+                "AND (task_class IS NULL OR substr(task_class, 1, 2) != '__') "
+                "ORDER BY created_at LIMIT 1 OFFSET ?",
+                (int(since), int(until), batch),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — a read error must not stop the pass
+        return until
+    if row is None or row[0] is None:
+        return until  # the window fits in one batch
+    # row is the (batch+1)-th trace: end just before it so the first `batch`
+    # traces are exactly the window.
+    return max(int(since), int(row[0]) - 1)
+
+
 # ── One pass / the service loop ─────────────────────────────────────────────
 
 def run_once(
@@ -231,6 +269,8 @@ def run_once(
             print(NOTHING_SETTLED_MESSAGE)
             return 0
 
+        until = _capped_until(db, since, until)
+
         if reflect_fn is None:
             from mini_ork.cli import reflect as reflect_cli  # noqa: PLC0415
 
@@ -254,7 +294,8 @@ def run_once(
                 # timed-out pass does not kill the service loop.
                 rc = exc.code if isinstance(exc.code, int) else 1
 
-        if rc == 0:
+        # A dry run reflected nothing, so it must not move the window on.
+        if rc == 0 and os.environ.get("MINI_ORK_DRY_RUN") != "1":
             _write_state(home, {"last_ok_until": until, "at": now})
         return rc
     finally:
