@@ -175,9 +175,13 @@ def _extract_trace_ids_sql(db_path: str, since_ts: int, batch: int) -> list[str]
     the function keeps its 3-arg signature (both callers — the pipeline and
     reflect's run-scoped selector — stay intact)."""
     until = _reflection_until_ts()
+    # The scheduled pass covers (since, until]: an inclusive lower bound
+    # re-selected the boundary second's traces every tick, and with more than
+    # one batch in that second the window could never move on.
+    lower = ">" if os.environ.get("MO_REFLECTION_SINCE_EXCLUSIVE") == "1" else ">="
     sql = (
         "SELECT trace_id FROM execution_traces "
-        "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+        f"WHERE CAST(strftime('%s', created_at) AS INTEGER) {lower} ? "
     )
     params: list = [int(since_ts)]
     if until is not None:

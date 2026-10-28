@@ -375,3 +375,85 @@ def test_other_system_exits_are_still_counted_per_trace(monkeypatch, tmp_path):
     monkeypatch.setattr(_ge, "has_watermark", lambda tid: False)
     monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "x.db"))
     reflection_pipeline.reflection_extract_gradients(0)  # does not raise
+
+
+# ── review 157 ──────────────────────────────────────────────────────────────
+
+
+def test_a_dense_second_never_wedges_the_schedule(home_db, monkeypatch, capsys):
+    """More traces in one second than a batch: every tick still moves on."""
+    home, db = home_db
+    monkeypatch.setenv("MO_REFLECTION_BATCH", "2")
+    T = 9_600_000
+    _add_traces(db, [T, T, T])
+    cfg = _enabled_cfg(home)
+    reflect = RecordingReflect()
+    states = []
+    for _ in range(3):
+        rs.run_once(str(home), db, cfg, now=10_000_000, reflect_fn=reflect)
+        states.append(_state(home)["last_ok_until"])
+    assert states == [T - 1, T, 10_000_000 - 1800]
+    assert "holds more than one batch" in capsys.readouterr().err
+
+
+def test_the_scheduled_window_excludes_its_lower_bound(home_db):
+    home, db = home_db
+    reflect = RecordingReflect()
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000, reflect_fn=reflect)
+    assert reflect.calls[0]["env"]["MO_REFLECTION_SINCE_EXCLUSIVE"] == "1"
+
+
+def test_exclusive_lower_bound_in_the_pipeline_selection(traced_db, monkeypatch):
+    monkeypatch.setenv("MO_REFLECTION_SINCE_EXCLUSIVE", "1")
+    got = reflection_pipeline._extract_trace_ids_sql(traced_db, 9_000_000, 100)
+    assert got == ["t-new"]  # t-old sits exactly on the bound
+    monkeypatch.delenv("MO_REFLECTION_SINCE_EXCLUSIVE")
+    got = reflection_pipeline._extract_trace_ids_sql(traced_db, 9_000_000, 100)
+    assert set(got) == {"t-old", "t-new"}
+
+
+def _reflect_writing_pass_stat(db: str, last_error: str):
+    from mini_ork.learning.ledger import record_pass_stat
+
+    calls = []
+
+    def _reflect(argv):
+        calls.append(argv)
+        record_pass_stat("tr-reflect-sched", "gradient_extract", inputs=3, outputs=1,
+                         failures=1, last_error=last_error, db=db)
+        return 0
+
+    return _reflect, calls
+
+
+def test_a_cost_circuit_abort_keeps_the_window(home_db, capsys):
+    home, db = home_db
+    reflect, calls = _reflect_writing_pass_stat(db, "cost_circuit_open: budget")
+    rc = rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000, reflect_fn=reflect)
+    assert rc == 0 and calls
+    assert not (home / "state" / "reflect-schedule.json").exists()
+    assert "cost circuit stopped extraction" in capsys.readouterr().out
+
+
+def test_a_plain_dispatch_failure_still_advances_the_window(home_db):
+    home, db = home_db
+    reflect, _calls = _reflect_writing_pass_stat(db, "HTTP 500 from provider")
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000, reflect_fn=reflect)
+    assert _state(home)["last_ok_until"] == 10_000_000 - 1800
+
+
+def test_scheduled_flag_dispatches_to_run_once(home_db, monkeypatch):
+    from mini_ork.cli import reflect as reflect_cli
+
+    home, db = home_db
+    seen = {}
+
+    def _fake_run_once(h, d, cfg, **kw):
+        seen.update(home=h, db=d, enabled=cfg["enabled"])
+        return 7
+
+    monkeypatch.setattr(rs, "run_once", _fake_run_once)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    assert reflect_cli.main(["--scheduled"]) == 7
+    assert seen == {"home": str(home), "db": db, "enabled": False}

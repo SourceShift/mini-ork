@@ -172,14 +172,19 @@ def _last_ok_until(state: dict) -> int | None:
 
 
 def _capped_until(db: str, since: int, until: int) -> int:
-    """``until``, lowered so the window holds at most one pipeline batch.
+    """``until``, lowered so the window ``(since, until]`` fits one batch.
 
     The pipeline selects at most ``MO_REFLECTION_BATCH`` traces (default 500)
-    per pass, oldest first. Advancing the state to ``until`` after a window
-    that held more would skip the rest for good, so the window ends at the
-    created_at of the batch-th trace instead and the next tick continues from
-    there (its ``since`` is inclusive, and the watermark skips traces already
-    reflected). Any read error keeps ``until``.
+    per pass, oldest first, and the scheduled pass selects strictly after
+    ``since`` (``MO_REFLECTION_SINCE_EXCLUSIVE``). When the window holds more
+    than one batch, it ends just before the (batch+1)-th trace's second, so
+    every trace in it is selected and the next tick continues from there.
+
+    Each pass always moves forward: the cap is never below the first second
+    after ``since``. When that single second alone holds more than a batch,
+    the window takes the whole second; the traces of it past the batch are
+    skipped (one stderr line says so) rather than wedging the schedule. Any
+    read error keeps ``until``.
     """
     try:
         batch = max(1, int(os.environ.get("MO_REFLECTION_BATCH", 500)))
@@ -192,7 +197,7 @@ def _capped_until(db: str, since: int, until: int) -> int:
         try:
             row = con.execute(
                 "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM execution_traces "
-                "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+                "WHERE CAST(strftime('%s', created_at) AS INTEGER) > ? "
                 "AND CAST(strftime('%s', created_at) AS INTEGER) <= ? "
                 "AND (task_class IS NULL OR substr(task_class, 1, 2) != '__') "
                 "ORDER BY created_at LIMIT 1 OFFSET ?",
@@ -204,9 +209,40 @@ def _capped_until(db: str, since: int, until: int) -> int:
         return until
     if row is None or row[0] is None:
         return until  # the window fits in one batch
-    # row is the (batch+1)-th trace: end just before it so the first `batch`
-    # traces are exactly the window.
-    return max(int(since), int(row[0]) - 1)
+    boundary = int(row[0])  # second of the (batch+1)-th trace
+    if boundary - 1 > since:
+        return boundary - 1
+    sys.stderr.write(
+        f"reflect schedule: second {boundary} holds more than one batch "
+        f"({batch}) of traces; the window takes it whole and may skip some\n")
+    return boundary
+
+
+def _circuit_aborted_since(db: str, started: int) -> bool:
+    """True when a gradient_extract pass since ``started`` hit the cost circuit.
+
+    A circuit-open refusal aborts the extraction batch, leaving the rest of
+    the window unreflected while reflect still exits 0, so the window must
+    not advance: those traces are exactly what a schedule exists to revisit.
+    Reads the pass-stats row reflect records (``learning_pass_stats``); a
+    missing table or any read error answers False (old behaviour).
+    """
+    try:
+        import sqlite3  # noqa: PLC0415
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = con.execute(
+                "SELECT count(*) FROM learning_pass_stats "
+                "WHERE stage='gradient_extract' AND ts >= ? AND failures > 0 "
+                "AND last_error LIKE '%cost_circuit_open%'",
+                (int(started),),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(row and row[0])
 
 
 # ── One pass / the service loop ─────────────────────────────────────────────
@@ -279,12 +315,14 @@ def run_once(
         overrides = {
             "MO_REFLECT_DEADLINE_S": str(deadline_s),
             "MO_REFLECTION_UNTIL_TS": str(until),
+            "MO_REFLECTION_SINCE_EXCLUSIVE": "1",
             # A scheduled pass is never run-scoped: an inherited run id would
             # route reflect through its run-scoped selector, which ignores the
             # until bound, and a post-run tag would skew timeout history.
             "MINI_ORK_REFLECT_RUN_ID": None,
             "MO_REFLECT_POST_RUN": None,
         }
+        started = int(time.time())
         with scoped_environ(overrides):
             try:
                 rc = reflect_fn(["--since", str(since)])
@@ -294,9 +332,14 @@ def run_once(
                 # timed-out pass does not kill the service loop.
                 rc = exc.code if isinstance(exc.code, int) else 1
 
-        # A dry run reflected nothing, so it must not move the window on.
+        # A dry run reflected nothing, and a cost-circuit abort left the rest
+        # of the window unreflected: neither may move the window on.
         if rc == 0 and os.environ.get("MINI_ORK_DRY_RUN") != "1":
-            _write_state(home, {"last_ok_until": until, "at": now})
+            if _circuit_aborted_since(db, started):
+                print("reflect schedule: the cost circuit stopped extraction; "
+                      "keeping the window for the next pass")
+            else:
+                _write_state(home, {"last_ok_until": until, "at": now})
         return rc
     finally:
         lease.release_lease(db, LEASE_KEY, token)
