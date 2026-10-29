@@ -106,11 +106,21 @@ jobs:
 
       - name: Run pytest (unit shard A)
         if: matrix.shard == 'unit-a'
-        run: find tests/unit -name 'test_*.py' | sort | awk 'NR % 2 == 1' | xargs python -m pytest -q -p no:cacheprovider -n auto
+        run: |
+          # pytest's default file patterns. An empty list must fail: `xargs`
+          # with no input would run bare pytest -- the whole suite -- green.
+          files=$(find tests/unit \( -name 'test_*.py' -o -name '*_test.py' \) | sort | awk 'NR % 2 == 1')
+          test -n "$files" || { echo "::error::unit shard A selected no test files"; exit 1; }
+          python -m pytest -q -p no:cacheprovider -n auto $files
 
       - name: Run pytest (unit shard B)
         if: matrix.shard == 'unit-b'
-        run: find tests/unit -name 'test_*.py' | sort | awk 'NR % 2 == 0' | xargs python -m pytest -q -p no:cacheprovider -n auto
+        run: |
+          # pytest's default file patterns. An empty list must fail: `xargs`
+          # with no input would run bare pytest -- the whole suite -- green.
+          files=$(find tests/unit \( -name 'test_*.py' -o -name '*_test.py' \) | sort | awk 'NR % 2 == 0')
+          test -n "$files" || { echo "::error::unit shard B selected no test files"; exit 1; }
+          python -m pytest -q -p no:cacheprovider -n auto $files
 
       - name: Run pytest (root + non-unit layers)
         if: matrix.shard == 'rest'
