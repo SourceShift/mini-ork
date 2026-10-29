@@ -130,6 +130,7 @@ research:
   skip_single_rater: true
   max_candidates: 200
   refresh_days: 30
+  auto_refresh: false   # true = relaunch the review recipe when older than refresh_days
   review_globs: {}
 
 # G12 — the sealed, paired impact acceptor for `bench:` candidates.
@@ -145,3 +146,10 @@ impact:
   timeout_s: 900
   guard_tolerances: {false_reject: 0, no_verdict: 0}
   secret_name: MO_RSI_IMPACT_SECRET   # secure tier: read from the vault
+
+# Post-merge canary (running-peak ratchet). Never reverts main: on a sustained
+# decline it halts technique adoption and queues a fix-forward regression candidate.
+monitor:
+  enabled: true
+  drop: 0.02
+  consecutive: 3

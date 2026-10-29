@@ -42,6 +42,7 @@ __all__ = [
     "ImplementConfig",
     "LeaseConfig",
     "MergeConfig",
+    "MonitorConfig",
     "ProbesConfig",
     "ResearchConfig",
     "SecureConfig",
@@ -248,11 +249,13 @@ class CriticConfig:
     model_timeout_s: int = 900
 
     def __post_init__(self) -> None:
+        # No lanes is the un-configured default: `CycleConfig(budget=..., decide=...)`
+        # must stay constructible without a critic panel. The "at least two" rule
+        # is enforced where a panel is actually configured, in `from_mapping`.
+        if not self.lanes:
+            return
         from mini_ork.verify.panel_heterogeneity import lane_family
 
-        if len(self.lanes) < 2:
-            raise ConfigError(
-                f"critic.lanes needs at least 2 independent critics, got {list(self.lanes)}")
         families = [lane_family(lane) for lane in self.lanes]
         if any(not f for f in families):
             raise ConfigError(f"critic.lanes: cannot resolve a family for {self.lanes}")
@@ -268,8 +271,12 @@ class CriticConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "CriticConfig":
         _only("critic", raw, frozenset({"lanes", "require_unanimous", "model_timeout_s"}))
+        lanes = _str_tuple("critic.lanes", raw.get("lanes", ()))
+        if len(lanes) < 2:
+            raise ConfigError(
+                f"critic.lanes needs at least 2 independent critics, got {list(lanes)}")
         return cls(
-            lanes=_str_tuple("critic.lanes", raw.get("lanes", ())),
+            lanes=lanes,
             require_unanimous=_flag("critic.require_unanimous",
                                     raw.get("require_unanimous", True)),
             model_timeout_s=_positive("critic.model_timeout_s",
@@ -376,13 +383,15 @@ class ResearchConfig:
     skip_single_rater: bool = True
     max_candidates: int = 200
     refresh_days: int = 30
+    auto_refresh: bool = False
     review_globs: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ResearchConfig":
         _only("research", raw, frozenset({
             "enabled", "domains", "verdicts", "skip_disagreement",
-            "skip_single_rater", "max_candidates", "refresh_days", "review_globs",
+            "skip_single_rater", "max_candidates", "refresh_days",
+            "auto_refresh", "review_globs",
         }))
         from mini_ork.rsi.candidates import DOMAINS
 
@@ -429,6 +438,8 @@ class ResearchConfig:
                                      raw.get("max_candidates", 200)),
             refresh_days=_positive("research.refresh_days",
                                    raw.get("refresh_days", 30)),
+            auto_refresh=_flag("research.auto_refresh",
+                               raw.get("auto_refresh", False)),
             review_globs=review_globs,
         )
 
@@ -520,6 +531,33 @@ class ImpactConfig:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class MonitorConfig:
+    """The post-merge canary: a running-peak ratchet over main's scores.
+
+    ``drop`` is how far below the best-ever score a canary has to fall to count
+    as a decline, and ``consecutive`` is how many trailing declines halt
+    technique adoption. Neither has a "do nothing" default: a canary that never
+    halts cannot protect an unattended loop from shipping a regression.
+    """
+
+    enabled: bool = True
+    drop: float = 0.02
+    consecutive: int = 3
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "MonitorConfig":
+        _only("monitor", raw, frozenset({"enabled", "drop", "consecutive"}))
+        drop = _number("monitor.drop", raw.get("drop", 0.02))
+        if not 0 <= drop < 1:
+            raise ConfigError(f"monitor.drop: must be in [0, 1), got {drop}")
+        return cls(
+            enabled=_flag("monitor.enabled", raw.get("enabled", True)),
+            drop=drop,
+            consecutive=_positive("monitor.consecutive", raw.get("consecutive", 3)),
+        )
+
+
 # --------------------------------------------------------------------------
 # The whole file
 # --------------------------------------------------------------------------
@@ -527,7 +565,7 @@ class ImpactConfig:
 _TOP_KEYS = frozenset({
     "version", "enabled", "mode", "interval_s", "max_cycles", "lease", "queue",
     "budget", "probes", "gates", "critic", "implement", "merge", "decide", "secure",
-    "research", "impact",
+    "research", "impact", "monitor",
 })
 
 
@@ -545,6 +583,7 @@ class CycleConfig:
     secure: SecureConfig = field(default_factory=SecureConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
     impact: ImpactConfig = field(default_factory=ImpactConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     version: int = 1
     enabled: bool = True
     mode: str = "once"
@@ -667,6 +706,7 @@ def from_mapping(raw: Any, *, env: Mapping[str, str] | None = None,
         secure=SecureConfig.from_mapping(_section(raw, "secure")),
         research=ResearchConfig.from_mapping(_section(raw, "research")),
         impact=ImpactConfig.from_mapping(_section(raw, "impact")),
+        monitor=MonitorConfig.from_mapping(_section(raw, "monitor")),
     )
     if strict:
         if not cfg.scoped_tests and not cfg.merge.test_cmd:

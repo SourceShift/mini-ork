@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -697,3 +698,151 @@ def test_show_renders_each_critic_and_its_first_finding():
 def test_show_survives_a_missing_or_shapeless_panel(raw):
     """``show`` is an operator tool: a bad column must not raise."""
     assert rsi_cycle._render_critics(raw) == []
+
+
+# ── research + impact ───────────────────────────────────────────────────────
+
+
+def test_research_reports_the_domain_on_an_empty_home(root, db, capsys):
+    _write_config(root)
+    rc = rsi_cycle.main(["research", "--json", "--root", str(root)])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [entry["domain"] for entry in payload["domains"]] == ["verification"]
+    entry = payload["domains"][0]
+    assert entry["review"] is None
+    assert entry["age_days"] is None
+    assert entry["techniques_by_status"] == {}
+
+
+def test_research_reports_the_newest_review(root, db, capsys):
+    _write_config(root)
+    review = root / ".mini-ork" / "runs" / "verify-cli-run" / "merged-review.json"
+    review.parent.mkdir(parents=True)
+    review.write_text(json.dumps({"ranked": [
+        {"id": "T1", "technique": "Adopt it", "verdict": "implement-now"},
+        {"id": "T2", "technique": "Skip it", "verdict": "skip"}]}),
+        encoding="utf-8")
+
+    rc = rsi_cycle.main(["research", "--json", "--root", str(root)])
+    assert rc == 0
+    dumped = capsys.readouterr().out
+    assert "verify-cli-run" in dumped
+    assert "review_id" in dumped and "age_days" in dumped
+    entry = json.loads(dumped)["domains"][0]
+    assert entry["ranked"] == 2
+    assert entry["eligible"] == 1
+
+
+def test_research_counts_unadopted_techniques_by_status(root, db, capsys):
+    _write_config(root)
+    con = sqlite3.connect(str(db))
+    con.executemany(
+        "INSERT INTO rsi_candidates (candidate_id, signature, domain, source, kind,"
+        " severity, files_json, evidence_key, first_seen_at, last_seen_at,"
+        " updated_at, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("c1", "s1", "verification", "research", "technique_unadopted",
+             40, "[]", "k1", 0, 0, 0, "queued"),
+            ("c2", "s2", "verification", "research", "technique_unadopted",
+             40, "[]", "k2", 0, 0, 0, "queued"),
+            ("c3", "s3", "verification", "research", "technique_unadopted",
+             40, "[]", "k3", 0, 0, 0, "skipped"),
+            ("c4", "s4", "verification", "research", "regression",
+             40, "[]", "k4", 0, 0, 0, "queued"),
+        ])
+    con.commit()
+    con.close()
+
+    rc = rsi_cycle.main(["research", "--json", "--root", str(root)])
+    assert rc == 0
+    entry = json.loads(capsys.readouterr().out)["domains"][0]
+    assert entry["techniques_by_status"] == {"queued": 2, "skipped": 1}
+
+
+def test_research_refresh_forces_the_monitor(root, db, capsys, monkeypatch):
+    from mini_ork.rsi import monitor
+
+    _write_config(root)
+    calls: list = []
+
+    def fake_maybe_refresh(root_, home_, cfg, *, now, force=False, domains=None):
+        calls.append({"root": Path(root_), "home": Path(home_), "now": now,
+                      "force": force, "domains": list(domains or [])})
+        return [{"domain": "verification", "action": "launched",
+                 "reason": "forced", "age_days": None, "log": "/tmp/x.log"}]
+
+    monkeypatch.setattr(monitor, "maybe_refresh", fake_maybe_refresh)
+    rc = rsi_cycle.main(["research", "--json", "--refresh", "--root", str(root)])
+
+    assert rc == 0
+    assert len(calls) == 1
+    assert calls[0]["force"] is True
+    assert calls[0]["domains"] == ["verification"]
+    assert calls[0]["home"].resolve() == (root / ".mini-ork").resolve()
+    assert "launched" in capsys.readouterr().out
+
+
+def test_impact_status_on_a_fresh_home_is_clean(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    assert rsi_cycle.main(["impact", "--home", str(home)]) == 0
+    assert "no benchmarks recorded" in capsys.readouterr().out
+
+
+def test_impact_status_reports_the_halt_marker(tmp_path, capsys):
+    from mini_ork.rsi import monitor
+
+    home = tmp_path / "home"
+    marker = monitor.halt_path(home)
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"bench": "verifier-replay", "peak": 0.9}),
+                      encoding="utf-8")
+
+    assert rsi_cycle.main(["impact", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert "adoption halted" in out
+    assert "verifier-replay" in out
+
+
+def test_impact_status_on_a_corrupt_state_is_rc1(tmp_path, capsys):
+    home = tmp_path / "home"
+    state = home / "rsi" / "impact" / "state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text("{ nope", encoding="utf-8")
+    assert rsi_cycle.main(["impact", "--home", str(home)]) == 1
+    assert capsys.readouterr().err.strip()
+
+
+def test_impact_rotate_of_an_unknown_benchmark_is_rc1(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    assert rsi_cycle.main(["impact", "rotate", "nope", "--home", str(home)]) == 1
+    assert capsys.readouterr().err.strip()
+
+
+def test_impact_rotate_prints_the_new_epoch(tmp_path, capsys):
+    from mini_ork.rsi import impact_state
+
+    home = tmp_path / "home"
+    state = impact_state.new_state()
+    impact_state.bench_state(state, "verifier-replay", "corpus")
+    impact_state.save_state(home, state)
+
+    assert rsi_cycle.main(
+        ["impact", "rotate", "verifier-replay", "--home", str(home)]) == 0
+    assert "verifier-replay" in capsys.readouterr().out
+    assert impact_state.load_state(home)["benchmarks"]["verifier-replay"]["epoch"] == 2
+
+
+def test_impact_with_an_unknown_sub_verb_is_rc2(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    assert rsi_cycle.main(["impact", "bogus", "--home", str(home)]) == 2
+    assert "usage" in capsys.readouterr().err
+
+
+def test_impact_canary_with_research_off_is_a_noop(root, db, capsys):
+    _write_config(root)
+    assert rsi_cycle.main(["impact", "canary", "--root", str(root)]) == 0
+    assert "research is disabled" in capsys.readouterr().out

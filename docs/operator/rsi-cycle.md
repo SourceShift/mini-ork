@@ -54,7 +54,7 @@ step under `--dry-run`; still writes and dispatches nothing), `--probe-run`
 Exit codes: `0` ok / lease held / no candidate / halted by budget or a switch;
 `1` internal error or a required probe failed; `2` usage or config.
 
-## The eleven gates
+## The twelve gates
 
 A cycle merges only if all of them pass. Each failure names its code, which is
 what `rsi-cycle show` prints and what the quarantine record keeps.
@@ -72,6 +72,7 @@ what `rsi-cycle show` prints and what the quarantine record keeps.
 | G9 | `no_new_probe_failures` | probe failures grew versus before the change |
 | G10 | `critic_unanimous` | fewer than 2 exogenous critics, or they split |
 | G11 | `budget` | 24h spend or this cycle's cost exceeds its cap |
+| G12 | `impact` | a `bench:` candidate showed no sealed, paired gain (dev split first; one sealed look at the spent α) |
 
 **G7 and G9 are differential on purpose.** `garden` and `validate --strict` are
 already red on a healthy checkout; a strict "rc == 0" gate would mean this
@@ -325,6 +326,70 @@ A failed run never crashes the cycle. SUGGEST without a proposal halts with
 `no_proposal`; a critic run that crashes returns no verdicts, G10 fails closed
 with `critic_not_exogenous`, and the cycle **quarantines** — keeping the
 worktree and the diff so the work is still there to review.
+
+## Research-driven adoption
+
+The research-driven loop closes the gap the ordinary cycle leaves open: instead
+of fixing only gaps a deterministic predicate can see, it reads the literature
+and tries to adopt what the papers already proved. The design is written up in
+`docs/plans/2026-10-29-research-driven-rsi-loop.md`; this section is the
+operator's view of it.
+
+**Turning it on.** Set `research.enabled: true` in the config and name the
+domains to read (`domains: [verification]`). A first look can be scoped to one
+domain with `mini-ork rsi-cycle research --domain verification`, which reports
+the newest review without spending anything.
+
+**Where techniques come from.** The `verification-technique-review` recipe
+collects a domain's papers, clusters the techniques into families and writes a
+ranked `merged-review.json` into its run directory. The research harvest reads
+the newest review for each domain and turns its top ranked rows into
+`technique_unadopted` candidates through the ordinary queue, so they compete for
+a cycle on severity like any other gap. The candidate's identity is the
+technique name, so a re-review that renumbers or regroups the same technique
+does not mint a duplicate.
+
+**What G12 checks.** A `bench:<name>` candidate is judged by the sealed, paired
+acceptor, not by a boolean predicate. It first splits the benchmark's items into
+a **dev** and a **sealed** split, keyed by a secret, so the implementer can only
+ever see the dev feedback. Improvement on the sealed split is tested with
+SAGE / exact McNemar, with a no-regression budget as a hard precondition and the
+benchmark's guards (false accepts, false rejects, no verdicts) checked before a
+gain is credited. Each sealed look spends α from the epoch's budget at the
+current look (`max_looks` bounds how many looks an epoch may take), and a
+corpus change rotates the epoch so spent α is never silently reset.
+
+**The revise loop.** When a benchmarked attempt shows no gain, the cycle does
+not just give up: it revises the attempt up to `impact.max_revisions` times,
+feeding back only the *dev* split's results. The sealed split stays sealed
+across revisions, so a loop cannot grind “no gain” into “gain” by remembering
+the test it is being graded on.
+
+**Family ordering.** Techniques are ordered by their review family, not by
+individual paper: a family that keeps failing is demoted as a family, which
+spreads attempts across genuinely different mechanisms instead of re-reading one
+line of work.
+
+**The canary and the adoption halt.** After merges, `monitor` scores `main` on
+the benchmark whenever its tree changes and keeps the score history (a **canary**
+per HEAD sha). When the score has declined more than `monitor.drop` below its
+best-ever value for `monitor.consecutive` canaries in a row, the monitor writes
+`<home>/rsi/ADOPTION_HALTED` — technique adoption stops — and queues a
+fix-forward `regression` candidate measured by G12 against current main. It never
+reverts main; a later canary at or above the peak clears the marker. Inspect the
+state with `mini-ork rsi-cycle impact` (status, canaries, peak, latest) and force
+a canary with `mini-ork rsi-cycle impact canary`. `mini-ork rsi-cycle research`
+reports each domain's newest review, its age, and how many of its techniques are
+unadopted; `--refresh` launches the review recipe now.
+
+**What it guarantees.** In one sentence: it **never merges a measured regression, halts rather than ships when it cannot tell, promises nothing about what no benchmark measures.** A benchmark is a sample, and G12 is explicit about that: it can refuse a change that looks good but is not proven, and it can pass a change that helps the measured items while hurting something no item covers.
+
+**The two tiers.** The simple tier keeps the split secret in a `0600` file under
+the RSI home (`<home>/rsi/impact/secret`); a missing or too-open file is an
+error, never an empty key. The secure tier reads the same secret from
+`secure.secret_store` — the `vault` — via `impact.secret_name`, and fails closed
+when the vault cannot produce it. One config chooses between them and no call
+site changes.
 
 ## What it does not do yet
 

@@ -49,7 +49,7 @@ def test_an_unknown_top_level_key_is_refused():
 
 @pytest.mark.parametrize("section", [
     "lease", "queue", "budget", "probes", "gates", "critic", "implement", "merge",
-    "decide", "secure", "research", "impact",
+    "decide", "secure", "research", "impact", "monitor",
 ])
 def test_an_unknown_key_in_every_section_is_refused(section):
     with pytest.raises(ConfigError, match=f"{section}: unknown key"):
@@ -481,3 +481,54 @@ def test_the_shipped_example_parses_strict_with_research_off():
     out = load_config(EXAMPLE, env={}, strict=True)
     assert out.research.enabled is False
     assert out.impact.alpha == 0.05
+
+
+# --------------------------------------------------------------------------
+# monitor: the post-merge canary is on, with a conservative ratchet
+# --------------------------------------------------------------------------
+
+
+def test_monitor_defaults_are_on_and_conservative():
+    out = cfg()
+    assert out.monitor.enabled is True
+    assert out.monitor.drop == 0.02
+    assert out.monitor.consecutive == 3
+
+
+def test_monitor_can_be_disabled_without_disabling_the_cycle():
+    out = cfg(monitor={"enabled": False})
+    assert out.monitor.enabled is False
+    assert out.enabled is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "needle"),
+    [
+        ({"drop": 1}, "monitor.drop"),
+        ({"drop": -0.01}, "monitor.drop"),
+        ({"drop": True}, "monitor.drop"),
+        ({"consecutive": 0}, "monitor.consecutive"),
+        ({"consecutive": True}, "monitor.consecutive"),
+    ],
+)
+def test_monitor_range_errors_name_the_field(raw, needle):
+    with pytest.raises(ConfigError) as excinfo:
+        cfg(monitor=raw)
+    assert needle in str(excinfo.value)
+
+
+def test_research_auto_refresh_defaults_off():
+    assert cfg().research.auto_refresh is False
+
+
+def test_research_auto_refresh_must_be_a_boolean():
+    with pytest.raises(ConfigError, match="research.auto_refresh"):
+        cfg(research={"auto_refresh": "yes"})
+
+
+def test_the_shipped_example_parses_strict_with_the_monitor_on():
+    out = load_config(EXAMPLE, env={}, strict=True)
+    assert out.monitor.enabled is True
+    assert out.monitor.drop == 0.02
+    assert out.monitor.consecutive == 3
+    assert out.research.auto_refresh is False
