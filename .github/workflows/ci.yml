@@ -70,9 +70,12 @@ jobs:
         # subprocess and git work in hundreds of files, the slowest file ~4%
         # of the total — so parallelism, not trimming single tests, is what
         # moves it. Split it odd/even by file and run everything else as a
-        # third shard; within a shard, xdist uses all cores (`-n auto`). The
-        # whole unit tier passes on 8 workers (14,000 passed, 0 failed,
-        # 2026-10-29), so tests do not share state across processes.
+        # third shard; within a shard, xdist uses all cores (`-n auto`). Both
+        # tiers pass on 8 workers (unit: 14,000 passed, 0 failed; rest: 734
+        # passed, its one local failure reproduces serially; 2026-10-29), so
+        # tests do not share state across processes.
+        # `find`, not `ls tests/unit/*.py`: the glob never reached
+        # tests/unit/acp/, so its 28 tests ran in no shard at all.
         shard: [unit-a, unit-b, rest]
     steps:
       - uses: actions/checkout@v7
@@ -103,11 +106,11 @@ jobs:
 
       - name: Run pytest (unit shard A)
         if: matrix.shard == 'unit-a'
-        run: ls tests/unit/*.py | awk 'NR % 2 == 1' | xargs python -m pytest -q -p no:cacheprovider -n auto
+        run: find tests/unit -name 'test_*.py' | sort | awk 'NR % 2 == 1' | xargs python -m pytest -q -p no:cacheprovider -n auto
 
       - name: Run pytest (unit shard B)
         if: matrix.shard == 'unit-b'
-        run: ls tests/unit/*.py | awk 'NR % 2 == 0' | xargs python -m pytest -q -p no:cacheprovider -n auto
+        run: find tests/unit -name 'test_*.py' | sort | awk 'NR % 2 == 0' | xargs python -m pytest -q -p no:cacheprovider -n auto
 
       - name: Run pytest (root + non-unit layers)
         if: matrix.shard == 'rest'
