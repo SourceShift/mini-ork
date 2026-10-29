@@ -35,19 +35,21 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import learn, ledger
+from . import benchmarks, impact, impact_state, learn, ledger
 from .candidates import Candidate
 from .config import CycleConfig
-from .gates import CriticVerdict, GateEvidence, ValidationReport, evaluate
+from .gates import BENCH_PREFIX, CriticVerdict, GateEvidence, ValidationReport, evaluate
 from .harvest import HarvestReport
 from .probes import ProbeResult
 from .queue import QueueConfig, QueuePlan, build_queue
 from .select import (
     DEFAULT_ALLOW_PREFIXES,
+    DENY_PREFIXES,
     Proposal,
     Selection,
     SelectConfig,
     SelectContext,
+    _allowlisted,
     select,
 )
 from .view import ledger_view
@@ -351,7 +353,7 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
             # ``fixed_externally`` on the cycle that first saw it.
             ledger.reconcile(con, [c.candidate_id for c in report.candidates],
                              now=rt.clock(),
-                             blind_sources=_blind_sources(report))
+                             blind_sources=_blind_sources(report, con))
 
     # --- QUEUE -------------------------------------------------------------
     plan = _build_queue(req, con, report, rt.clock())
@@ -595,14 +597,19 @@ def _evidence(req: CycleRequest, report, cand: Candidate, impl: Implementation,
 
     cfg = req.config
     root = getattr(impl.worktree, "path", req.root)
+    existing_frozen = frozen_hits(list(impl.changed_files),
+                                  enforced_frozen_paths(str(root)))
+    # A candidate may not edit the evaluator surface either: ``select`` refuses
+    # the proposal pre-dispatch, and G3 re-checks the real diff here so a child
+    # that widened its own scope cannot slip a gate file past the filter.
+    denied = [p for p in impl.changed_files if _allowlisted(p, DENY_PREFIXES)]
     return replace(
         measured,
         harvest_ok=report.harvest_ok,
         required_probe_failures=tuple(
             p.probe_id for p in report.probes if p.failed and p.required),
         child_verdict=impl.verdict,
-        frozen_hits=tuple(frozen_hits(list(impl.changed_files),
-                                      enforced_frozen_paths(str(root)))),
+        frozen_hits=tuple(dict.fromkeys([*existing_frozen, *denied])),
         changed_files=tuple(impl.changed_files),
         scope_files=tuple(selection.files),
         allow_prefixes=cfg.gates.allow_prefixes or DEFAULT_ALLOW_PREFIXES,
@@ -862,9 +869,33 @@ def _scoped_runner(req: CycleRequest):
 def _default_harvest(req: CycleRequest, con, now: int, probes):
     from .harvest import harvest
 
-    return harvest(req.root, con, now=now,
-                   cfg={"per_source_max": req.config.probes.per_source_max},
-                   probes=tuple(probes))
+    report = harvest(req.root, con, now=now,
+                     cfg={"per_source_max": req.config.probes.per_source_max},
+                     probes=tuple(probes))
+    rcfg = req.config.research
+    if not rcfg.enabled:
+        return report
+
+    from dataclasses import replace as _replace
+    from . import research
+
+    domains = [d for d in rcfg.domains if not req.domains or d in req.domains]
+    specs = {d: _replace(research.DEFAULT_SPECS[d],
+                         review_glob=rcfg.review_globs.get(
+                             d, research.DEFAULT_SPECS[d].review_glob))
+             for d in domains if d in research.DEFAULT_SPECS}
+    harvests = research.harvest_all(
+        req.home, specs, now=now, max_n=rcfg.max_candidates,
+        verdicts=rcfg.verdicts,
+        skip_disagreement=rcfg.skip_disagreement,
+        skip_single_rater=rcfg.skip_single_rater)
+    for harvest_result in harvests:
+        for text in (*harvest_result.notes, *((
+            harvest_result.error,) if harvest_result.error else ())):
+            print(f"[rsi] research {harvest_result.domain}: {text}",
+                  file=sys.stderr)
+    added = tuple(c for h in harvests for c in h.candidates)
+    return replace(report, candidates=tuple(report.candidates) + added)
 
 
 #: How long one SUGGEST run may take. Five model nodes, four of them in
@@ -1588,7 +1619,12 @@ def _default_measure(req: CycleRequest, cand: Candidate, impl: Implementation,
     lint_ok, lint_detail = _lint(wt, changed, req.config.gates.cmd_timeout_s)
     pytest_ok, pytest_detail = _pytest(wt, req, cand, changed)
     static_before, static_after, static_ran = _static_differential(req, wt)
-    gap_before, gap_after = _gap(req, cand, wt, changed=changed)
+    if cand.success_command.startswith(BENCH_PREFIX):
+        # G8 is about "the gap still reproduces"; a benchmark candidate has no
+        # `db:` gap to measure and is judged by G12 instead.
+        gap_before, gap_after = None, None
+    else:
+        gap_before, gap_after = _gap(req, cand, wt, changed=changed)
     failures_before, failures_after, probes_ran = _probe_differential(req, wt)
     return GateEvidence(
         lint_ok=lint_ok, lint_detail=lint_detail,
@@ -1597,7 +1633,196 @@ def _default_measure(req: CycleRequest, cand: Candidate, impl: Implementation,
         gap_before=gap_before, gap_after=gap_after,
         probe_failures_before=failures_before, probe_failures_after=failures_after,
         probes_ran=probes_ran,
+        impact=_impact(req, cand, impl),
     )
+
+
+def _impact_path(req: CycleRequest) -> Path:
+    return req.home / "rsi" / req.cycle_id / "impact.json"
+
+
+def _write_impact(req: CycleRequest, out: Mapping[str, Any]) -> None:
+    path = _impact_path(req)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+
+
+def _impact(req: CycleRequest, cand: Candidate, impl: Implementation,
+            *, base: Path | None = None) -> dict[str, Any] | None:
+    """Measure a ``bench:`` candidate's sealed impact; ``None`` if it is not one.
+
+    Dev first, spending no error budget; then one sealed look under SAGE with a
+    no-regression budget and guard metrics. The decision is written to
+    ``rsi/<cycle>/impact.json`` on every path, errors included, so an operator
+    can see what the acceptor saw and why it stopped. Only this function and the
+    operator artifact may read ``out["sealed"]``; ``public_impact`` is the view
+    the revise loop gets.
+    """
+    if not cand.success_command.startswith(BENCH_PREFIX):
+        return None
+    name = cand.success_command[len(BENCH_PREFIX):]
+    icfg = req.config.impact
+    wt = Path(getattr(impl.worktree, "path", req.root))
+    out: dict[str, Any] = {
+        "benchmark": name, "status": "error", "stage": "setup", "reason": "",
+        "epoch": None, "look": None, "alpha": None, "dev": None,
+        "sealed": None, "guards": None, "flaky": [],
+    }
+    try:
+        try:
+            bench = benchmarks.get_benchmark(name)
+        except KeyError:
+            out["reason"] = "unknown_benchmark"
+            return out
+        ctx = benchmarks.BenchContext(
+            home=req.home, repo=req.root, workers=icfg.workers,
+            timeout_s=icfg.timeout_s)
+        secret = impact_state.load_secret(
+            req.home, secure_store=req.config.secure.secret_store,
+            secret_name=icfg.secret_name)
+        items = dict(bench.items(ctx))
+        if not items:
+            out["reason"] = "empty_corpus"
+            return out
+        state = impact_state.load_state(req.home)
+        entry = impact_state.bench_state(
+            state, name, impact_state.corpus_hash(items))
+        out["epoch"] = entry["epoch"]
+        split = impact.split_items(
+            items, secret=secret, epoch=entry["epoch"],
+            dev_fraction=icfg.dev_fraction, strata=items)
+
+        base_tree = base or _detached_base(req, wt)
+        if base_tree is None:
+            out["reason"] = "no_base"
+            return out
+        try:
+            first = benchmarks.run_benchmark(name, base_tree, ctx=ctx)
+            stable: Any = None
+            stable_path: Path | None = None
+            if first.tree is not None:
+                stable_path = (impact_state.impact_dir(req.home)
+                               / f"stable-{name}-{first.tree}.json")
+                if stable_path.exists():
+                    try:
+                        loaded = json.loads(
+                            stable_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        loaded = None
+                    if isinstance(loaded, list):
+                        stable = loaded
+            if stable is None:
+                scores = [first.scores]
+                for _ in range(max(0, icfg.base_repeats - 1)):
+                    again = benchmarks.run_benchmark(
+                        name, base_tree, ctx=ctx, use_cache=False)
+                    scores.append(again.scores)
+                stable_set, flaky = impact.stable_items(scores)
+                stable = stable_set
+                out["flaky"] = sorted(flaky)
+                if stable_path is not None:
+                    stable_path.parent.mkdir(parents=True, exist_ok=True)
+                    stable_path.write_text(
+                        json.dumps(sorted(stable_set)), encoding="utf-8")
+        finally:
+            # Only a tree this function detached is this function's to remove.
+            if base is None:
+                _remove_detached(req, base_tree)
+
+        head = benchmarks.run_benchmark(name, wt, ctx=ctx)
+        dev_items = [i for i in split["dev"] if i in stable]
+        sealed_items = [i for i in split["sealed"] if i in stable]
+
+        dev_table = impact.paired_counts(
+            first.scores, head.scores, items=dev_items)
+        dev_dec = impact.sage_decision(
+            dev_table, alpha=0.5, lam=icfg.lam,
+            max_regression_rate=icfg.max_regression_rate)
+        out["dev"] = {
+            **dev_table.to_dict(),
+            "reason": dev_dec["reason"],
+            "items": _dev_feedback(dev_items, first, head),
+        }
+        if dev_dec["reason"] not in ("accepted", "not_significant"):
+            out.update(status="rejected", stage="dev",
+                       reason=f"dev_{dev_dec['reason']}")
+            return out
+
+        if entry["looks"] >= icfg.max_looks:
+            out.update(status="rejected", stage="sealed",
+                       reason="sealed_budget_exhausted")
+            return out
+
+        look = entry["looks"] + 1
+        alpha_k = impact.look_alpha(icfg.alpha, look, spending=icfg.spending)
+        sealed_table = impact.paired_counts(
+            first.scores, head.scores, items=sealed_items)
+        dec = impact.sage_decision(
+            sealed_table, alpha=alpha_k, lam=icfg.lam,
+            max_regression_rate=icfg.max_regression_rate)
+        guards = impact.guard_check(
+            first.guards, head.guards, tolerances=icfg.guard_tolerances,
+            lower_is_better=bench.lower_is_better)
+        accepted = bool(dec["accept"] and guards["ok"])
+        impact_state.record_look(state, name, accepted=accepted)
+        impact_state.save_state(req.home, state)
+        if accepted:
+            reason = "accepted"
+        elif not dec["accept"]:
+            reason = str(dec["reason"])
+        else:
+            reason = "guard_violation"
+        out.update(
+            status="accepted" if accepted else "rejected", stage="sealed",
+            look=look, alpha=alpha_k, reason=reason,
+            sealed={**sealed_table.to_dict(), "p_value": dec["p_value"],
+                    "delta": dec["delta"],
+                    "regression_rate": dec["regression_rate"]},
+            guards=guards,
+        )
+    except impact_state.ImpactStateError as exc:
+        out["reason"] = f"state_error: {exc}"
+    except Exception as exc:  # noqa: BLE001 - recorded, never raised at the gate
+        out["reason"] = f"measure_error: {type(exc).__name__}: {exc}"[:300]
+    finally:
+        _write_impact(req, out)
+    return out
+
+
+def _dev_feedback(items: Sequence[str], base, head) -> list[dict[str, Any]]:
+    """The dev items worth naming: changed outcomes, or a head failure."""
+    out: list[dict[str, Any]] = []
+    for item in sorted(items):
+        base_score = base.scores.get(item)
+        head_score = head.scores.get(item)
+        if base_score == head_score and head.scores.get(item, 0) >= 0.5:
+            continue
+        out.append({
+            "item": item,
+            "stratum": head.strata.get(item, ""),
+            "base": base_score,
+            "head": head_score,
+            "reason": str((head.meta.get("reasons") or {}).get(item, ""))[:200],
+        })
+        if len(out) >= 40:
+            break
+    return out
+
+
+def public_impact(out: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The revise-loop view: no sealed counts, no guards, no flaky ids.
+
+    The sealed split returns one bit; handing the counts to a node that may
+    rewrite the candidate would let it overfit the split it is measured on.
+    """
+    if out is None:
+        return None
+    view = dict(out)
+    view["sealed"] = None
+    view["guards"] = None
+    view.pop("flaky", None)
+    return view
 
 
 def _run(argv: Sequence[str], *, cwd: Path, timeout_s: int,
@@ -1827,16 +2052,34 @@ def _retire_stale_runs(con: sqlite3.Connection, req: CycleRequest, now: int) -> 
     return cursor.rowcount or 0
 
 
-def _blind_sources(report: HarvestReport) -> list[str]:
+def _blind_sources(report: HarvestReport, con=None) -> list[str]:
     """The ``source`` values whose absence this harvest cannot be read as a fix.
 
     A skipped DB rule names itself as ``db:<RULE>``; a probe that did not run to
     a verdict names ``probe:<id>``. Everything else (a probed rule, an AST rule,
     a rule that answered "closed") observed its subject and may be trusted.
+
+    Research is a second blind producer. When the report carries no technique
+    candidate — because research is switched off, or its review is missing — the
+    open ``research:*`` rows still name gaps nobody looked at this cycle, so the
+    ledger must not reconcile them away as ``fixed_externally``.
     """
     blind = [f"db:{rule}" for rule in report.skipped]
     blind += [f"probe:{probe.probe_id}" for probe in report.probes
               if probe.status not in ("ok", "findings")]
+    if con is not None and not any(
+            c.kind == "technique_unadopted" for c in report.candidates):
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT source FROM rsi_candidates"
+                " WHERE status = 'open' AND kind = 'technique_unadopted'"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            source = row[0] if row else None
+            if source and source not in blind:
+                blind.append(str(source))
     return blind
 
 

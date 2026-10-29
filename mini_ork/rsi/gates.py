@@ -1,4 +1,4 @@
-"""The eleven merge gates — judgement over evidence, never execution.
+"""The twelve merge gates — judgement over evidence, never execution.
 
 A cycle may merge only when every gate below passes. That makes the gates the
 security boundary of the whole loop, so three rules shape this module:
@@ -36,6 +36,10 @@ Two gates carry their own vocabulary:
   unanimously rejects the *change* is evidence about the fix, while a panel that
   disagrees with itself is evidence about the question. A majority vote is merge
   authority under neither.
+* **G12** measures a ``bench:<name>`` candidate on a sealed benchmark split:
+  a dev split first (spending no error budget), then one spend-limited sealed
+  look under SAGE with a no-regression budget and guard metrics. A non-bench
+  candidate passes it untouched, and G8 defers to it.
 """
 from __future__ import annotations
 
@@ -47,6 +51,7 @@ from mini_ork.rsi.select import DEFAULT_ALLOW_PREFIXES
 from mini_ork.verify.panel_heterogeneity import model_family
 
 __all__ = [
+    "BENCH_PREFIX",
     "FAIL_CODES",
     "GATE_ORDER",
     "CriticVerdict",
@@ -72,7 +77,11 @@ GATE_ORDER: tuple[tuple[str, str, str], ...] = (
     ("G9", "no_new_probe_failures", "new_probe_failure"),
     ("G10", "critic_unanimous", "critic_split"),
     ("G11", "budget", "budget_exceeded"),
+    ("G12", "impact", "no_measured_gain"),
 )
+
+#: The success-command scheme that routes a candidate to G12 instead of G8.
+BENCH_PREFIX = "bench:"
 
 #: Every fail code a gate can emit, including G10's two extra.
 FAIL_CODES: tuple[str, ...] = tuple(code for _, _, code in GATE_ORDER) + (
@@ -192,6 +201,8 @@ class GateEvidence:
     daily_cap: float = 0.0
     cycle_cost: float = 0.0
     per_cycle_cap: float = 0.0
+    # G12
+    impact: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +353,8 @@ def _g7(ev: GateEvidence) -> GateResult:
 
 
 def _g8(ev: GateEvidence) -> GateResult:
+    if ev.metric_command.startswith(BENCH_PREFIX):
+        return GateResult("G8", "success_metric", True, detail="measured by G12")
     command = ev.metric_command or "the success command"
     if ev.gap_before is True and ev.gap_after is False:
         return GateResult("G8", "success_metric", True)
@@ -411,9 +424,23 @@ def _g11(ev: GateEvidence) -> GateResult:
     return GateResult("G11", "budget", True)
 
 
+def _g12(ev: GateEvidence) -> GateResult:
+    if not ev.metric_command.startswith(BENCH_PREFIX):
+        return GateResult("G12", "impact", True)
+    if ev.impact is None:
+        return GateResult("G12", "impact", False, "no_measured_gain",
+                          "impact was not measured")
+    if ev.impact.get("status") == "accepted":
+        return GateResult("G12", "impact", True)
+    stage = ev.impact.get("stage") or "setup"
+    reason = ev.impact.get("reason") or "unknown"
+    return GateResult("G12", "impact", False, "no_measured_gain",
+                      f"{stage}: {reason}")
+
+
 _GATE_FNS = {
     "G1": _g1, "G2": _g2, "G3": _g3, "G4": _g4, "G5": _g5, "G6": _g6,
-    "G7": _g7, "G8": _g8, "G9": _g9, "G10": _g10, "G11": _g11,
+    "G7": _g7, "G8": _g8, "G9": _g9, "G10": _g10, "G11": _g11, "G12": _g12,
 }
 
 

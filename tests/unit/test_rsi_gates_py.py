@@ -1,4 +1,4 @@
-"""Unit tests: the eleven merge gates, and the two red-baseline traps.
+"""Unit tests: the twelve merge gates, and the two red-baseline traps.
 
 The gates decide whether a self-authored patch reaches ``main``, so the tests
 are written the way an attacker would read them:
@@ -43,7 +43,7 @@ GOOD_CRITICS = (_critic("c1", "glm-5.3"), _critic("c2", "claude-opus-5-5"))
 
 
 def _evidence(**kw) -> GateEvidence:
-    """A record where all eleven gates pass. Overrides break one at a time."""
+    """A record where all twelve gates pass. Overrides break one at a time."""
     base = dict(
         harvest_ok=True,
         child_verdict={"pass": True, "files_changed": 1, "tests_pass": True},
@@ -83,10 +83,10 @@ def _codes(ev: GateEvidence) -> tuple[str, ...]:
 # ── the happy path ──────────────────────────────────────────────────────────
 
 
-def test_all_eleven_gates_pass_on_complete_evidence():
+def test_all_twelve_gates_pass_on_complete_evidence():
     report = evaluate(_evidence())
     assert report.passed, [r.to_dict() for r in report.failing]
-    assert len(report.results) == 11
+    assert len(report.results) == 12
     assert [r.gate for r in report.results] == [g for g, _, _ in GATE_ORDER]
     assert report.to_dict()["failed"] == []
 
@@ -224,6 +224,52 @@ def test_g8_fails_closed_when_the_metric_was_not_measured():
     report = evaluate(_evidence(gap_before=None, gap_after=False))
     assert {r.gate: r for r in report.results}["G8"].code == "metric_unchanged"
     assert "not measured" in {r.gate: r for r in report.results}["G8"].detail
+
+
+def test_g8_defers_a_bench_command_to_g12():
+    report = evaluate(_evidence(metric_command="bench:verifier-replay",
+                                gap_before=True, gap_after=True))
+    gate = {r.gate: r for r in report.results}["G8"]
+    assert gate.ok is True
+    assert gate.detail == "measured by G12"
+
+
+# ── G12 the sealed impact gate ─────────────────────────────────────────────
+
+
+def _gate(name: str, ev: GateEvidence) -> GateResult:
+    return {r.gate: r for r in evaluate(ev).results}[name]
+
+
+def test_g12_passes_a_non_bench_command_untouched():
+    gate = _gate("G12", _evidence(metric_command="db:L10"))
+    assert gate.ok is True
+    assert gate.name == "impact"
+    assert gate.code == ""
+
+
+def test_g12_fails_when_the_impact_was_not_measured():
+    gate = _gate("G12", _evidence(metric_command="bench:verifier-replay",
+                                  impact=None))
+    assert gate.ok is False
+    assert gate.code == "no_measured_gain"
+    assert gate.detail == "impact was not measured"
+
+
+def test_g12_passes_an_accepted_impact():
+    gate = _gate("G12", _evidence(metric_command="bench:verifier-replay",
+                                  impact={"status": "accepted"}))
+    assert gate.ok is True
+    assert gate.code == ""
+
+
+def test_g12_names_the_stage_and_reason_of_a_rejection():
+    gate = _gate("G12", _evidence(
+        metric_command="bench:verifier-replay",
+        impact={"status": "rejected", "stage": "dev", "reason": "dev_net_loss"}))
+    assert gate.ok is False
+    assert gate.code == "no_measured_gain"
+    assert gate.detail == "dev: dev_net_loss"
 
 
 # ── G9 probe differential ───────────────────────────────────────────────────

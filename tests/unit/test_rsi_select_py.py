@@ -487,3 +487,64 @@ def test_the_lint_assertion_is_not_vacuous():
     broken = sel.kickoff.replace("## Files in scope", "## Stuff")
     findings = lint(broken, project=ROOT, recipe="framework-edit", home=None)
     assert findings, "kickoff_lint agreed with a kickoff it should reject"
+
+
+# ── benchmark-measured techniques (G12) ────────────────────────────────────
+
+
+BENCH_COMMAND = "bench:verifier-replay"
+
+
+def _technique_cand(success_command: str = BENCH_COMMAND) -> Candidate:
+    return Candidate.build(
+        domain="verification",
+        source="research:G01",
+        kind="technique_unadopted",
+        title="adopt T1: replay the verifier",
+        evidence_key="technique:replay-the-verifier",
+        now=NOW,
+        files=("recipes/code-fix/verifiers/test.py",),
+        success_command=success_command,
+    )
+
+
+def test_registered_success_commands_include_the_benchmarks():
+    assert BENCH_COMMAND in registered_success_commands()
+
+
+def test_a_technique_touching_the_evaluator_is_a_self_edit():
+    cand = _technique_cand()
+    sel = _run(cand, Proposal(candidate_id=cand.candidate_id,
+                              new_files=("evals/x.json",), summary="edit it"))
+    assert sel.accepted is False
+    assert sel.code == "self_edit_of_gate"
+
+
+def test_a_technique_off_the_benchmark_surface_is_rejected():
+    cand = _technique_cand()
+    sel = _run(cand, Proposal(candidate_id=cand.candidate_id,
+                              files=("mini_ork/dispatch/routing.py",),
+                              summary="routing change"))
+    assert sel.accepted is False
+    assert sel.code == "off_surface"
+
+
+def test_a_technique_inside_the_benchmark_surface_is_accepted():
+    cand = _technique_cand()
+    sel = _run(cand, Proposal(
+        candidate_id=cand.candidate_id,
+        files=("recipes/code-fix/verifiers/test.py",),
+        summary="change the verifier"))
+    assert sel.accepted, (sel.code, sel.detail)
+    assert "held-out benchmark" in sel.kickoff
+    assert "reports success on the fixed tree" not in sel.kickoff
+
+
+def test_a_non_bench_kickoff_still_names_the_gap_constraint():
+    cand = _cand()
+    text = build_kickoff(
+        cand, Proposal(candidate_id=cand.candidate_id),
+        verification_command="db:L1",
+        files=("mini_ork/learning/ledger.py",))
+    assert "The gap must stop reproducing" in text
+    assert "held-out benchmark" not in text
