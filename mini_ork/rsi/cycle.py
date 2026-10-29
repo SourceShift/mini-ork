@@ -38,7 +38,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import benchmarks, impact, impact_state, learn, ledger
+from . import benchmarks, impact, impact_state, learn, ledger, monitor, research
 from .candidates import Candidate
 from .config import CycleConfig
 from .gates import BENCH_PREFIX, CriticVerdict, GateEvidence, ValidationReport, evaluate
@@ -357,6 +357,13 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
             ledger.reconcile(con, [c.candidate_id for c in report.candidates],
                              now=rt.clock(),
                              blind_sources=_blind_sources(report, con))
+
+    # --- RESEARCH PREFLIGHT ------------------------------------------------
+    # The canary and the research refresh sit between HARVEST and QUEUE so that
+    # a canary regression and a stale review are both visible to *this* queue.
+    # The helper is a no-op unless ``research.enabled``, and a dry run never
+    # touches either — the default config therefore behaves exactly as before.
+    report = _research_preflight(req, rt, con, report)
 
     # --- QUEUE -------------------------------------------------------------
     plan = _build_queue(req, con, report, rt.clock())
@@ -1127,6 +1134,80 @@ def _default_harvest(req: CycleRequest, con, now: int, probes):
                   file=sys.stderr)
     added = tuple(c for h in harvests for c in h.candidates)
     return replace(report, candidates=tuple(report.candidates) + added)
+
+
+def _canary_benches(req: CycleRequest) -> tuple[str, ...]:
+    """The distinct benchmark names this cycle's research domains are scored on.
+
+    A domain the module does not know has no benchmark, and a domain the
+    operator left out of ``--domain`` this run is not scored. Distinct because
+    two domains may share one benchmark; scoring it twice would spend twice and
+    record two canaries for one tree.
+    """
+    benches: dict[str, None] = {}
+    for domain in req.config.research.domains:
+        if req.domains and domain not in req.domains:
+            continue
+        spec = research.DEFAULT_SPECS.get(domain)
+        if spec is not None:
+            benches.setdefault(spec.benchmark, None)
+    return tuple(benches)
+
+
+def _research_preflight(req: CycleRequest, rt: Runtime, con,
+                        report: HarvestReport) -> HarvestReport:
+    """Score the canary and relaunch stale reviews before the queue is drawn.
+
+    Both jobs belong to ``monitor``; the cycle only sequences them. They run
+    *after* HARVEST so a halt can drop the technique candidates and queue a
+    fix-forward regression for this cycle's QUEUE rather than the next one.
+
+    Research is off by default and a dry run spawns nothing, so with the stock
+    config this is a no-op. A refresh or canary failure is reported and ignored:
+    neither may halt a cycle, because neither is a measurement of the candidate
+    the cycle exists to fix. A halt marker, by contrast, is a decision already
+    made — the canary wrote it — so it is honoured here.
+    """
+    cfg = req.config
+    if not cfg.research.enabled or req.dry_run:
+        return report
+
+    try:
+        for entry in monitor.maybe_refresh(req.root, req.home, cfg,
+                                          now=rt.clock(), domains=req.domains):
+            if entry.get("action") == "launched":
+                print(f"[rsi] research refresh: {entry.get('domain')} launched"
+                      f" ({entry.get('log')})", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - a refresh never halts a cycle
+        print(f"[rsi] research refresh failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    if cfg.monitor.enabled:
+        for bench in _canary_benches(req):
+            try:
+                outcome = monitor.run_canary(req.root, req.home, cfg, bench,
+                                             now=rt.clock())
+            except Exception as exc:  # noqa: BLE001 - a canary never crashes a cycle
+                print(f"[rsi] canary {bench} failed: {type(exc).__name__}: {exc}",
+                      file=sys.stderr)
+                continue
+            print(f"[rsi] canary {bench}: {outcome.get('status')}"
+                  f" score={outcome.get('score')} peak={outcome.get('peak')}",
+                  file=sys.stderr)
+
+    halt = monitor.adoption_halted(req.home)
+    if halt is not None:
+        # The canary has decided technique adoption is unsafe until the score
+        # recovers, so the technique candidates never reach the queue.
+        report = replace(report, candidates=tuple(
+            c for c in report.candidates if c.kind != "technique_unadopted"))
+        print(f"[rsi] adoption halted: {halt.get('bench', '?')}"
+              " canary below its peak", file=sys.stderr)
+        if "bench" in halt:
+            reg = monitor.regression_candidate(halt, now=rt.clock())
+            ledger.upsert_candidate(con, reg, now=rt.clock())
+            report = replace(report, candidates=(*report.candidates, reg))
+    return report
 
 
 #: How long one SUGGEST run may take. Five model nodes, four of them in
