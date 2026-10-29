@@ -113,6 +113,56 @@ def test_gate_outcomes_count_node_end_events(home: Path) -> None:
     assert any(r["cells"][0]["t"] == "test.py" for r in registry["rows"])
 
 
+def test_unlabelled_verifier_results_are_labelable_from_the_row(home: Path) -> None:
+    """The abstain gate calibrates against these labels; the page must feed it."""
+    now = int(time.time())
+    _sql(home,
+         ("INSERT INTO verifier_results (result_id, run_id, verifier_name, verdict, created_at) "
+          "VALUES (?,?,?,?,?)", ("vr-a", "run-a", "test.py", "pass", now)),
+         ("INSERT INTO verifier_results (result_id, run_id, verifier_name, verdict, "
+          "is_false_positive, created_at) VALUES (?,?,?,?,?,?)",
+          ("vr-b", "run-b", "lint.py", "fail", 1, now)))
+
+    table = _section(build_page(home, "verify", "gates", {}),
+                     "Verifier calibration · unlabelled results")
+
+    assert [r["cells"][0]["t"] for r in table["rows"]] == ["vr-a"]
+    acts = {a["label"]: a["do"] for a in table["rows"][0]["acts"]}
+    assert acts["False positive"]["cli"] == [
+        "verifier", "annotate", "--result-id", "vr-a", "--kind", "false_positive"]
+    assert acts["False negative"]["cli"] == [
+        "verifier", "annotate", "--result-id", "vr-a", "--kind", "false_negative"]
+    assert acts["False positive"]["home"] is False
+    assert acts["False positive"]["confirm"] and acts["False negative"]["confirm"]
+    assert table["actions"][0]["do"] == {
+        "cli": ["verifier", "list", "--unannotated"], "home": False}
+
+
+def test_every_row_action_parses_against_its_subcommand(home: Path) -> None:
+    """A row button that its parser rejects is a dead control, like a bad header action."""
+    from mini_ork.cli import verifier as verifier_cli
+
+    now = int(time.time())
+    _sql(home, ("INSERT INTO verifier_results (result_id, run_id, verifier_name, verdict, created_at) "
+                "VALUES (?,?,?,?,?)", ("vr-a", "run-a", "test.py", "pass", now)))
+
+    table = _section(build_page(home, "verify", "gates", {}),
+                     "Verifier calibration · unlabelled results")
+
+    parser = verifier_cli._build_parser()
+    for action in table["rows"][0]["acts"] + table["actions"]:
+        cli = action["do"]["cli"]
+        assert cli[0] == "verifier"
+        parser.parse_args(cli[1:])
+
+
+def test_no_unlabelled_results_says_so_instead_of_an_empty_table(home: Path) -> None:
+    table = _section(build_page(home, "verify", "gates", {}),
+                     "Verifier calibration · unlabelled results")
+    assert table["rows"][0]["cells"][1]["t"] == "No unlabelled verifier results"
+    assert table["rows"][0]["acts"] == []
+
+
 def test_a_broken_source_costs_one_section(home: Path, monkeypatch) -> None:
     def boom(_home):
         raise RuntimeError("db locked")

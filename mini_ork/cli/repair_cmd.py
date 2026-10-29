@@ -17,6 +17,7 @@ is reported and does not abort the sweep.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -271,6 +272,23 @@ def _print_text(rows: list[dict[str, Any]]) -> None:
         sys.stdout.write(
             f"{row['id']}  {row.get('action')}  {node}  {row.get('reason') or ''}\n"
         )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Describe the argv ``_parse`` accepts, for the IDE's action checks.
+
+    ``_parse`` stays hand-rolled so its error text is unchanged; this parser is
+    the contract the page-action test validates against.
+    """
+    parser = argparse.ArgumentParser(prog="mini-ork repair", add_help=False)
+    parser.add_argument("run_id", nargs="?")
+    parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--since-days", type=int, default=4)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--include-experiments", action="store_true")
+    parser.add_argument("--home")
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:

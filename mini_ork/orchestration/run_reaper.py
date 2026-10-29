@@ -712,7 +712,8 @@ def _duration(text: str) -> int:
     return int(match.group(1)) * _UNITS[match.group(2)]
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and the IDE's action checks."""
     parser = argparse.ArgumentParser(
         prog="mini-ork reap",
         description="Fail runs whose dispatcher died without writing a terminal status.")
@@ -721,7 +722,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stale-after", type=_duration, default=None, metavar="DUR",
                         help="also reap runs with no .pid idle at least DUR (e.g. 6h)")
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     home = Path(args.home or os.environ.get("MINI_ORK_HOME") or Path.cwd() / ".mini-ork")
     home = home.expanduser().absolute()
     if not (home / "state.db").is_file():

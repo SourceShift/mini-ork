@@ -388,6 +388,20 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         errors["counts"] = f"{type(exc).__name__}: {exc}"
     web = _web_ui()
     actions = [S.btn("Open web UI", S.url(web), "ghost")] if web else []
+    # The sweep lives on the list, not on a run: both verbs decide over every
+    # run in the home. Each pair is plan-then-apply so a mis-click cannot
+    # rewrite lifecycles. ``supervise`` has no ``--home`` flag of its own.
+    actions += [
+        S.btn("Reap plan", S.cli("reap", "--dry-run"), "ghost"),
+        S.btn("Reap stranded", S.cli("reap", confirm="Fail every run whose dispatcher died?"),
+              "ghost"),
+        S.btn("Supervise plan", S.cli("supervise", "--once", "--dry-run", home=False), "ghost"),
+        S.btn("Supervise once",
+              S.cli("supervise", "--once",
+                    confirm="Sweep parked self-driving runs and resume those it can?",
+                    home=False),
+              "ghost"),
+    ]
     return S.page(
         "runs", "Runs & live execution",
         "Every run of the project, including runs started from the CLI and automations.",

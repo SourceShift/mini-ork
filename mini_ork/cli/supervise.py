@@ -147,7 +147,8 @@ def _emit(actions: list[dict], as_json: bool) -> None:
         print(f"{run_id}: {verb} — {reason}".rstrip(" —"))
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and the IDE's action checks."""
     parser = argparse.ArgumentParser(
         prog="mini-ork supervise",
         description="Sweep parked self-driving runs under one lease.")
@@ -161,7 +162,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="print the action list as JSON")
     parser.add_argument("--config", default=None,
                         help="YAML config path (or MO_SUPERVISE_CONFIG)")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     config_path = args.config or os.environ.get("MO_SUPERVISE_CONFIG") or ""
     try:

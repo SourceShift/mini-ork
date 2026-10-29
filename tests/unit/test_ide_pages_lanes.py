@@ -161,6 +161,14 @@ def test_cost_tab(ledger: Path) -> None:
     assert [c["t"] for c in ledger_rows[0]["cells"]][1:] == ["minimax", "worker", "2.2K", "$9.00"]
 
 
+def test_header_offers_the_lifetime_reports(home: Path) -> None:
+    page = lanes.build(home, None, {})
+    assert [b["do"] for b in page["actions"]] == [
+        {"cli": ["lifetime", "summary"], "home": False},
+        {"cli": ["lifetime", "conductor-history"], "home": False},
+    ]
+
+
 def test_entrypoint_every_tab(ledger: Path) -> None:
     for tab in ("lanes", "routing", "cost"):
         page = build_page(ledger, "lanes", tab, {})

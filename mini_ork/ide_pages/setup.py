@@ -617,7 +617,21 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         sections += S.guarded(errors, "Projects", lambda: _projects(home))
     else:
         sections += S.guarded(errors, "Health & exports", lambda: _health(home))
+    # ``onboard`` is interactive and mutates the workspace, so the real run goes
+    # through ``S.terminal`` (it owns a TTY) while the plan is a safe ``cli``
+    # action. ``--workspace`` is passed explicitly because the page's cwd is the
+    # home, not the project the user opened.
+    project = str(home.parent)
+    actions = [S.btn("Run all checks", S.set_args(checked=str(int(time.time()))))]
+    if tab == "readiness":
+        actions += [
+            S.btn("Onboarding plan",
+                  S.cli("onboard", "--dry-run", "--workspace", project, home=False), "ghost"),
+            S.btn("Onboard this project",
+                  S.terminal(["onboard", "--workspace", project],
+                             cwd=project, home=False), "ghost"),
+        ]
     return S.page("setup", "Setup & health",
                   "Getting mini-ork wired into this project and this editor, and keeping it healthy.",
-                  actions=[S.btn("Run all checks", S.set_args(checked=str(int(time.time()))))],
+                  actions=actions,
                   tabs=TABS, tab=tab, args=args, sections=sections, errors=errors)

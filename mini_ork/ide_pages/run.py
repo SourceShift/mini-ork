@@ -763,12 +763,69 @@ def _actions(run: Run) -> list[dict[str, Any]]:
         acts.extend(_stop_kill_actions(run))
     else:
         acts.extend(_review_actions(run))
+        if O.state_word(run) == "failed":
+            # ``repair`` decides the auto-repair from the run's own failure
+            # markers; the plan is read-only, so it stays a one-click action.
+            acts.append(S.btn("Repair plan",
+                              S.cli("repair", run.id, "--dry-run", home=False), "ghost"))
+            acts.append(S.btn("Repair",
+                              S.cli("repair", run.id,
+                                    confirm=f"Apply the auto-repair for {run.id}?", home=False),
+                              "ghost"))
         acts.append(S.btn("Certify this change", S.page_link("verify", "certify", run=run.id)))
         acts.append(S.btn("Open run folder", S.reveal(str(run.run_dir)), "ghost"))
     # Last: the orchestrator is a way to *read* the run, so it sits after the
     # controls that change it, in both the running and the finished branch.
     acts.append(_orchestrator_action(run))
     return acts
+
+
+def _graph_patches_section(run: Run) -> list[dict[str, Any]]:
+    """The run's typed graph patches, each applicable from its own row.
+
+    A patch is a numbered, immutable edit to the run's workflow (reassign a
+    lane, insert a node, split the run); ``apply`` materialises it and revives
+    the run from the patched workflow. The reader is the same one
+    ``mini-ork graph-patch list`` uses, so the page and the CLI cannot disagree
+    about what is on disk. Nothing is offered while the run is live: a patch
+    applies by reviving, and a run that is still executing has its processes.
+    """
+    try:
+        from mini_ork.recovery import graph_patch
+
+        entries = graph_patch.list_patches(run.home, run.id)
+    except Exception:  # noqa: BLE001 — an unreadable patch dir costs this section
+        return []
+    if not entries:
+        return []
+    live = _running(run)
+    rows = []
+    for entry in entries:
+        number = int(entry.get("number") or 0)
+        status = str(entry.get("status") or "proposed")
+        acts: list[dict[str, Any]] = []
+        if status != "applied" and not live:
+            acts.append(S.btn("Validate",
+                              S.cli("graph-patch", "validate", run.id, str(number), home=False),
+                              "ghost"))
+            acts.append(S.btn("Apply",
+                              S.cli("graph-patch", "apply", run.id, str(number),
+                                    confirm=(f"Apply graph patch {number:03d} and revive "
+                                             f"{run.id} from the patched workflow?"),
+                                    home=False)))
+        rows.append({
+            "cells": [S.mono(f"{number:03d}"),
+                      S.cell(status, "green" if status == "applied" else "yellow"),
+                      S.muted(entry.get("kind")),
+                      S.mono(entry.get("from_node")),
+                      S.muted(entry.get("reason"))],
+            "acts": acts,
+        })
+    return [S.table("Graph patches",
+                    [S.col(44), S.col(70), S.col(110), S.col(110), S.col(fr=1, min=140)],
+                    ["#", "status", "kind", "from node", "reason"], rows, full=True,
+                    note="Typed, immutable edits to this run's workflow. Applying one "
+                         "materialises the patched workflow and revives the run from it.")]
 
 
 # r-ide-review: the park / merge-review sections are additive — a page that
@@ -5085,6 +5142,10 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run, changes=True),
     }[resolved]()
+    # A graph patch is a recovery artifact, so it belongs beside the graph and
+    # the outcome — the two tabs a failed run is diagnosed from.
+    if resolved in ("dag", "outcome"):
+        sections = sections + _graph_patches_section(run)
     if lane:
         sections = lane + sections
 
@@ -5223,7 +5284,9 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
                   tab=tab, args={"run": run.id,
                                  **({"node": args["node"]} if args.get("node") else {}),
                                  **_orch_args(args)},
-                  sections=review_sections + sections, desc=_desc_fold(run, None, run.id),
+                  sections=review_sections + sections
+                  + (_graph_patches_section(run) if tab in ("dag", "overview") else []),
+                  desc=_desc_fold(run, None, run.id),
                   refresh=orch_tab.refresh_seconds(run))
     # Additive at every level: the graph is available to an old IDE too.
     page["graph"] = _graph(run, args.get("node"))

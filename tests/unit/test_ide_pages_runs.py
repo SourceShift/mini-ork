@@ -57,6 +57,19 @@ def _lane_call(home: Path, run_id: str, lane: str, *, status: str = "failed",
     con.close()
 
 
+def test_header_offers_the_recovery_sweeps(home: Path) -> None:
+    built = page.build(home, None, {})
+    clis = [button["do"]["cli"] for button in built["actions"] if "cli" in button["do"]]
+    assert ["reap", "--dry-run"] in clis
+    assert ["supervise", "--once", "--dry-run"] in clis
+    for verb, args in (("reap", []), ("supervise", ["--once"])):
+        apply = next(b for b in built["actions"] if b["do"].get("cli") == [verb, *args])
+        assert apply["do"]["confirm"]
+    supervise = next(b for b in built["actions"]
+                     if b["do"].get("cli") == ["supervise", "--once"])
+    assert supervise["do"]["home"] is False
+
+
 def test_why_column_names_the_lane_that_ended_the_run(home: Path) -> None:
     """A failed run must say WHICH LANE failed, not just that it failed.
 

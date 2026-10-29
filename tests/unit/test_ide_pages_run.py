@@ -285,6 +285,69 @@ def test_actions_follow_the_run_state(home: Path) -> None:
     assert "Certify this change" not in labels
 
 
+def test_a_failed_run_offers_a_repair_plan_and_the_repair(home: Path) -> None:
+    _seed(home, status="failed")
+    page = build_page(home, "run", None, {"run": RUN})
+    repairs = [a["do"] for a in page["actions"] if a["do"].get("cli", [None])[0] == "repair"]
+    assert repairs == [
+        {"cli": ["repair", RUN, "--dry-run"], "home": False},
+        {"cli": ["repair", RUN], "home": False, "confirm": f"Apply the auto-repair for {RUN}?"},
+    ]
+
+
+def test_a_published_run_does_not_offer_repair(home: Path) -> None:
+    _seed(home)
+    page = build_page(home, "run", None, {"run": RUN})
+    assert not [a for a in page["actions"] if a["do"].get("cli", [None])[0] == "repair"]
+
+
+def test_a_proposed_graph_patch_is_listed_with_validate_and_apply(home: Path) -> None:
+    """A patch on disk must be reachable from the page that shows the failure."""
+    from mini_ork.recovery import graph_patch
+
+    _seed(home, status="failed")
+    number = graph_patch.propose(home / "runs" / RUN, {
+        "kind": "swap_lane", "from_node": "implementer", "node": "implementer",
+        "lane": "codex", "reason": "the worker lane ran out of quota", "source": "operator"})
+
+    page = build_page(home, "run", None, {"run": RUN})
+
+    row = _section(page, "table", "Graph patches")["rows"][0]
+    assert [c["t"] for c in row["cells"][:4]] == [f"{number:03d}", "proposed", "swap_lane",
+                                                  "implementer"]
+    acts = {a["label"]: a["do"] for a in row["acts"]}
+    assert acts["Validate"] == {"cli": ["graph-patch", "validate", RUN, str(number)], "home": False}
+    assert acts["Apply"]["cli"] == ["graph-patch", "apply", RUN, str(number)]
+    assert acts["Apply"]["home"] is False and f"{number:03d}" in acts["Apply"]["confirm"]
+    # A row button its parser rejects is a dead control.
+    from mini_ork.cli import graph_patch as graph_patch_cli
+
+    parser = graph_patch_cli.build_parser()
+    for action in row["acts"]:
+        assert action["do"]["cli"][0] == "graph-patch"
+        parser.parse_args(action["do"]["cli"][1:])
+
+
+def test_a_live_run_offers_no_graph_patch_apply(home: Path) -> None:
+    """Applying revives the run, so a run that is still executing offers none."""
+    from mini_ork.recovery import graph_patch
+
+    _seed(home, status="executing")
+    graph_patch.propose(home / "runs" / RUN, {
+        "kind": "rerun", "from_node": "implementer",
+        "reason": "retry the implementer", "source": "operator"})
+
+    row = _section(build_page(home, "run", None, {"run": RUN}), "table", "Graph patches")["rows"][0]
+
+    assert row["acts"] == [] and row["cells"][0]["t"] == "001"
+
+
+def test_no_graph_patch_section_without_patches(home: Path) -> None:
+    _seed(home, status="failed")
+    page = build_page(home, "run", None, {"run": RUN})
+    assert not [s for s in page["sections"] if s.get("title") == "Graph patches"]
+
+
 def test_a_run_without_a_known_recipe_lays_nodes_out_by_time(home: Path) -> None:
     _seed(home, recipe="gone-recipe")
     page = build_page(home, "run", None, {"run": RUN})

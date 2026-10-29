@@ -57,6 +57,7 @@ with floats 1e-6 and ints exact).
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sqlite3
 import sys
@@ -67,6 +68,7 @@ __all__ = [
     "conductor_history",
     "summary",
     "help_text",
+    "build_parser",
     "main",
     "_db_path",
     "_column_header_lines",
@@ -409,6 +411,24 @@ HELP_TEXT = (
 
 def help_text() -> str:
     return HELP_TEXT
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Describe the argv ``main`` accepts, for the IDE's action checks.
+
+    ``main`` keeps its hand-rolled parsing so stdout stays byte-compatible with
+    ``bin/mini-ork-lifetime``; this parser is the contract the page-action test
+    validates against, and the place a future ``--help`` can be generated from.
+    """
+    parser = argparse.ArgumentParser(prog="mini-ork lifetime", add_help=False)
+    subcommands = parser.add_subparsers(dest="sub")
+    subcommands.add_parser("summary")
+    show_parser = subcommands.add_parser("show")
+    show_parser.add_argument("recipe")
+    show_parser.add_argument("--task-class")
+    history_parser = subcommands.add_parser("conductor-history")
+    history_parser.add_argument("n", nargs="?", type=int, default=10)
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:

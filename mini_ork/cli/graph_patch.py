@@ -123,7 +123,8 @@ def _run(args: argparse.Namespace) -> int:
     raise graph_patch.GraphPatchError(f"unknown verb: {args.verb!r}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and the IDE's action checks."""
     parser = argparse.ArgumentParser(
         prog="mini-ork graph-patch",
         description="Typed, immutable run-graph edits applied through recover --workflow.",
@@ -160,7 +161,11 @@ def main(argv: list[str] | None = None) -> int:
     p_credit = sub.add_parser("credit", help="per-kind outcome credit vs the rerun control")
     p_credit.add_argument("--json", action="store_true")
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     try:
         return _run(args)
     except graph_patch.GraphPatchError as exc:

@@ -263,6 +263,60 @@ def _specialised_gates(home: Path) -> dict[str, Any]:
     return S.lst("Specialised gates", items, note="Rows of gate_registry, evaluated by mini_ork.gates.")
 
 
+def _verifier_calibration(home: Path) -> dict[str, Any]:
+    """Unlabelled verifier results, each labelable from its own row.
+
+    ``verifier_results`` is the ground truth ``gates.abstain_gate`` calibrates
+    its abstention threshold against, and a row only becomes ground truth once
+    an operator marks it a false positive or negative. The writer
+    (``verifier_result_annotate``) had no caller until ``mini-ork verifier
+    annotate`` was written; the row buttons are what make the loop reachable
+    without a terminal, which is the difference between a calibration table
+    that exists and one that is fed.
+    """
+    db = _db(home)
+    rows = _rows(db, "verifier_results",
+                 "SELECT result_id, run_id, verifier_name, verdict, created_at "
+                 "FROM verifier_results "
+                 "WHERE is_false_positive = 0 AND is_false_negative = 0 "
+                 "ORDER BY created_at DESC, result_id LIMIT 20")
+    out = []
+    for r in rows:
+        rid = str(r.get("result_id") or "")
+        verdict = str(r.get("verdict") or "")
+        out.append({
+            "cells": [S.mono(rid),
+                      S.cell(verdict, {"pass": "green", "fail": "red"}.get(verdict, "yellow")),
+                      S.mono(r.get("verifier_name")),
+                      S.muted(_short(r.get("run_id"))),
+                      S.muted(S.age(r.get("created_at"), int(time.time())))],
+            "acts": [
+                S.btn("False positive",
+                      S.cli("verifier", "annotate", "--result-id", rid,
+                            "--kind", "false_positive",
+                            confirm=(f"Label {rid} a false positive — the verifier "
+                                     "rejected a good change?"),
+                            home=False), "ghost"),
+                S.btn("False negative",
+                      S.cli("verifier", "annotate", "--result-id", rid,
+                            "--kind", "false_negative",
+                            confirm=(f"Label {rid} a false negative — the verifier "
+                                     "passed a bad change?"),
+                            home=False), "ghost"),
+            ],
+        })
+    if not out:
+        out = [{"cells": [S.muted("—"), S.muted("No unlabelled verifier results"), "", "", ""],
+                "acts": []}]
+    return S.table("Verifier calibration · unlabelled results",
+                   [S.col(150), S.col(90), S.col(140), S.col(130), S.col(80)],
+                   ["result", "verdict", "verifier", "run", "age"], out, full=True,
+                   note="`verifier_results` is what the abstain gate calibrates against; a row "
+                        "becomes evidence only once an operator labels it.",
+                   actions=[S.btn("Unlabelled in the CLI",
+                                  S.cli("verifier", "list", "--unannotated", home=False), "ghost")])
+
+
 def _verifier_registry(home: Path) -> dict[str, Any]:
     from mini_ork import recipes_catalog
 
@@ -634,6 +688,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     elif tab == "gates":
         sections = (S.guarded(errors, "Gate outcomes · last 24 h", lambda: _gate_outcomes(home))
                     + S.guarded(errors, "Specialised gates", lambda: _specialised_gates(home))
+                    + S.guarded(errors, "Verifier calibration · unlabelled results",
+                                lambda: _verifier_calibration(home))
                     + S.guarded(errors, "Verifier registry", lambda: _verifier_registry(home))
                     + S.guarded(errors, "Minimum evidence", lambda: _minimum_evidence(home)))
     elif tab == "panels":

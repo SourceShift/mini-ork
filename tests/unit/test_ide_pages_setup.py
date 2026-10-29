@@ -52,6 +52,18 @@ def test_every_tab_builds(home: Path, monkeypatch) -> None:
         "readiness", "features", "settings", "zed", "projects", "health"]
 
 
+def test_readiness_offers_onboarding_and_only_readiness_does(home: Path) -> None:
+    project = str(home.parent)
+    readiness = setup.build(home, "readiness", {})
+    clis = [b["do"] for b in readiness["actions"] if "cli" in b["do"]]
+    assert {"cli": ["onboard", "--dry-run", "--workspace", project], "home": False} in clis
+    terminals = [b["do"]["terminal"] for b in readiness["actions"] if "terminal" in b["do"]]
+    assert terminals == [{"home": False, "cli": ["onboard", "--workspace", project], "cwd": project}]
+    for tab in ("features", "settings", "zed", "projects", "health"):
+        for button in setup.build(home, tab, {})["actions"]:
+            assert "cli" not in (button["do"] or {}) and "terminal" not in (button["do"] or {})
+
+
 def test_readiness(home: Path, monkeypatch) -> None:
     monkeypatch.setattr(acp_setup, "_load_lane_map", lambda home: {"implementer": "minimax", "reviewer": "glm,minimax"})
 

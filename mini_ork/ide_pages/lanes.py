@@ -54,7 +54,11 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
                     + S.guarded(errors, "Last 7 days", lambda: _last_7_days(home))
                     + S.guarded(errors, "Guards", lambda: _guards(home))
                     + S.guarded(errors, "Ledger · latest calls", lambda: _ledger(home)))
-    return S.page("lanes", TITLE, SUB, chips_=chips, actions=[], tabs=TABS, tab=tab, args=args,
+    # The lifetime reports read MINI_ORK_HOME / MINI_ORK_DB themselves and reject
+    # ``--home``, so they are ``home=False`` actions rather than appended flags.
+    actions = [S.btn("Lifetime summary", S.cli("lifetime", "summary", home=False), "ghost"),
+               S.btn("Conductor history", S.cli("lifetime", "conductor-history", home=False), "ghost")]
+    return S.page("lanes", TITLE, SUB, chips_=chips, actions=actions, tabs=TABS, tab=tab, args=args,
                   sections=sections, errors=errors)
 
 
