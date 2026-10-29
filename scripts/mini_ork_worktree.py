@@ -689,7 +689,7 @@ _REVIEW_CACHE_REL = os.path.join("state", "pre-push-review-cache.json")
 _REVIEW_CACHE_TTL_S = 7 * 86400
 
 
-def _review_cached(pid: str) -> bool:
+def _review_cached(pid: str, *, written_since: int | None = None) -> bool:
     """True only when ``pid`` has a fresh terminal review in the gate's cache.
 
     The gate writes ``<home>/state/pre-push-review-cache.json`` only for a
@@ -698,6 +698,14 @@ def _review_cached(pid: str) -> bool:
     evidence that the panel reviewed exactly this patch. Anything unreadable or
     malformed means "no cached review" — fail closed, so the push hook runs
     the panel instead of skipping it on an unproven review.
+
+    ``written_since`` (review 166): the entry must have been written at or
+    after that epoch, i.e. by the gate run that just finished. The driver
+    cannot check the review *mode* the way the gate does, and a stale entry
+    for the same patch from an earlier run in another mode (heuristic-only,
+    say) would otherwise hand off a review this push never got. A genuine
+    cache hit is not rewritten, so it is not handed off either: the in-lock
+    hook then finds the same hit itself, mode-checked, without an LLM call.
     """
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(ROOT, ".mini-ork")
     path = os.path.join(home, _REVIEW_CACHE_REL)
@@ -719,6 +727,8 @@ def _review_cached(pid: str) -> bool:
         return False
     at = entry.get("at")
     if not isinstance(at, int):
+        return False
+    if written_since is not None and at < written_since:
         return False
     age = int(time.time()) - at
     return 0 <= age <= _REVIEW_CACHE_TTL_S
@@ -754,6 +764,9 @@ def _prereview(wt: str) -> str:
     env.pop("MO_REVIEW_PRECHECKED_PATCH", None)
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join(part for part in (wt, existing) if part)
+    # Two seconds of slack absorbs a clock-second boundary between this read
+    # and the gate's own write; a stale entry from an earlier run is older.
+    started = int(time.time()) - 2
     rc = subprocess.run(
         [python, "-m", "mini_ork.pre_push_review", "gate",
          "--target", "main", "--cwd", wt],
@@ -769,7 +782,7 @@ def _prereview(wt: str) -> str:
               "the push hook will retry it")
         return ""
     pid = _patch_id(wt)
-    if pid and _review_cached(pid):
+    if pid and _review_cached(pid, written_since=started):
         return pid
     print("[mo-worktree] pre-push review did not complete a cached review; "
           "the push hook will run it")
