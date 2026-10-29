@@ -366,7 +366,7 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
     report = _research_preflight(req, rt, con, report)
 
     # --- QUEUE -------------------------------------------------------------
-    plan = _build_queue(req, con, report, rt.clock())
+    plan = _queue_for(req, con, report, rt.clock())
     # HGM ordering: inside the selected list, technique candidates are re-ordered
     # by clade Thompson sampling over family credit, with the collapse override
     # forcing an untried family first. A plan with no technique item is unchanged.
@@ -600,6 +600,30 @@ def _queue_cfg(req: CycleRequest) -> QueueConfig:
     if req.max_candidates is None:
         return req.config.queue
     return replace(req.config.queue, max_candidates=req.max_candidates)
+
+
+def _queue_for(req: CycleRequest, con, report, now: int) -> QueuePlan:
+    """The QUEUE step's plan. ``research.first`` builds it from techniques alone.
+
+    ``_build_queue`` caps each domain at ``queue.per_domain_max`` by severity
+    *before* anything re-orders the selected list. When the harvest also holds
+    verification gaps (severity 60–86), those gaps fill that cap and every
+    ``technique_unadopted`` candidate is dropped with ``domain_cap`` — so the
+    research-first loop never sees one. Building the pool from the technique
+    candidates alone keeps the cap, the avoidance filters and credit all in
+    force; only the pool they run over narrows.
+
+    A technique-only pool that still yields nothing (every technique avoided)
+    is not an answer: fall back to the full candidate set rather than to an
+    empty cycle.
+    """
+    if req.config.research.first:
+        tech = tuple(c for c in report.candidates if c.kind == "technique_unadopted")
+        if tech:
+            plan = _build_queue(req, con, replace(report, candidates=tech), now)
+            if plan.top is not None:
+                return plan
+    return _build_queue(req, con, report, now)
 
 
 def _build_queue(req: CycleRequest, con, report, now: int) -> QueuePlan:
