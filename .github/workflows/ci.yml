@@ -59,8 +59,10 @@ jobs:
     name: python tests (${{ matrix.python-version }} / ${{ matrix.shard }})
     runs-on: ubuntu-latest
     # Each shard runs its tests on every runner core (pytest-xdist, below).
-    # Serially the unit shards took 23-39 min and 50 was the timeout; a shard
-    # that now needs more than 30 is a hang or a regression worth seeing.
+    # Serially the unit shards spent 23-39 min in pytest under a 50 min
+    # timeout. On 4-vCPU runners with -n auto they spent 10.8-16.1 (PR #233,
+    # 2026-10-29); 30 keeps the old ~1.8x headroom over the slowest, and a
+    # shard that needs more is a hang or a regression worth seeing.
     timeout-minutes: 30
     strategy:
       fail-fast: false
