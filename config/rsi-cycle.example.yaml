@@ -118,3 +118,30 @@ secure:
   secret_store: ""          # e.g. vault://mini-ork/rsi
   db_path: ""               # shared DB; empty -> <MINI_ORK_HOME>/state.db
   node_pool: ""
+
+# Research-driven adoption (docs/plans/2026-10-29-research-driven-rsi-loop.md).
+# Off by default: when on, the harvest reads the newest technique review per domain
+# and queues its ranked techniques as `technique_unadopted` candidates.
+research:
+  enabled: false
+  domains: [verification]
+  verdicts: [implement-now, next]
+  skip_disagreement: true
+  skip_single_rater: true
+  max_candidates: 200
+  refresh_days: 30
+  review_globs: {}
+
+# G12 — the sealed, paired impact acceptor for `bench:` candidates.
+impact:
+  alpha: 0.05                 # per-epoch false-accept budget
+  spending: horizon_free      # | per_decision
+  lam: 1.0                    # 1.0 = exact McNemar
+  max_regression_rate: 0.0    # 0 = no previously-correct item may break
+  dev_fraction: 0.5
+  base_repeats: 2             # base re-runs; items that flip are excluded as flaky
+  max_looks: 30               # sealed looks per epoch before `sealed_budget_exhausted`
+  workers: 4
+  timeout_s: 900
+  guard_tolerances: {false_reject: 0, no_verdict: 0}
+  secret_name: MO_RSI_IMPACT_SECRET   # secure tier: read from the vault

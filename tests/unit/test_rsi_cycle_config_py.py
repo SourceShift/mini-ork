@@ -49,7 +49,7 @@ def test_an_unknown_top_level_key_is_refused():
 
 @pytest.mark.parametrize("section", [
     "lease", "queue", "budget", "probes", "gates", "critic", "implement", "merge",
-    "decide", "secure",
+    "decide", "secure", "research", "impact",
 ])
 def test_an_unknown_key_in_every_section_is_refused(section):
     with pytest.raises(ConfigError, match=f"{section}: unknown key"):
@@ -403,3 +403,81 @@ def test_a_blank_lane_in_the_panel_is_refused():
         cfg(critic={"lanes": ["glm_lens", "  "]})
     with pytest.raises(ConfigError, match="contains an empty entry"):
         cfg(critic={"lanes": ["glm_lens", ""]})
+
+
+# --------------------------------------------------------------------------
+# research: the harvest is off unless the operator turns it on
+# --------------------------------------------------------------------------
+
+
+def test_research_defaults_leave_the_cycle_untouched():
+    out = cfg()
+    assert out.research.enabled is False
+    assert out.research.domains == ("verification",)
+    assert out.research.verdicts == ("implement-now", "next")
+
+
+def test_research_rejects_an_unknown_domain():
+    with pytest.raises(ConfigError, match="research.domains: unknown domain"):
+        cfg(research={"domains": ["nope"]})
+
+
+def test_research_rejects_an_empty_domain_list():
+    with pytest.raises(ConfigError, match="research.domains"):
+        cfg(research={"domains": []})
+
+
+def test_research_rejects_a_review_glob_outside_the_configured_domains():
+    with pytest.raises(ConfigError, match="research.review_globs"):
+        cfg(research={"review_globs": {"routing": "mini_ork/rsi/*.py"}})
+
+
+def test_research_rejects_a_non_mapping_review_globs():
+    with pytest.raises(ConfigError, match="research.review_globs"):
+        cfg(research={"review_globs": ["verification"]})
+
+
+# --------------------------------------------------------------------------
+# impact: G12's knobs are range-checked, not clamped
+# --------------------------------------------------------------------------
+
+
+def test_impact_defaults():
+    out = cfg()
+    assert out.impact.alpha == 0.05
+    assert out.impact.spending == "horizon_free"
+    assert out.impact.guard_tolerances == {"false_reject": 0.0, "no_verdict": 0.0}
+
+
+@pytest.mark.parametrize(
+    ("raw", "needle"),
+    [
+        ({"alpha": 0}, "impact.alpha"),
+        ({"alpha": 1}, "impact.alpha"),
+        ({"alpha": True}, "impact.alpha"),
+        ({"spending": "x"}, "impact.spending"),
+        ({"lam": 0}, "impact.lam"),
+        ({"max_regression_rate": 1.5}, "impact.max_regression_rate"),
+        ({"dev_fraction": 1}, "impact.dev_fraction"),
+        ({"max_looks": 0}, "impact.max_looks"),
+        ({"guard_tolerances": {"x": -1}}, "impact.guard_tolerances"),
+        ({"guard_tolerances": {"x": True}}, "impact.guard_tolerances"),
+        ({"secret_name": ""}, "impact.secret_name"),
+    ],
+)
+def test_impact_range_errors_name_the_field(raw, needle):
+    with pytest.raises(ConfigError) as excinfo:
+        cfg(impact=raw)
+    assert needle in str(excinfo.value)
+
+
+def test_an_integer_is_accepted_for_a_float_field_and_stored_as_float():
+    out = cfg(impact={"lam": 2})
+    assert out.impact.lam == 2.0
+    assert isinstance(out.impact.lam, float)
+
+
+def test_the_shipped_example_parses_strict_with_research_off():
+    out = load_config(EXAMPLE, env={}, strict=True)
+    assert out.research.enabled is False
+    assert out.impact.alpha == 0.05

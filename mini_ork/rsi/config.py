@@ -38,10 +38,12 @@ __all__ = [
     "CycleConfig",
     "DecideConfig",
     "GatesConfig",
+    "ImpactConfig",
     "ImplementConfig",
     "LeaseConfig",
     "MergeConfig",
     "ProbesConfig",
+    "ResearchConfig",
     "SecureConfig",
     "load_config",
 ]
@@ -80,6 +82,17 @@ def _positive(where: str, value: Any) -> int:
 def _positive_float(where: str, value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ConfigError(f"{where}: expected a positive number, got {value!r}")
+    return float(value)
+
+
+def _number(where: str, value: Any) -> float:
+    """A number, bool refused. Range checks stay at the call site.
+
+    ``bool`` is an ``int`` in Python, so ``alpha: true`` would otherwise parse
+    as 1.0 and be refused only by the range check — with the wrong message.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{where}: expected a number, got {value!r}")
     return float(value)
 
 
@@ -352,6 +365,161 @@ class SecureConfig:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchConfig:
+    """The research harvest. Off by default, so today's cycle is untouched."""
+
+    enabled: bool = False
+    domains: tuple[str, ...] = ("verification",)
+    verdicts: tuple[str, ...] = ("implement-now", "next")
+    skip_disagreement: bool = True
+    skip_single_rater: bool = True
+    max_candidates: int = 200
+    refresh_days: int = 30
+    review_globs: Mapping[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "ResearchConfig":
+        _only("research", raw, frozenset({
+            "enabled", "domains", "verdicts", "skip_disagreement",
+            "skip_single_rater", "max_candidates", "refresh_days", "review_globs",
+        }))
+        from mini_ork.rsi.candidates import DOMAINS
+
+        domains = _str_tuple("research.domains", raw.get("domains", ("verification",)))
+        unknown = [d for d in domains if d not in DOMAINS]
+        if unknown:
+            raise ConfigError(f"research.domains: unknown domain {unknown[0]!r}")
+        if not domains:
+            raise ConfigError("research.domains: must list at least one domain")
+        verdicts = _str_tuple("research.verdicts",
+                              raw.get("verdicts", ("implement-now", "next")))
+        if not verdicts:
+            raise ConfigError("research.verdicts: must list at least one verdict")
+
+        globs_raw = raw.get("review_globs", {})
+        if globs_raw is None:
+            globs_raw = {}
+        if not isinstance(globs_raw, Mapping):
+            raise ConfigError(
+                f"research.review_globs: expected a mapping, got "
+                f"{type(globs_raw).__name__}")
+        review_globs: dict[str, str] = {}
+        for key, value in globs_raw.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ConfigError(
+                    f"research.review_globs: keys must be non-empty strings, "
+                    f"got {key!r}")
+            if key not in domains:
+                raise ConfigError(f"research.review_globs: unknown domain {key!r}")
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(
+                    f"research.review_globs: {key}: expected a non-empty glob")
+            review_globs[key] = value
+
+        return cls(
+            enabled=_flag("research.enabled", raw.get("enabled", False)),
+            domains=domains,
+            verdicts=verdicts,
+            skip_disagreement=_flag("research.skip_disagreement",
+                                    raw.get("skip_disagreement", True)),
+            skip_single_rater=_flag("research.skip_single_rater",
+                                    raw.get("skip_single_rater", True)),
+            max_candidates=_positive("research.max_candidates",
+                                     raw.get("max_candidates", 200)),
+            refresh_days=_positive("research.refresh_days",
+                                   raw.get("refresh_days", 30)),
+            review_globs=review_globs,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImpactConfig:
+    """G12's sealed, paired acceptor. Defaults describe the strictest usable gate."""
+
+    alpha: float = 0.05
+    spending: str = "horizon_free"
+    lam: float = 1.0
+    max_regression_rate: float = 0.0
+    dev_fraction: float = 0.5
+    base_repeats: int = 2
+    max_looks: int = 30
+    workers: int = 4
+    timeout_s: int = 900
+    guard_tolerances: Mapping[str, float] = field(
+        default_factory=lambda: {"false_reject": 0.0, "no_verdict": 0.0})
+    secret_name: str = "MO_RSI_IMPACT_SECRET"
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "ImpactConfig":
+        _only("impact", raw, frozenset({
+            "alpha", "spending", "lam", "max_regression_rate", "dev_fraction",
+            "base_repeats", "max_looks", "workers", "timeout_s",
+            "guard_tolerances", "secret_name",
+        }))
+
+        alpha = _number("impact.alpha", raw.get("alpha", 0.05))
+        if not 0 < alpha < 1:
+            raise ConfigError(f"impact.alpha: must be in (0, 1), got {alpha}")
+        spending = str(raw.get("spending", "horizon_free"))
+        if spending not in ("horizon_free", "per_decision"):
+            raise ConfigError(
+                f"impact.spending: {spending!r} not one of "
+                "('horizon_free', 'per_decision')")
+        lam = _number("impact.lam", raw.get("lam", 1.0))
+        if lam <= 0:
+            raise ConfigError(f"impact.lam: must be positive, got {lam}")
+        max_regression_rate = _number(
+            "impact.max_regression_rate", raw.get("max_regression_rate", 0.0))
+        if not 0 <= max_regression_rate <= 1:
+            raise ConfigError(
+                f"impact.max_regression_rate: must be in [0, 1], got "
+                f"{max_regression_rate}")
+        dev_fraction = _number("impact.dev_fraction", raw.get("dev_fraction", 0.5))
+        if not 0 < dev_fraction < 1:
+            raise ConfigError(
+                f"impact.dev_fraction: must be in (0, 1), got {dev_fraction}")
+
+        tolerances_raw = raw.get("guard_tolerances")
+        if tolerances_raw is None:
+            tolerances = {"false_reject": 0.0, "no_verdict": 0.0}
+        else:
+            if not isinstance(tolerances_raw, Mapping):
+                raise ConfigError(
+                    f"impact.guard_tolerances: expected a mapping, got "
+                    f"{type(tolerances_raw).__name__}")
+            tolerances = {}
+            for key, value in tolerances_raw.items():
+                if not isinstance(key, str) or not key.strip():
+                    raise ConfigError(
+                        f"impact.guard_tolerances: keys must be non-empty "
+                        f"strings, got {key!r}")
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or value < 0):
+                    raise ConfigError(
+                        f"impact.guard_tolerances: {key}: expected a number >= 0, "
+                        f"got {value!r}")
+                tolerances[key] = float(value)
+
+        secret_name = raw.get("secret_name", "MO_RSI_IMPACT_SECRET")
+        if not isinstance(secret_name, str) or not secret_name.strip():
+            raise ConfigError("impact.secret_name: must be a non-empty string")
+
+        return cls(
+            alpha=alpha,
+            spending=spending,
+            lam=lam,
+            max_regression_rate=max_regression_rate,
+            dev_fraction=dev_fraction,
+            base_repeats=_positive("impact.base_repeats", raw.get("base_repeats", 2)),
+            max_looks=_positive("impact.max_looks", raw.get("max_looks", 30)),
+            workers=_positive("impact.workers", raw.get("workers", 4)),
+            timeout_s=_positive("impact.timeout_s", raw.get("timeout_s", 900)),
+            guard_tolerances=tolerances,
+            secret_name=secret_name,
+        )
+
+
 # --------------------------------------------------------------------------
 # The whole file
 # --------------------------------------------------------------------------
@@ -359,6 +527,7 @@ class SecureConfig:
 _TOP_KEYS = frozenset({
     "version", "enabled", "mode", "interval_s", "max_cycles", "lease", "queue",
     "budget", "probes", "gates", "critic", "implement", "merge", "decide", "secure",
+    "research", "impact",
 })
 
 
@@ -374,6 +543,8 @@ class CycleConfig:
     implement: ImplementConfig = field(default_factory=ImplementConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
     secure: SecureConfig = field(default_factory=SecureConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
+    impact: ImpactConfig = field(default_factory=ImpactConfig)
     version: int = 1
     enabled: bool = True
     mode: str = "once"
@@ -431,6 +602,11 @@ class CycleConfig:
             "critic": {"lanes": list(self.critic.lanes)},
             "gates": {"max_files": self.gates.max_files,
                       "static_mode": self.gates.static_mode},
+            "research": {"enabled": self.research.enabled,
+                         "domains": list(self.research.domains)},
+            "impact": {"alpha": self.impact.alpha,
+                       "spending": self.impact.spending,
+                       "max_looks": self.impact.max_looks},
         }
 
 
@@ -489,6 +665,8 @@ def from_mapping(raw: Any, *, env: Mapping[str, str] | None = None,
         merge=MergeConfig.from_mapping(_section(raw, "merge")),
         decide=DecideConfig.from_mapping(_section(raw, "decide")),
         secure=SecureConfig.from_mapping(_section(raw, "secure")),
+        research=ResearchConfig.from_mapping(_section(raw, "research")),
+        impact=ImpactConfig.from_mapping(_section(raw, "impact")),
     )
     if strict:
         if not cfg.scoped_tests and not cfg.merge.test_cmd:
