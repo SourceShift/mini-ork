@@ -131,6 +131,7 @@ research:
   max_candidates: 200
   refresh_days: 30
   auto_refresh: false   # true = relaunch the review recipe when older than refresh_days
+  first: false          # true = technique candidates ahead of gap candidates
   review_globs: {}
 
 # G12 — the sealed, paired impact acceptor for `bench:` candidates.
@@ -144,6 +145,7 @@ impact:
   max_looks: 30               # sealed looks per epoch before `sealed_budget_exhausted`
   workers: 4
   timeout_s: 900
+  max_revisions: 2            # re-dispatches after a measured no-gain (dev feedback only)
   guard_tolerances: {false_reject: 0, no_verdict: 0}
   secret_name: MO_RSI_IMPACT_SECRET   # secure tier: read from the vault
 

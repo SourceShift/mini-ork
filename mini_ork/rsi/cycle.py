@@ -24,9 +24,12 @@ policy knob with a dangerous default — ``decide.auto_merge`` — has no defaul
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import random
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -357,6 +360,10 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
 
     # --- QUEUE -------------------------------------------------------------
     plan = _build_queue(req, con, report, rt.clock())
+    # HGM ordering: inside the selected list, technique candidates are re-ordered
+    # by clade Thompson sampling over family credit, with the collapse override
+    # forcing an untried family first. A plan with no technique item is unchanged.
+    plan = _order_research(req, con, plan)
     cand = _pick(req, plan)
     if cand is None:
         return _finish(req, rt, con, "no_candidate", rc=0,
@@ -437,43 +444,79 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
                                 reason=f"cycle {req.cycle_id}")
     _refresh(req, token)
 
-    # --- IMPLEMENT ---------------------------------------------------------
-    impl = (rt.implement or _default_implement)(req, cand, selection)
-    if impl is None or not impl.landed_something:
-        detail = (impl.detail if impl is not None else "the implementer produced nothing")
-        extra = {**_candidate_fields(cand),
-                 "child_run_id": getattr(impl, "child_run_id", "")}
-        if impl is not None:
-            # A cleanup that fails must not delete the rejection it was tidying.
-            # ``clean`` now raises when the worktree or its claims survive, and
-            # an exception escaping here would turn a decided ``rejected`` row
-            # into an opaque ``error`` — losing the reason AND leaving the same
-            # survivor in place. The row carries both facts instead; ``detail``
-            # is the column, because a made-up key is refused by the ledger.
-            try:
-                (rt.clean or _default_clean)(req, impl)
-            except Exception as exc:  # noqa: BLE001 - recorded in the row, not swallowed
-                detail += f"; cleanup failed ({type(exc).__name__}): {exc}"
-        # Same reason-code discipline as the SUGGEST rejection: a child that
-        # lands nothing is a *kind* of failure (`implement_empty`), and the
-        # operator needs it in the row to tell it from a pre-dispatch filter.
-        return _finish(req, rt, con, "rejected", rc=0, candidate_id=cand.candidate_id,
-                       halt_reason=f"implement_empty: {detail}", detail=detail,
-                       extra=extra)
+    # --- IMPLEMENT + VALIDATE (GEPA-style revision) ------------------------
+    # A technique candidate whose *only* failing deterministic gate is G12, and
+    # whose rejection is a measured no-gain, is re-dispatched with dev-only
+    # feedback rather than abandoned on the first look. ``selection`` carries the
+    # original kickoff on every revision; ``base_selection`` is the reference
+    # that keeps the appended section from stacking.
+    base_selection = selection
+    attempt = 0
+    total_cost = 0.0
+    history: list[dict[str, Any]] = []
+    while True:
+        if rt.implement is not None or attempt == 0:
+            impl = (rt.implement or _default_implement)(req, cand, selection)
+        else:
+            impl = _default_implement(req, cand, selection, attempt=attempt)
+        if impl is None or not impl.landed_something:
+            detail = (impl.detail if impl is not None
+                      else "the implementer produced nothing")
+            if attempt > 0:
+                detail = f"revision {attempt}: {detail}"
+            extra = {**_candidate_fields(cand),
+                     "child_run_id": getattr(impl, "child_run_id", "")}
+            if impl is not None:
+                # A cleanup that fails must not delete the rejection it was tidying.
+                # ``clean`` now raises when the worktree or its claims survive, and
+                # an exception escaping here would turn a decided ``rejected`` row
+                # into an opaque ``error`` — losing the reason AND leaving the same
+                # survivor in place. The row carries both facts instead; ``detail``
+                # is the column, because a made-up key is refused by the ledger.
+                try:
+                    (rt.clean or _default_clean)(req, impl)
+                except Exception as exc:  # noqa: BLE001 - recorded in the row, not swallowed
+                    detail += f"; cleanup failed ({type(exc).__name__}): {exc}"
+            # Same reason-code discipline as the SUGGEST rejection: a child that
+            # lands nothing is a *kind* of failure (`implement_empty`), and the
+            # operator needs it in the row to tell it from a pre-dispatch filter.
+            return _finish(req, rt, con, "rejected", rc=0,
+                           candidate_id=cand.candidate_id,
+                           halt_reason=f"implement_empty: {detail}", detail=detail,
+                           extra=extra)
 
-    # --- VALIDATE ----------------------------------------------------------
-    measurement = (rt.measure or _default_measure)(req, cand, impl, selection)
-    evidence = _evidence(req, report, cand, impl, selection, measurement, spend)
-    first = evaluate(evidence)
+        total_cost += float(impl.cost_usd or 0.0)
+        # G11 reads ``cycle_cost``: every attempt's spend is the same cycle's, so
+        # the cumulative total is what it must judge — not the last child's bill.
+        impl = replace(impl, cost_usd=total_cost)
+        measurement = (rt.measure or _default_measure)(req, cand, impl, selection)
+        evidence = _evidence(req, report, cand, impl, selection, measurement, spend)
+        first = evaluate(evidence)
 
-    # G10 is the last of eleven ANDed gates, so a panel verdict cannot rescue a
-    # cycle some other gate already failed — the merge decision is identical
-    # either way. Cycle 12 (2026-10-26) bought a critic panel after G8 had
-    # already failed and quarantined for the same reason; the panel is the most
-    # expensive part of VALIDATE, so the dead cycle must not pay for it.
-    deterministic = ValidationReport(tuple(r for r in first.results if r.gate != "G10"))
-    if not deterministic.passed:
-        return _quarantine(req, rt, con, cand, impl, deterministic, "gate_failed")
+        # G10 is the last of eleven ANDed gates, so a panel verdict cannot rescue a
+        # cycle some other gate already failed — the merge decision is identical
+        # either way. Cycle 12 (2026-10-26) bought a critic panel after G8 had
+        # already failed and quarantined for the same reason; the panel is the most
+        # expensive part of VALIDATE, so the dead cycle must not pay for it.
+        deterministic = ValidationReport(
+            tuple(r for r in first.results if r.gate != "G10"))
+        if deterministic.passed:
+            break
+        if not _revisable(req, deterministic, measurement, attempt, total_cost):
+            return _quarantine(req, rt, con, cand, impl, deterministic, "gate_failed")
+
+        history.append(_attempt_record(attempt, impl, measurement))
+        _archive_impact(req, attempt)
+        try:
+            (rt.clean or _default_clean)(req, impl)
+        except Exception as exc:  # noqa: BLE001 - recorded in the row, not swallowed
+            return _quarantine(req, rt, con, cand, impl, deterministic,
+                               "revise_cleanup_failed", detail=str(exc))
+        attempt += 1
+        selection = _revise_selection(req, base_selection, history)
+        measured = measurement.impact if isinstance(measurement.impact, Mapping) else {}
+        print(f"[rsi] revision {attempt}/{req.config.impact.max_revisions}: "
+              f"{measured.get('reason') or 'no measured gain'}", file=sys.stderr)
 
     raw = (rt.critics or _default_critics)(req, cand, impl, selection, first)
     evidence = _with_critics(evidence, raw)
@@ -562,6 +605,194 @@ def _build_queue(req: CycleRequest, con, report, now: int) -> QueuePlan:
         credits=ledger.credit_stats(con, min_n=req.config.queue.credit_min_n),
         domains=req.domains,
     )
+
+
+def _order_research(req: CycleRequest, con, plan: QueuePlan) -> QueuePlan:
+    """HGM ordering of the technique candidates already in the selected list.
+
+    Inside the positions the queue assigned to ``technique_unadopted`` items, the
+    order comes from clade Thompson sampling over family credit
+    (:func:`impact.thompson_order`). When recent attempts plateau on one family,
+    :func:`impact.family_collapse` forces an untried family first — the
+    principle-level local optimum this ordering exists to break out of.
+
+    The plan is a *permutation*: no item is dropped or added, so a pinned
+    candidate still resolves through ``plan.find``.
+    """
+    positions = [i for i, item in enumerate(plan.selected)
+                 if item.candidate.kind == "technique_unadopted"]
+    if not positions:
+        return plan
+
+    try:
+        rows = con.execute(
+            "SELECT candidate_id, source, outcome FROM rsi_credit"
+            " WHERE source LIKE 'research:%' ORDER BY created_at, id").fetchall()
+    except sqlite3.Error:
+        rows = []
+    attempts = [
+        {
+            "family": str(source).split(":", 1)[1],
+            "technique": candidate_id or "",
+            "success": outcome == "merged",
+        }
+        for (candidate_id, source, outcome) in rows
+    ]
+
+    techniques = [plan.selected[i].candidate for i in positions]
+    pmax = max(float(c.evidence.get("priority") or 0) for c in techniques) or 1.0
+    options = [
+        {
+            "id": cand.candidate_id,
+            "family": (cand.source.split(":", 1)[1]
+                       if ":" in cand.source else cand.source),
+            "prior": float(cand.evidence.get("priority") or 0) / pmax,
+        }
+        for cand in techniques
+    ]
+    rng = random.Random(int(hashlib.sha256(req.cycle_id.encode()).hexdigest()[:8], 16))
+    order = impact.thompson_order(options, attempts, rng=rng)
+
+    col = impact.family_collapse([a["family"] for a in attempts],
+                                 [a["success"] for a in attempts])
+    if col["collapse"]:
+        recent = set(col["recent_families"])
+        family_of = {option["id"]: option["family"] for option in options}
+        order = ([oid for oid in order if family_of.get(oid) not in recent]
+                 + [oid for oid in order if family_of.get(oid) in recent])
+
+    by_id = {item.candidate.candidate_id: item for item in plan.selected}
+    if req.config.research.first:
+        selected = ([by_id[oid] for oid in order]
+                    + [item for item in plan.selected
+                       if item.candidate.kind != "technique_unadopted"])
+    else:
+        selected = list(plan.selected)
+        for position, oid in zip(positions, order):
+            selected[position] = by_id[oid]
+    selected = [replace(item, rank=i + 1) for i, item in enumerate(selected)]
+    print(f"[rsi] research order: {', '.join(order)}"
+          f" (collapse: {col['collapse']})", file=sys.stderr)
+    return replace(plan, selected=tuple(selected))
+
+
+def _revisable(req: CycleRequest, report: ValidationReport,
+               measurement: GateEvidence, attempt: int, total_cost: float) -> bool:
+    """Whether a failed attempt is a measured no-gain worth revising.
+
+    Only G12 may be red: any other failing gate is a defect the benchmark cannot
+    answer, and re-dispatching it would pay twice for the same rejection. A
+    sealed-budget exhaustion or an error is not a measurement of the change, so
+    neither is revisable, and a revision must stay under the cycle cap.
+    """
+    failing = [r.gate for r in report.results if not r.ok]
+    impact_out = measurement.impact
+    return (
+        attempt < req.config.impact.max_revisions
+        and failing == ["G12"]
+        and isinstance(impact_out, Mapping)
+        and impact_out.get("status") == "rejected"
+        and impact_out.get("reason") != "sealed_budget_exhausted"
+        and total_cost < float(req.config.budget.per_cycle_cap_usd)
+    )
+
+
+def _attempt_record(attempt: int, impl: Implementation,
+                    measurement: GateEvidence) -> dict[str, Any]:
+    """One history entry, built from the *public* impact view.
+
+    ``public_impact`` strips sealed counts, guards and flaky ids, so nothing a
+    revision prompt sees can overfit the split the change is measured on.
+    """
+    return {
+        "attempt": attempt + 1,
+        "impact": public_impact(measurement.impact),
+        "changed": list(impl.changed_files),
+        "diff": (impl.diff or "")[:6000],
+    }
+
+
+def _revise_section(req: CycleRequest, history: Sequence[Mapping[str, Any]]) -> str:
+    """The dev-only feedback appended to the kickoff for the next attempt."""
+    number = len(history) + 1
+    total = req.config.impact.max_revisions + 1
+    last = history[-1]
+    impact_out = last["impact"] or {}
+    dev = impact_out.get("dev") or {}
+
+    lines = [
+        f"## Revision {number} of {total} — the previous attempt showed no measured gain",
+        "",
+        "The harness measured each attempt on a held-out benchmark. You see only "
+        "its dev half; the sealed half reports a single bit.",
+        "",
+        "### Previous attempts",
+    ]
+    for entry in history:
+        entry_impact = entry["impact"] or {}
+        entry_dev = entry_impact.get("dev") or {}
+        lines.append(
+            f"- attempt {entry['attempt']}: stopped at "
+            f"{entry_impact.get('stage') or 'unknown'}: "
+            f"{entry_impact.get('reason') or 'unknown'}. Dev split: "
+            f"{entry_dev.get('wins') or 0} fixed, "
+            f"{entry_dev.get('losses') or 0} broken, "
+            f"{entry_dev.get('both_fail') or 0} still wrong."
+        )
+
+    lines += ["", "### Dev items the last attempt still gets wrong or broke"]
+    items = dev.get("items") or []
+    if not items:
+        lines.append("- (none)")
+    else:
+        for item in list(items)[:15]:
+            lines.append(
+                f"- `{item.get('item', '')}` ({item.get('stratum', '')}): "
+                f"base {item.get('base')}, now {item.get('head')}. "
+                f"Verifier said: {item.get('reason', '')}"
+            )
+
+    lines += ["", "### What the last attempt changed"]
+    changed = last.get("changed") or []
+    if not changed:
+        lines.append("- (none)")
+    else:
+        lines.extend(f"- `{path}`" for path in changed)
+
+    lines += [
+        "",
+        "```diff",
+        last.get("diff") or "",
+        "```",
+        "",
+        "### Rules for this revision",
+        "- These attempts were tried and rejected: do not resubmit the same change.",
+        "- Generalize. A change that special-cases the item ids above will fail the "
+        "sealed half, which holds different items.",
+        "- First check that the change implements the Mechanism under Expected Edit. "
+        "A no-gain result often means the mechanism was not implemented as described.",
+        "- If the dev split shows 0 fixed and 0 broken, the change altered no verdict: "
+        "it is probably outside the code path the benchmark exercises.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _revise_selection(req: CycleRequest, selection: Selection,
+                      history: Sequence[Mapping[str, Any]]) -> Selection:
+    """Append the revision section to the ORIGINAL kickoff and re-hash it."""
+    new = (selection.kickoff.rstrip() + "\n\n"
+           + _revise_section(req, history) + "\n")
+    return replace(selection, kickoff=new,
+                   kickoff_sha=hashlib.sha256(new.encode("utf-8")).hexdigest())
+
+
+def _archive_impact(req: CycleRequest, attempt: int) -> None:
+    """Keep each attempt's impact.json next to the one it superseded."""
+    source = _impact_path(req)
+    if not source.exists():
+        return
+    shutil.copyfile(source, source.parent / f"impact-attempt-{attempt + 1}.json")
 
 
 def _select_context(req: CycleRequest, con, report, cand: Candidate) -> SelectContext:
@@ -1345,7 +1576,8 @@ def worktree_config(req: CycleRequest, *, slug: str, files: Sequence[str],
 
 
 def _default_implement(req: CycleRequest, cand: Candidate,
-                       selection: Selection) -> Implementation | None:
+                       selection: Selection, *,
+                       attempt: int = 0) -> Implementation | None:
     """Claim a worktree, dispatch the child inside it, land its diff."""
     from .worktree import (
         Abstain,
@@ -1364,7 +1596,11 @@ def _default_implement(req: CycleRequest, cand: Candidate,
 
     child_home = req.home / "rsi" / req.cycle_id / "child-home"
     child_home.mkdir(parents=True, exist_ok=True)
-    run_id, rc, out = _dispatch_child(req, wt, selection.kickoff, child_home)
+    if attempt:
+        run_id, rc, out = _dispatch_child(req, wt, selection.kickoff, child_home,
+                                          attempt=attempt)
+    else:
+        run_id, rc, out = _dispatch_child(req, wt, selection.kickoff, child_home)
 
     diff_path = child_home / "runs" / run_id / "framework-edit.diff"
     verdict_path = child_home / "runs" / run_id / "verdict.json"
@@ -1399,10 +1635,17 @@ def _default_implement(req: CycleRequest, cand: Candidate,
     )
 
 
-def _dispatch_child(req: CycleRequest, wt, kickoff: str, child_home: Path) -> tuple[str, int, str]:
-    """Run ``framework-edit`` inside the worktree, with its own home and DB."""
-    run_id = f"{req.cycle_id}-fe"
-    kickoff_path = child_home / "kickoff.md"
+def _dispatch_child(req: CycleRequest, wt, kickoff: str, child_home: Path, *,
+                    attempt: int = 0) -> tuple[str, int, str]:
+    """Run ``framework-edit`` inside the worktree, with its own home and DB.
+
+    Each revision is a distinct child run — ``<cycle>-fe-r<n>`` with its own
+    kickoff file — so the first attempt's artifacts and worktree diff stay
+    readable next to the revision that superseded them.
+    """
+    run_id = f"{req.cycle_id}-fe" if attempt == 0 else f"{req.cycle_id}-fe-r{attempt}"
+    kickoff_path = (child_home / "kickoff.md" if attempt == 0
+                    else child_home / f"kickoff-r{attempt}.md")
     kickoff_path.write_text(kickoff, encoding="utf-8")
     argv = [
         "timeout", str(req.config.implement.child_timeout_s),

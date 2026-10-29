@@ -86,6 +86,17 @@ def _positive_float(where: str, value: Any) -> float:
     return float(value)
 
 
+def _non_negative_int(where: str, value: Any) -> int:
+    """An ``int >= 0``; ``bool`` is refused because it is an ``int`` in Python.
+
+    A revision budget of ``true`` would otherwise read as ``1`` and silently
+    allow a paid re-dispatch the operator never wrote down.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"{where}: expected an integer >= 0, got {value!r}")
+    return value
+
+
 def _number(where: str, value: Any) -> float:
     """A number, bool refused. Range checks stay at the call site.
 
@@ -272,7 +283,11 @@ class CriticConfig:
     def from_mapping(cls, raw: Mapping[str, Any]) -> "CriticConfig":
         _only("critic", raw, frozenset({"lanes", "require_unanimous", "model_timeout_s"}))
         lanes = _str_tuple("critic.lanes", raw.get("lanes", ()))
-        if len(lanes) < 2:
+        # No lanes is the un-configured default (``CriticConfig()``); the "at
+        # least two" rule applies only once a file actually names a panel. A
+        # parser that refused an absent section could not build the harness
+        # configs that never dispatch critics.
+        if lanes and len(lanes) < 2:
             raise ConfigError(
                 f"critic.lanes needs at least 2 independent critics, got {list(lanes)}")
         return cls(
@@ -384,14 +399,19 @@ class ResearchConfig:
     max_candidates: int = 200
     refresh_days: int = 30
     auto_refresh: bool = False
+    #: ``true`` = technique candidates ahead of gap candidates in the queue.
+    first: bool = False
     review_globs: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _flag("research.first", self.first)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ResearchConfig":
         _only("research", raw, frozenset({
             "enabled", "domains", "verdicts", "skip_disagreement",
             "skip_single_rater", "max_candidates", "refresh_days",
-            "auto_refresh", "review_globs",
+            "auto_refresh", "first", "review_globs",
         }))
         from mini_ork.rsi.candidates import DOMAINS
 
@@ -440,6 +460,7 @@ class ResearchConfig:
                                    raw.get("refresh_days", 30)),
             auto_refresh=_flag("research.auto_refresh",
                                raw.get("auto_refresh", False)),
+            first=_flag("research.first", raw.get("first", False)),
             review_globs=review_globs,
         )
 
@@ -457,16 +478,21 @@ class ImpactConfig:
     max_looks: int = 30
     workers: int = 4
     timeout_s: int = 900
+    #: How many times a measured no-gain is re-dispatched before quarantine.
+    max_revisions: int = 2
     guard_tolerances: Mapping[str, float] = field(
         default_factory=lambda: {"false_reject": 0.0, "no_verdict": 0.0})
     secret_name: str = "MO_RSI_IMPACT_SECRET"
+
+    def __post_init__(self) -> None:
+        _non_negative_int("impact.max_revisions", self.max_revisions)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ImpactConfig":
         _only("impact", raw, frozenset({
             "alpha", "spending", "lam", "max_regression_rate", "dev_fraction",
             "base_repeats", "max_looks", "workers", "timeout_s",
-            "guard_tolerances", "secret_name",
+            "max_revisions", "guard_tolerances", "secret_name",
         }))
 
         alpha = _number("impact.alpha", raw.get("alpha", 0.05))
@@ -526,6 +552,8 @@ class ImpactConfig:
             max_looks=_positive("impact.max_looks", raw.get("max_looks", 30)),
             workers=_positive("impact.workers", raw.get("workers", 4)),
             timeout_s=_positive("impact.timeout_s", raw.get("timeout_s", 900)),
+            max_revisions=_non_negative_int(
+                "impact.max_revisions", raw.get("max_revisions", 2)),
             guard_tolerances=tolerances,
             secret_name=secret_name,
         )
