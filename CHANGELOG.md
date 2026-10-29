@@ -432,8 +432,9 @@ nodes or Daytona / E2B / Modal sandboxes. The verification stack is on by defaul
 
 ### Removed
 
-- **Browser UI**: the vendored agent-canvas SPA (`ui/`) and the older `ui.old/` frontend
-  are gone, with the release's SPA tarball and the `web-deps`, `web-build`, `web-dev`, `web-up` and
+- **Browser UI**: the vendored agent-canvas SPA that lived in `ui/` and the older `ui.old/`
+  frontend are gone (`ui/` now holds the IDE crate submodule; see Changed), with the release's
+  SPA tarball and the `web-deps`, `web-build`, `web-dev`, `web-up` and
   `web-snapshot` make targets. `mini-ork serve` keeps the JSON API and answers `/` with a
   `{ui_built: false}` stub; the UI is now the Rust IDE crate in the `zed-mini-ork` fork. (40903048)
 - **`mini-ork improve`, `mini-ork eval` and `mini-ork promote`**: removed with their `bin/` shims
