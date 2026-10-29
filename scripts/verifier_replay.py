@@ -48,6 +48,15 @@ import run_heldout as rh  # noqa: E402
 
 RUN_NAME = re.compile(r"^heldout-(mo-[0-9a-f]+)-\d+$")
 
+# Run a verifier script with an explicit import root ahead of the default
+# sys.path[0] ('' — the scratch cwd, which is itself a mini-ork checkout).
+# The scratch tree's test subprocesses inherit the environment, not sys.path,
+# so they are untouched.  runpy deliberately does not add the script's own
+# directory to sys.path; the verifier has no sibling imports today.
+BOOTSTRAP = ("import runpy, sys; root, script = sys.argv[1], sys.argv[2]; "
+             "sys.path[0:0] = [root]; sys.argv = [script]; "
+             "runpy.run_path(script, run_name='__main__')")
+
 
 def _git(repo: Path | str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
@@ -75,15 +84,24 @@ def stored_patches(patches_dir: Path, tasks: dict[str, dict]) -> list[tuple[Path
     return out
 
 
-def run_verifier(verifier: Path, scratch: Path, python: str, timeout: int) -> tuple[bool | None, str]:
+def run_verifier(verifier: Path, scratch: Path, python: str, timeout: int,
+                 *, import_root: Path | None = None) -> tuple[bool | None, str]:
     """(pass, reason) from the verifier's JSON line; pass is None when it
-    produced no verdict (crash, timeout, non-JSON)."""
+    produced no verdict (crash, timeout, non-JSON).
+
+    ``import_root`` makes the verifier's own ``import mini_ork…`` resolve to
+    that tree while the scratch tree's test subprocesses (which inherit the
+    environment, not ``sys.path``) stay untouched."""
     with tempfile.TemporaryDirectory() as tmp:
         env = {**os.environ, "MO_TARGET_CWD": str(scratch), "MINI_ORK_HOME": tmp,
                "MINI_ORK_RUN_DIR": tmp, "MINI_ORK_RUN_ID": "verifier-replay",
                "PYTHONDONTWRITEBYTECODE": "1"}
+        if import_root is None:
+            cmd = [python, str(verifier)]
+        else:
+            cmd = [python, "-c", BOOTSTRAP, str(import_root), str(verifier)]
         try:
-            proc = subprocess.run([python, str(verifier)], cwd=scratch, env=env,
+            proc = subprocess.run(cmd, cwd=scratch, env=env,
                                   capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return None, "verifier timed out"
@@ -101,7 +119,8 @@ def run_verifier(verifier: Path, scratch: Path, python: str, timeout: int) -> tu
 
 
 def replay_one(source: Path, task: dict, *, repo: Path, verifier: Path,
-               python: str, timeout: int) -> dict:
+               python: str, timeout: int, import_root: Path | None = None,
+               hidden: bool = True) -> dict:
     """``source`` is a runner-kept patch file or a run dir holding review-diff.patch."""
     patch = source if source.is_file() else source / "review-diff.patch"
     scratch_parent = repo.parent / f"{repo.name}-replay-scratch"
@@ -117,8 +136,34 @@ def replay_one(source: Path, task: dict, *, repo: Path, verifier: Path,
                        + (applied.stderr.strip().splitlines() or [""])[0][:200])
             return row
         # 1) verifier FIRST — before the hidden tests are restored.
-        row["verifier_pass"], row["verifier_reason"] = run_verifier(verifier, scratch, python, timeout)
+        row["verifier_pass"], row["verifier_reason"] = run_verifier(
+            verifier, scratch, python, timeout, import_root=import_root)
         # 2) ground truth: restore hidden tests from the fix and grade.
+        if hidden:
+            graded = rh.grade(scratch, task, python, timeout)
+            row["hidden_pass"] = graded["passed"]
+            row["failed_ids"] = graded["failed_ids"]
+        return row
+    finally:
+        _git(repo, "worktree", "remove", "--force", str(scratch), check=False)
+
+
+def grade_one(source: Path, task: dict, *, repo: Path, python: str,
+              timeout: int) -> dict:
+    """Ground truth only: apply the patch to a scratch worktree of the task's
+    base commit and grade it with the hidden tests.  No verifier runs."""
+    patch = source if source.is_file() else source / "review-diff.patch"
+    scratch_parent = repo.parent / f"{repo.name}-replay-scratch"
+    scratch_parent.mkdir(exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix="replay-", dir=str(scratch_parent)))
+    _git(repo, "worktree", "add", "-q", "--detach", str(scratch), task["base_sha"])
+    row = {"run": source.name, "task": task["id"]}
+    try:
+        applied = _git(scratch, "apply", "--whitespace=nowarn", str(patch), check=False)
+        if applied.returncode != 0:
+            row["skipped"] = ("patch does not apply to base: "
+                              + (applied.stderr.strip().splitlines() or [""])[0][:200])
+            return row
         graded = rh.grade(scratch, task, python, timeout)
         row["hidden_pass"] = graded["passed"]
         row["failed_ids"] = graded["failed_ids"]
