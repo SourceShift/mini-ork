@@ -284,9 +284,8 @@ def render_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
-def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
-    out = stdout if stdout is not None else sys.stdout
-    err = stderr if stderr is not None else sys.stderr
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and any in-process caller."""
     parser = argparse.ArgumentParser(
         prog="mini-ork metrics revise",
         description="Rounds-to-pass, implementer attempts, and the reviewer findings ledger.",
@@ -300,7 +299,13 @@ def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
     parser.add_argument("--runs-dir", default=None,
                         help="run dirs to scan (default: next to the DB)")
     parser.add_argument("--json", action="store_true")
-    a = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
+    out = stdout if stdout is not None else sys.stdout
+    err = stderr if stderr is not None else sys.stderr
+    a = build_parser().parse_args(argv)
     db = a.db or _default_db()
     if not os.path.isfile(db):
         err.write(f"mini-ork metrics revise: no state.db at {db}\n")

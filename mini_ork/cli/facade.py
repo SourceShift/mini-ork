@@ -10,7 +10,8 @@ from mini_ork.client import MiniOrk
 from mini_ork.types import ProviderPolicy, RunRequest, SpawnRequest
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and any in-process caller."""
     parser = argparse.ArgumentParser(description="Python facade for mini-ork")
     parser.add_argument("kickoff", nargs="?", help="Kickoff markdown file to run or spawn")
     parser.add_argument("--recipe", help="Force a recipe")
@@ -20,7 +21,11 @@ def main() -> int:
     parser.add_argument("--child-run", help="Stable child run id for --spawn-parent")
     parser.add_argument("--allow-child-spawn", action="store_true", help="Permit the spawned child to spawn descendants")
     parser.add_argument("--no-execute", action="store_true", help="For --spawn-parent, approve only without executing the child")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     if not args.kickoff:
         print(json.dumps({"ok": True, "package": "mini_ork"}))

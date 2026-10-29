@@ -252,15 +252,20 @@ def _print_human(result: dict, out) -> None:
                   f"holdout={lift.get('n_holdout_itt')}; need {result['min_n']} each)\n")
 
 
-def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
-    out = stdout if stdout is not None else sys.stdout
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and any in-process caller."""
     p = argparse.ArgumentParser(prog="mini-ork metrics context",
                                 description="Context v2 delivery and outcome, read-only.")
     p.add_argument("--db", default=None, help="state.db (default: $MINI_ORK_DB, else <home>/state.db)")
     p.add_argument("--runs-dir", default=None, help="run dirs to scan (default: next to the DB)")
     p.add_argument("--runs", action="store_true", help="include the per-run records")
     p.add_argument("--json", action="store_true")
-    a = p.parse_args(argv)
+    return p
+
+
+def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
+    out = stdout if stdout is not None else sys.stdout
+    a = build_parser().parse_args(argv)
     db = a.db or _default_db()
     runs_dir = Path(a.runs_dir) if a.runs_dir else Path(db).resolve().parent / "runs"
     records = collect(runs_dir, db)

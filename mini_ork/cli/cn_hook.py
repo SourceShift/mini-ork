@@ -36,7 +36,8 @@ def _prefetch(session: str, prompt: str, cwd: str, output: str) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and any in-process caller."""
     parser = argparse.ArgumentParser(prog="mini_ork.cli.cn_hook")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -58,7 +59,11 @@ def main(argv: list[str] | None = None) -> int:
     outcome.add_argument("--evidence", default="")
     outcome.add_argument("--session", default="")
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     if args.command == "prefetch":
         return _prefetch(args.session, args.prompt, args.cwd, args.output)
     if args.command == "post":

@@ -138,6 +138,22 @@ def ide_spec_level(level: int | None) -> Iterator[None]:
 
 # ── actions ────────────────────────────────────────────────────────────────
 
+# The discriminating key of every action dict built below. The IDE dispatches a
+# ``do`` by which of these it carries, so a new constructor must add its key
+# here — this set is the contract, and ``tests/unit/test_ide_pages_orch.py``
+# reads it instead of keeping a hand-copied list that drifts.
+ACTION_KEYS = frozenset({
+    "cli", "page", "set", "run", "path", "reveal", "url", "thread", "project",
+    "pick_files", "project_pick", "project_forget", "terminal", "copy",
+})
+
+# Keys that ride an action dict without changing what it does: the confirm
+# text, the run/pending/done labels, and the page-link/open-run arguments.
+ACTION_MODIFIERS = frozenset({
+    "confirm", "pending", "done", "title", "tab", "args",
+})
+
+
 def cli(*args: str, confirm: str | None = None, home: bool = True) -> dict[str, Any]:
     """An action that runs a mini-ork subcommand.
 

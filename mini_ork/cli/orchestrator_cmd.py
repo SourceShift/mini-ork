@@ -43,7 +43,7 @@ _SAFE_TOKEN_CHARS = frozenset(
 _EVENT_WINDOW = 400
 
 
-def _parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mini-ork orchestrator",
         description="Observe a run between its node boundaries.",
@@ -275,7 +275,7 @@ def main(rest: list[str] | None = None, root: str | None = None) -> int:
     del root
     argv = list(sys.argv[1:] if rest is None else rest)
     try:
-        args = _parser().parse_args(argv)
+        args = build_parser().parse_args(argv)
     except SystemExit as exc:  # argparse already printed its usage line
         return int(exc.code or 0)
     if args.verb != "watch":

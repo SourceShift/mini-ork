@@ -23,7 +23,7 @@ from mini_ork.triage.failures import latest_failed_run, resolve_db, triage_run
 _BLAME_EXIT = {"mini_ork": 0, "consumer": 3, "unknown": 3}
 
 
-def _parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mini-ork triage",
         description="Attribute a failed run to mini-ork or the consumer; optionally queue a fix.",
@@ -46,7 +46,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(rest=None, root=None) -> int:
     argv = list(sys.argv[1:] if rest is None else rest)
-    args = _parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
 
     run_id = args.run
     if not run_id and args.latest:

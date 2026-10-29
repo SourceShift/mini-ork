@@ -13,8 +13,9 @@ from mini_ork.ide_pages import orch, spec
 from mini_ork.stores import migrate as mig
 
 REPO = Path(__file__).resolve().parents[2]
-_ACTION_KEYS = {"cli", "page", "set", "run", "path", "reveal", "url", "thread", "project",
-                "project_pick", "terminal"}
+# Imported, never copied: ``spec`` is where the action constructors live, so the
+# set of discriminators they produce is the contract this checker enforces.
+_ACTION_KEYS = spec.ACTION_KEYS
 
 
 def check_page(page: dict[str, Any], key: str) -> None:
@@ -43,6 +44,41 @@ def check_page(page: dict[str, Any], key: str) -> None:
             for field in ("c", "mc"):
                 if field in it:
                     assert colour_ok(it[field])
+
+
+def test_action_keys_cover_every_action_constructor() -> None:
+    """``spec.ACTION_KEYS`` is exactly what the constructors below produce.
+
+    ``check_page`` accepts a ``do`` when it carries one of these keys, so a
+    constructor whose key is missing from the set makes every page that uses it
+    fail for the wrong reason — and a key with no constructor is dead weight
+    that hides a deleted action. Sampling every constructor is what keeps the
+    set honest; the verbatim copy this replaced had already drifted
+    (``pick_files``, ``project_forget``, ``copy`` were all absent).
+    """
+    samples = [
+        spec.cli("board", "show"),
+        spec.page_link("runs", "runs"),
+        spec.set_args(theme="dark"),
+        spec.open_run("run-x"),
+        spec.open_path("/tmp/x"),
+        spec.reveal("/tmp/x"),
+        spec.project("/tmp/x"),
+        spec.pick_files(["threads", "attach"]),
+        spec.project_pick(),
+        spec.project_forget("/tmp/x"),
+        spec.terminal(cwd="/tmp"),
+        spec.url("https://example.com"),
+        spec.thread("hi"),
+        spec.copy("x"),
+    ]
+    produced: set[str] = set()
+    for action in samples:
+        discriminators = set(action) - spec.ACTION_MODIFIERS
+        assert len(discriminators) == 1, (action, discriminators)
+        produced |= discriminators
+    assert produced == set(spec.ACTION_KEYS), (
+        produced - set(spec.ACTION_KEYS), set(spec.ACTION_KEYS) - produced)
 
 
 @pytest.fixture

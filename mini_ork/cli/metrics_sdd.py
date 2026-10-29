@@ -251,9 +251,8 @@ def _default_db() -> str:
     return os.path.join(home, "state.db")
 
 
-def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
-    out = stdout if stdout is not None else sys.stdout
-    err = stderr if stderr is not None else sys.stderr
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and any in-process caller."""
     p = argparse.ArgumentParser(prog="mini-ork metrics sdd",
                                 description="The SDD plan's baselines, read-only.")
     p.add_argument("--db", default=None, help="state.db (default: $MINI_ORK_DB, else <home>/state.db)")
@@ -262,7 +261,13 @@ def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
     p.add_argument("--write-run-dir-baseline", default=None, help="freeze the live run-dir scan to this file")
     p.add_argument("--no-run-dirs", action="store_true", help="DB metrics only")
     p.add_argument("--json", action="store_true")
-    a = p.parse_args(argv)
+    return p
+
+
+def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
+    out = stdout if stdout is not None else sys.stdout
+    err = stderr if stderr is not None else sys.stderr
+    a = build_parser().parse_args(argv)
     db = a.db or _default_db()
     if not os.path.isfile(db):
         err.write(f"mini-ork metrics sdd: no state.db at {db}\n")

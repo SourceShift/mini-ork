@@ -207,7 +207,8 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The argv contract, shared by ``main`` and any in-process caller."""
     parser = argparse.ArgumentParser(
         prog="mini-ork skills",
         description="Operate the skill registry: list, inspect, validate, promote.",
@@ -234,7 +235,11 @@ def main(argv: list[str] | None = None) -> int:
     p_promote.add_argument("--force", action="store_true", help="overwrite an existing skill")
     p_promote.set_defaults(fn=_cmd_promote)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return args.fn(args)
 
 

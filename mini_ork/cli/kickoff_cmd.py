@@ -29,7 +29,7 @@ from pathlib import Path
 DEFAULT_RECIPE = "code-fix"
 
 
-def _parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mini-ork kickoff",
         description="Draft and inspect kickoff files.",
@@ -89,7 +89,7 @@ def _cmd_new(args: argparse.Namespace) -> int:
 def main(rest: list[str] | None = None, root: str | None = None) -> int:
     del root
     argv = list(sys.argv[1:] if rest is None else rest)
-    args = _parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
     if args.verb == "new":
         return _cmd_new(args)
     sys.stderr.write("usage: mini-ork kickoff new <text> [--recipe R] [--home H]\n")
