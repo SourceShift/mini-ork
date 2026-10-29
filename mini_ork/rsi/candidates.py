@@ -46,6 +46,8 @@ KIND_BASE: Mapping[str, int] = {
     "signal_not_propagated": 58,
     "temporal_corruption": 54,
     "unused_capability": 46,
+    # a ranked research technique not yet adopted
+    "technique_unadopted": 44,
     "stale_signal": 38,
     "quality_red": 36,
     "coverage_gap": 30,
