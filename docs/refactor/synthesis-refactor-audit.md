@@ -1,329 +1,272 @@
-# Synthesis: refactor-audit of `wt/t1-kernel-hole-3` @ `e178d24e`
+# Synthesis — `wt/t1-certificate` @ `4ff3a0aa` (anytime-valid promotion certificate + per-class α ledger)
 
-**Diff:** "feat(kernel): freeze the self-driving policy's inputs". It adds 8 paths to the frozen kernel in `config/kernel-frozen.yaml:43-50` and `mini_ork/vcs/repo_integrity_guard.py:72-80`, edits one count pin and adds one test file (4 files, +198/−13).
+**Diff under review:** `db/migrations/0086_promotion_certificates.sql`, `mini_ork/cli/apply.py`,
+`mini_ork/learning/promotion_certificate.py`, `tests/unit/test_promotion_certificate.py`, plus direct
+callers (`apply_run` → `evaluate_gate` → `certify`; `execute.py:2175-2179` → `auto_sweep`).
 
-**Inputs:** the five anonymous panel responses A–E (`panel_reports/panel-responses.md`). Every `path:line` is relative to `/Volumes/docker-ssd/ps/mini-ork-worktrees/review-t1-kernel-hole-3`.
+**Panel verdicts:** A ADJUST · B ADJUST (one required item) · C APPROVE-as-is (take R1 if one ADJUST is
+forced) · D ADJUST · E ADJUST → **4 ADJUST / 1 APPROVE.**
 
-## Consolidated merge verdict: **ADJUST**
+**Synthesis verdict: ADJUST.** Merging is safe for the live loop. Four responses (B, C, D, E) independently confirm two things.
+First, the flag-off path emits no `cert` key and touches no DB (`apply.py:642`, `:728-729`). Second, every
+certificate rewrite is guarded by `if decision == "promoted"` (`apply.py:647-701`), so the overlay can only
+demote. The problem is that the feature's only enabled state is a **silent shutdown of the promotion
+channel**: the bar is 40 and the e-value ceiling is 3.06 (all five responses). The fixes are cheap now and
+expensive later. Migration 0086 and the module are still unmerged, so schema changes cost nothing today and cost a migration after
+merge. Land the five P1 wins below (≈8.5 eng-days), then merge.
 
-The panel split 3 to 2: B, C and D said ADJUST; A and E said APPROVE.
-
-Nothing in the diff makes `main` less safe. Every entry is a pure restriction, it fails closed, and the tests pass (46/46). ADJUST is about whether the commit's **claim** is true, not about safety.
-
-- **The headline claim is false.** "Freeze the policy's inputs" leaves out `mini_ork/triage/failures.py`. That module is imported directly by the frozen gatherer (`mini_ork/recovery/escalation.py:51`), computes one of its fields (`:285`), and writes the rows the daily cap counts.
-- **The new comment is false on one branch.** It says "a consumer that cannot read the yaml still enforces these" (`repo_integrity_guard.py:47-50`), but this is untrue on the framework-edit verifier's fallback branch.
-
-Both fixes take a day or less and touch files the commit already edits or their frozen sibling (Top-5 #1 and #2). Everything else is follow-up work.
-
-### What the synthesizer verified itself (read-only, inside the diff and its direct callers)
-
-- **Tests: 46/46 pass on Python 3.12** (`/usr/local/bin/python3.12`), whether or not the lane's `MO_*`/`MINI_ORK_*` environment is set. This matches A's receipt.
-  - On this lane's default `python3` (micromamba **3.9.23**) the same three files give **15 failed / 31 passed**. The subprocess tests that drive `static-check.py` die before writing their `.checks.tsv`.
-  - That failure comes from the interpreter, not the code (CI runs 3.11 and 3.12), but it is a reproduction trap (§6).
-  - The worktree was clean before and after; tests ran with `-p no:cacheprovider` and `PYTHONDONTWRITEBYTECODE=1`.
-- **Claims checked against code.** ✔ = confirmed, ~ = partly confirmed, ✖ = refuted:
-
-| Claim | Result |
-|---|---|
-| K1: the static-check fallback reads neither YAML | ✔ |
-| K2: `triage/failures.py` feeds the policy and is unfrozen | ✔ |
-| K3: `scheduler.py` writes `epics.status` | ✔ |
-| K4: `apply.py` is neither frozen nor high-tier | ✔ |
-| K5: brittle count and order pins | ✔ |
-| A-2: negative control uses `retry_hint.py` | ✔ |
-| B-1: replan dispatch has no `persist_call` | ✔ |
-| B-3: no negative cache for failed diagnoses | ✔ |
-| B-4: no `cost_pause` in `diagnoser_llm.py`, `graph_patch.py` or `dispatch/providers.py` | ✔ |
-| C-5: a branch can loosen its own merge tier | ✖ (bootstrap only) |
-| C-8: `select.py` `frozen_paths=()` default | ✔ |
-| D-4: L11 harvest names a now-frozen file | ✔ |
-| D-5: `review_policy.py` neither frozen nor high-tier | ✔ |
-| D-6: `rsi/worktree.py:289` drops `run_id` | ✔ |
-| D-7: token consumed only at `publisher_authored_patch.py:1504` | ✔ |
-| D-8: labeller query shape at `supervisor.py:274-281` | ~ (query shape confirmed; the indefinitely-unlabelled consequence was not traced) |
-| D-13: stale "FORWARD DECLARATION" at `config/kernel-frozen.yaml:22` | ✔ |
-| Frozen surface added by the diff | ✔ 7,274 lines across the 8 files |
-
-**ID convention:**
-- `A-n`: A's F-n. `A-Rn`: A's recommendations. `A-§7`: A's open question.
-- `B-n`: B's finding-n. `B-Xn`: B's architectural item n.
-- `C-n`: C's table row n.
-- `D-n`: D's F-n.
-- `E-n`: E's refactor-n. E's own merge table maps F1→E-1, F2→E-2, F3→E-3, F4→E-7, F5→E-6, F6→E-4.
-- `S-1`: a finding of the synthesizer's own.
-- `Kn`: a cross-response cluster.
-
-**[f:…] check:** the context block supplies no `[f:…]` ids, so no failure-id repeat can be named. The relevant `[t:…]` lessons are covered in §6.
-
-### Contradictions adjudicated
-
-| Dispute | Claims | What the code says | Ruling |
-|---|---|---|---|
-| Does the verifier's fallback still read the target's committed YAML? | **B-11:** "not a hole: the union with the target's HEAD yaml covers them". **E-1:** reachable only if import fails *and* HEAD lacks the file. **A-5 / C-3:** neither YAML is read. | The fallback's `parse_frozen_paths` returns `[]` (`recipes/framework-edit/verifiers/static-check.py:74-75`). So `_target_committed_frozen_paths` (`:617-629`) also returns `[]`, and `load_frozen_paths` (`:77-78`) returns the stale 14 entries. | **A and C are right on the mechanics; B and E are wrong.** Reachability is low (A-5): the fallback runs only if importing `repo_integrity_guard` raises, and that module imports only `fnmatch`/`os`/`subprocess` (`repo_integrity_guard.py:37-39`). C ("high") and D ("HIGH") overrate it. It stays P1 because all five responses flag it, it costs 0.5 day, and it makes the diff's own comment false. |
-| Can a branch loosen its own merge tier? | **C-5:** yes, when `origin/main` is unavailable. **D:** no. | `load_rules` (`mini_ork/gates/merge_risk.py:150-174`) reads `origin/main` first. If `origin/main` is missing, `changed_files` (`:181-191`, which diffs `origin/main...HEAD`) raises, and the gate fails closed (`:411-412`). | **D is right.** C-5 can only happen while `origin/main` exists but lacks `config/risk-tiers.yaml` (bootstrap), so it drops to P3. Residual: precedence slot 1, `MO_RISK_TIERS_FILE`, is an ambient-environment override with no guard. |
-| Is the freeze too broad or too narrow? | **Too broad:** A-4, C-12, C-13 (7,274 lines). **Too narrow:** B-6, C-1/2/4/6/7, D-2/3/5 (freeze more). | Both are true. | **Whole-file freezing cannot satisfy both.** Near term: freeze only the small, direct input (`failures.py`, 499 lines), and put the large enforcement and writer modules in the high risk tier. Long term: kernel extraction (A-R4) plus a computed closure (A-R1 / E-2). See §3, runtime bundle. |
-| APPROVE or ADJUST? | A and E: APPROVE. B, C and D: ADJUST, but each asks for a different set of fixes. | — | **ADJUST, limited to the two consensus items** (Top-5 #1 and #2). B's required item, freezing `config/providers.yaml`, `dispatch/providers.py` and `dispatch/telemetry.py`, is a 2-of-5 finding that would deepen the over-breadth problem (K8). It moves to P2 as K14. |
-
-**Which findings the diff caused.** K1 (the diff updated 2 of 3 copies), K5, A-2, K9 and D-4 (L11 dies because the diff froze `diagnosis_ledger.py`) come from this diff. So does K8, as a choice the diff made. D-6 existed before but runs more often now, because the trigger set grew from 14 to 22. **Everything else already exists on `main`.**
+**ID key.** `A-N` = A's table row N · `B-N` = B's refactor-N · `C-N` = C's R-N (`C-§7` = its hardest
+question) · `D-N` = D's finding-N, `D-16` = D's architectural change 1 (model-tier the control arm);
+D's architectural changes 2/3 restate D-8/D-3 · `E-N` = E's F-N. ★ = raised by 2+ responses.
 
 ---
 
 ## Section 1: Severity × leverage matrix
 
-★ = the finding appears in 2 or more responses.
-
 | | **HIGH leverage** | **MED leverage** | **LOW leverage** |
 |---|---|---|---|
-| **P1** | **K1★** A-5 · B-11 · C-3 · D-1 · E-1: the verifier's fallback floor is stale at 14 entries and reads neither YAML ✔<br>**K2★** A-1b · C-1 · D-3 · E-2: `triage/failures.py` feeds `signature_fix_failed_before` and writes the cap's rows, and is unfrozen ✔<br>**K4★** A-3 · D-2 · E-2: `cli/apply.py` (the apply-loop guard) is neither frozen nor high-tier ✔ | **K3★** A-1c · C-2 · E-2: `scheduler.py` writes the `epics.status` the breaker reads ✔<br>B-1: the replan LLM dispatch is never metered ✔<br>B-3: a failed model diagnosis is never cached, so it is re-paid every sweep ✔<br>B-4: neither frozen LLM call site consults `cost_pause` ✔<br>**K6★** A-7 · C-9 · D-9 · E-7: the tests prove 1 of 5 enforcement points | **K5★** A-6 · C-16 · C-17 · D-9 · E-7: `len == 22` and `[-8:] == NEW` pins ✔<br>**K9★** C-11 · C-13 · D-13 (+ D-7): the YAML comment overclaims (stale forward declaration; effect listed as an input; token scope) ✔<br>A-2: the negative control pins the known input `retry_hint.py` as unfrozen ✔<br>D-4: the L11 harvest candidate can only ever be rejected ✔ |
-| **P2** | **K2'★** A-R1 · E-2: a computed import-closure test<br>**K8★** A-4 · A-R4 · C-12 · C-13: whole-file over-breadth (+7,274 frozen lines); extract small kernels instead<br>**K7★** A-R5 · B-11 · C-18 · E-1 · E-9: five copies of one list; make one source<br>**K14★** A-§7 · B-6: `config/providers.yaml` and the dispatch layer steer the policy without touching a frozen path<br>**K11★** C-6 · C-7 · D-5 · D-12: the approval chain is not publish-frozen, and `review_policy.py` is not even high-tier ✔<br>B-9: the escalation policy has a count cap but no dollar ceiling | **K10★** C-10 · D-11 · E-6: the probe-fixtures glob is only in the YAML, not the floor ✔<br>**K12★** D-10 · D-14 · E-3: the merge gate reads the list from the engine's working tree, with two roots inside one cycle ✔<br>C-8: `select.py:166` defaults to `frozen_paths=()`, which fails open ✔<br>D-6: the RSI land drops `run_id`, so safety events are orphaned and not deduped ✔<br>D-8: the revive-path labeller skips NULL `fix_epic_id` rows ~<br>C-4: `db/migrations/**` is merge-high but not publish-frozen<br>A-R8: record which writer produced each policy-input row<br>B-2 · B-5 · B-12: gateway rate table; `max_turns=3`; no tier ladder | B-7 (evidence-pack hash)<br>B-10 (no diagnoser lane fallback)<br>B-13 (provider pre-filter)<br>B-14 (replan cache keyed by file number)<br>C-14 (missing `bug_reports` / `epics` indexes)<br>C-15 (4–5 sqlite connections per escalate) |
-| **P3** | A-R7: server-side enforcement bound to a signed kernel manifest (secure tier)<br>A-§7: a decision-replay corpus (outcome-based protection) | A-R9 · A-R10: frozen-lines ratio metric; per-file refusal panel<br>A-8: `docs/SAFETY.md` is silent on the frozen kernel<br>B-X3 · B-8: batch fleet diagnosis; request prompt caching<br>S-1: two stray open safety events in the live `state.db` | **K13★** C-19 · C-20 · E-4 · E-5: YAML parse cache; literal-set matcher<br>E-8 · E-10 · B-15 · D-15<br>E-6 (inline `paths: [...]` parse)<br>C-5 ✖ (reachable only at bootstrap) |
+| **P1** | **Unreachable at shipped config** ★ A-1, A-3, B-1, B-10, C-15, D-1, E-1 · **No pre-flight before probe spend / no inverse of the threshold** ★ C-1, D-2, D-6, D-14 · **Config failures silent or deferred** ★ A-5, A-21, B-2 · **Suite never exercises real probe sizes** ★ A-4, E-16 (+B-10) | **Infra failure → sticky evidence quarantine** ★ A-6, A-12, C-2, C-3, D-7, E-13 · **Cert evidence dropped from the audit trail** ★ A-15, A-27, E-2 · **Prerequisites undocumented / undiscoverable** ★ A-18, A-19, A-25, C-17, D-13, E-15 · **Provenance columns missing (run_id, scorer, dry_run, probe-set hash)** ★ A-9, C-4, C-11, B-8 · B-9 (flag-off test is new-vs-new) | **Duplicate index** ★ A-24, C-7 · **DDL declared twice, substring-only guard** ★ A-7, B-3, E-9 · **`executescript` implicit COMMIT** ★ A-8, B-4, D-9, E-8 · **Ledger key folds `-`→`_`** ★ A-22, C-6, E-6 · C-10 (append-only triggers) · A-14 (timestamp type) · A-20 (α has no guardrail) |
+| **P2** | **α-ledger freezes the class** ★ A-2, B-1, D-4, E-4, E-5 · **`ledger=none` / mode switching / per-class policy pinning** ★ A-11, A-16, C-5, D-5, E-14 · **Ledger scope is per-DB-file, no secure tier** ★ C-9, D-15 · C-8 (split `decide()` / `certify()`) | **Write-only ledger, no reader, no structured cert record** ★ E-3, C-16 · E-12 (env-sourced vectors, `ids` ignored) · E-7 (public `evaluate_gate` without `task_class` quarantines) · B-11 (one machine-readable status) · D-8 (serial probe sweep — outside diff) · D-12 (runbook cost 2× off — outside diff) · A-26 (no concurrency test) | **gains/losses computed 2–3×** ★ A-23, B-6 · **Per-call connection / DDL / resolve on hot path** ★ D-10, D-11, A-10 · B-7 (extract demote overlay) · C-13 (λ=0.9 after measurement) |
+| **P3** | C-§7 (frozen probe set → adaptive overfitting) · C-14 (e-LOND mode) · E-10 (second, uncoordinated α budget in `rsi/impact.py`) · C-12 (α/λ/ledger per class in `task_class.yaml`) | E-11 (best-of-N control: power loss, docstring H0 inaccurate) · D-3 (control-vector cache — **rejected as stated**) · D-16 (cheap control lane — **rejected as stated**) · A-13 (ledger retention — **rejected**) | A-17 (`log_e` instead of underflowing `e`) · B-5 (binary-outcome validation) |
 
-**Consensus ranking** (how many responses raise each cluster):
+### 1.1 Where this synthesis overrules the panel
 
-| Responses | Clusters |
-|---|---|
-| 5 / 5 | K1 |
-| 4 / 5 | K2, K5, K6, K7 |
-| 3 / 5 | K3, K4, K10 |
-| 2 / 5 | K8, K9, K11, K12, K13, K14 |
+Several proposed fixes would **break the guarantee the module exists to provide**. Do not implement these as written:
 
-The panel agrees most on the single-source and closure problems. It disagrees only on how severe they are, and on whether the fix is "freeze more" or "freeze smarter".
+1. **E-4 "make the slot idempotent on `(task_class, candidate_id)` and reuse it"** is unsound. A re-test
+   runs fresh probe arms, so it is a fresh look. Two looks at one `α_k` double that slot's error. The sound
+   form is **optional continuation**: hold one slot per candidate and *multiply* each fresh e-value into
+   that candidate's running product. That product is still a test supermartingale, so Ville bounds it at `α_k`.
+2. **E-5 "spend α only on tests that reached the promote branch"** is unsound. The branch is chosen from
+   the same data as the e-value, so selecting on it inflates `E[E_j | selected]`. The existing
+   *zero-discordant* skip (`promotion_certificate.py:191-199`) is sound, and B's soundness note is right,
+   for a specific reason: `E_j = 1` *exactly* on the skipped event, so `E[E_τ] ≤ P(τ<∞) ≤ 1`. Non-promote
+   tests do not have `E_j = 1`. A gain-heavy test with one regression has `1.75⁶·0.25 ≈ 7.2`.
+3. **A-2 "make the spend rule linear (α/k)"** is unsound: `Σ 1/k` diverges. A bounded horizon only works
+   when normalized, `α/(k·H_N)`. **D-4(b) / A-2 "reset epoch"** is only sound if epochs get disjoint α
+   shares (e.g. `α·2⁻ᵉ` for epoch `e`). A plain reset gives the class unlimited total α.
+4. **D-4(a) "make `ledger=none` the documented mode for high-volume classes"** contradicts D-5. `none` is
+   the exact fixed-α defect the module docstring (`promotion_certificate.py:3-6`) says it replaces.
+5. **A-13 "register the table with retention, keep 90 days"** is unsound. If retention deletes every row for
+   an idle class, `MAX(slot)+1` (`promotion_certificate.py:205`) returns to slot 1 and the budget silently resets.
+   C-10 is right: the ledger is append-only, and the head counter is never pruned.
+6. **D-3 "cache the control vector across candidates"** — D asserts "the statistic is preserved". It is
+   not preserved *conditionally*. A cached "baseline failed" on a probe the baseline usually passes is a
+   free gain, with probability `q_i`, for **every later** null candidate. The guarantee then becomes an
+   average over one cache draw, and the conditional-validity argument (`promotion_certificate.py:10-16`)
+   no longer applies. Don't ship it without a new proof.
+7. **D-16 "route the control arm to a cheaper lane"** fails open. Under H0 the lane gap appears as
+   systematic gains (`E[a−b] > 0`), and a finite calibration cannot prove `E[a−b] ≤ 0`.
+8. **B-2's patch as written is inert.** Config errors are only read inside `if cfg["enabled"]`
+   (`apply.py:642-644`, the same point A-21 makes). B's patch keeps `enabled = False` for `=true`, so the
+   new error never surfaces. The correct fix treats any set value other than `""`/`"0"` as
+   *enabled*, then fails on anything that isn't `"1"`. Even better, refuse in the arm-time pre-flight (Win 2).
+9. **A-8's Python-version split is wrong.** `executescript` issues its implicit COMMIT on 3.12 too under the
+   default legacy transaction control. E reproduced the COMMIT (`in_transaction = False`). The defect is real
+   on both CI interpreters; the version difference is not.
+10. **C's and D's "the DDL test pins it byte-for-byte" is wrong about the test.** B quotes
+    `tests/unit/test_promotion_certificate.py:168-172`: it checks substrings only. D is right that the two
+    copies match *today*. The guard is still weak (A-7, B-3, E-9).
+11. **A-12 vs D-7:** `sqlite3.connect`'s default `timeout=5.0` equals `busy_timeout=5000`. The timeout
+    value is not the bug. The bug is that a lock timeout gets classified as evidence (D-7, C-3).
+12. **E-11 "the martingale property does not hold"** is overstated. With `b = max` of N draws,
+    `E[a−b] ≤ 0` still holds under H0, so the e-value stays valid. The cost is power, plus a docstring that
+    describes the wrong null.
 
 ---
 
 ## Section 2: Top 5 immediate wins (P1)
 
-Ranked by ROI: severity × leverage ÷ effort.
+Ranked by ROI. Total ≈ **8.5 eng-days** (< 2 weeks).
 
-| # | ID | Title | Responses | One-line fix | Effort |
+| # | ID(s) | Title | Source | One-line fix | Effort |
 |---|---|---|---|---|---|
-| 1 | **K1★** | Verifier fallback enforces 14 of 22 entries and reads neither YAML | A-5, B-11, C-3, D-1, E-1 | Sync the inline floor at `recipes/framework-edit/verifiers/static-check.py:57-72`, give the fallback a real block-list parser at `:74-75`, and add a fallback-equals-floor sync test | 0.5 d |
-| 2 | **K2★ + K5★ + K9★** | Close the direct-import hole and make the YAML honest | C-1, D-3, E-2, A-1b; A-6, C-16/17, D-9, E-7; C-11, C-13, D-13, D-7 | Add `mini_ork/triage/failures.py` to `config/kernel-frozen.yaml:43-50` and `repo_integrity_guard.py:72-80`, switch the pins to set membership, and correct the YAML comment | 1 d |
-| 3 | **K4★** | The apply loop's frozen guard is editable and merges at low tier | A-3, D-2, E-2 | Add `mini_ork/cli/apply.py` to the `high:` list in `config/risk-tiers.yaml` (after `:30`) | 0.5 d |
-| 4 | **B-1 + B-4** | The two frozen LLM sites are unmetered (replan) and ungated (both) | B | `persist_call` after `mini_ork/recovery/graph_patch.py:703-710`, plus a `cost_pause` check before both dispatches | 1.5 d |
-| 5 | **B-3** | A failed model diagnosis is re-dispatched on every sweep | B (B-7 is the companion) | Negative cache keyed on the evidence-pack sha256 at `mini_ork/recovery/diagnose.py:1084-1093` | 2 d |
+| 1 | A-1★, B-1★, B-11, D-14★, E-1★ | **Name the unreachable state; expose the threshold's inverse** | all five | Add `required_gains(slot, alpha, bet, ledger)` and `max_e(n, bet)` to `promotion_certificate.py:109-129`. Return `status ∈ {certified, uncertified, unreachable, no_vectors, misconfigured, unavailable}` plus a `ledger_warning` when `ledger != "spend"` (A-11, D-5). Make `apply.py:691-701` say `certificate unreachable: need ≥g probes, have n`. | 1.5 d |
+| 2 | C-1★, D-2★, D-6, B-2★, A-5★, A-21★, A-20, docs ★ (A-18, A-19, C-17, D-13, E-15) | **Arm-time pre-flight in `apply_run`, before any probe dollar** | C, D, B, A, E | Next to the frozen-kernel check, before `_ps.probe_score` (`apply.py:1301`): check `resolve_config` errors (corrected B-2 flag parse), that `_db_path` resolves (`apply.py:199`), that `required_gains(MAX(slot)+1) ≤` the effective non-anchor gate-probe count under `MO_APPLY_PROBE_MAX_TASKS` and `MO_APPLY_PROBE_GIT_ORACLE` (`probe_scorer.py:320-330`), that `MO_APPLY_PROBE_BUDGET_USD` buys `(control_n+1)·n` arms (`probe_scorer.py:1126`), and that α ≤ 0.2 unless explicitly overridden. On any failure: **exit 2 with no `apply_attempts` row** (so `_previously_failed`, `apply.py:1172`, never blacklists). Put the prerequisites into the env block at `apply.py:61-64`, a `docs/operator/feature-flags.md` row, and a `features/registry.py:504` entry. | 2.5 d |
+| 3 | D-7★, C-2★, C-3★, E-13★, A-6★ | **Separate infra failure from evidence failure** | D, C, E, A | At `apply.py:661` use `sqlite3.connect(path, timeout=30)` (matches `scheduler.py:99`). Retry `BEGIN IMMEDIATE` (`promotion_certificate.py:203`) on `database is locked` with backoff. Record any residual `unavailable`/`misconfigured` with `reason_class='infra'`, which `_previously_failed` (`apply.py:1172-1187`) ignores. Today one busy second or one bad env var permanently blacklists every directive that *measured* an improvement (C-1). | 2 d |
+| 4 | A-24★/C-7★, A-7★/B-3★/E-9★, A-8★/B-4★/E-8★, A-9★/C-4★/C-11★, A-22★/C-6★/E-6★, C-10, A-14 | **Fix 0086 while it is still free** | A, B, C, E | In `0086_promotion_certificates.sql`: drop `idx_promotion_certificates_class` (`:24` duplicates the `UNIQUE` at `:22`). Add `run_id`, `scorer`, `dry_run`, `probe_set_hash`, `probe_ids`, and raw `task_class` next to the folded key. Add no-UPDATE/no-DELETE triggers. Settle `created_at` (`:21`) now. Derive `pc.DDL` from the migration with a byte-equality test (`tests/…:168`). Replace `executescript` (`promotion_certificate.py:66`) with per-statement `execute` behind a once-per-process guard (`apply.py:205 _SCHEMA_INIT`). | 1 d |
+| 5 | A-4★/B-10★/E-16★, B-9, A-27★/E-2★, A-26, B-8★ | **Pin the claims the suite currently can't see** | A, B, D, E | (a) A test that loads the shipped probe config (`_load_probes`, `_probe_setting`) and asserts the pre-flight refuses at cap 2, which pins the dead zone. (b) A golden flag-off string captured from `HEAD~1:apply.py`, replacing the new-vs-new test at `tests/…:351`. (c) Fold `e/slot/α_k/threshold` into the rationale on **every** slot-consuming path, including already-quarantined ones (`apply.py:678-701`), assert it lands in `apply_attempts` (`apply.py:1502`), and tag dry-run spends (B-8). (d) A two-connection race test for slot allocation. | 1.5 d |
 
-**Total: about 5.5 engineering days**, well under the 2-week budget. The ones just below the cut are listed after #5.
-
-**#1 K1: verifier fallback.** Responses agree, 5 of 5.
-- **Fix:** add the 8 entries to the inline `FROZEN_PATHS_DEFAULT` at `static-check.py:57-72`. Then replace the `return []` stub at `:74-75` with the 15-line block-list parser from `repo_integrity_guard.py:99-118`, so `_target_committed_frozen_paths` (`:617-629`) actually reads the target's HEAD YAML on the degraded path.
-- **Test:** add E-1's `test_static_check_fallback_equals_floor`, which is the test that would have caught this.
-- `static-check.py` is itself frozen, so this needs a human kickoff with `MO_ALLOW_FROZEN_EDIT=1` and a person's approval at merge (§7).
-
-**#2 K2 + K5 + K9: one commit, same surface.**
-- **Freeze `failures.py`.** Add `mini_ork/triage/failures.py` (499 lines) to both lists. `escalation.py:51` imports it, `:285` feeds `diagnosis_fingerprint` into `signature_fix_failed_before`, and `failures.py:449` stamps the `agent_role="self-driving"` rows that `escalation.py:153-158` counts for the daily cap.
-- **Fix the pins first.** Adding a 23rd entry breaks `tests/unit/test_frozen_kernel.py:372` (`len(got) == 22`) and `tests/unit/test_frozen_kernel_policy_inputs.py:77` (`[-8:] == NEW`). Replace them with `set(NEW) <= set(FROZEN_PATHS_DEFAULT)` (A-R3). K5 is a prerequisite of K2, not a nicety.
-- **Fix the comment in the same commit:**
-  - `config/kernel-frozen.yaml:22` still calls `escalation_policy.py` a "FORWARD DECLARATION", but it exists and `escalation.py:45-50` imports it.
-  - `:36-42` lists `graph_patch` (an effect) and two enforcement points as "INPUTS".
-  - The header should say the operator token works **only at publish** (`publisher_authored_patch.py:1504` is the only consumer of `frozen_edit_allowed`).
-
-**#3 K4: put the apply loop in the high risk tier.** Do not freeze it as a whole file.
-- `apply.py` is 1,883 lines and actively edited. Freezing it whole would deepen K8 and pull it out of RSI.
-- With high tier, a self-driving edit that removes `_frozen_target` (`mini_ork/cli/apply.py:740`, called at `:1138`) needs a person's approval at merge. That closes the unattended path A-3 describes: the apply loop writes the engine tree without going through `land_patch`.
-- Moving `_frozen_target` and `_frozen_by_inode` (`:740-794`) into the frozen `repo_integrity_guard` is P2 (K8).
-
-**#4 B-1 + B-4: meter and gate the two frozen LLM sites.**
-- **Meter the replan.** `graph_patch.py` has no `persist_call` (confirmed by grep), so replan spend never reaches the ledger that `cost_pause` and the daily budget read. Copy `diagnoser_llm.py:479-489`.
-- **Gate both sites.** Neither `diagnoser_llm.py:525` nor `graph_patch.py:703` consults `cost_pause`, and `dispatch/providers.py` does not either.
-- **Unchecked:** B's `cost_pause.check(run_id, 0.0)` behaviour was not read; confirm it against `mini_ork/dispatch/cost_pause.py:59-87` before relying on it.
-
-**#5 B-3: negative-cache failed diagnoses.**
-- **The gap:** `_cached_model_diagnosis` (`diagnose.py:1043-1054`) reuses a stored diagnosis only when `source == "model"`. Every `None` return from `diagnose_with_model` (`:1086-1091`) falls through to a rule result, so the next sweep pays again. The "asked at most once per run" docstring at `auto_repair.py:489-490` is true only when the model succeeds.
-- **Keep it fail-closed:** the marker records "asked, declined" and never stands in for a diagnosis. That is B's own "what's already right" guard.
-
-**Just below the cut** (all P1):
-
-| ID | Fix | Effort |
-|---|---|---|
-| K6 | Parametrize `tests/unit/test_frozen_kernel_policy_inputs.py:120-157` over all 8 entries, and add verifier and `merge_risk` tier tests (E-7) | 1.5 d |
-| K3 | Put `mini_ork/scheduler.py` in the high tier as a stopgap (data-layer bundle) | 0.25 d |
-| D-4 | Make `_l11_diagnosis_unlabelled` raise `_GapClosed` when its only file is frozen (`mini_ork/rsi/harvest.py:606-630`) | 0.5 d |
-| A-2 | Point the negative control at a module provably off the policy path (`test_frozen_kernel_policy_inputs.py:94-97`) | 0.1 d |
+Why this order: Win 1 makes the failure *legible*. Win 2 makes it *free*: no ~$135 / ~13 h probe run (D-1,
+citing `docs/operator/probe-harvest-runbook.md:60`) just to learn the result is 3.06 < 40. Win 3 stops the
+fail-closed path from destroying evidence. Win 4 costs one day now and a migration later. Win 5 is what would
+have caught A-1 before review.
 
 ---
 
-## Section 3: Next-version architectural shifts (P2)
+## Section 3: v0.x+1 architectural shifts (P2)
 
-### Bundle R: Runtime and kernel enforcement (≈3 eng-wks)
+### Bundle R — runtime: certificate-driven sample size (≈2.5 eng-wks)
 
-Goal: make the frozen kernel computed, single-sourced and small.
+The panel frames the ledger as "freezing" (A-2, B-1, C-§5, D-4, E-4, E-5). **The binding constraint is the fixed probe count, not the
+spend rule.** C's own table shows the required clean gains grow only *logarithmically*: 7 → 14 → 22 → 31 over slots
+1 → 10 → 100 → 1000. A spending sequence like `∝ 1/(k·log²k)` saves about 4 gains at k=1000 and *costs*
+gains at k=10. Rewriting the spend rule therefore buys little. Make the probe count follow the bar:
 
-- **K2' (A-R1 / E-2): computed closure test.**
-  - Add `tests/unit/test_frozen_kernel_closure.py`. It walks imports with `ast` from `escalation_policy.py`, `escalation.gather_inputs` (`escalation.py:250-287`) and `diagnose.diagnose`.
-  - It must follow lazy imports; the diagnoser is lazily imported at `diagnose.py:1086`.
-  - Every module it reaches must be frozen or sit in a `POLICY_INPUT_ALLOWLIST` with a one-line justification.
-  - This turns K2/K3-style drift into a failing build.
-- **K8 (A-R4): extract small kernels, then unfreeze the large modules.**
-  - Move the R2 labeller out of `supervisor.py:813,843` into `diagnosis_ledger.py`, which is already frozen.
-  - Move the publish-refusal block at `publisher_authored_patch.py:1503-1518` into `repo_integrity_guard.refuse_frozen`.
-  - Move `apply.py:740-794` into the guard.
-  - Then unfreeze `supervisor.py` and `publisher_authored_patch.py`, and drop `graph_patch.py` (C-13 / D-13) or re-justify it as an effect.
-- **K7 (E-1, E-9, A-R5): one source for the list.** Create a dependency-free data module, `mini_ork/vcs/_frozen_floor.py`, and import it from the guard, the verifier fallback and the tests. Add a `mini-ork kernel frozen` command that prints the effective list.
-- **K10, E-6:** move `recipes/code-fix/probes/fixtures/**` (`config/kernel-frozen.yaml:55`) into the floor, and make `_minimal_parse` (`repo_integrity_guard.py:99-118`) handle the inline list form.
-- **K12 (E-3 + D-14):** at merge, use the committed `origin/main:config/kernel-frozen.yaml`, the branch's committed additions and the floor. Drop the engine working tree as a source (`merge_risk.py:337`).
-- **C-8:** `select.py:166` should default to the floor, or raise on an empty `frozen_paths`. Right now the type's default is the value that fails open.
-- **K11:** add `mini_ork/gates/review_policy.py` to `config/risk-tiers.yaml` at minimum. It decides whether an approval must be signed (`merge_approval.py:508-511`), and today it merges at low tier. `merge_approval.py` and `gaming_scan.py` are already high-tier (`config/risk-tiers.yaml:28,30`); freezing them is optional.
+- `apply_run` asks `probe_score` for `required_gains(next_slot) + margin` gate probes instead of a static
+  `MO_APPLY_PROBE_MAX_TASKS` (`probe_scorer.py:328`). The slot is fixed before any data is seen, so this is valid.
+- **Futility stopping inside the sweep.** Stop launching arms once `e·(1+λ)^remaining < 1/α_k`. It is always
+  valid (it can only reduce rejections), it is the in-sweep form of D-2's pre-flight, and it is the actual
+  payoff of "anytime-valid". Success stopping (`e ≥ 1/α_k`, licensed by Ville) conflicts with the
+  tolerance-0 per-task regression gate, which needs full coverage. Leave it off unless that coverage
+  requirement is relaxed on purpose.
+- Split `decide()` (pure) from `certify()` (spends) — C-8. This absorbs B-7 (extract the four demote arms at
+  `apply.py:630-701`), B-6/A-23 (count gains/losses once, `apply.py:520-525`), and E-7 (resolve `task_class` from
+  the candidate row when the caller omits it, instead of quarantining with a `ValueError` at
+  `promotion_certificate.py:72`).
+- C-13 (λ 0.75 → 0.9) only after measuring on a harvested set. It saves one probe at slot 1.
+- **Prerequisite P1s:** Win 1, Win 2. **Scope note:** the futility hook lives in `probe_scorer.py`, outside
+  this diff (constraint c:1), so file it as its own ticket.
+- **Risk if deferred:** every certifiable evaluation costs about 56 launches (D-3's arithmetic), and SDK or what-if callers of
+  `evaluate_gate` spend real α (C-8).
 
-**Prerequisite P1s:** #1 and #2.
+### Bundle L — data layer: ledger head + provenance (≈2 eng-wks)
 
-**Risk if deferred:** every new import from a frozen module into an editable helper silently reopens the hole (A §1, "closure drift"). The frozen surface roughly doubled (+7,274 lines), squeezing RSI's candidate pool further each time.
+- `ledger_heads(task_class PK, mode, alpha_total, bet, epoch, next_slot)` — C-5, A-16. This gives O(1) slot
+  allocation instead of the `MAX()` scan at `promotion_certificate.py:205`. It pins mode/α/λ on first spend,
+  and an env value that differs from the head becomes a Win-2 refusal. That closes D-5's leak (`none`-mode tests spending `spend`-mode slots) and C-5's
+  silent `none→spend` switch.
+- Per-candidate optional continuation: the *sound* form of E-4 (§1.1 item 1).
+- Certify only vectors from the probe scorer. Pair them by `ids`, not by position (E-12, `apply.py:496-507`). Skip
+  `certify` entirely for `FABRICATING_SCORERS` (C-4), so mock runs stop raising the bar for real ones.
+- A `cert_json` column on `promotion_records` (A-15, C-16) and a reader (`mini-ork apply certificates
+  --task-class X`, E-3). Today the table's only reader is the writer's own `MAX(slot)`.
+- **Prerequisite P1s:** Win 4. **Risk if deferred:** the union bound can be voided by a mode switch, and nothing
+  records it. The "auditable" ledger is not queryable.
 
-### Bundle D: Data layer (≈2–2.5 eng-wks)
+### Bundle S — secure tier: one class, one ledger (≈3 eng-wks)
 
-Goal: the policy reads database rows, so either freeze their writers or record which writer produced each row.
+- D-15 is the panel's only **fail-open** finding. The ledger lives in whatever `MINI_ORK_DB` the node has, so
+  under `--placement remote` each node restarts at slot 1 and the effective α multiplies with the node count.
+- C-9: a `CertificateLedger` protocol, `spend(class, e) → (slot, bar)`. The simple tier is SQLite. The secure
+  tier is a shared store (`ledger_heads … FOR UPDATE`). One config file chooses between them, following the vault pattern CLAUDE.md
+  names as the reference for the two-tier rule. Until this ships, the simple tier must state its per-DB scope
+  (module docstring, SAFETY.md §PromotionGate) and refuse to arm off a node-local DB under remote placement.
+- **Prerequisite P1s:** Win 2 (the refusal hook), Bundle L (the head row). **Risk if deferred:** the first
+  multi-node deployment certifies at up to N·α without any signal.
 
-- **K3, the permanent fix.** Do not freeze all 1,239 lines of `scheduler.py`.
-  - Route terminal epic transitions (`scheduler.py:756,822,878` write `"escalated"`) through a small frozen `set_epic_terminal_status()`.
-  - Have `_collapse_tripped` (`escalation.py:186-206`) count only rows written by frozen writers (A-R8, writer provenance).
-  - Remapping a failure to a status outside `{failed, escalated, abandoned}` (`escalation.py:61`) then stops disarming the breaker.
-- **C-4:** add `db/migrations/**` to the publish-time frozen list. Today it is merge-high only (`config/risk-tiers.yaml:13`), and a trigger on `diagnosis_ledger` or `epics` would steer the policy without touching any frozen path.
-- **D-8:** in `_ledger_ids` (`supervisor.py:274-281`), treat a NULL `fix_epic_id` as `IS NULL`, or key the labeller on the row id stored in `repair.json`.
-- **D-4, permanent fix:** give the L11 "unlabelled diagnoses" signal an unfrozen owner. Otherwise the labelled corpus may never reach `MIN_LABELS = 30` (`escalation_policy.py:25`), and the policy stays on `BOOTSTRAP_BAR`. This is D's inference and was not traced end to end.
-- **C-14 / C-15:** add indexes on `bug_reports(agent_role, updated_at)` and `epics(created_at)`, and use one connection per escalate instead of 4–5 (`escalation.py:135-138`).
+### Bundle O — observability (≈1 eng-wk)
 
-**Prerequisite P1s:** #2, because `failures.py` writes the cap's rows and must be frozen before provenance means anything.
+- An OTel span event `mini_ork.apply.certificate` with slot / e / threshold / mode / probe_set_hash / cost (C-16).
+- A dashboard showing α remaining per class, slots per week, certified rate, and **cost per certificate**. A frozen class shows up in cost per certificate
+  before it shows up in the promote rate (C §6).
+- Alert on any `misconfigured`/`unavailable` count above 0. After Wins 2–3 they should be impossible.
+- **Prerequisite P1s:** Win 5(c), Bundle L. **Risk if deferred:** the only freeze detector is someone asking
+  why nothing promotes.
 
-**Risk if deferred:** the daily cap and the collapse breaker can be disarmed through unfrozen writers, and the calibrated bar may never leave bootstrap.
+### Bundle D — LLM dispatch: probe economics (outside this diff, ≈2 eng-wks, separate ticket)
 
-### Bundle L: LLM dispatch (≈2.5–3 eng-wks)
-
-Goal: one gated, metered, cached entry point for every recovery LLM call.
-
-- **B-X2, `dispatch_gated(request, run_id, feature)`.** In order: consult `cost_pause`, dispatch, persist an `llm_calls` row, apply a positive/negative cache keyed on the prompt hash. This folds B-1, B-3, B-4 and B-7 into one edit, and every future recovery call inherits it.
-- **B-5 / B-12:** set `max_turns=1` at `diagnoser_llm.py:75` and `graph_patch.py:77`. Both calls are toolless and produce a single JSON reply. Add a tier ladder that escalates when the verbatim-substring validator (`:455-458`) rejects a reply.
-- **B-2:** add per-model rates for the `gateway` family in `mini_ork/dispatch/telemetry.py:42-45`. The diagnoser's default lane has zero cache-cost breakdown today.
-- **B-9:** add `cost_usd_24h` to `EscalationInputs` (`escalation.py:276-287`). This edits the frozen policy, so it is an operator-owned change.
-- **B-10, B-14:** a fallback ladder for the diagnoser lane; key the replan cache on content (`graph_patch.py:685-689`).
-- **K14 (A-§7, B-6):** decide whether `config/providers.yaml` counts as a policy input. Recommendation: do not freeze the whole registry, since that would block every operator lane change behind approval. Instead, make the diagnoser and replan lane choice a frozen routing input (B-X1), and pass the resolved model into `EscalationInputs`.
-
-**Prerequisite P1s:** #4 and #5.
-
-**Risk if deferred:**
-- Replan spend stays invisible to every cost gate.
-- Spend on the failure path is unbounded on chronically unclassifiable runs during a 10-hour autopilot.
-- The fix-epic cap stays count-only: 3 framework-edit runs a day with no dollar ceiling.
-
-### Bundle O: Observability (≈1 eng-wk)
-
-- **D-6:** thread the cycle's `run_id` through `mini_ork/rsi/worktree.py:289` into `land_patch`, as `mini_ork/cli/publisher.py:437-440` already does. The dedupe in `safety_events.py:275-291` only runs `if run_id:`.
-- **S-1:** resolve the two stray open events described in §6.
-- **A-R9:** report frozen lines ÷ engine lines as a first-class metric, and require each freeze kickoff to state how it moves the ratio.
-- **A-R10:** a per-file panel of frozen refusals and overrides. Any file that keeps refusing legitimate work becomes the next K8 extraction.
-- **A-8:** add a frozen-kernel section to `docs/SAFETY.md`.
-
-**Prerequisite P1s:** none.
-
-**Risk if deferred:** RSI refusals cannot be joined to their runs, and over-freezing stays invisible until someone notices RSI starving.
-
-**Total P2: about 8.5–9.5 eng-weeks.**
+- D-8: a bounded worker pool with budget *reservation* in place of the sequential pre-flight at
+  `probe_scorer.py:1170` (≈4× wall-clock at `control_n=3`). Safe, because it does not change the statistic.
+- D-12: reprice `docs/operator/probe-harvest-runbook.md:60` at the `control_n=1` that `:65` prescribes (≈$67, not ≈$135).
+- D-3 and D-16 are **not** in this bundle (see §1.1 items 6–7).
+- **Risk if deferred:** a ≈13 h serial evaluation per candidate keeps bounding RSI-cycle throughput.
 
 ---
 
-## Section 4: Long horizon (P3 and advisory)
+## Section 4: Long-horizon (P3 + advisory)
 
-- **A-R7, server-side enforcement.** All five enforcement points run inside the repo the loop edits, and the worktree merge pushes `HEAD:main` with no server-side gate. Following the two-tier rule in `CLAUDE.md`:
-  - **Simple tier:** today's local checks.
-  - **Secure tier:** a pre-receive hook or ruleset that refuses commits touching the effective frozen set unless they are signed by the operator key.
-  - One config key chooses the tier, in the shape of `config/vault.example.yaml`.
-  - At 1000× (A §1) the kernel becomes a signed, content-addressed artifact versioned apart from the code it governs. Like the K14 recommendation, a third-party recipe must never ship its own floor; `static-check.py` currently does exactly that.
-- **A-§7, decision-replay corpus.** See §5.
-- **B-X3 / B-8:** batch the fleet's diagnoses (a shared prefix across K evidence packs), and request prompt caching on the stable `_prompt` prefix (`diagnoser_llm.py:364-386`). Both are only measurable after B-2.
-- **K13 / E-8 / E-10 / B-15:** parse caching, a literal-set matcher, no tree walk per literal pattern in `apply.py:773-794`, one patch parse per publish, and registry memoisation. None of these matters at 22–23 patterns. Revisit when the list passes about 100 entries.
-- **D-15:** add one test that pins `fnmatch` glob semantics for `/**`.
-- **C-5 ✖:** downgraded (see the contradiction table). Keep a one-line note that `MO_RISK_TIERS_FILE` overrides everything.
-- **A-4, advisory:** before merge, tell the autopilot owner that any change to the 8 files now needs `MO_ALLOW_FROZEN_EDIT=1` at publish and a person at merge. The recovery subsystem also drops out of RSI's candidate pool (`mini_ork/rsi/select.py:428-431`).
+- **C-14** e-LOND (online FDR) ledger mode for productive classes past ~50 slots. It changes the guarantee from
+  FWER to FDR, so make it per-class and tied to the risk rung, never a global default.
+- **E-10** `rsi/impact.py:113-128` runs a second α budget over a possibly overlapping decision stream. One shared
+  per-class spending policy, or a written proof that the streams are disjoint. Advisory, outside this diff: as
+  quoted, `alpha0/(Z·k·log2(k+1))` sums to a *divergent* series unless it is horizon-capped. Worth a one-line check.
+- **C-12** declare α/λ/ledger per class in `task_class.yaml` (`schemas/task_class.schema.json`). Env stays a
+  simple-tier override only.
+- **C-11** signed and frozen probe sets for marketplace recipes. Win 4 records the hash; this enforces it.
+- **E-11** feed the control's per-retry outcomes (not `max`) or document the actual H0 (`probe_scorer.py:1252`).
+  This is a power issue, not a validity issue (§1.1 item 12).
+- **A-17** store `log_e` (`0.25**1000 == 0.0` at `promotion_certificate.py:98`). **B-5** reject non-binary
+  outcomes in `paired_counts` (`:77-88`).
+- **A-10/D-11** gate the import and `resolve_config()` on the flag (`apply.py:640-641`). Also make
+  `execute.py:2179`'s `except Exception: pass` log instead of swallowing. That second part is the real hazard; the import is not
+  (D: `pyproject.toml:95` ships `mini_ork*`).
+- **D-10** reuse the caller's connection, after Bundle R's split makes ownership explicit.
+- **Rejected, tracked so they are not re-proposed:** A-13 (retention), D-3 (control cache), D-16 (cheap
+  control lane), E-4/E-5 as written, A-2's α/k.
 
 ---
 
 ## Section 5: Hardest open question
 
-**Can a sound policy-input closure be computed at all?** (A-§7, sharpened by B-6, C-4 and K3.)
+**C-§7: what null does the certificate reject, when one frozen probe set is reused for every candidate in a
+class?**
 
-The panel found that the frozen policy can be steered through at least five channels that no import-closure test sees:
+The supermartingale argument is sound for "this candidate is no better than baseline *on these probes*, given
+LLM run-to-run noise". The ledger then union-bounds noise-luck across *every* test the class ever runs. That is
+real and valuable. It says nothing about generalization. A proposer that over thousands of iterations finds a
+directive that is *genuinely* better on 7–14 specific probes, and nowhere else, is not a null under this test.
+Certifying it is not a type-I error.
 
-| Channel | Evidence |
-|---|---|
-| Config | `config/providers.yaml` decides the self-diagnosis refusal through `_model_of` / `_independence` (`diagnoser_llm.py:317-350`, B-6) |
-| Environment | `MO_FIX_EPIC_DAILY_CAP` and `MO_FIX_EPIC_BREAKER_N` (`escalation.py:85-92`, A-§7) |
-| Prompts | the diagnoser prompt (A-§7) |
-| Database rows written by unfrozen code | `scheduler.py`'s `epics.status` (K3) |
-| Database triggers | a new migration, which the RSI cycle applies automatically (C-4) |
+**Assessment: C's three options are not enough on their own, but the structural fix does not wait on research.**
 
-Freezing every channel freezes half the system, which is K8's failure mode taken further. Freezing none leaves the commit's sentence ("decides only from what its inputs hand it") true only in a narrow, syntactic sense.
+1. **Ship now, inside Win 2's docs:** in SAFETY.md §PromotionGate (C-17), say "noise guard, not a
+   generalization guard". That is C's option 3, and it is the honest description of what merges.
+2. **Ship with the harvest:** certify on probes the proposer never gets feedback from. Today the leak is
+   concrete. `evaluate_gate` names regressed probe ids in its rationale (`apply.py:506-507`, E-12), and the
+   rationale is persisted and readable (`apply.py:1502`). Gate probes guide the search; `holdout: true` probes
+   (never scored by apply, per C) *certify*, and their per-probe outcomes stay out of every rationale. With
+   `probe_set_hash` on each row (Win 4), rotation becomes auditable. Rotation stays sound only with disjoint
+   per-epoch α shares (§1.1 item 3). C's worry about R5 epochs is resolved by tying the epoch to the rotation
+   *and* to a halving α share.
+3. **Research still needed:** how much the 1-bit-per-test decision channel leaks at this probe-set size. The runbook's null calibration
+   (D cites §4.1) is the right instrument. Run the real optimizer against a placebo directive generator on a
+   frozen set and count certifications. Reusable-holdout results suggest leakage grows roughly like `√(k/n)` in
+   the number of looks, so at n=14 and hundreds of tests it is not negligible. Do not move `α` defaults until
+   that number exists.
 
-**Assessment: the proposed mitigations are necessary but not sufficient, and this needs research, not just engineering.**
-
-- **The import-closure test (A-R1 / E-2)** is a cheap, deterministic **tripwire**. Ship it (Bundle R), but treat it as a drift alarm, not a soundness proof.
-- **Writer provenance (A-R8)** closes the database-row channel properly, but only if row-writing goes through frozen writers, and that is the K8 extraction work again.
-- **A decision-replay corpus** (A-§7: replay a held-out set of failures through the live `diagnose → gather_inputs → decide` path on every merge) catches steering through *any* channel, but only on the cases in the corpus.
-  - The corpus then has to be frozen too. The repo already does this for the code-fix probes (`config/kernel-frozen.yaml:51-55`).
-  - That makes this the strongest candidate for a secure-tier mitigation.
-
-**Proposed research.** Run a seeded red-team RSI campaign whose objective rewards fix-epic throughput. Count how many of the five channels above each defense catches: closure test, replay corpus, provenance, and server-side enforcement (A-R7). The repo's verification stack already names a "gate hackability" operator (`docs/architecture/verification-stack.md`, per `CLAUDE.md`). Whether it can drive this experiment was not checked; that is its natural home. Until the experiment runs, rank the defenses as **replay corpus + server-side enforcement > provenance > import closure**, and do not let a green closure test be read as "the policy cannot be steered".
+A second question, close behind: D-3 and D-16 show that the **cost pressure this feature creates pushes toward
+changes that silently void its null**. Any future probe-cost optimization should carry a written validity
+argument in the PR, the way `promotion_certificate.py:10-16` does.
 
 ---
 
 ## Section 6: Dogfood reflection
 
-**Was the audit reproducible through the framework?** Partly.
-
-- **The plan was a fallback.** The planner's output was invalid JSON, so mini-ork generated a deterministic recipe plan. This is a degradation in the coordination layer before dispatch (lesson **`[t:th-5a29ee8386e1]`**). It did not break this run, because the recipe workflow drove the dispatch, but a re-run is not guaranteed to get a plan written by the model.
-- **The kickoff file is not durable.** It lives under `/private/tmp/claude-501/…/scratchpad/review/`, a temporary scratchpad. The audit cannot be reproduced once that directory is cleaned.
-- **The test receipt depends on the interpreter.** The lane's default `python3` is 3.9.23, and on it the same test files give 15 false failures. A lens that ran tests on the lane default would have reported the diff as broken. A's "46 passed" holds only on Python 3.11 or newer.
-
-**Did lens-level success mean grounded findings?** No.
-
-- All five lenses finished, but **two were mechanically wrong about the only 5-of-5 finding (K1)**. B-11 said "not a hole" and E-1 described a reachability condition the code does not have. Neither noticed that the fallback's `parse_frozen_paths` returns `[]`.
-- This repeats **`[t:th-65a39d1b0e3c]`** (a node that finished is not evidence the run's goal was met) and **`[t:th-acd129ae2eed]`** (a lens artifact is not automatically a grounded assessment).
-- The downstream `lens_completeness` verifier checks that every lens produced an artifact, not that the artifacts are correct. Per **`[t:th-7d2e92b2ce92]`**, its pass must not be read as a correctness gate.
-- This synthesis is the single auditable artifact that **`[t:th-1e42cc51c68c]`** requires.
-
-**Recipe gap the synthesis exposed.** The synthesizer is told to read only `panel_reports`, but settling the K1 and C-5 contradictions required reading `static-check.py:53-81` and `merge_risk.py:150-191`. This synthesis read the diff and its direct callers read-only, within constraint `[c:1]`, and says so openly. The recipe should either declare the diff plus direct callers as a synthesizer input, or add a "verify contradictions" node between `anonymize_panel` and `synthesizer`.
-
-**Did any lens get blocked by something the audit itself found?** No lens was blocked; all were read-only. **The fixes are blocked, by design.**
-- P1 #1 edits `static-check.py`. That file is frozen, and its own guard is never unlocked by the token for auto-triage runs (`static-check.py` `_frozen_kernel_guard`: "The ALLOW token can NEVER unlock this check").
-- P1 #4 and #5 edit files this diff freezes (`graph_patch.py`, `diagnoser_llm.py`, `diagnose.py`).
-- P1 #2 and #3 edit frozen files (`config/kernel-frozen.yaml`, `repo_integrity_guard.py`) or high-tier files (`config/risk-tiers.yaml`).
-- So **the autopilot cannot dispatch any of the top-5 fixes**. That is the frozen kernel working as intended, and the loop closes correctly.
-
-**S-1, the synthesizer's own finding.** A read-only query on the live `/Volumes/docker-ssd/ps/mini-ork/.mini-ork/state.db` found two **open** `safety_events` rows:
-- `frozen-kernel-edit` (high, id `40c9bde8…`) and `frozen-kernel-override` (medium, id `f02851bf…`);
-- both with evidence `{"run_id": "", "paths": ["mini_ork/recovery/supervisor.py"], "boundary": "publish"}`;
-- both at ts `1793106641`, which is 2026-10-27 14:10:41 +0100, **25 minutes before** this commit's author time of 14:36:03.
-
-This is exactly the refuse-then-override fixture in `tests/unit/test_frozen_kernel_policy_inputs.py:120-157`. The likely cause is that the change's development run executed an early version of the test against the live database. The current test isolates the database (`:124-125`), and this synthesis's own test runs wrote nothing to the live database (checked by timestamp).
-- **Effect:** the two rows inflate the open-event count on the verify page (`mini_ork/ide_pages/verify.py:590-591`), and they show D-6's empty-`run_id` shape.
-- **Action (operator, not this lane):** resolve both rows with a note. The cause is attributed with moderate confidence, not proven.
+- **Reproducible via the framework: yes, partially.** The refactor-audit recipe dispatched all five lenses,
+  the anonymize transform, and this synthesizer. The planner LLM, however, emitted invalid JSON, and the run went
+  ahead on mini-ork's **deterministic fallback plan** (plan `assumptions[1]`). The recipe is reproducible; the
+  planner step is not.
+- **Did a lens get blocked by something this audit found? No, but the meta-loop is closed the wrong way.**
+  With `MO_APPLY_CERTIFICATE=1` at shipped settings, *no* recipe can promote, and that includes improvements to
+  this recipe's own prompts. Recipes without probes get `no per-task vectors` → quarantine (D-6 receipt). The
+  feature under audit would freeze the loop that improves the auditor.
+- **Lesson check.** No `[f:…]` ids were supplied in this run's context, so no f-id is repeated. The closest
+  supplied lesson is **[t:th-7d2e92b2ce92] (vacuous verifier verdict)**, and the change repeats its shape: the
+  commit's green suite (54 passed, per B and C) is *vacuous* for the feature's headline claim. Every test fabricates 12-probe
+  vectors (`tests/…:211`, `:336-338`, `:612-614`), and none exercises the shipped cap of 2 (A-4, B-10, D, E-16).
+  [t:th-65a39d1b0e3c] applies to this run too: five lens "successes" are not a synthesis, which is why
+  §1.1 exists.
+- **Grounding ([t:th-acd129ae2eed]).** B and C report running the test file (54 passed). D reports executed
+  receipts against a throwaway DB. E shows grep and REPL evidence. A cites greps. Per the input manifest, this
+  synthesizer read only the anonymized panel and re-executed nothing. I re-derived the load-bearing arithmetic by hand:
+  `1.75² = 3.0625`, `1.75⁷ ≈ 50.3 ≥ 40`, `1.75¹⁴ ≈ 2527 < 20·11·12 = 2640`, so exactly 10 certifiable slots
+  at n=14, which agrees with D-4. I resolved factual conflicts from quoted code (§1.1 items 9–11).
+- **Scope leaks.** D's cost section (D-3, D-8, D-12, D-16) and E-10 audit code outside the diff and its
+  direct callers, against kickoff constraint c:1. They are useful, but they belong in Bundle D, not in this merge's verdict.
+  Two of them (D-3, D-16) would have broken the certificate if adopted. That is the cost of a lens without a file allowlist.
 
 ---
 
 ## Section 7: How to re-run
 
 ```bash
-# 1. Re-run the audit from the engine checkout.
-#    First copy the kickoff somewhere durable: the /private/tmp scratchpad is temporary (§6).
+# From the main checkout; the review worktree must sit at 4ff3a0aa.
 cd /Volumes/docker-ssd/ps/mini-ork
-bin/mini-ork run refactor-audit \
-  /private/tmp/claude-501/-Volumes-docker-ssd-Migration-Development-researcher/69c08fc2-54d1-4754-ba39-2d8679676baf/scratchpad/review/kickoff-t1-kernel-hole-3.md
-#    The synthesis lands at .mini-ork/runs/<run_id>/synthesis.md (recipes/refactor-audit/README.md:76-82).
+env -u MO_APPLY_CERTIFICATE -u MO_AUTO_APPLY \
+  bin/mini-ork run refactor-audit \
+  /private/tmp/claude-501/-Volumes-docker-ssd-Migration-Development-researcher/69c08fc2-54d1-4754-ba39-2d8679676baf/scratchpad/review/kickoff-t1-certificate.md
+# → .mini-ork/runs/<run_id>/synthesis.md
 
-# 2. Re-check the test receipt. Needs Python >= 3.11: the lane's default 3.9 gives 15 false failures.
-cd /Volumes/docker-ssd/ps/mini-ork-worktrees/review-t1-kernel-hole-3
-T=$(mktemp -d)
-MINI_ORK_HOME="$T/home" MINI_ORK_DB="$T/state.db" PYTHONDONTWRITEBYTECODE=1 \
-  python3.12 -m pytest -q -p no:cacheprovider \
-    tests/unit/test_frozen_kernel_policy_inputs.py \
-    tests/unit/test_frozen_kernel.py \
-    tests/unit/test_repo_integrity_guard_py.py      # expect: 46 passed
-
-# 3. Re-check the two contradiction rulings.
-sed -n 53,81p   recipes/framework-edit/verifiers/static-check.py   # K1: fallback parse_frozen_paths -> []
-sed -n 150,174p mini_ork/gates/merge_risk.py                        # C-5: origin/main is read first
+# Ground truth the panel ran (read-only):
+python3 -m pytest -q /Volumes/docker-ssd/ps/mini-ork-worktrees/review-t1-certificate/tests/unit/test_promotion_certificate.py
 ```
 
-**Does any P1 block self-dispatch?**
-- **Of the audit:** no. `refactor-audit` is read-only and touches no frozen path.
-- **Of the fixes:** yes, explicitly. **P1 #1 (K1) blocks self-dispatch of itself**: an `origin=auto-triage` framework-edit run that touches `recipes/framework-edit/verifiers/static-check.py` is refused, and the token cannot override that. P1 #2, #4 and #5 touch frozen paths, and #3 touches a high-tier path.
-
-All five must ship as **human-authored** framework-edit kickoffs, with no auto-triage marker. Use a worktree (`make worktree SLUG=…`), set `MO_ALLOW_FROZEN_EDIT=1` at publish, and get a person's approval at merge (`mini_ork/gates/merge_risk.py:333-345`).
+- **No P1 blocks self-dispatch.** The certificate sits only on the apply path and is off by default. Unset
+  `MO_APPLY_CERTIFICATE` and `MO_AUTO_APPLY` anyway. Otherwise the post-run `auto_sweep` (`execute.py:2175-2179`)
+  spends α slots as a side effect of running the audit, and under the infra-failure finding (Win 3) a busy DB
+  turns those into sticky quarantines.
+- **Reproducibility gap:** the kickoff lives in a `/private/tmp` scratchpad. Persist it in the repo, or this
+  command stops working after the next reboot.
+- **Planner fallback:** expect the same "invalid JSON → deterministic recipe plan" path. The output is
+  equivalent, but the planner lane's failure is unaddressed.
