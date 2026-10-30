@@ -1,0 +1,32 @@
+{
+  "base_sha": "c6b0f6302d046c8c4b383140d89fbcbe7fb3036a",
+  "fail_to_pass": [
+    "tests.test_web_smoke::test_load_transcript_strips_z_insight_blocks"
+  ],
+  "fix_sha": "ccda47b4940ef33fc043b8a2d389784cc0df8375",
+  "pass_to_pass": [
+    "tests.test_web_smoke::test_active_runs_includes_unfinished_task_runs",
+    "tests.test_web_smoke::test_fingerprint_recursive_self_improve",
+    "tests.test_web_smoke::test_load_transcript_falls_back_to_output_artifact",
+    "tests.test_web_smoke::test_load_transcript_prefers_stable_agent_sidecar"
+  ],
+  "provenance": {
+    "baseline_outcome": 1.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "solved",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-ccda47b494-1790694360",
+      "heldout-mo-ccda47b494-1790695182",
+      "heldout-mo-ccda47b494-1790701118"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-ccda47b494"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/test_web_smoke.py"
+  ]
+}

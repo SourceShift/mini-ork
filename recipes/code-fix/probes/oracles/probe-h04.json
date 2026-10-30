@@ -1,0 +1,38 @@
+{
+  "base_sha": "f0c1029e44418b2162f97d1dcc69d541baa5e645",
+  "fail_to_pass": [
+    "tests.unit.test_promotion_gate_py::test_evidence_run_ids_drops_null_and_blank",
+    "tests.unit.test_promotion_gate_py::test_promotion_evaluate_no_benchmark",
+    "tests.unit.test_promotion_gate_py::test_promotion_evaluate_persisted_row",
+    "tests.unit.test_promotion_gate_py::test_promotion_floor_can_be_raised",
+    "tests.unit.test_promotion_gate_py::test_promotion_floor_cannot_be_lowered",
+    "tests.unit.test_promotion_gate_py::test_promotion_rejects_evidence_from_a_single_run"
+  ],
+  "fix_sha": "1d25b0927d1b9ab0ba7a00063dc6368228b6db5b",
+  "pass_to_pass": [
+    "tests.unit.test_promotion_gate_py::test_mo_promote_synthesis_gate_all_conditions_met",
+    "tests.unit.test_promotion_gate_py::test_mo_promote_synthesis_gate_bypass",
+    "tests.unit.test_promotion_gate_py::test_mo_promote_synthesis_gate_rejections",
+    "tests.unit.test_promotion_gate_py::test_promotion_approve_no_pending",
+    "tests.unit.test_promotion_gate_py::test_promotion_approve_round_trip",
+    "tests.unit.test_promotion_gate_py::test_promotion_evaluate_missing_arg_error"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "change/R4/verdict",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-1d25b0927d-1790709728",
+      "heldout-mo-1d25b0927d-1790726023"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-1d25b0927d"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_promotion_gate_py.py"
+  ]
+}

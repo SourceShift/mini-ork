@@ -1,0 +1,60 @@
+{
+  "base_sha": "1ade82901badd295d05552fff64278400da81621",
+  "fail_to_pass": [
+    "tests.unit.test_cli_apply_py::test_launch_run_scrubs_run_scoped_env"
+  ],
+  "fix_sha": "0b2d30cfc9e6fa9f7e4c00e176d7cb737227eeec",
+  "pass_to_pass": [
+    "tests.unit.test_cli_apply_py::test_apply_is_native_in_dispatcher",
+    "tests.unit.test_cli_apply_py::test_apply_mutation_append_idempotent",
+    "tests.unit.test_cli_apply_py::test_apply_mutation_replace_mode_restores_whole_file",
+    "tests.unit.test_cli_apply_py::test_apply_run_dry_run_promote_writes_no_file",
+    "tests.unit.test_cli_apply_py::test_apply_run_enabled_rewrites_file_and_registers_version",
+    "tests.unit.test_cli_apply_py::test_apply_run_forced_regression_quarantines",
+    "tests.unit.test_cli_apply_py::test_apply_run_launch_failure_is_caught_not_fatal",
+    "tests.unit.test_cli_apply_py::test_apply_run_no_candidate",
+    "tests.unit.test_cli_apply_py::test_apply_run_probe_dead_arms_refuse_promote",
+    "tests.unit.test_cli_apply_py::test_apply_run_probe_no_probe_set_never_promotes",
+    "tests.unit.test_cli_apply_py::test_apply_run_probe_regression_quarantines",
+    "tests.unit.test_cli_apply_py::test_apply_run_probe_vetted_promote_without_unvetted",
+    "tests.unit.test_cli_apply_py::test_apply_run_refuses_unvetted_promote_by_default",
+    "tests.unit.test_cli_apply_py::test_auto_sweep_no_recipe_skips",
+    "tests.unit.test_cli_apply_py::test_auto_sweep_top1_per_target_through_gate",
+    "tests.unit.test_cli_apply_py::test_cli_help_and_usage_errors",
+    "tests.unit.test_cli_apply_py::test_cli_main_end_to_end_no_candidate",
+    "tests.unit.test_cli_apply_py::test_edit_memory_never_reproposes_failed_directive",
+    "tests.unit.test_cli_apply_py::test_evaluate_gate_human_approval_override",
+    "tests.unit.test_cli_apply_py::test_evaluate_gate_pertask_no_regression",
+    "tests.unit.test_cli_apply_py::test_evaluate_gate_scalar_paths",
+    "tests.unit.test_cli_apply_py::test_module_invocation_help",
+    "tests.unit.test_cli_apply_py::test_pick_candidate_gradient_filters_by_target",
+    "tests.unit.test_cli_apply_py::test_pick_candidate_gradient_last_resort",
+    "tests.unit.test_cli_apply_py::test_pick_candidate_pattern_records_priority",
+    "tests.unit.test_cli_apply_py::test_pick_candidate_skips_promoted_and_falls_to_emergent",
+    "tests.unit.test_cli_apply_py::test_post_run_learning_auto_apply_wiring",
+    "tests.unit.test_cli_apply_py::test_probe_scorer_absolute_target_lands_in_temp_copy",
+    "tests.unit.test_cli_apply_py::test_probe_scorer_budget_zero_truncates_to_nothing",
+    "tests.unit.test_cli_apply_py::test_probe_scorer_missing_directive_or_target_returns_none",
+    "tests.unit.test_cli_apply_py::test_probe_scorer_no_probes_returns_none",
+    "tests.unit.test_cli_apply_py::test_probe_scorer_two_arms_vectors_and_cleanup",
+    "tests.unit.test_cli_apply_py::test_run_id_from_stdout_sink_and_fallback",
+    "tests.unit.test_cli_apply_py::test_score_candidate_mock_deterministic"
+  ],
+  "provenance": {
+    "baseline_outcome": 1.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "solved",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-0b2d30cfc9-1790707501"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-0b2d30cfc9"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_cli_apply_py.py"
+  ]
+}

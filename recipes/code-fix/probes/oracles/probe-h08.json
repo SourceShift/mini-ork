@@ -1,0 +1,32 @@
+{
+  "base_sha": "e865bf3c87ac5b44c4b49d2ec259dd0bfa151dc6",
+  "fail_to_pass": [
+    "tests.unit.test_mini_ork_self_improve_py::test_restore_root_surface_leak"
+  ],
+  "fix_sha": "2c13681b73256aed19164fdb16ec0b2664577e2b",
+  "pass_to_pass": [
+    "tests.unit.test_mini_ork_self_improve_py::test_decide_outcome",
+    "tests.unit.test_mini_ork_self_improve_py::test_help_unknown_badcaps",
+    "tests.unit.test_mini_ork_self_improve_py::test_promote_synthesis",
+    "tests.unit.test_mini_ork_self_improve_py::test_record_run",
+    "tests.unit.test_mini_ork_self_improve_py::test_record_success",
+    "tests.unit.test_mini_ork_self_improve_py::test_seconds_to_hms"
+  ],
+  "provenance": {
+    "baseline_outcome": 1.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "solved",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-2c13681b73-1790705835"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-2c13681b73"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_mini_ork_self_improve_py.py"
+  ]
+}

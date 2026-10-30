@@ -1,0 +1,37 @@
+{
+  "base_sha": "3814461738caa7df278558fd8ac5dc29de902e76",
+  "fail_to_pass": [
+    "tests.unit.test_workspace_env::test_run_contract_keys_survive_a_second_filter_pass",
+    "tests.unit.test_workspace_env::test_run_contract_keys_survive_alongside_ambient_keys",
+    "tests.unit.test_workspace_env::test_run_contract_match_is_case_insensitive"
+  ],
+  "fix_sha": "a5ad5a42ad6bef965a39df62dcc6e165ed8c8ab1",
+  "pass_to_pass": [
+    "tests.unit.test_workspace_env::test_api_key_suffix_catches_unknown_provider",
+    "tests.unit.test_workspace_env::test_api_key_suffix_does_not_match_aws",
+    "tests.unit.test_workspace_env::test_both_backends_share_one_policy_object",
+    "tests.unit.test_workspace_env::test_case_insensitive_on_key_name",
+    "tests.unit.test_workspace_env::test_drops_host_shell_identity",
+    "tests.unit.test_workspace_env::test_drops_unrelated_host_secrets",
+    "tests.unit.test_workspace_env::test_forwards_harness_and_provider_keys",
+    "tests.unit.test_workspace_env::test_public_and_underscore_aliases_are_the_same_object",
+    "tests.unit.test_workspace_env::test_run_contract_exception_is_exact_name_not_the_whole_namespace"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "provider/R6/implementer",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-a5ad5a42ad-1790727458"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-a5ad5a42ad"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_workspace_env.py"
+  ]
+}

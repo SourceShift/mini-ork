@@ -1,0 +1,61 @@
+{
+  "base_sha": "72dab0f6bca40de94efac5acf562972ca5a6bbb8",
+  "fail_to_pass": [
+    "tests.unit.test_goal_loop_driver::test_default_run_wave_cost_delta_clamps_nonpositive",
+    "tests.unit.test_goal_loop_driver::test_default_run_wave_records_real_cost_delta"
+  ],
+  "fix_sha": "c1a0826c53a0944c8a48283423a666436d5f1dde",
+  "pass_to_pass": [
+    "tests.unit.test_goal_loop_driver::test_absent_env_keeps_historical_defaults",
+    "tests.unit.test_goal_loop_driver::test_autoraise_flag_off_leaves_daily_budget_untouched",
+    "tests.unit.test_goal_loop_driver::test_autoraise_lifts_daily_budget_when_progress_predicted",
+    "tests.unit.test_goal_loop_driver::test_autoraise_starvation_aware_does_not_stop_on_unfunded_flat",
+    "tests.unit.test_goal_loop_driver::test_autoraise_stops_at_cap_even_when_progress_predicted",
+    "tests.unit.test_goal_loop_driver::test_autoraise_stops_when_funded_waves_flat",
+    "tests.unit.test_goal_loop_driver::test_book_loop_diverges_when_truly_stuck",
+    "tests.unit.test_goal_loop_driver::test_book_loop_does_not_diverge_at_wave_two",
+    "tests.unit.test_goal_loop_driver::test_budget_stops_before_wave_three",
+    "tests.unit.test_goal_loop_driver::test_cli_max_waves_flag_reaches_the_driver",
+    "tests.unit.test_goal_loop_driver::test_default_run_wave_exports_quarantine_to_recipe",
+    "tests.unit.test_goal_loop_driver::test_default_run_wave_fn_falls_back_to_child_kickoff",
+    "tests.unit.test_goal_loop_driver::test_default_run_wave_fn_prefers_wave_kickoff",
+    "tests.unit.test_goal_loop_driver::test_default_run_wave_fn_raises_when_both_kickoffs_unset",
+    "tests.unit.test_goal_loop_driver::test_default_spawn_fn_evidence_falls_back_to_reason",
+    "tests.unit.test_goal_loop_driver::test_default_spawn_fn_passthrough_for_template_without_placeholders",
+    "tests.unit.test_goal_loop_driver::test_default_spawn_fn_templating_for_inline_body",
+    "tests.unit.test_goal_loop_driver::test_default_spawn_fn_templating_substitutes_evidence",
+    "tests.unit.test_goal_loop_driver::test_default_spawn_fn_templating_substitutes_unit_and_reason",
+    "tests.unit.test_goal_loop_driver::test_diverged_regressing_two_waves",
+    "tests.unit.test_goal_loop_driver::test_diverged_same_signature_two_waves",
+    "tests.unit.test_goal_loop_driver::test_divergence_patience_window",
+    "tests.unit.test_goal_loop_driver::test_drive_reads_declared_budget_from_env",
+    "tests.unit.test_goal_loop_driver::test_drive_reads_declared_max_iterations_from_env",
+    "tests.unit.test_goal_loop_driver::test_empty_env_value_is_treated_as_absent",
+    "tests.unit.test_goal_loop_driver::test_explicit_argument_beats_declared_env",
+    "tests.unit.test_goal_loop_driver::test_goal_met_on_wave_two",
+    "tests.unit.test_goal_loop_driver::test_malformed_declared_value_fails_loud",
+    "tests.unit.test_goal_loop_driver::test_pending_units_dont_trip_all_quarantined",
+    "tests.unit.test_goal_loop_driver::test_quarantine_excludes_unit_after_two_identical_hashes",
+    "tests.unit.test_goal_loop_driver::test_reason_fingerprint_strips_volatile_counters",
+    "tests.unit.test_goal_loop_driver::test_record_wave_scopes_hash_to_attempted",
+    "tests.unit.test_goal_loop_driver::test_sweep_dry_run_records_planned_spawns",
+    "tests.unit.test_goal_loop_driver::test_sweep_dry_run_uses_default_spawn_fn_under_env",
+    "tests.unit.test_goal_loop_driver::test_sweep_run_deferred_on_value_error",
+    "tests.unit.test_goal_loop_driver::test_wave_signature_reasons_distinguish_moved_failure"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "unmeasured-failure",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [],
+    "source": "heldout-mined",
+    "task_id": "mo-c1a0826c53"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_goal_loop_driver.py"
+  ]
+}

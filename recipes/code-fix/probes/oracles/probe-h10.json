@@ -1,0 +1,56 @@
+{
+  "base_sha": "b98939a4062aa4beea6690d5f609dda8c5a51abb",
+  "fail_to_pass": [
+    "tests.unit.test_goal_loop_recipe::test_terminal_fail_worker_exhausted_idle_is_terminal"
+  ],
+  "fix_sha": "36f79ec7ab6d289fc9b4ac0ae215ed7cd768ade1",
+  "pass_to_pass": [
+    "tests.unit.test_goal_loop_recipe::test_apply_armed_requires_deploy_and_redispatch_cmds",
+    "tests.unit.test_goal_loop_recipe::test_apply_disabled_is_noop_passthrough",
+    "tests.unit.test_goal_loop_recipe::test_apply_dry_records_plan_without_executing",
+    "tests.unit.test_goal_loop_recipe::test_apply_live_deploys_redispatches_with_argv_and_awaits",
+    "tests.unit.test_goal_loop_recipe::test_apply_live_failed_status_still_deploys_and_await_gives_up",
+    "tests.unit.test_goal_loop_recipe::test_apply_live_terminal_fail_cmd_gives_up_fast",
+    "tests.unit.test_goal_loop_recipe::test_apply_live_terminal_fail_cmd_unset_is_backward_compatible",
+    "tests.unit.test_goal_loop_recipe::test_apply_live_terminal_pass_beats_fail",
+    "tests.unit.test_goal_loop_recipe::test_evaluate_units_classifies_pass_and_fail",
+    "tests.unit.test_goal_loop_recipe::test_goal_check_handles_zero_units",
+    "tests.unit.test_goal_loop_recipe::test_goal_check_writes_fail_with_failing_units",
+    "tests.unit.test_goal_loop_recipe::test_goal_check_writes_pass_when_zero_failing",
+    "tests.unit.test_goal_loop_recipe::test_harvest_evidence_appends_stderr",
+    "tests.unit.test_goal_loop_recipe::test_harvest_evidence_captures_full_multiline_output",
+    "tests.unit.test_goal_loop_recipe::test_harvest_evidence_clamps_to_max_chars",
+    "tests.unit.test_goal_loop_recipe::test_harvest_evidence_empty_units_is_empty_dict",
+    "tests.unit.test_goal_loop_recipe::test_harvest_evidence_passes_unit_as_argv_not_shell",
+    "tests.unit.test_goal_loop_recipe::test_harvest_evidence_tolerates_nonzero_exit",
+    "tests.unit.test_goal_loop_recipe::test_harvest_selected_evidence_falls_back_to_reason_when_blank",
+    "tests.unit.test_goal_loop_recipe::test_harvest_selected_evidence_no_run_dir_has_text_empty_path",
+    "tests.unit.test_goal_loop_recipe::test_harvest_selected_evidence_slug_sanitizes_pathlike_unit",
+    "tests.unit.test_goal_loop_recipe::test_harvest_selected_evidence_unset_cmd_is_empty",
+    "tests.unit.test_goal_loop_recipe::test_harvest_selected_evidence_writes_file_and_returns_text",
+    "tests.unit.test_goal_loop_recipe::test_load_recipe_register_is_idempotent",
+    "tests.unit.test_goal_loop_recipe::test_load_recipe_register_returns_true_and_registers_goal_sweep",
+    "tests.unit.test_goal_loop_recipe::test_terminal_fail_failed_but_still_churning_is_not_terminal",
+    "tests.unit.test_goal_loop_recipe::test_terminal_fail_guards_reject_bad_invocation",
+    "tests.unit.test_goal_loop_recipe::test_terminal_fail_newest_run_age",
+    "tests.unit.test_goal_loop_recipe::test_terminal_fail_permfail_always_terminal",
+    "tests.unit.test_goal_loop_recipe::test_workflow_compiles_with_six_edge_chain",
+    "tests.unit.test_goal_loop_recipe::test_workflow_declares_sweep_implementer_node_between_dispatcher_and_check",
+    "tests.unit.test_goal_loop_recipe::test_workflow_yaml_parses_and_validates_recursion"
+  ],
+  "provenance": {
+    "baseline_outcome": 1.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "solved",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [],
+    "source": "heldout-mined",
+    "task_id": "mo-36f79ec7ab"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_goal_loop_recipe.py"
+  ]
+}

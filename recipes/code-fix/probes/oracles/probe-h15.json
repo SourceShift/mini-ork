@@ -1,0 +1,55 @@
+{
+  "base_sha": "53a8257643633e299c6811f53224be5659d1c1cd",
+  "fail_to_pass": [
+    "tests.test_web_smoke::test_project_home_resolution_is_idempotent"
+  ],
+  "fix_sha": "2ccbbd51259c8525165138327bd8520a2a6f70af",
+  "pass_to_pass": [
+    "tests.test_web_smoke::test_active_runs_includes_unfinished_task_runs",
+    "tests.test_web_smoke::test_agents_endpoint_legacy_null_snapshot_uses_fallback",
+    "tests.test_web_smoke::test_agents_endpoint_prefers_dispatch_config_snapshot",
+    "tests.test_web_smoke::test_agents_yaml_has_capabilities_section",
+    "tests.test_web_smoke::test_auth_require_token_accepts_valid_token",
+    "tests.test_web_smoke::test_auth_require_token_rejects_missing_header",
+    "tests.test_web_smoke::test_cache_cost_components_sum_to_cost_usd",
+    "tests.test_web_smoke::test_capability_check_fails_when_family_missing_one",
+    "tests.test_web_smoke::test_capability_check_passes_when_family_supports_all",
+    "tests.test_web_smoke::test_dispatch_config_snapshot_columns_exist",
+    "tests.test_web_smoke::test_error_category_column_exists",
+    "tests.test_web_smoke::test_fingerprint_recursive_self_improve",
+    "tests.test_web_smoke::test_finish_reason_column_exists",
+    "tests.test_web_smoke::test_lane_fuse_ignores_nonretryable_failures",
+    "tests.test_web_smoke::test_lane_fuse_trips_after_three_retryable_failures",
+    "tests.test_web_smoke::test_legacy_rows_with_zero_cache_still_query",
+    "tests.test_web_smoke::test_llm_calls_cache_columns_exist",
+    "tests.test_web_smoke::test_llm_calls_route_tolerates_null_taxonomy_columns",
+    "tests.test_web_smoke::test_llm_dispatch_classifies_invalid_api_key_as_auth",
+    "tests.test_web_smoke::test_load_transcript_falls_back_to_output_artifact",
+    "tests.test_web_smoke::test_load_transcript_prefers_stable_agent_sidecar",
+    "tests.test_web_smoke::test_load_transcript_strips_z_insight_blocks",
+    "tests.test_web_smoke::test_node_heartbeat_fuse_columns_exist",
+    "tests.test_web_smoke::test_pause_cost_rejects_missing_run",
+    "tests.test_web_smoke::test_pause_cost_writes_sentinel",
+    "tests.test_web_smoke::test_profile_answerer_has_one_native_owner",
+    "tests.test_web_smoke::test_python_plan_references_native_auto_answer",
+    "tests.test_web_smoke::test_resume_cost_clears_sentinel_and_audits",
+    "tests.test_web_smoke::test_resume_cost_without_sentinel_returns_error"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "change/R5/test",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-2ccbbd5125-1790705279"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-2ccbbd5125"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/test_web_smoke.py"
+  ]
+}

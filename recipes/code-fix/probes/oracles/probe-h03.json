@@ -1,0 +1,50 @@
+{
+  "base_sha": "1d25b0927d1b9ab0ba7a00063dc6368228b6db5b",
+  "fail_to_pass": [
+    "tests.unit.test_cw_por_fail_closed::test_compute_error_does_not_pass",
+    "tests.unit.test_cw_por_fail_closed::test_fail_open_names_are_gone[default_passed]",
+    "tests.unit.test_cw_por_fail_closed::test_fail_open_names_are_gone[indeterminate_default_passed]",
+    "tests.unit.test_cw_por_fail_closed::test_gate_rejects_when_checker_unavailable",
+    "tests.unit.test_cw_por_fail_closed::test_gate_rejects_when_compute_raises",
+    "tests.unit.test_cw_por_fail_closed::test_gate_rejects_when_no_ground_truth",
+    "tests.unit.test_cw_por_fail_closed::test_import_failure_does_not_pass",
+    "tests.unit.test_cw_por_fail_closed::test_indeterminate_verdict_does_not_pass"
+  ],
+  "fix_sha": "069c1e4704da4491ca96b8318911303b7b6cd46a",
+  "pass_to_pass": [
+    "tests.unit.test_cw_por_fail_closed::test_authority_capture_still_fails",
+    "tests.unit.test_cw_por_fail_closed::test_gate_still_passes_a_healthy_panel",
+    "tests.unit.test_cw_por_fail_closed::test_gate_still_rejects_authority_capture",
+    "tests.unit.test_cw_por_fail_closed::test_healthy_panel_passes",
+    "tests.unit.test_promotion_gate_py::test_evidence_run_ids_drops_null_and_blank",
+    "tests.unit.test_promotion_gate_py::test_mo_promote_synthesis_gate_all_conditions_met",
+    "tests.unit.test_promotion_gate_py::test_mo_promote_synthesis_gate_bypass",
+    "tests.unit.test_promotion_gate_py::test_mo_promote_synthesis_gate_rejections",
+    "tests.unit.test_promotion_gate_py::test_promotion_approve_no_pending",
+    "tests.unit.test_promotion_gate_py::test_promotion_approve_round_trip",
+    "tests.unit.test_promotion_gate_py::test_promotion_evaluate_missing_arg_error",
+    "tests.unit.test_promotion_gate_py::test_promotion_evaluate_no_benchmark",
+    "tests.unit.test_promotion_gate_py::test_promotion_evaluate_persisted_row",
+    "tests.unit.test_promotion_gate_py::test_promotion_floor_can_be_raised",
+    "tests.unit.test_promotion_gate_py::test_promotion_floor_cannot_be_lowered",
+    "tests.unit.test_promotion_gate_py::test_promotion_rejects_evidence_from_a_single_run"
+  ],
+  "provenance": {
+    "baseline_outcome": 1.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "solved",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-069c1e4704-1790726797"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-069c1e4704"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_cw_por_fail_closed.py",
+    "tests/unit/test_promotion_gate_py.py"
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "base_sha": "b52293d9ff6af4ff15d4a024ee643117ac14cd77",
+  "fail_to_pass": [
+    "tests.unit.test_mini_ork_epics_py::test_prose_dep_resolution_parity",
+    "tests.unit.test_mini_ork_epics_py::test_unresolved_dep_warns_and_skips_parity"
+  ],
+  "fix_sha": "cb7b9ddc2c6a1833e5c8ec63f54b4e1755854f8f",
+  "pass_to_pass": [
+    "tests.unit.test_mini_ork_epics_py::test_ingest_db_parity",
+    "tests.unit.test_mini_ork_epics_py::test_priority_parity",
+    "tests.unit.test_mini_ork_epics_py::test_skip_marker_parity",
+    "tests.unit.test_mini_ork_epics_py::test_split_files_and_kickoff_path_parity"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "change/R4/verdict",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-cb7b9ddc2c-1790701664",
+      "heldout-mo-cb7b9ddc2c-1790710765",
+      "heldout-mo-cb7b9ddc2c-1790712534"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-cb7b9ddc2c"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_mini_ork_epics_py.py"
+  ]
+}

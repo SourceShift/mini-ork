@@ -1,0 +1,29 @@
+{
+  "base_sha": "a6ba0f00809f01bfd333ec972f7faddc8565cac9",
+  "fail_to_pass": [
+    "tests.unit.test_frontier_llm_research_recipe::test_deterministic_verifiers_emit_nonvacuous_pass_envelopes"
+  ],
+  "fix_sha": "710553586def4737c48fd506f596e5d6f7953203",
+  "pass_to_pass": [
+    "tests.unit.test_frontier_llm_research_recipe::test_200_source_fixture_survives_sharding_rollup_and_assembly",
+    "tests.unit.test_frontier_llm_research_recipe::test_collector_identifies_the_mini_ork_client_to_libwit",
+    "tests.unit.test_frontier_llm_research_recipe::test_workflow_has_one_bounded_artifact_handoff_per_summary_shard"
+  ],
+  "provenance": {
+    "baseline_outcome": 1.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "solved",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-710553586d-1790704993"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-710553586d"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_frontier_llm_research_recipe.py"
+  ]
+}
