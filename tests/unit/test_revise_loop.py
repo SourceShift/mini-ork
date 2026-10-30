@@ -89,7 +89,7 @@ if counter:
     except OSError:
         pass
 behavior = os.environ.get("{env}", "pass")
-fail = behavior in ("fail", "fail_toolchain") or (behavior == "fail_first" and n == 0)
+fail = behavior in ("fail", "fail_toolchain") or (behavior == "fail_first" and n == 0) or (behavior == "pass_first" and n >= 1)
 payload = {{"pass": not fail,
             "reasons": ["{name}: synthetic round-0 failure"] if fail else []}}
 if behavior == "fail_toolchain":

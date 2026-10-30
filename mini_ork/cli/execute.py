@@ -1191,6 +1191,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # ``None`` means the recipe declared no block (or there is no workflow file):
     # its `escalates_to` edges stay inert and the declared budget does not apply.
     recursion = None
+    # Imported unconditionally: the wave loop calls it on every wave, including
+    # runs with no workflow file (where ``ever_passed`` simply never matters).
+    from mini_ork.workflow.recursion import regressed_sources
+
     if workflow and os.path.isfile(workflow):
         from mini_ork.workflow import compile_workflow
 
@@ -1420,6 +1424,11 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         fields_by_id = {field[0]: field for field in work_fields}
         # revise round bookkeeping: target node_id -> rounds already consumed.
         round_used: dict[str, int] = {}
+        # Node ids that finished rc 0 in an earlier wave of THIS run. The
+        # recursion regression guard compares each wave's failures against this
+        # pre-wave set (I8a: a repair source that passed before and fails now
+        # stops the loop instead of revising a passing slice).
+        ever_passed: set[str] = set()
         # Rounds-to-pass ledger (rev6 R5b): a recover process starts its
         # in-memory counter at 1, so number rows from the table's offset and a
         # recovered run continues its numbering instead of overwriting it.
@@ -1798,6 +1807,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                         db, run_id,
                         f"spec-test-defect ({_defect_name}): {_defect_text}",
                     )
+            # I8a: identify this wave's regressions against the set of nodes
+            # that passed in EARLIER waves, then fold this wave's passes in.
+            # Order is load-bearing — computing after the update would classify
+            # a source that passed in an earlier wave and fails now as a miss.
+            _regressed_now = set(regressed_sources(
+                ever_passed, [f[0] for f, rc, _fr in outcomes if rc != 0]))
+            ever_passed |= {f[0] for f, rc, _fr in outcomes if rc == 0}
             if revise_groups:
                 for target, failed_sources in revise_groups.items():
                     _target_edge = repair_edges[failed_sources[0][0][0]]
@@ -1809,6 +1825,29 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     _escalation_fired = any(
                         _src_field[0] in escalation_edges
                         for _src_field, _src_rc, _src_fr in failed_sources)
+                    if _escalation_fired and recursion is not None:
+                        _regressed = sorted(
+                            _src_field[0]
+                            for _src_field, _src_rc, _src_fr in failed_sources
+                            if _src_field[0] in _regressed_now)
+                        if _regressed:
+                            print(
+                                f"[revise] recursion regression for {target}: "
+                                f"{', '.join(_regressed)} passed in an earlier "
+                                "round and now fail — stopping the loop instead "
+                                "of revising a passing slice",
+                                file=sys.stderr,
+                            )
+                            from mini_ork.cli.execute_handlers import (  # noqa: PLC0415
+                                _append_run_note,
+                            )
+
+                            _append_run_note(
+                                db, run_id,
+                                f"recursion_regression: {target} "
+                                f"({', '.join(_regressed)})",
+                            )
+                            continue
                     if _escalation_fired and recursion is not None:
                         from mini_ork import cost_ledger as _cost_ledger  # noqa: PLC0415
 

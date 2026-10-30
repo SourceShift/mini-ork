@@ -82,6 +82,15 @@ def _as_float(value: Any, key: str, path: Path) -> float:
     return float(value)
 
 
+def regressed_sources(ever_passed, failed_node_ids) -> list[str]:
+    """Node ids that failed this wave after passing in an EARLIER wave of the same run.
+
+    Pure: no I/O. ``ever_passed`` is the set of node ids that finished rc 0 in any
+    previous wave; ``failed_node_ids`` are this wave's failed repair sources.
+    """
+    return sorted({n for n in failed_node_ids if n in ever_passed})
+
+
 def load_recursion_config(workflow_path: str | Path) -> RecursionConfig | None:
     """Return the workflow's declared recursion config, or ``None`` if it has none.
 
