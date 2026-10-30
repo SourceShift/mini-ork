@@ -376,3 +376,47 @@ def test_warning_text_all_n_failed(repo, state, tmp_path, capsys):
     review_fn, _calls = _review_fn(verdict="approve", lens_rows=FAILED_ROWS)
     _run(repo, env, review_fn)
     assert "no LLM lens ran (all 2 failed)" in capsys.readouterr().out
+
+
+# ── 8. an unreadable lens record is degraded, not clean ────────────────────
+
+
+def _raise_locked(*_args, **_kwargs):
+    """Stand-in for ``_lens_runs`` when the state DB cannot be read."""
+    raise sqlite3.OperationalError("database is locked")
+
+
+def test_all_failed_read_error_is_degraded(monkeypatch, state):
+    monkeypatch.setattr(gate_mod, "_lens_runs", _raise_locked)
+    assert gate_mod._llm_lenses_all_failed(1, state.db) == (True, 0)
+    assert gate_mod._llm_lenses_all_failed(1, state.db, fresh=True) == (True, 0)
+
+
+def test_read_error_review_is_not_cached(monkeypatch, repo, state, tmp_path):
+    home = tmp_path / "home"
+    env = _gate_env(home, state.db)
+    # Every lens row is `ok`; only the *read* fails.
+    review_fn, calls = _review_fn(verdict="approve", lens_rows=OK_ROWS)
+    monkeypatch.setattr(gate_mod, "_lens_runs", _raise_locked)
+
+    first = _run(repo, env, review_fn)
+    assert first.cached is False
+    assert repo.pid not in _read_cache(home)
+
+    second = _run(repo, env, review_fn)
+    assert len(calls) == 2, "an unreadable review must not be reused from the cache"
+    assert second.cached is False
+    assert repo.pid not in _read_cache(home)
+
+
+def test_read_error_secure_tier_blocks(monkeypatch, repo, state, tmp_path):
+    home = tmp_path / "home"
+    env = _gate_env(home, state.db, secure=True)
+    review_fn, _calls = _review_fn(verdict="approve", lens_rows=OK_ROWS)
+    monkeypatch.setattr(gate_mod, "_lens_runs", _raise_locked)
+
+    result = _run(repo, env, review_fn)
+    assert result.rc == 1
+    assert result.verdict == "unavailable"
+    assert result.reason == "secure tier: no LLM lens ran"
+    assert repo.pid not in _read_cache(home)
