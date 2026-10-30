@@ -38,6 +38,15 @@ MAX_SRC_FILES = 12
 DEFAULT_LANDING_REF = "origin/main"
 _SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 KICKOFF_TEST_RE = re.compile(r"(tests/(?:[\w-]+/)*test_\w+\.py)")
+# Files a run dir keeps that ARE (or contain) the change the run made. A probe
+# whose problem statement names such a run hands the arm its answer.
+ANSWER_ARTIFACTS = (
+    "framework-edit.diff", "framework-edit.diff.agent", "review-diff.patch",
+    "review-delta.patch", "salvage.patch",
+)
+# Run-id-shaped tokens: a slug with a run of at least 6 digits in it
+# (`<slug>-YYYYMMDDHHMMSS`, `<slug>-YYYYMMDD-HHMMSS`, `run-<epoch>-<pid>`).
+_RUN_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\d{6,}[A-Za-z0-9_.-]*")
 DEFAULT_MAX_NEW = 12
 MAX_PER_CLUSTER = 6
 HOLDOUT_FRACTION = 0.25
@@ -545,6 +554,26 @@ def _strip_frontmatter(text: str) -> str:
     return text[match.end():] if match else text
 
 
+def answer_pointers(text: str, home: str) -> list[str]:
+    """Run ids named in ``text`` whose ``<home>/runs/<id>/`` holds an answer artifact.
+
+    Sorted and de-duplicated. A token that is not an existing run dir is ignored;
+    a run dir with none of :data:`ANSWER_ARTIFACTS` is not a pointer.
+    """
+    found: set[str] = set()
+    for raw in _RUN_TOKEN.findall(text or ""):
+        token = raw.rstrip(".-_")
+        if token in found:
+            continue
+        run_dir = os.path.join(home, "runs", token)
+        if os.path.isdir(run_dir) and any(
+            os.path.exists(os.path.join(run_dir, name))
+            for name in ANSWER_ARTIFACTS
+        ):
+            found.add(token)
+    return sorted(found)
+
+
 def failed_run_candidates(
     home: str, root: str, *, landing_ref: str = DEFAULT_LANDING_REF
 ) -> tuple[list[dict], list[dict]]:
@@ -555,7 +584,10 @@ def failed_run_candidates(
     ``landing_ref``, the landing commit's first parent is the base and the
     landing commit itself is the fix — a ready-made git oracle. Runs sharing a
     landing commit merge into one candidate. The first rule that fires gives the
-    rejection reason, so the order is load-bearing.
+    rejection reason, so the order is load-bearing (``no-pre-impl-fixture``,
+    ``baseline-unreachable``, ``layer:<name>``, ``kickoff-unrecoverable``,
+    ``no-test-named``, ``test-not-landed``, ``no-parent``,
+    ``landing-too-broad``, then ``answer-pointer``).
     """
     if landing_ref.startswith("-"):
         raise ValueError(f"landing_ref must be a ref, not an option: {landing_ref!r}")
@@ -685,6 +717,11 @@ def failed_run_candidates(
             if blob is not None:
                 text = blob.decode("utf-8", "replace")
         problem_statement = _strip_frontmatter(text)
+
+        pointers = answer_pointers(problem_statement, home)
+        if pointers:
+            reject("answer-pointer")
+            continue
 
         candidate = {
             "task_id": f"fe-{fix_sha[:10]}",
