@@ -61,6 +61,12 @@
         "budget_cap_total_usd": { "type": "number", "minimum": 0 }
       }
     },
+    "review_after_nodes": {
+      "type": "array",
+      "description": "Nodes after which a run parks for operator review (merged into the review policy's after_nodes; MO_REVIEW_RECIPE_NODES=0 disables).",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
     "source_artifact": {
       "type": ["string", "null"],
       "description": "Named final artifact used by publishing or review recipes."

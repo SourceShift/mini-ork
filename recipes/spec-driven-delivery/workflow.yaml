@@ -56,6 +56,11 @@ edges:
 #   "<spec_id>/<deliverable_id>" IDs and stopping when the hash repeats for
 #   two consecutive iterations.
 # per-iteration cap (removed in 2026-10, nothing read it): 15.00
+# Park the run after the contract is compiled so an operator can ratify it
+# before `ratification_check` and before any implementer spends budget.
+# `MO_REVIEW_RECIPE_NODES=0` disables the declared pause for unattended runs.
+review_after_nodes: [contract_compiler]
+
 recursion:
   max_iterations: 6
   budget_cap_total_usd: 100.00

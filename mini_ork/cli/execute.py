@@ -1125,6 +1125,64 @@ def _resolve_task_class(plan_path: str, run_id: str, db: str) -> str:
     return "generic"
 
 
+def _declared_review_nodes(workflow_path, node_names, environ) -> tuple[tuple[str, ...], str]:
+    """``(after_nodes_to_publish, message)`` for a workflow's ``review_after_nodes``.
+
+    ``()`` when the workflow declares none, or when ``MO_REVIEW_RECIPE_NODES=0``
+    (the message says so). A declared name that is not a node of this workflow
+    raises ``ValueError`` (zero-fallback: a typo must not silently drop the
+    pause). Otherwise the result is the review policy's current ``after_nodes``
+    (``load_policy(env=environ)``, so env and ``review.yaml`` still count),
+    followed by the declared nodes, de-duplicated, order preserved.
+    """
+    import yaml
+
+    try:
+        with open(workflow_path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle) or {}
+    except OSError as exc:
+        raise ValueError(f"cannot read workflow at {workflow_path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"workflow at {workflow_path} is not valid YAML: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"workflow at {workflow_path} must be a mapping")
+
+    declared = document.get("review_after_nodes")
+    if declared is None:
+        declared = []
+    elif not isinstance(declared, list):
+        raise ValueError(
+            "review_after_nodes must be a list of node names, got "
+            f"{type(declared).__name__}")
+    for name in declared:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"review_after_nodes entries must be non-empty strings, got {name!r}")
+        if name not in node_names:
+            raise ValueError(
+                f"review_after_nodes names a node not in this workflow: {name!r}")
+
+    if not declared:
+        return (), ""
+
+    raw_knob = environ.get("MO_REVIEW_RECIPE_NODES")
+    if raw_knob is not None and raw_knob.strip() == "0":
+        return (), (
+            "workflow review_after_nodes disabled by MO_REVIEW_RECIPE_NODES=0 "
+            f"({', '.join(declared)})")
+
+    from mini_ork.gates.review_policy import load_policy
+
+    merged: list[str] = []
+    for name in (*load_policy(env=environ).after_nodes, *declared):
+        if name not in merged:
+            merged.append(name)
+    message = (
+        f"{', '.join(declared)} (declared by the workflow; "
+        "MO_REVIEW_RECIPE_NODES=0 disables)")
+    return tuple(merged), message
+
+
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -1216,6 +1274,23 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 "MO_RECURSION_MAX_ITERATIONS": str(recursion.max_iterations),
                 "MO_RECURSION_BUDGET_CAP_TOTAL_USD": f"{recursion.budget_cap_total_usd:.2f}",
             })
+
+        # A recipe may declare its own operator-review pauses. Merge them into
+        # the policy's ``after_nodes`` so the existing node-review machinery
+        # parks the run there. A declared name that is not a node of this
+        # workflow is a fatal setup error: silently dropping the pause would
+        # defeat the gate the recipe asked for.
+        try:
+            review_nodes, review_message = _declared_review_nodes(
+                workflow, set(compiled.nodes), os.environ)
+        except ValueError as exc:
+            sys.stderr.write(f"execute: workflow review_after_nodes: {exc}\n")
+            return 2
+        if review_nodes:
+            publish_env({"MO_REVIEW_AFTER_NODES": ",".join(review_nodes)})
+            sys.stderr.write(f"[review] pausing after: {review_message}\n")
+        elif review_message:
+            sys.stderr.write(f"[review] {review_message}\n")
 
     # One repair map for the round loop: a `retries` edge and an escalated
     # `escalates_to` edge mean the same thing to it -- send the findings back to
