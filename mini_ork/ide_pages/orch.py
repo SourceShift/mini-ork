@@ -619,6 +619,12 @@ def _race_groups(home: Path) -> list[list[dict[str, Any]]]:
                 break
         else:
             races.append([{**c, "_key": key, "_start": start}])
+    # Races stay newest first (the scan order), but a race's contestants are
+    # shown in launch order. The scan is created_at DESC, so without this a
+    # race whose launches straddle a second boundary listed them reversed,
+    # and a same-second tie fell back to SQLite's unspecified row order.
+    for race in races:
+        race.sort(key=lambda c: (c["_start"], str(c["id"])))
     return races
 
 
