@@ -70,6 +70,14 @@ except Exception:                       # pragma: no cover — defensive only
     def runnable_manager(root="."):
         return "pnpm" if shutil.which("pnpm") else ("npm" if shutil.which("npm") else "")
 
+try:
+    # Its own seam: an older mini_ork without classify_suite_spawn must not
+    # knock run_argv/runnable_manager above onto their PATH-guessing fallbacks.
+    from mini_ork.verify.pm import classify_suite_spawn
+except Exception:                       # pragma: no cover — defensive only
+    def classify_suite_spawn(argv, rc, output):  # noqa: ARG001
+        return ""
+
 
 def _child_env(environ=None):
     """Environment for the target repo's type-check command.
@@ -334,7 +342,8 @@ def _tsc_overlay(root: str, files: list[str]) -> str | None:
     return handle.name
 
 
-def _emit(*, passed: bool, reason: str, evidence: str | None, gating: bool) -> None:
+def _emit(*, passed: bool, reason: str, evidence: str | None, gating: bool,
+          failure_kind: str = "") -> None:
     """The verifier's envelope, in the shape the level deriver can read.
 
     ``mini_ork/verify/levels.py::_read_verifier_evidence`` accepts a recipe
@@ -364,6 +373,8 @@ def _emit(*, passed: bool, reason: str, evidence: str | None, gating: bool) -> N
     }
     if not gating:
         payload["status"] = "unverified"
+    if failure_kind and not passed:
+        payload["failure_kind"] = failure_kind
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
 
@@ -444,6 +455,7 @@ def main():
             except OSError:
                 pass
 
+    failure_kind = ""
     if exit_code == 0:
         passed = True
         error_summary = ""
@@ -459,8 +471,15 @@ def main():
                         break
         except OSError:
             pass
+        try:
+            with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                text = f.read(65536)
+        except OSError:
+            text = ""
+        failure_kind = classify_suite_spawn(cmd, exit_code, text)
 
-    _emit(passed=passed, reason=error_summary, evidence=LOG_PATH, gating=True)
+    _emit(passed=passed, reason=error_summary, evidence=LOG_PATH, gating=True,
+          failure_kind=failure_kind)
     return exit_code
 
 

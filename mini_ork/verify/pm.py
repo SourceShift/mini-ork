@@ -207,3 +207,34 @@ def classify_spawn(argv, rc, output):  # noqa: ARG001 — argv is part of the co
         if needle in text:
             return "toolchain"
     return ""
+
+
+# A test or typecheck SUITE log is not a bare spawn: a test that raises
+# FileNotFoundError prints "No such file or directory" while the tool ran fine.
+# Only the unambiguous "the tool never started" signals count for a suite, and only
+# in the head of its log, before any test output.
+_SUITE_SPAWN_FAILURES = (
+    "command not found",
+    "EBADDEVENGINES",
+    "not recognized as an internal or external command",
+    "could not determine executable to run",
+)
+_SUITE_HEAD_LINES = 20
+
+
+def classify_suite_spawn(argv, rc, output):  # noqa: ARG001 — argv mirrors classify_spawn
+    """``"toolchain"`` when a test/typecheck SUITE never started its tool, else ``""``.
+
+    Stricter than :func:`classify_spawn`: the rc rules are the same (127, or killed
+    by a signal), but only :data:`_SUITE_SPAWN_FAILURES` count, and only in the first
+    :data:`_SUITE_HEAD_LINES` lines. ``""`` keeps today's verdict (fail-closed).
+    """
+    if rc == 127:
+        return "toolchain"
+    if isinstance(rc, int) and rc < 0:
+        return "toolchain"
+    head = "\n".join((output or "").splitlines()[:_SUITE_HEAD_LINES])
+    for needle in _SUITE_SPAWN_FAILURES:
+        if needle in head:
+            return "toolchain"
+    return ""
