@@ -1,0 +1,44 @@
+{
+  "base_sha": "b464dd38a4c609dc05483d7a833b507368f1678e",
+  "fail_to_pass": [
+    "tests.unit.test_acp_review_flow::test_agent_inactive_turn_fallback_names_the_node",
+    "tests.unit.test_acp_review_flow::test_agent_review_card_approve_approves_only_named_node",
+    "tests.unit.test_acp_review_flow::test_agent_review_card_approve_resumes_parked_run",
+    "tests.unit.test_acp_review_flow::test_agent_review_card_changes_directs_to_request_changes_command",
+    "tests.unit.test_acp_review_flow::test_agent_review_card_dedupes_one_per_run_node",
+    "tests.unit.test_acp_review_flow::test_agent_review_card_walks_every_pending_node_then_resumes_once",
+    "tests.unit.test_acp_review_flow::test_approve_with_node_approves_and_resumes",
+    "tests.unit.test_acp_review_flow::test_approve_without_node_approves_the_merge",
+    "tests.unit.test_acp_review_flow::test_checkpoints_renders_markdown_table",
+    "tests.unit.test_acp_review_flow::test_commands_register_four_review_commands_in_completion_list",
+    "tests.unit.test_acp_review_flow::test_replay_keeps_locations_without_advancing_live_dedup",
+    "tests.unit.test_acp_review_flow::test_request_changes_rejects_and_retries_from_node",
+    "tests.unit.test_acp_review_flow::test_request_changes_warns_when_steering_emit_fails",
+    "tests.unit.test_acp_review_flow::test_restore_restores_content_and_reports_safety_ref",
+    "tests.unit.test_acp_review_flow::test_restore_unknown_node_refuses_without_touching_worktree",
+    "tests.unit.test_acp_review_flow::test_task_state_reviewing_with_pause_is_needs_you_listing_awaiting_nodes",
+    "tests.unit.test_acp_review_flow::test_task_state_run_mark_parked_for_review_is_needs_you"
+  ],
+  "fix_sha": "f1acdab2446ca2a32c70ee61b6a3af932ea2d7aa",
+  "pass_to_pass": [
+    "tests.unit.test_acp_review_flow::test_agent_review_card_skipped_when_run_not_reviewing",
+    "tests.unit.test_acp_review_flow::test_checkpoints_on_unknown_run_returns_user_readable_text"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "task_runs.status=failed",
+    "cluster": "change/R4/reviewer",
+    "harvested_at": "2026-10-30T23:35:33Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "framework-edit",
+    "run_ids": [
+      "hr-acp-review-20261015172315"
+    ],
+    "source": "failed-run",
+    "task_id": "fe-f1acdab244"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_acp_review_flow.py"
+  ]
+}

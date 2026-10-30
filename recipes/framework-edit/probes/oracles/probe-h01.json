@@ -1,0 +1,52 @@
+{
+  "base_sha": "4d21a384569e85a1f4ec39f39ce4f9ad077c253c",
+  "fail_to_pass": [
+    "tests.unit.test_ide_pages_search::test_a_query_only_reports_progress_while_the_builder_runs",
+    "tests.unit.test_ide_pages_search::test_a_second_builder_exits_at_once",
+    "tests.unit.test_ide_pages_search::test_build_commits_once_per_batch",
+    "tests.unit.test_ide_pages_search::test_build_indexes_everything_and_releases_the_lock",
+    "tests.unit.test_ide_pages_search::test_build_refreshes_stale_runs_too",
+    "tests.unit.test_ide_pages_search::test_ensure_schema_drops_indexed_when_seen_updated_at_missing",
+    "tests.unit.test_ide_pages_search::test_like_fallback_when_fts5_is_unavailable",
+    "tests.unit.test_ide_pages_search::test_no_builder_spawns_while_one_holds_the_lock",
+    "tests.unit.test_ide_pages_search::test_no_state_db_is_an_empty_search",
+    "tests.unit.test_ide_pages_search::test_reindex_budget_with_slow_body_caps_home",
+    "tests.unit.test_ide_pages_search::test_reindex_indexes_main_artifacts",
+    "tests.unit.test_ide_pages_search::test_reindex_on_warm_index_does_not_read_bodies",
+    "tests.unit.test_ide_pages_search::test_reindex_picks_up_a_changed_kickoff",
+    "tests.unit.test_ide_pages_search::test_reindex_picks_up_edit_during_a_backlog",
+    "tests.unit.test_ide_pages_search::test_reindex_picks_up_run_whose_updated_at_advances",
+    "tests.unit.test_ide_pages_search::test_reindex_reindexes_runs_after_cache_wipe",
+    "tests.unit.test_ide_pages_search::test_reindex_respects_max_runs_budget",
+    "tests.unit.test_ide_pages_search::test_reindex_skips_already_indexed_ones",
+    "tests.unit.test_ide_pages_search::test_reindex_spawns_the_builder_only_when_work_remains",
+    "tests.unit.test_ide_pages_search::test_reindex_time_budget_covers_whole_call",
+    "tests.unit.test_ide_pages_search::test_reindex_time_budget_stops_early_and_reports_indexing",
+    "tests.unit.test_ide_pages_search::test_reindex_walks_stale_runs_and_populates_the_fts_table",
+    "tests.unit.test_ide_pages_search::test_search_ands_two_terms",
+    "tests.unit.test_ide_pages_search::test_search_empty_query_returns_zero",
+    "tests.unit.test_ide_pages_search::test_search_pagination",
+    "tests.unit.test_ide_pages_search::test_search_prefix_match",
+    "tests.unit.test_ide_pages_search::test_search_special_chars_are_stripped",
+    "tests.unit.test_ide_pages_search::test_warm_home_indexes_new_runs_on_the_next_call"
+  ],
+  "fix_sha": "2c808e46a9cb9ab7343f472c000c227b5a9d4895",
+  "pass_to_pass": [],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "task_runs.status=failed",
+    "cluster": "change/R4/reviewer",
+    "harvested_at": "2026-10-30T23:35:33Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "framework-edit",
+    "run_ids": [
+      "ide-kickoff-search-20261007091357"
+    ],
+    "source": "failed-run",
+    "task_id": "fe-2c808e46a9"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_ide_pages_search.py"
+  ]
+}

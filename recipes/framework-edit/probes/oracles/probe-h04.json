@@ -1,0 +1,43 @@
+{
+  "base_sha": "5b48b2c9d09fbec87604df6cb9e8897f5d8ae3b5",
+  "fail_to_pass": [
+    "tests.unit.test_agents_local_overlay_py::test_a_broken_template_is_named_as_the_template",
+    "tests.unit.test_agents_local_overlay_py::test_a_missing_MINI_ORK_AGENTS_file_is_an_error_not_a_silent_fallback",
+    "tests.unit.test_agents_local_overlay_py::test_coalition_gate_reads_the_overlay_from_home_not_the_engine_root",
+    "tests.unit.test_agents_local_overlay_py::test_decision_service_default_lane_reads_overlay",
+    "tests.unit.test_agents_local_overlay_py::test_env_override_beats_local_overlay",
+    "tests.unit.test_agents_local_overlay_py::test_malformed_overlay_raises_value_error",
+    "tests.unit.test_agents_local_overlay_py::test_merge_does_not_mutate_inputs",
+    "tests.unit.test_agents_local_overlay_py::test_merge_list_replaces_and_null_removes",
+    "tests.unit.test_agents_local_overlay_py::test_no_overlay_returns_template_path_unchanged",
+    "tests.unit.test_agents_local_overlay_py::test_overlay_merges_recursively_over_template",
+    "tests.unit.test_agents_local_overlay_py::test_overlay_null_removes_key_and_list_replaces",
+    "tests.unit.test_agents_local_overlay_py::test_snapshot_freezes_merged_content",
+    "tests.unit.test_agents_local_overlay_py::test_snapshot_reports_a_broken_overlay_instead_of_hiding_it",
+    "tests.unit.test_agents_local_overlay_py::test_template_bytes_unchanged[merge]",
+    "tests.unit.test_agents_local_overlay_py::test_template_bytes_unchanged[no_overlay]",
+    "tests.unit.test_agents_local_overlay_py::test_template_bytes_unchanged[null_remove]",
+    "tests.unit.test_agents_local_overlay_py::test_template_bytes_unchanged[snapshot]"
+  ],
+  "fix_sha": "f6261b02e4789c7a59aa6524d27da06bf209e3ce",
+  "pass_to_pass": [
+    "tests.unit.test_agents_local_overlay_py::test_git_check_ignore_on_overlay_path"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "task_runs.status=failed",
+    "cluster": "change/R5/test_verifier",
+    "harvested_at": "2026-10-30T23:35:33Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "framework-edit",
+    "run_ids": [
+      "agents-overlay-1790760612"
+    ],
+    "source": "failed-run",
+    "task_id": "fe-f6261b02e4"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_agents_local_overlay_py.py"
+  ]
+}

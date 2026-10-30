@@ -1,0 +1,46 @@
+{
+  "base_sha": "2c2e619c49f8f73357d183adf812d2af8dac4b14",
+  "fail_to_pass": [
+    "tests.unit.test_codefix_strengthen_verifier::test_adequate_does_not_call_or_emit",
+    "tests.unit.test_codefix_strengthen_verifier::test_error_record_keeps_verdict",
+    "tests.unit.test_codefix_strengthen_verifier::test_mode_off_does_not_call_or_emit",
+    "tests.unit.test_codefix_strengthen_verifier::test_no_base_worktree_does_not_call_or_emit",
+    "tests.unit.test_codefix_strengthen_verifier::test_no_kickoff_does_not_call_or_emit",
+    "tests.unit.test_codefix_strengthen_verifier::test_skipped_record_not_emitted",
+    "tests.unit.test_codefix_strengthen_verifier::test_strong_path_fake_kwargs",
+    "tests.unit.test_codefix_strengthen_verifier::test_strong_path_inadequate_emits_record",
+    "tests.unit.test_codefix_strengthen_verifier::test_weak_path_rounds_remaining_keeps_failure",
+    "tests.unit.test_suite_strengthen::test_budget_s_default_floor_and_typo",
+    "tests.unit.test_suite_strengthen::test_empty_answer",
+    "tests.unit.test_suite_strengthen::test_full_run",
+    "tests.unit.test_suite_strengthen::test_full_run_leaves_trees_untouched",
+    "tests.unit.test_suite_strengthen::test_mode_parsing",
+    "tests.unit.test_suite_strengthen::test_no_import_no_admission",
+    "tests.unit.test_suite_strengthen::test_partial_match",
+    "tests.unit.test_suite_strengthen::test_prompt_contents",
+    "tests.unit.test_suite_strengthen::test_settings_defaults_and_clamps",
+    "tests.unit.test_suite_strengthen::test_skips_never_dispatch",
+    "tests.unit.test_suite_strengthen::test_strengthen_threads_one_deadline_to_lane_and_runner",
+    "tests.unit.test_suite_strengthen::test_targeting_is_capped"
+  ],
+  "fix_sha": "564ce92f1b154631eb3d872ab866c8383fb0fb09",
+  "pass_to_pass": [],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "task_runs.status=failed",
+    "cluster": "change/R5/spec-tests",
+    "harvested_at": "2026-10-30T23:35:33Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "framework-edit",
+    "run_ids": [
+      "rsi-t1-suite-strengthening-20261027-134701"
+    ],
+    "source": "failed-run",
+    "task_id": "fe-564ce92f1b"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_codefix_strengthen_verifier.py",
+    "tests/unit/test_suite_strengthen.py"
+  ]
+}
