@@ -112,6 +112,35 @@ def test_unknown_node_raises_naming_it(tmp_path, empty_home):
     assert "nope" in str(excinfo.value)
 
 
+@pytest.mark.parametrize("node_type", ["verifier", "publisher", "rollback", "eval", "reflector"])
+def test_non_checkpointing_node_type_raises(tmp_path, empty_home, node_type):
+    # These handlers publish no node_checkpoints row, so a pause after one
+    # would never park the run; the declaration must fail loudly instead.
+    wf = _workflow(tmp_path, review_after_nodes=["gate"])
+    with pytest.raises(ValueError) as excinfo:
+        _declared_review_nodes(wf, {"gate": node_type, "sink": "publisher"}, {})
+    assert "'gate'" in str(excinfo.value) and node_type in str(excinfo.value)
+    assert "never" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("node_type", ["researcher", "implementer", "reviewer", "transform", "planner"])
+def test_checkpointing_node_type_is_accepted(tmp_path, empty_home, node_type):
+    wf = _workflow(tmp_path, review_after_nodes=["gate"])
+    nodes, _ = _declared_review_nodes(wf, {"gate": node_type}, {})
+    assert nodes == ("gate",)
+
+
+def test_spec_driven_delivery_declares_a_checkpointing_node():
+    import mini_ork
+    from mini_ork.workflow import compile_workflow
+
+    wf = Path(mini_ork.__file__).resolve().parents[1] / "recipes" / "spec-driven-delivery" / "workflow.yaml"
+    compiled = compile_workflow(str(wf))
+    types = {name: node.type for name, node in compiled.nodes.items()}
+    nodes, _ = _declared_review_nodes(str(wf), types, {"MO_REVIEW_RECIPE_NODES": "1"})
+    assert "contract_compiler" in nodes
+
+
 def test_non_list_value_raises(tmp_path, empty_home):
     wf = _workflow(tmp_path, review_after_nodes="contract_compiler")
     with pytest.raises(ValueError):

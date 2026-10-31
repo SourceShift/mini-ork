@@ -1125,6 +1125,13 @@ def _resolve_task_class(plan_path: str, run_id: str, db: str) -> str:
     return "generic"
 
 
+# Node types whose handlers publish no node_checkpoints row on success
+# (execute_handlers: verifier, publisher, rollback, eval, reflector). The review
+# gate needs that row to park, so these cannot carry a review_after_nodes pause.
+_NON_CHECKPOINTING_NODE_TYPES = frozenset(
+    {"verifier", "publisher", "rollback", "eval", "reflector"})
+
+
 def _declared_review_nodes(workflow_path, node_names, environ) -> tuple[tuple[str, ...], str]:
     """``(after_nodes_to_publish, message)`` for a workflow's ``review_after_nodes``.
 
@@ -1161,6 +1168,16 @@ def _declared_review_nodes(workflow_path, node_names, environ) -> tuple[tuple[st
         if name not in node_names:
             raise ValueError(
                 f"review_after_nodes names a node not in this workflow: {name!r}")
+        # ``node_names`` may map name -> node type. The review gate parks a run
+        # only after a node that published a node_checkpoints success row, and
+        # these handlers publish none, so a pause declared after one would
+        # silently never fire.
+        node_type = node_names.get(name) if hasattr(node_names, "get") else None
+        if node_type in _NON_CHECKPOINTING_NODE_TYPES:
+            raise ValueError(
+                f"review_after_nodes names {name!r}, a {node_type} node; {node_type} "
+                "nodes record no checkpoint, so a review pause after it would never "
+                "fire — pause after the node that produces what needs review")
 
     if not declared:
         return (), ""
@@ -1288,7 +1305,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         # defeat the gate the recipe asked for.
         try:
             review_nodes, review_message = _declared_review_nodes(
-                workflow, set(compiled.nodes), os.environ)
+                workflow, {name: node.type for name, node in compiled.nodes.items()},
+                os.environ)
         except ValueError as exc:
             sys.stderr.write(f"execute: workflow review_after_nodes: {exc}\n")
             return 2
