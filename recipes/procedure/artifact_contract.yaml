@@ -1,0 +1,16 @@
+task_class: procedure
+expected_artifact: composite
+success_verifiers:
+  - verifiers/report-check.py
+failure_policy: request_changes
+rollback_policy: >
+  Keep the step report under runs/<id>/. The procedure's own changes stay in
+  the working tree, uncommitted, for the operator to review: this recipe has
+  no reviewer node, so the publisher never commits.
+source_artifact: procedure-report.md
+outputs:
+  - procedure-report.md
+acceptance_criteria:
+  - procedure-report.md exists under ${MINI_ORK_RUN_DIR} with a "## Steps" section.
+  - Every step of the kickoff's procedure has one checklist line, checked when done.
+  - No step is left unchecked.
