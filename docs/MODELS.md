@@ -158,6 +158,20 @@ identity it ran under. With `MO_REQUIRE_CONFORMANCE=1` the lane preflight
 refuses a lane that has no passing probe **for the harness release it runs
 now** — upgrading the CLI re-opens the question until the lane is probed again.
 
+Every run also writes a **harness card** to `runs/<run_id>/harness-card.md`
+(and `.json`): per lane, the harness and release that served it, its calls,
+tokens and cost, and that release's conformance status; per node, the lane it
+requested and the lane that served it. A fallback is listed as a warning, and
+so is a *family collapse* — nodes that asked for different model families but
+were all served by one, which turns a heterogeneous panel into same-family
+consensus without failing anything:
+
+```bash
+mini-ork harness-card <run_id>            # markdown
+mini-ork harness-card <run_id> --json     # the card as JSON
+mini-ork harness-card <run_id> --write    # (re)write it into the run dir
+```
+
 ---
 
 ## Changing Providers
