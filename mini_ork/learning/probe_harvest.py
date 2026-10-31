@@ -597,8 +597,12 @@ def repo_checkouts(root: str) -> list[str]:
 _VENV_PYTHON = re.compile(r"\S*/\.?venv/bin/(python[0-9.]*)")
 # An absolute POSIX path left in a probe after relativisation: something that
 # only exists on the harvesting host.
+# Host-specific roots only: `/usr` and `/etc` are deliberately absent — a
+# `#!/usr/bin/env bash` shebang is universal, and rejecting it would drop
+# every kickoff that carries a script.
 _HOST_PATH = re.compile(
-    r"(?<![\w.:-])/(?:Volumes|Users|home|private|tmp|var|opt|mnt|srv)/"
+    r"(?<![\w.:-])/(?:Volumes|Users|home|private|tmp|var|opt|mnt|srv|root|"
+    r"workspaces?|data|media|scratch|Library|Applications)/"
     r"[^\s`'\"),;]+"
 )
 
@@ -949,6 +953,11 @@ def harvest(
         "n_candidates": n_candidates,
         "admitted": admitted_report,
         "rejected": rejected,
+        # Every mining-stage rejection, always. ``rejected`` keeps its
+        # this-run-only semantics; this key is the audit trail for the
+        # safety guards (``answer-pointer``, ``host-path``), which were
+        # otherwise visible only as a drop in ``n_candidates``.
+        "mined_rejected": list(mined_rejected),
         "n_admitted_gate": sum(1 for c in admitted if not c["holdout"]),
         "n_admitted_holdout": sum(1 for c in admitted if c["holdout"]),
         "diagnoses_available": diagnoses_available,
