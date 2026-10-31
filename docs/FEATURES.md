@@ -33,9 +33,9 @@ family grades its own homework.
 
 | Feature | Where | What it gives you |
 |---|---|---|
-| Lane-based model routing | `.mini-ork/config/agents.yaml` + `lib/llm-dispatch.sh` | Recipes declare roles (`reviewer`, `glm_lens`); config maps roles to model families. Swap vendors without touching workflows. |
-| 7 provider families out of the box | `lib/providers/cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh` | Zhipu, Moonshot, OpenAI, DeepSeek, Anthropic ×2, MiniMax — each a clean process with isolated env and real timeouts. |
-| BYO-key provider registry | `config/providers.yaml` + `lib/providers/registry.sh` | Declare any Anthropic/OpenAI-compatible endpoint (`anthropic-native`, `anthropic-compat`, `openai-compat`, `executable`) with your own API keys. No wrapper code needed. |
+| Lane-based model routing | `.mini-ork/config/agents.yaml` + `mini_ork/dispatch/llm_dispatch.py` | Recipes declare roles (`reviewer`, `glm_lens`); config maps roles to model families. Swap vendors without touching workflows. |
+| Committed provider lanes | `config/providers.yaml` | Zhipu, Moonshot, MiniMax and DeepSeek gateways, Anthropic ×2, Codex, OpenCode — each a clean process with isolated env and real timeouts. |
+| BYO-key provider registry | `config/providers.yaml` + `mini_ork/dispatch/providers.py` | Declare any Anthropic/OpenAI-compatible endpoint (`anthropic-native`, `anthropic-compat`, `codex-native`, `opencode-native`, `openai-compat`, `uhp`, `executable`) with your own API keys. No wrapper code needed. |
 | Heterogeneous lens panels | `recipes/refactor-audit/`, `recipes/db-migration/`, others | 4–5 parallel review lenses on *distinct* families per cycle — low-correlation evidence channels, not same-vendor consensus. |
 | Coalition gate (ρ hard-block) | `lib/coalition_gate.sh` | Pre-synthesis family-diversity check: blocks synthesis when the panel degenerates into a same-family coalition. |
 | Panel topology telemetry | `lib/topology_metrics.sh` | Measures realised (ρ, C, I) per panel run; classifies panel health into 8 topology classes. |
@@ -54,7 +54,7 @@ is structural:
 | Cheap-lane routing | `.mini-ork/config/agents.yaml` | Tactical checks run on budget families (GLM, DeepSeek); frontier models (Opus) are reserved for synthesis and architecture review. Price/role fit is configuration, not luck. |
 | Per-call LLM ledger | `llm_calls` table (`db/migrations/0018_llm_calls_session_id.sql`) | Every dispatch logs model, tokens, cost, duration, session. Answer "where did the money go?" with SQL. |
 | List-price cost meter | `mini_ork/dispatch/providers.py` (`claude_cost`) + `.mini-ork/config/pricing.yaml` | Token totals come from the result envelope; each non-Anthropic model is priced at its provider's list price (input, cache read, cache write, output), so the ledger and the daily cap reflect real spend. |
-| Budget caps | `config/agents.yaml` (`budget:`) + `lib/llm-dispatch.sh` | Declared defaults: $5/epic, $0.50/run, $50/day. The daily cap is enforced inside the dispatcher (`MO_DAILY_BUDGET_USD`); per-lane budgets are surfaced to every dispatch as flags. |
+| Budget caps | `config/agents.yaml` (`budget:`) + `mini_ork/dispatch/llm_dispatch.py` | Declared defaults: $5/epic, $0.50/run, $50/day. The daily cap is enforced inside the dispatcher (`MO_DAILY_BUDGET_USD`); per-lane budgets are surfaced to every dispatch as flags. |
 | Daily cost circuit breaker | `MO_DAILY_BUDGET_USD` + pre-iter cost check in `bin/mini-ork-self-improve` | Long-running loops halt *before* creating the next worktree once 24h spend exceeds the cap. |
 | Behavioral circuit breaker | `lib/circuit_breaker.sh` | Detects cost-burn-without-write, artifact-hash stagnation, and stuck verdicts — kills spinning runs instead of letting them bill. |
 | Stage-level memoization | `lib/cache.sh` | LLM stages emit cache rows; identical stages reuse prior output instead of re-paying. |
@@ -150,7 +150,7 @@ experience and feeds it forward:
 - **44 framework primitives** in `lib/` — dispatch, gates, memory, evolution, safety, telemetry (full list: `ls lib/*.sh`)
 - **19 schema migrations** in `db/migrations/` — the full memory + telemetry + safety substrate
 - **12 recipes** in `recipes/` — see the README recipes table
-- **7 provider families** in `lib/providers/` + BYO registry in `config/providers.yaml`
+- **Provider lanes** in the `config/providers.yaml` registry (committed lanes + your own BYO entries)
 
 ---
 

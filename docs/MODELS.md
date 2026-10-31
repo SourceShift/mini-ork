@@ -2,30 +2,44 @@
 
 mini-ork routes work through **lanes**. A workflow node declares a
 `model_lane`, and `.mini-ork/config/agents.yaml` maps that lane to a provider
-family. The provider wrapper then invokes the external CLI or API adapter.
+entry in the registry (`config/providers.yaml`). The entry's `kind` selects the
+transport — an external agent CLI or a direct HTTP adapter — built by
+`mini_ork/dispatch/providers.py`.
 
 This keeps recipes portable: a recipe can say `reviewer` or `glm_lens` without
 hard-coding a vendor model in every node.
 
 ---
 
-## Shipped Provider Families
+## Committed Provider Lanes
 
-Provider wrappers live in `lib/providers/`:
+Lanes are entries in `config/providers.yaml`; there is no per-lane wrapper. (The
+bash wrappers `lib/providers/cl_*.sh` were removed in the 2026-07 bash removal,
+`docs/plans/2026-07-26-bash-removal-plan.md`.) A
+`$MINI_ORK_HOME/config/providers.yaml` replaces the committed file as a whole —
+it is not merged — so copy every lane you still need into it.
 
-| Provider key | Wrapper | Typical use |
-|---|---|---|
-| `glm` | `lib/providers/cl_glm.sh` | cheap tactical checks and structured analysis |
-| `kimi` | `lib/providers/cl_kimi.sh` | long-context review and synthesis |
-| `codex` | `lib/providers/cl_codex.sh` | executable coding and repository-grounded work |
-| `deepseek` | `lib/providers/cl_deepseek.sh` | budget planning or implementation lanes |
-| `opus` | `lib/providers/cl_opus.sh` | high-reasoning review, synthesis, architecture lens |
-| `sonnet` | `lib/providers/cl_sonnet.sh` | general Anthropic worker lane |
-| `minimax` | `lib/providers/cl_minimax.sh` | additional heterogeneous lens family |
+| Lane | Kind | Transport | Typical use |
+|---|---|---|---|
+| `glm` | `anthropic-compat` | Claude CLI against an Anthropic-shaped gateway (`GLM_API_KEY`) | cheap tactical checks and structured analysis |
+| `kimi` | `anthropic-compat` | Claude CLI against a gateway (`KIMI_API_KEY`) | long-context review and synthesis |
+| `minimax` | `anthropic-compat` | Claude CLI against a gateway (`MINIMAX_API_KEY`) | additional heterogeneous lens family |
+| `deepseek`, `deepseek_flash` | `anthropic-compat` | Claude CLI against a gateway (`DEEPSEEK_API_KEY`) | budget planning or implementation lanes |
+| `opus`, `sonnet` | `anthropic-native` | Claude CLI on the ambient Anthropic login | high-reasoning review; general worker |
+| `anthropic_api` | `anthropic-native` | Claude CLI with your own `ANTHROPIC_API_KEY` | the same, billed to your key |
+| `codex` | `codex-native` | `codex` CLI on its ambient login | executable coding and repository-grounded work |
+| `opencode` | `opencode-native` | `opencode` CLI, auth from its own store | additional coding lane |
+| `openai_api` | `openai-compat` | direct HTTP to an OpenAI-shaped endpoint (`OPENAI_API_KEY`) | BYO-key chat endpoints (OpenAI, OpenRouter, vLLM) |
+| `uhp_harnessrouter` | `uhp` | direct HTTP SSE to a local HarnessRouter | local-only harness routing |
 
-Exact model names and prices belong in the provider wrapper or deployment
-environment, not in recipe docs. Verify live provider pricing before large
-runs.
+An `executable` kind runs a command you name, for transports no built-in kind
+covers. Every gateway lane needs its key in `config/secrets.local.sh`; a missing
+key fails the dispatch at the lane preflight (`mini-ork doctor` reports it
+first).
+
+Exact model names and prices belong in the registry entry's `model:` pin or the
+deployment environment, not in recipe docs. Verify live provider pricing before
+large runs.
 
 ---
 
@@ -68,8 +82,8 @@ Resolution path:
 ```text
 workflow.yaml node.model_lane
   -> .mini-ork/config/agents.yaml lane binding
-  -> lib/providers/cl_<provider>.sh
-  -> external CLI/API configured on the host
+  -> config/providers.yaml entry (its `kind` picks the transport)
+  -> external CLI or direct HTTP endpoint configured on the host
 ```
 
 ---
@@ -126,18 +140,18 @@ For any Anthropic or OpenAI-compatible endpoint, add an entry to
 (the NAME of an env var you export in
 `$MINI_ORK_HOME/config/secrets.local.sh` — template at
 `config/secrets.example.sh`). Then bind a lane to it in
-`.mini-ork/config/agents.yaml`. A `cl_<name>.sh` wrapper always takes
-precedence over a registry entry of the same name. See `docs/CONFIG.md` →
+`.mini-ork/config/agents.yaml`. See `docs/CONFIG.md` →
 "Bring-your-own providers" and `tests/test_provider_registry.sh`.
 
-### Option 2: cl_*.sh wrapper (custom CLI or env logic)
+### Option 2: `executable` kind (custom CLI or env logic)
 
-1. Add a wrapper at `lib/providers/cl_<provider>.sh`.
-2. Make it read prompt input, call the external model, write the response to
-   stdout, and return non-zero on failure.
+1. Write an executable script that reads the prompt, calls the external model,
+   writes the response to stdout, and exits non-zero on failure.
+2. Declare it in `config/providers.yaml` with `kind: executable` and
+   `script: <path>` (relative paths resolve against the mini-ork root; the
+   file must be executable).
 3. Add a lane binding in `.mini-ork/config/agents.yaml`.
-4. Add a smoke probe to the relevant provider-doctor or integration script
-   (`tests/test_providers_live.sh` covers the shipped lanes).
+4. Run `mini-ork doctor` to confirm the lane passes its preflight.
 
 The top-level recipes should not need to change when a provider is added; they
 should keep referring to lanes.

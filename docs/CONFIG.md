@@ -102,7 +102,7 @@ lanes:
   minimax_lens: minimax
 ```
 
-Provider wrappers ship in `lib/providers/cl_{glm,kimi,codex,deepseek,opus,sonnet,minimax}.sh`. Recipe-specific policies, such as recursive self-improvement, can stage their own lane file before running.
+Lane names resolve through the provider registry in `config/providers.yaml` (see `docs/MODELS.md` for the committed lanes). Recipe-specific policies, such as recursive self-improvement, can stage their own lane file before running.
 
 ---
 
@@ -211,8 +211,10 @@ human_gate:
 
 Store in `$MINI_ORK_HOME/config/secrets.local.sh` (default:
 `.mini-ork/config/secrets.local.sh`) — a plain bash file of `export KEY=...`
-lines, sourced by `lib/llm-dispatch.sh` inside each dispatch subshell so keys
-never leak into the parent orchestrator process. Never committed
+lines. The dispatcher never executes it: `mini_ork/dispatch/secrets.py`
+validates the file and reads only plain `export NAME=value` records into each
+provider's environment, so keys never leak into the parent orchestrator
+process. Never committed
 (`.gitignore` covers `**/secrets.local.*`). Start from the template:
 
 ```bash
@@ -231,16 +233,16 @@ Override the file location with `MINI_ORK_SECRETS=/abs/path/to/secrets.sh`.
 
 ### Bring-your-own providers (providers.yaml)
 
-To use your own Anthropic or OpenAI-compatible API endpoints without writing
-a `lib/providers/cl_*.sh` wrapper, declare them in `config/providers.yaml`
-(or `$MINI_ORK_HOME/config/providers.yaml`, or a file pointed to by
-`MINI_ORK_PROVIDERS`). Each entry names a provider with `kind`
-(`anthropic-native` | `anthropic-compat` | `openai-compat` | `executable`),
+To use your own Anthropic or OpenAI-compatible API endpoints, declare them in
+`config/providers.yaml` (or `$MINI_ORK_HOME/config/providers.yaml`, or a file
+pointed to by `MINI_ORK_PROVIDERS`); no wrapper code is needed. Each entry
+names a provider with `kind` (`anthropic-native` | `anthropic-compat` |
+`codex-native` | `opencode-native` | `openai-compat` | `uhp` | `executable`),
 an optional `model` pin, `base_url`, and `api_key_env` — the NAME of the
 env var holding the key, which you export in `secrets.local.sh`.
 
-A `cl_<name>.sh` wrapper always wins over a registry entry of the same
-name, so registry entries cannot change builtin provider behavior. Wire a
+A `$MINI_ORK_HOME/config/providers.yaml` replaces the committed registry as a
+whole (it is not merged), so copy every lane you still need into it. Wire a
 lane to your entry in `config/agents.yaml`:
 
 ```yaml
