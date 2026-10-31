@@ -4085,6 +4085,12 @@ def _handle_eval(ctx: NodeDispatch):
     return 0, "done"
 
 
+def _handle_subgraph(ctx: NodeDispatch):
+    """One recipe as a node of another — see mini_ork.orchestration.subgraph."""
+    from mini_ork.orchestration import subgraph
+    return subgraph.handle(ctx)
+
+
 NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "researcher": _handle_researcher,
     "transform": _handle_transform,
@@ -4094,6 +4100,7 @@ NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "eval": _handle_eval,
     "publisher": _handle_publisher,
     "rollback": _handle_rollback,
+    "subgraph": _handle_subgraph,
 }
 
 

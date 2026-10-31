@@ -89,6 +89,8 @@
       "type": "object",
       "required": ["name", "type", "dispatch_mode"],
       "additionalProperties": false,
+      "if": { "properties": { "type": { "const": "subgraph" } }, "required": ["type"] },
+      "then": { "required": ["recipe"] },
       "properties": {
         "name": {
           "type": "string",
@@ -108,7 +110,8 @@
             "eval",
             "reflector",
             "publisher",
-            "rollback"
+            "rollback",
+            "subgraph"
           ]
         },
         "model_lane": {
@@ -125,6 +128,15 @@
           "type": ["string", "null"],
           "description": "Path (relative to repo root) or key of the prompt template for this node.",
           "default": ""
+        },
+        "recipe": {
+          "type": "string",
+          "description": "subgraph nodes only: the recipe run as a child run (one recipe as a node of another).",
+          "pattern": "^[a-z0-9][a-z0-9_-]*$"
+        },
+        "kickoff": {
+          "type": "string",
+          "description": "subgraph nodes only: the child run's kickoff (absolute, or relative to the run dir then the target repo). Defaults to the parent run's kickoff."
         },
         "verifier_ref": {
           "type": ["string", "null"],
