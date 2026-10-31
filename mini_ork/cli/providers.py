@@ -9,6 +9,7 @@ owner-only local store used by the native dispatcher.
 from __future__ import annotations
 
 import getpass
+import json
 import os
 import sys
 from collections.abc import Iterable, Mapping
@@ -28,9 +29,13 @@ from mini_ork.dispatch.secrets import (
 _USAGE = """Usage:
   mini-ork providers status [--workflow <workflow.yaml>] [<lane> ...]
   mini-ork providers configure [--workflow <workflow.yaml>] [--replace] [--from-stdin] [<lane> ...]
+  mini-ork providers conform [--json] [--timeout <seconds>] <lane> ...
 
 `status` reports only credential presence and source. `configure` reads values
 from a hidden terminal prompt, or NAME=value lines on standard input.
+`conform` runs one real dispatch per lane through its harness and checks the
+dispatch contract (cwd, tools, JSON reply, usage, read-only); it costs a small
+call per lane. Exit 0 when every lane conforms, 1 otherwise.
 """
 
 
@@ -258,13 +263,58 @@ def _configure(
     return _print_status(models, root)
 
 
+def _state_db() -> str | None:
+    db = os.environ.get("MINI_ORK_DB") or str(
+        Path(os.environ.get("MINI_ORK_HOME") or ".mini-ork") / "state.db")
+    return db if os.path.isfile(db) else None
+
+
+def _conform_main(argv: list[str], root: Path) -> int:
+    from mini_ork.dispatch import conformance
+
+    as_json = False
+    timeout_s = 180.0
+    lanes: list[str] = []
+    while argv:
+        item = argv.pop(0)
+        if item == "--json":
+            as_json = True
+        elif item == "--timeout":
+            if not argv:
+                raise ValueError("--timeout requires <seconds>")
+            timeout_s = float(argv.pop(0))
+        elif item.startswith("-"):
+            raise ValueError(f"unknown conform option: {item}")
+        else:
+            lanes.append(item)
+    if not lanes:
+        raise ValueError("conform needs one or more lanes")
+    db = _state_db()
+    models = list(dict.fromkeys(model for _, model in resolve_models(lanes, root=root)))
+    verdicts = [conformance.probe(m, root=root, db=db, timeout_s=timeout_s) for m in models]
+    if as_json:
+        print(json.dumps(verdicts, indent=2, sort_keys=True))
+    else:
+        for v in verdicts:
+            harness = v["harness"]
+            status = "PASS" if v["ok"] else "FAIL " + ",".join(v["failures"])
+            print(f"{v['lane']:<16} {harness.get('harness', '?'):<22} "
+                  f"{harness.get('version') or '-':<28} {status}")
+            if v["error"] and not v["ok"]:
+                print(f"{'':<16} error: {v['error']}")
+        if db is None:
+            print("(no state db found: verdicts were not recorded)")
+    return 0 if all(v["ok"] for v in verdicts) else 1
+
+
 def main(argv: list[str] | None = None, *, root: str | Path | None = None) -> int:
     """Run ``mini-ork providers`` without exposing credential material."""
     root_path = Path(root or os.environ.get("MINI_ORK_ROOT") or Path(__file__).resolve().parents[2])
     try:
-        action, workflow, replace, from_stdin, lanes = _parse_args(
-            list(sys.argv[1:] if argv is None else argv)
-        )
+        raw = list(sys.argv[1:] if argv is None else argv)
+        if raw[:1] == ["conform"]:
+            return _conform_main(raw[1:], root_path)
+        action, workflow, replace, from_stdin, lanes = _parse_args(raw)
         if action == "help":
             sys.stdout.write(_USAGE)
             return 0

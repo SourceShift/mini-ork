@@ -116,6 +116,50 @@ nodes:
 
 ---
 
+## Harness Identity and Conformance
+
+A lane name does not say what ran: the same model behind a different harness,
+or a different release of the same CLI, is a different system, and a harness
+swap alone moves cost and token counts by multiples. Every `llm_calls` row
+therefore records the harness that served it in `metadata_json.harness`, and
+the dispatch row in the audit chain carries the same object:
+
+```json
+{"harness": "claude-code", "kind": "anthropic-native", "binary": "claude", "version": "2.1.3 (Claude Code)"}
+```
+
+`harness` is the vendor CLI (`claude-code`, `codex`, `opencode`), an
+`executable` script (version `sha256:<12 hex>` of the script), or one of
+mini-ork's own transports (`mini-ork/openai-compat`, `mini-ork/uhp`, …; version
+`mini-ork <version>`). CLI versions are read once per release of the binary and
+cached in `$MINI_ORK_HOME/harness-versions.json`.
+
+The lane preflight only asks a gateway whether it accepts a key. A
+**conformance probe** asks whether the lane, through its real harness, keeps
+the dispatch contract. It runs one real dispatch — same argv, env, cwd pin and
+default tool grants a node gets — on a task with an unguessable answer:
+
+```bash
+mini-ork providers conform codex sonnet glm      # PASS/FAIL per lane; exit 1 if any fail
+mini-ork providers conform --json --timeout 120 codex
+```
+
+| check | passes when |
+|---|---|
+| `answered` | the dispatch returned rc 0 with text |
+| `cwd_and_tools` | the lane read a nonce file in the pinned cwd and returned it |
+| `json_contract` | the reply is a JSON object carrying the nonce (the planner shape rule) |
+| `usage_reported` | input + output tokens > 0, so cost accounting is real |
+| `read_only` | the scratch directory holds only the probe file afterwards |
+
+Each probe costs one small call, is written to `llm_calls` like any other
+dispatch, and lands in the audit chain as `conformance_probe` with the harness
+identity it ran under. With `MO_REQUIRE_CONFORMANCE=1` the lane preflight
+refuses a lane that has no passing probe **for the harness release it runs
+now** — upgrading the CLI re-opens the question until the lane is probed again.
+
+---
+
 ## Changing Providers
 
 To change all nodes on a lane, edit `.mini-ork/config/agents.yaml`:
@@ -151,7 +195,9 @@ For any Anthropic or OpenAI-compatible endpoint, add an entry to
    `script: <path>` (relative paths resolve against the mini-ork root; the
    file must be executable).
 3. Add a lane binding in `.mini-ork/config/agents.yaml`.
-4. Run `mini-ork doctor` to confirm the lane passes its preflight.
+4. Run `mini-ork doctor` to confirm the lane passes its preflight, then
+   `mini-ork providers conform <lane>` to confirm its harness keeps the
+   dispatch contract.
 
 The top-level recipes should not need to change when a provider is added; they
 should keep referring to lanes.

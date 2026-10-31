@@ -237,7 +237,8 @@ prefix, and an unchained row after it begins is a break.
 
 | `event_type` | Written by | `event` carries |
 |---|---|---|
-| `dispatch` | `llm_dispatch._insert_llm_calls_row` (every `llm_calls` row) | `llm_call_id`, `status`, `error_category`, `cost_usd`, `feature`, `run_id` |
+| `dispatch` | `llm_dispatch._insert_llm_calls_row` (every `llm_calls` row) | `llm_call_id`, `status`, `error_category`, `cost_usd`, `feature`, `run_id`, `harness` (name, kind, binary, version) |
+| `conformance_probe` | `mini-ork providers conform` (via `mini_ork/dispatch/conformance.py`) | `ok`, the five `checks`, `failures`, `harness`, `duration_ms`, `cost_usd`; target `lane:<name>` |
 | `gate_verdict` | `verifier_rubric._insert_result_row` (every `verifier_results` row) | `result_id`, `verdict`, `confidence`, `rubric_id` |
 | `promotion` / `rollback` / `quarantine` | `version_registry.register` (status `stable`) / `rollback` / `quarantine` | the version ids involved and the reason |
 | `human_override` | `version_registry.clear_quarantine` (actor `human:<approver>`) | `version_id`, `action` |

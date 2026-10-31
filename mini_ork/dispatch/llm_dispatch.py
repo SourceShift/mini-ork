@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 
 from mini_ork.context import context_env
-from mini_ork.dispatch import failure_class, lane_affinity
+from mini_ork.dispatch import failure_class, harness_identity, lane_affinity
 from mini_ork.stores import audit_chain
 from mini_ork.dispatch.predicates import (
     SHAPE_REJECT_RC,
@@ -683,6 +683,15 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
     # attempts keep ``dispatch_attempt``/``chain``) — and this is the one choke
     # point every llm_calls writer here goes through.
     _md["placement"] = _current_placement()
+    if "harness" not in _md:
+        # Which harness, at which release, served this row. The lane name alone
+        # cannot say, and a harness swap moves cost and tokens by multiples.
+        try:
+            served_by = harness_identity.identity(str(model_id))
+        except Exception:  # noqa: BLE001 — identity must never cost the row
+            served_by = None
+        if served_by is not None:
+            _md["harness"] = served_by
     _sess = _md.get("session_id")
     metadata_json = _json.dumps(_md)
     try:
@@ -733,13 +742,17 @@ def _insert_llm_calls_row(con, provider, model_id, tier, feature_name, actor, st
             insert_cols.append(name); values.append(val)
     ph = ",".join("?" for _ in insert_cols)
     cur = con.execute(f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({ph})", values)
-    # The dispatch, its outcome and its cost, sealed into the audit chain in
-    # the same transaction as the ledger row.
+    try:
+        served_by = json.loads(metadata_json or "{}").get("harness")
+    except (ValueError, AttributeError):
+        served_by = None
+    # The dispatch, its outcome, its cost and the harness that served it,
+    # sealed into the audit chain in the same transaction as the ledger row.
     audit_chain.append_event_soft(
         con, "dispatch", f"lane:{provider}", f"model:{model_id}",
         {"llm_call_id": cur.lastrowid, "status": status, "error_category": error_category,
          "cost_usd": float(cost_usd or 0.0), "feature": feature_name,
-         "run_id": context_env("MINI_ORK_RUN_ID") or None},
+         "run_id": context_env("MINI_ORK_RUN_ID") or None, "harness": served_by},
     )
     con.commit()
 
