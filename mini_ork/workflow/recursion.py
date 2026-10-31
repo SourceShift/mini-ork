@@ -22,11 +22,17 @@ load rather than at 3am.
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
+
+# Under ``<run_dir>/revise/`` next to the archived ``round-<n>/`` directories.
+EVER_PASSED_FILE = "ever-passed.json"
 
 # Schema order. The loader checks presence in this order so a block missing
 # several keys reports the first one deterministically.
@@ -80,6 +86,48 @@ def _as_float(value: Any, key: str, path: Path) -> float:
             f"recursion.{key} must be >= 0, got {value} in {path}"
         )
     return float(value)
+
+
+def load_ever_passed(run_dir) -> set[str]:
+    """Node ids recorded as passed in earlier waves of this run (``set()`` when none).
+
+    Reads ``<run_dir>/revise/ever-passed.json`` (a JSON list of strings). A missing file is
+    ``set()``. An unreadable or malformed file raises ``ValueError``: a corrupted record must
+    not silently disable the guard.
+    """
+    path = Path(run_dir) / "revise" / EVER_PASSED_FILE
+    if not path.exists():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+    if not isinstance(payload, list) or not all(
+            isinstance(node_id, str) for node_id in payload):
+        raise ValueError(f"{path}: expected a JSON list of strings")
+    return set(payload)
+
+
+def save_ever_passed(run_dir, ever_passed) -> None:
+    """Atomically write ``sorted(ever_passed)`` to ``<run_dir>/revise/ever-passed.json``."""
+    revise_dir = Path(run_dir) / "revise"
+    revise_dir.mkdir(parents=True, exist_ok=True)
+    path = revise_dir / EVER_PASSED_FILE
+    # Same-dir temp + os.replace: a crash mid-write leaves either the old
+    # record or the new one, never a truncated file `recover` cannot read.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=revise_dir, prefix=".ever-passed-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(sorted(ever_passed), handle)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def regressed_sources(ever_passed, failed_node_ids) -> list[str]:

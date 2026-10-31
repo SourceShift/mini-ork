@@ -14,6 +14,7 @@ message), and a verifier that never passed is not a regression.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -25,6 +26,10 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mini_ork.workflow.recursion import regressed_sources  # noqa: E402
+from mini_ork.workflow.recursion import (  # noqa: E402
+    load_ever_passed,
+    save_ever_passed,
+)
 import test_revise_loop as revise_loop  # noqa: E402
 
 
@@ -173,3 +178,182 @@ def test_a_verifier_that_never_passed_is_not_a_regression(tmp_path, monkeypatch,
     assert "recursion regression" not in err
     assert state["implementer"] > 1           # the loop did iterate
     assert rc != 0
+
+
+# ── the persisted memory: load/save helpers ─────────────────────────────────
+
+def test_ever_passed_round_trips_through_disk(tmp_path):
+    save_ever_passed(tmp_path, {"b", "a"})
+    assert load_ever_passed(tmp_path) == {"a", "b"}
+
+
+def test_missing_ever_passed_file_loads_as_empty(tmp_path):
+    assert load_ever_passed(tmp_path) == set()
+
+
+def test_a_malformed_ever_passed_record_raises_value_error(tmp_path):
+    revise = tmp_path / "revise"
+    revise.mkdir()
+    (revise / "ever-passed.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_ever_passed(tmp_path)
+
+
+def test_saving_ever_passed_creates_the_revise_dir(tmp_path):
+    assert not (tmp_path / "revise").exists()
+    save_ever_passed(tmp_path, {"test"})
+    assert (tmp_path / "revise" / "ever-passed.json").is_file()
+
+
+def test_saved_ever_passed_is_a_sorted_json_list(tmp_path):
+    save_ever_passed(tmp_path, {"c", "a", "b"})
+    payload = json.loads(
+        (tmp_path / "revise" / "ever-passed.json").read_text(encoding="utf-8"))
+    assert payload == ["a", "b", "c"]
+
+
+# ── wiring: `retries`-edge repairs are guarded too ──────────────────────────
+
+def _retries_workflow(*, with_recursion=False) -> dict:
+    """The ``_regression_workflow`` DAG, but ``test`` repairs through a
+    ``retries`` edge instead of ``escalates_to``.
+
+    Before the fix the guard was gated on ``_escalation_fired``, so a
+    ``retries``-edge repair was never checked even in a recipe that declared
+    ``recursion:``. This pins the widened coverage.
+    """
+    workflow = {
+        "version": "0.2.0",
+        "task_class": "code_fix",
+        "dispatch_mode": "serial",
+        "nodes": [
+            {"name": "planner", "type": "planner", "dispatch_mode": "serial"},
+            {"name": "implementer", "type": "implementer",
+             "model_lane": "worker", "dispatch_mode": "serial"},
+            {"name": "test", "type": "verifier",
+             "verifier_ref": "verifiers/test.py", "dispatch_mode": "serial"},
+            {"name": "reviewer", "type": "reviewer",
+             "model_lane": "reviewer", "dispatch_mode": "serial"},
+        ],
+        "edges": [
+            {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+            {"from": "implementer", "to": "test", "edge_type": "verifies"},
+            {"from": "test", "to": "reviewer", "edge_type": "depends_on"},
+            {"from": "test", "to": "implementer", "edge_type": "retries",
+             "max_rounds": 2},
+            {"from": "reviewer", "to": "implementer", "edge_type": "retries",
+             "max_rounds": 2},
+        ],
+    }
+    if with_recursion:
+        workflow["recursion"] = {
+            "max_iterations": 3,
+            "budget_cap_total_usd": 100.0,
+        }
+    return workflow
+
+
+def test_retries_repair_is_guarded_in_a_recursion_recipe(tmp_path, monkeypatch, capsys):
+    """``test`` passes round 0 and fails round 1; the repair edge is a
+    ``retries`` edge, so only the widened condition can stop the loop."""
+    rc, state, run_dir = revise_loop._run(
+        tmp_path, monkeypatch,
+        workflow=_retries_workflow(with_recursion=True),
+        reviewer_verdicts=["needs_revision", "pass"],
+        test="pass_first",
+    )
+    err = capsys.readouterr().err
+
+    assert "recursion regression" in err
+    assert "test passed in an earlier round and now fail" in err
+    assert "recursion_regression: implementer (test)" in _run_notes(tmp_path)
+    # Round 0 + the reviewer's granted round 1; the regressed test wave must
+    # not grant a second round.
+    assert state["implementer"] == 2
+    assert _revise_rounds(run_dir) == [1]
+    assert rc != 0
+
+
+def test_the_same_retries_workflow_without_recursion_is_unguarded(
+        tmp_path, monkeypatch, capsys):
+    """No ``recursion:`` block means no guard and no message: the ``retries``
+    loop keeps iterating exactly as before the guard was widened."""
+    rc, state, _run_dir = revise_loop._run(
+        tmp_path, monkeypatch,
+        workflow=_retries_workflow(with_recursion=False),
+        reviewer_verdicts=["needs_revision", "pass"],
+        test="pass_first",
+    )
+    err = capsys.readouterr().err
+
+    assert "recursion regression" not in err
+    assert state["implementer"] == 3          # round 0 + two granted rounds
+    assert rc != 0
+
+
+# ── wiring: the memory survives a process restart ───────────────────────────
+
+def test_a_passing_wave_persists_ever_passed_to_the_run_dir(
+        tmp_path, monkeypatch):
+    rc, _state, run_dir = revise_loop._run(
+        tmp_path, monkeypatch,
+        workflow=_retries_workflow(with_recursion=True),
+        reviewer_verdicts=["pass"],
+        test="pass",
+    )
+
+    assert rc == 0
+    record = run_dir / "revise" / "ever-passed.json"
+    assert record.is_file()
+    assert "test" in json.loads(record.read_text(encoding="utf-8"))
+
+
+def test_a_resumed_run_loads_ever_passed_before_dispatching(
+        tmp_path, monkeypatch, capsys):
+    """Seed the record as a ``mini-ork recover`` would leave it: ``test``
+    passed before the restart. It fails on the very first wave, and the guard
+    still fires — which is only possible if the record was loaded from disk."""
+    real_seed = revise_loop._seed_task_run
+
+    def _seed_and_record(db):
+        real_seed(db)
+        revise = tmp_path / "run" / "revise"
+        revise.mkdir(parents=True)
+        (revise / "ever-passed.json").write_text('["test"]', encoding="utf-8")
+
+    monkeypatch.setattr(revise_loop, "_seed_task_run", _seed_and_record)
+    rc, state, run_dir = revise_loop._run(
+        tmp_path, monkeypatch,
+        workflow=_regression_workflow(with_recursion=True),
+        reviewer_verdicts=["needs_revision"],
+        test="fail",
+    )
+    err = capsys.readouterr().err
+
+    assert "recursion regression" in err
+    assert "recursion_regression: implementer (test)" in _run_notes(tmp_path)
+    assert state["implementer"] == 1          # stopped on the first wave
+    assert _revise_rounds(run_dir) == []
+    assert rc != 0
+
+
+def test_a_corrupted_ever_passed_record_is_fatal(tmp_path, monkeypatch, capsys):
+    real_seed = revise_loop._seed_task_run
+
+    def _seed_and_corrupt(db):
+        real_seed(db)
+        revise = tmp_path / "run" / "revise"
+        revise.mkdir(parents=True)
+        (revise / "ever-passed.json").write_text("{not json", encoding="utf-8")
+
+    monkeypatch.setattr(revise_loop, "_seed_task_run", _seed_and_corrupt)
+    rc, _state, _run_dir = revise_loop._run(
+        tmp_path, monkeypatch,
+        workflow=_regression_workflow(with_recursion=True),
+        reviewer_verdicts=["pass"],
+        test="pass",
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "ever-passed.json" in err

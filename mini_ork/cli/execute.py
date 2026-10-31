@@ -1251,7 +1251,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     recursion = None
     # Imported unconditionally: the wave loop calls it on every wave, including
     # runs with no workflow file (where ``ever_passed`` simply never matters).
-    from mini_ork.workflow.recursion import regressed_sources
+    # ``load_ever_passed`` / ``save_ever_passed`` persist that memory under
+    # ``<run_dir>/revise/`` so a ``mini-ork recover`` inherits it (I8a).
+    from mini_ork.workflow.recursion import (
+        load_ever_passed,
+        regressed_sources,
+        save_ever_passed,
+    )
 
     if workflow and os.path.isfile(workflow):
         from mini_ork.workflow import compile_workflow
@@ -1482,6 +1488,20 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # the base already passes and the implementer changed nothing. ``main``
     # closes the run terminal ``not_needed`` instead of counting a failure.
     already_satisfied = False
+    # I8a memory: node ids that finished rc 0 in an earlier wave, loaded from
+    # ``<run_dir>/revise/ever-passed.json`` so a ``mini-ork recover`` (cost
+    # pause, review pause, crash) does not forget what passed before the
+    # restart. A corrupted record is fatal setup: silently starting empty
+    # would disable the guard on exactly the resumed run that needs it.
+    # Only a recipe that declares `recursion:` consults the guard, so only
+    # such a run reads or writes the record (no stray revise/ for the rest).
+    ever_passed: set[str] = set()
+    if recursion is not None:
+        try:
+            ever_passed = load_ever_passed(live_run_dir)
+        except ValueError as exc:
+            sys.stderr.write(f"execute: revise/ever-passed.json: {exc}\n")
+            return 2
 
     def _dispatch_dependency_graph():
         """Dispatch control/data dependencies in readiness waves.
@@ -1491,7 +1511,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         selected parent succeeded; failed parents block descendants without
         executing a publisher or consumer against partial state.
         """
-        nonlocal fail_count, abstain_count, pause_count, already_satisfied
+        nonlocal fail_count, abstain_count, pause_count, already_satisfied, ever_passed
         pending = {field[0]: field for field in work_fields}
         statuses: dict[str, str] = {}
         order = {field[0]: index for index, field in enumerate(work_fields)}
@@ -1499,11 +1519,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         fields_by_id = {field[0]: field for field in work_fields}
         # revise round bookkeeping: target node_id -> rounds already consumed.
         round_used: dict[str, int] = {}
-        # Node ids that finished rc 0 in an earlier wave of THIS run. The
-        # recursion regression guard compares each wave's failures against this
-        # pre-wave set (I8a: a repair source that passed before and fails now
-        # stops the loop instead of revising a passing slice).
-        ever_passed: set[str] = set()
         # Rounds-to-pass ledger (rev6 R5b): a recover process starts its
         # in-memory counter at 1, so number rows from the table's offset and a
         # recovered run continues its numbering instead of overwriting it.
@@ -1889,6 +1904,15 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             _regressed_now = set(regressed_sources(
                 ever_passed, [f[0] for f, rc, _fr in outcomes if rc != 0]))
             ever_passed |= {f[0] for f, rc, _fr in outcomes if rc == 0}
+            # Persist the memory so a resumed run starts from this wave, not
+            # from nothing. Saving is enrichment: a write failure warns and
+            # must not fail a run that otherwise succeeded.
+            if recursion is not None:
+                try:
+                    save_ever_passed(live_run_dir, ever_passed)
+                except OSError as exc:
+                    sys.stderr.write(
+                        f"  [warn] ever-passed record not saved: {exc}\n")
             if revise_groups:
                 for target, failed_sources in revise_groups.items():
                     _target_edge = repair_edges[failed_sources[0][0][0]]
@@ -1900,7 +1924,11 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     _escalation_fired = any(
                         _src_field[0] in escalation_edges
                         for _src_field, _src_rc, _src_fr in failed_sources)
-                    if _escalation_fired and recursion is not None:
+                    # In a recipe that declares `recursion:`, ANY repair round
+                    # is guarded — a `retries`-edge repair as well as an
+                    # `escalates_to` one. The budget cap below keeps its
+                    # escalation-only condition.
+                    if recursion is not None:
                         _regressed = sorted(
                             _src_field[0]
                             for _src_field, _src_rc, _src_fr in failed_sources
