@@ -45,11 +45,17 @@ _CLASS_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
      re.compile(r"429 Too Many Requests|rate_limit_exceeded|rate limit reached"
                 r"|insufficient_quota|Fair Usage Policy|Request rejected \(429\)"
                 r"|api_error_status\"?:\s*\"?429")),
+    # A bare 401/529 anywhere in the log ("took 401ms", "5290 tokens") is not
+    # a status: the code must sit after HTTP/status or before its reason word.
     ("overloaded",
-     re.compile(r"529 |overloaded_error|Service Unavailable")),
+     re.compile(r"(?:HTTP\S*\s+|status[\"']?\s*[:=]\s*[\"']?)529(?!\d)"
+                r"|(?<![\w.])529\s+overloaded|overloaded_error|Service Unavailable",
+                re.IGNORECASE)),
     ("auth_failed",
-     re.compile(r"401|authentication_error|invalid_api_key"
-                r"|API Key appears to be invalid")),
+     re.compile(r"(?:HTTP\S*\s+|status[\"']?\s*[:=]\s*[\"']?)401(?!\d)"
+                r"|(?<![\w.])401\s+(?:unauthorized|authentication)"
+                r"|authentication_error|invalid_api_key"
+                r"|API Key appears to be invalid", re.IGNORECASE)),
     ("timed_out",
      re.compile(r"gtimeout|timed out|deadline_exceeded")),
 )

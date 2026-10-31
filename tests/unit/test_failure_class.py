@@ -423,3 +423,57 @@ def test_only_a_lane_local_fault_is_a_fuse_strike(hermetic, tmp_path, error, fus
     refused = [r for r in rows if (r["actor"] or "").endswith(":refused")]
     assert bool(refused) is (not fused), rows
     assert mod.check_lane_fuse(hermetic, "codex", "config", strikes=1) is fused
+
+
+# ── typed status: a provider-reported HTTP status decides before the text ──
+
+@pytest.mark.parametrize("text, status, expected", [
+    # The status wins over contradictory wording in the body.
+    ("rate limit reached, please slow down", 401, ("credential", "auth")),
+    ("HTTP 429: API Error: Token Plan usage limit reached", 429, ("quota", "quota")),
+    ("too many requests in a short window", 429, ("rate_limit", "capacity")),
+    (MODEL_NOT_FOUND, 400, ("model_access", "config")),
+    ("bad request: messages[3] has no content", 400, ("caller_fault", "request")),
+    ("payload too large", 413, ("caller_fault", "request")),
+    ("blocked by content filter", 422, ("caller_fault", "safety")),
+    ("upstream overloaded", 529, ("transient", "capacity")),
+    ("service unavailable", 503, ("transient", "capacity")),
+    ("internal error", 500, ("transient", "provider")),
+    ("request timed out at the gateway", 408, ("timeout", "network")),
+])
+def test_reported_status_decides_first(text, status, expected):
+    assert failure_class.classify(text, 1, http_status=status) == expected
+
+
+@pytest.mark.parametrize("status", [None, "", "abc", 0, 999, 302])
+def test_absent_or_unusable_status_falls_back_to_text(status):
+    assert failure_class.classify(QUOTA_TEXT, 1, http_status=status) == ("quota", "quota")
+    assert failure_class.classify("something odd", 1, http_status=status) == (
+        "unknown", "unknown")
+
+
+def test_a_bare_429_inside_a_number_is_not_quota():
+    from mini_ork.dispatch.llm_dispatch import classify_error
+
+    assert classify_error("job 14290 hit its monthly report window") != "quota"
+    assert classify_error("HTTP 429: monthly token plan exhausted") == "quota"
+
+
+def test_provider_error_record_carries_the_status(tmp_path):
+    from mini_ork.dispatch.llm_dispatch import (
+        _provider_error_from_result,
+        _provider_error_record,
+    )
+
+    out = tmp_path / "out.txt"
+    out.write_text(json.dumps({"type": "result", "is_error": True,
+                               "api_error_status": 429,
+                               "result": "API Error: usage limit reached"}))
+    assert _provider_error_record(str(out)) == (
+        429, "HTTP 429: API Error: usage limit reached")
+    assert _provider_error_from_result(str(out)) == "HTTP 429: API Error: usage limit reached"
+
+    out.write_text(json.dumps({"type": "result", "is_error": True,
+                               "result": "API Error: something"}))
+    assert _provider_error_record(str(out)) == (None, "API Error: something")
+    assert _provider_error_record(str(tmp_path / "missing.txt")) == (None, "")

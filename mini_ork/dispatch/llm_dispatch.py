@@ -75,7 +75,7 @@ def classify_error(message: str, rc: str | int = "") -> str:
                  r"|insufficient balance|out of credits|purchase credits"
                  r"|credit limit|credit balance", text):
         return "quota"
-    if re.search(r"429", text) and re.search(
+    if re.search(r"(^|[^0-9])429([^0-9]|$)", text) and re.search(
             r"monthly|tokens-per-day|billing|quota|token plan", text):
         return "quota"
     if re.search(r"(^|[^0-9])(429|503)([^0-9]|$)", text) and re.search(
@@ -208,7 +208,16 @@ def strip_protocol_blocks(out_file: str) -> None:
 
 
 def _provider_error_from_result(out_file: str) -> str:
-    """The real provider error from a claude-code ``result`` object on stdout.
+    """The provider error text from a claude-code ``result`` object on stdout.
+
+    Kept for callers that only want the message; see ``_provider_error_record``
+    for the typed status that travels alongside it.
+    """
+    return _provider_error_record(out_file)[1]
+
+
+def _provider_error_record(out_file: str) -> tuple[int | None, str]:
+    """``(api_error_status, message)`` from a claude-code ``result`` object.
 
     The claude-code wrapper prints a provider rejection as a JSON ``result``
     object (or a JSONL stream line) on stdout — ``{"type":"result",
@@ -217,12 +226,14 @@ def _provider_error_from_result(out_file: str) -> str:
     only, so the 429 sat invisible in stdout JSON and ``classify_error`` never
     saw the quota wording. Parse stdout for that object and return
     ``f"HTTP {status}: {result}"[:1000]`` (no ``HTTP`` part when there is no
-    status); return ``""`` when stdout has no such object.
+    status) together with the status as an int, so the classifier can decide
+    on the provider's own status rather than re-parse it from the message;
+    return ``(None, "")`` when stdout has no such object.
     """
     try:
         raw = open(out_file, encoding="utf-8", errors="replace").read()
     except OSError:
-        return ""
+        return (None, "")
     candidates: list[dict] = []
     # One whole-object document (a single result), plus each JSONL stream line.
     try:
@@ -241,7 +252,7 @@ def _provider_error_from_result(out_file: str) -> str:
             continue
         if isinstance(obj, dict):
             candidates.append(obj)
-    best = ""
+    best: tuple[int | None, str] = (None, "")
     for obj in candidates:
         if obj.get("is_error") is not True:
             continue
@@ -250,7 +261,11 @@ def _provider_error_from_result(out_file: str) -> str:
             continue
         status = obj.get("api_error_status")
         prefix = f"HTTP {status}: " if status is not None and str(status) else ""
-        best = (prefix + result)[:1000]
+        try:
+            status_int = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status_int = None
+        best = (status_int, (prefix + result)[:1000])
     return best
 
 
@@ -1392,7 +1407,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     # ``result`` object (``is_error: true``, ``api_error_status``, ``result``).
     # Surface it so ``error_message``/``error_category`` carry the provider's
     # own words (the MiniMax 429 quota text) instead of the CLI's stderr chatter.
-    provider_err = _provider_error_from_result(out_file)
+    provider_status, provider_err = _provider_error_record(out_file)
     if provider_err:
         err = provider_err
     err = redact_secrets(err)
@@ -1403,10 +1418,13 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     class_text = err_full
     if provider_err:
         class_text = f"{class_text}\n{provider_err}" if class_text else provider_err
-    cls, category = failure_class.classify(class_text, rc)
+    cls, category = failure_class.classify(class_text, rc, http_status=provider_status)
     hint = failure_class.wait_hint(class_text)
     retryable = failure_class.retryable(cls)
     metadata = {"failure_class": cls}
+    if provider_status is not None:
+        # The status the class was decided on, so the ledger shows why.
+        metadata["http_status"] = provider_status
     if hint is not None:
         metadata["wait_hint_s"] = hint
     row_actor = actor
