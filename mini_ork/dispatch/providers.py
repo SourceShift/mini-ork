@@ -1322,8 +1322,36 @@ def lane_health(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> LaneHealth:
-    """Cheap pre-dispatch check for registry-defined lanes."""
+    """Cheap pre-dispatch check for registry-defined lanes.
+
+    With ``MO_REQUIRE_CONFORMANCE=1`` a lane whose credentials pass must also
+    have passed a conformance probe under the harness release it runs now
+    (``mini_ork.dispatch.conformance``).
+    """
     runtime = context_env_snapshot() if environment is None else environment
+    health = _credential_health(model, root, runtime)
+    if health.ok and runtime.get("MO_REQUIRE_CONFORMANCE") == "1":
+        return _conformance_gate(model, root, runtime, health)
+    return health
+
+
+def _conformance_gate(model: str, root: str | os.PathLike[str] | None,
+                      runtime: Mapping[str, str], health: LaneHealth) -> LaneHealth:
+    from .conformance import passed
+
+    db = runtime.get("MINI_ORK_DB") or str(
+        Path(runtime.get("MINI_ORK_HOME") or ".mini-ork") / "state.db")
+    if not os.path.isfile(db):
+        return LaneHealth(False, f"{model}: MO_REQUIRE_CONFORMANCE=1 but there is no state db at {db}")
+    ok, reason = passed(model, db=db, root=root, environment=runtime)
+    return health if ok else LaneHealth(False, reason)
+
+
+def _credential_health(
+    model: str,
+    root: str | os.PathLike[str] | None,
+    runtime: Mapping[str, str],
+) -> LaneHealth:
     try:
         registry = _load_providers_registry(root)
         _resolve_from_registry(model, registry, root, environment=runtime)
@@ -1602,7 +1630,8 @@ def dispatch_model(
     envelope = envelope_from_env(context_env)
     if not envelope.is_empty():
         effective_env = {**effective_env, **envelope.as_env()}
-        unsupported = envelope.unsupported_axes(engine.capabilities())
+        unsupported = envelope.unsupported_axes(
+            _envelope_capabilities(engine, request.model, root))
         if unsupported:
             return DispatchResult(
                 ok=False,
@@ -1673,6 +1702,21 @@ def dispatch_model(
     result = backend(effective, spec)
     _stash_session_id(result.session_id, merged_env)
     return result
+
+
+# Lanes served by mini-ork's own HTTP transports run no harness: nothing reads
+# a materialized skill, an MCP config or an agent doc. They borrow the claude
+# engine for argv handling only, so its capabilities must not stand in for
+# theirs — a grant there was accepted and then silently unused.
+_HARNESSLESS_KINDS = frozenset({"openai-compat", "openai-chat"})
+
+
+def _envelope_capabilities(engine: "HarnessEngine", model: str,
+                           root: str | os.PathLike[str] | None) -> "Capabilities":
+    """The capabilities a node's envelope is checked against for ``model``."""
+    if _lane_kind(model, root) in _HARNESSLESS_KINDS:
+        return Capabilities()
+    return engine.capabilities()
 
 
 def _stash_session_id(session_id: str, env: Mapping[str, str]) -> None:

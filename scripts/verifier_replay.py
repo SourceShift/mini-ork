@@ -37,9 +37,11 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -84,16 +86,58 @@ def stored_patches(patches_dir: Path, tasks: dict[str, dict]) -> list[tuple[Path
     return out
 
 
+# A scoped verifier run hands the verifier's own test subprocess an explicit
+# pytest command; only files with this suffix are candidate tests.
+TEST_SUFFIX = ".py"
+
+
+def is_test_path(path: str) -> bool:
+    """True for a path under ``tests/`` or a ``test_*.py`` basename."""
+    return path.endswith(TEST_SUFFIX) and (
+        path.startswith("tests/") or "/tests/" in path
+        or Path(path).name.startswith("test_"))
+
+
+def patch_files(patch: Path, cwd: Path) -> list[str]:
+    """The files a ``patch`` touches, from ``git apply --numstat`` in ``cwd``.
+
+    Returns ``[]`` when the patch cannot be parsed (a scoped run then simply
+    has fewer candidate test files)."""
+    proc = _git(cwd, "apply", "--numstat", str(patch), check=False)
+    if proc.returncode != 0:
+        return []
+    files: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        columns = line.split("\t")
+        if len(columns) >= 3:
+            files.append(columns[2])
+    return files
+
+
 def run_verifier(verifier: Path, scratch: Path, python: str, timeout: int,
-                 *, import_root: Path | None = None) -> tuple[bool | None, str]:
+                 *, import_root: Path | None = None,
+                 extra_env: Mapping[str, str] | None = None) -> tuple[bool | None, str]:
     """(pass, reason) from the verifier's JSON line; pass is None when it
     produced no verdict (crash, timeout, non-JSON).
 
     ``import_root`` makes the verifier's own ``import mini_ork…`` resolve to
     that tree while the scratch tree's test subprocesses (which inherit the
-    environment, not ``sys.path``) stay untouched."""
+    environment, not ``sys.path``) stay untouched.
+
+    ``extra_env`` is merged into the child environment per call (never into
+    ``os.environ`` — items run in threads); the fixed keys below still win.
+
+    An inherited ``MINI_ORK_TEST_CMD`` is scrubbed to empty (the verifier
+    treats a falsy value as "auto-detect"): the operator's pinned command
+    targets their checkout, not this scratch tree, so letting it through would
+    silently measure the wrong tests.  A caller that wants a specific command
+    opts in explicitly through ``extra_env``."""
     with tempfile.TemporaryDirectory() as tmp:
-        env = {**os.environ, "MO_TARGET_CWD": str(scratch), "MINI_ORK_HOME": tmp,
+        inherited = {k: v for k, v in os.environ.items() if k != "MINI_ORK_TEST_CMD"}
+        env = {**inherited, "MINI_ORK_TEST_CMD": "", **(extra_env or {}),
+               "MO_TARGET_CWD": str(scratch), "MINI_ORK_HOME": tmp,
                "MINI_ORK_RUN_DIR": tmp, "MINI_ORK_RUN_ID": "verifier-replay",
                "PYTHONDONTWRITEBYTECODE": "1"}
         if import_root is None:
@@ -120,7 +164,7 @@ def run_verifier(verifier: Path, scratch: Path, python: str, timeout: int,
 
 def replay_one(source: Path, task: dict, *, repo: Path, verifier: Path,
                python: str, timeout: int, import_root: Path | None = None,
-               hidden: bool = True) -> dict:
+               hidden: bool = True, scoped_tests: bool = False) -> dict:
     """``source`` is a runner-kept patch file or a run dir holding review-diff.patch."""
     patch = source if source.is_file() else source / "review-diff.patch"
     scratch_parent = repo.parent / f"{repo.name}-replay-scratch"
@@ -136,8 +180,24 @@ def replay_one(source: Path, task: dict, *, repo: Path, verifier: Path,
                        + (applied.stderr.strip().splitlines() or [""])[0][:200])
             return row
         # 1) verifier FIRST — before the hidden tests are restored.
-        row["verifier_pass"], row["verifier_reason"] = run_verifier(
-            verifier, scratch, python, timeout, import_root=import_root)
+        if scoped_tests:
+            files = sorted(
+                {f for f in (task.get("test_files") or [])
+                 if (scratch / f).is_file()}
+                | {f for f in patch_files(patch, scratch)
+                   if is_test_path(f) and (scratch / f).is_file()})
+            if not files:
+                row["skipped"] = "no runnable tests for a scoped verifier run"
+                return row
+            row["scoped_tests"] = files
+            cmd = " ".join([shlex.quote(python), "-m", "pytest", "-q", "-p",
+                            "no:asyncio", *map(shlex.quote, files)])
+            row["verifier_pass"], row["verifier_reason"] = run_verifier(
+                verifier, scratch, python, timeout, import_root=import_root,
+                extra_env={"MINI_ORK_TEST_CMD": cmd})
+        else:
+            row["verifier_pass"], row["verifier_reason"] = run_verifier(
+                verifier, scratch, python, timeout, import_root=import_root)
         # 2) ground truth: restore hidden tests from the fix and grade.
         if hidden:
             graded = rh.grade(scratch, task, python, timeout)

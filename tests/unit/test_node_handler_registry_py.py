@@ -9,7 +9,7 @@ from mini_ork.context import context_env
 def test_registry_covers_builtin_node_types():
     assert set(ex.NODE_HANDLER_REGISTRY) == {
         "researcher", "transform", "implementer", "reviewer", "verifier", "eval",
-        "publisher", "rollback"}
+        "publisher", "rollback", "subgraph"}
     assert set(ex.EARLY_NODE_HANDLERS) == {"planner", "reflector"}
 
 

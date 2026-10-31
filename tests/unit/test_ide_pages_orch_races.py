@@ -103,6 +103,22 @@ def test_each_contestant_row_opens_its_run(home: Path) -> None:
     assert all(row["acts"][0]["do"]["title"] == TITLE for row in rows)
 
 
+def test_contestants_keep_launch_order_across_a_second_boundary(home: Path) -> None:
+    # The run scan is created_at DESC; a race launched across a second boundary
+    # used to list its contestants reversed (CI flake on 2026-10-30).
+    _contestant(home, "run-a", lane="codex", created=1_790_000_000)
+    _contestant(home, "run-b", lane="glm", created=1_790_000_001)
+    rows = _race_sections(home)[0]["rows"]
+    assert [row["acts"][0]["do"]["run"] for row in rows] == ["run-a", "run-b"]
+
+
+def test_same_second_contestants_order_by_run_id(home: Path) -> None:
+    _contestant(home, "run-b", lane="glm", created=1_790_000_000)
+    _contestant(home, "run-a", lane="codex", created=1_790_000_000)
+    rows = _race_sections(home)[0]["rows"]
+    assert [row["acts"][0]["do"]["run"] for row in rows] == ["run-a", "run-b"]
+
+
 def test_a_closed_workspace_reads_as_an_em_dash(home: Path) -> None:
     _contestant(home, "run-a", lane="codex")
     _contestant(home, "run-b", lane="glm", workspace=False)

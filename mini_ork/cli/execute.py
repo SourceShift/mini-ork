@@ -1125,6 +1125,130 @@ def _resolve_task_class(plan_path: str, run_id: str, db: str) -> str:
     return "generic"
 
 
+# Node types whose handlers publish no node_checkpoints row on success
+# (execute_handlers: verifier, publisher, rollback, eval, reflector). The review
+# gate needs that row to park, so these cannot carry a review_after_nodes pause.
+_NON_CHECKPOINTING_NODE_TYPES = frozenset(
+    {"verifier", "publisher", "rollback", "eval", "reflector"})
+
+
+def _declared_review_nodes(workflow_path, node_names, environ) -> tuple[tuple[str, ...], str]:
+    """``(after_nodes_to_publish, message)`` for a workflow's ``review_after_nodes``.
+
+    ``()`` when the workflow declares none, or when ``MO_REVIEW_RECIPE_NODES=0``
+    (the message says so). A declared name that is not a node of this workflow
+    raises ``ValueError`` (zero-fallback: a typo must not silently drop the
+    pause). Otherwise the result is the review policy's current ``after_nodes``
+    (``load_policy(env=environ)``, so env and ``review.yaml`` still count),
+    followed by the declared nodes, de-duplicated, order preserved.
+    """
+    import yaml
+
+    try:
+        with open(workflow_path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle) or {}
+    except OSError as exc:
+        raise ValueError(f"cannot read workflow at {workflow_path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"workflow at {workflow_path} is not valid YAML: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"workflow at {workflow_path} must be a mapping")
+
+    declared = document.get("review_after_nodes")
+    if declared is None:
+        declared = []
+    elif not isinstance(declared, list):
+        raise ValueError(
+            "review_after_nodes must be a list of node names, got "
+            f"{type(declared).__name__}")
+    for name in declared:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"review_after_nodes entries must be non-empty strings, got {name!r}")
+        if name not in node_names:
+            raise ValueError(
+                f"review_after_nodes names a node not in this workflow: {name!r}")
+        # ``node_names`` may map name -> node type. The review gate parks a run
+        # only after a node that published a node_checkpoints success row, and
+        # these handlers publish none, so a pause declared after one would
+        # silently never fire.
+        node_type = node_names.get(name) if hasattr(node_names, "get") else None
+        if node_type in _NON_CHECKPOINTING_NODE_TYPES:
+            raise ValueError(
+                f"review_after_nodes names {name!r}, a {node_type} node; {node_type} "
+                "nodes record no checkpoint, so a review pause after it would never "
+                "fire — pause after the node that produces what needs review")
+
+    if not declared:
+        return (), ""
+
+    raw_knob = environ.get("MO_REVIEW_RECIPE_NODES")
+    if raw_knob is not None and raw_knob.strip() == "0":
+        return (), (
+            "workflow review_after_nodes disabled by MO_REVIEW_RECIPE_NODES=0 "
+            f"({', '.join(declared)})")
+
+    from mini_ork.gates.review_policy import load_policy
+
+    merged: list[str] = []
+    for name in (*load_policy(env=environ).after_nodes, *declared):
+        if name not in merged:
+            merged.append(name)
+    message = (
+        f"{', '.join(declared)} (declared by the workflow; "
+        "MO_REVIEW_RECIPE_NODES=0 disables)")
+    return tuple(merged), message
+
+
+_AUTHORSHIP_GATE_FILE = "authorship-separation-gate.json"
+
+
+def _authorship_separation_gate(workflow_path, *, root, home, run_dir, db, run_id,
+                                gate_mode) -> int | None:
+    """I2a authorship-separation gate: ``2`` to refuse the run, ``None`` to proceed.
+
+    Only called with ``gate_mode`` ``shadow`` or ``enforce`` (``off`` reads and
+    writes nothing). The families are resolved from the agents config the
+    dispatcher itself reads (run snapshot / home / root template + the
+    per-user overlay), so the gate judges the lanes the nodes will be routed
+    to. ``shadow`` records ``authorship-separation-gate.json`` and, when it
+    would block, a task_runs note; it never refuses. An unreadable workflow or
+    agents config is fatal under ``enforce`` (a gate that cannot look must not
+    pass) and recorded under ``shadow``.
+    """
+    import yaml
+
+    from mini_ork.dispatch.agents_config import lane_families
+    from mini_ork.dispatch.llm_dispatch import _effective_lanes
+    from mini_ork.verify import authorship_separation as _as
+    from mini_ork.verify.probe_validity import record_note
+
+    shadow = gate_mode == "shadow"
+    try:
+        with open(workflow_path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle) or {}
+        if not isinstance(document, dict):
+            raise ValueError(f"workflow at {workflow_path} must be a mapping")
+        lanes = _effective_lanes(root, home) or {}
+        ok, reason, detail = _as.check_separation(document, lane_families({"lanes": lanes}))
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        ok, reason, detail = False, f"authorship_separation_unreadable: {exc}", {}
+
+    if shadow:
+        report = {"mode": "shadow", "would_block": not ok, "reason": reason, **detail}
+        with contextlib.suppress(OSError):
+            with open(os.path.join(run_dir, _AUTHORSHIP_GATE_FILE), "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=1, default=str)
+        if not ok:
+            record_note(db, run_id, f"[shadow] authorship separation would block: {reason}")
+        return None
+    if not ok:
+        sys.stderr.write(f"execute: authorship separation refused: {reason}\n")
+        record_note(db, run_id, f"authorship_separation_refused: {reason}")
+        return 2
+    return None
+
+
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -1191,6 +1315,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # ``None`` means the recipe declared no block (or there is no workflow file):
     # its `escalates_to` edges stay inert and the declared budget does not apply.
     recursion = None
+    # Imported unconditionally: the wave loop calls it on every wave, including
+    # runs with no workflow file (where ``ever_passed`` simply never matters).
+    # ``load_ever_passed`` / ``save_ever_passed`` persist that memory under
+    # ``<run_dir>/revise/`` so a ``mini-ork recover`` inherits it (I8a).
+    from mini_ork.workflow.recursion import (
+        load_ever_passed,
+        regressed_sources,
+        save_ever_passed,
+    )
+
     if workflow and os.path.isfile(workflow):
         from mini_ork.workflow import compile_workflow
 
@@ -1212,6 +1346,43 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 "MO_RECURSION_MAX_ITERATIONS": str(recursion.max_iterations),
                 "MO_RECURSION_BUDGET_CAP_TOTAL_USD": f"{recursion.budget_cap_total_usd:.2f}",
             })
+
+        # A recipe may declare its own operator-review pauses. Merge them into
+        # the policy's ``after_nodes`` so the existing node-review machinery
+        # parks the run there. A declared name that is not a node of this
+        # workflow is a fatal setup error: silently dropping the pause would
+        # defeat the gate the recipe asked for.
+        try:
+            review_nodes, review_message = _declared_review_nodes(
+                workflow, {name: node.type for name, node in compiled.nodes.items()},
+                os.environ)
+        except ValueError as exc:
+            sys.stderr.write(f"execute: workflow review_after_nodes: {exc}\n")
+            return 2
+        if review_nodes:
+            publish_env({"MO_REVIEW_AFTER_NODES": ",".join(review_nodes)})
+            sys.stderr.write(f"[review] pausing after: {review_message}\n")
+        elif review_message:
+            sys.stderr.write(f"[review] {review_message}\n")
+
+        # I2a (MO_AUTHORSHIP_SEPARATION=shadow|1, default OFF): the probe
+        # author's model family must differ from the implementer's. Runs before
+        # any node is dispatched; `off` reads and writes nothing.
+        from mini_ork.verify import authorship_separation
+
+        try:
+            separation_mode = authorship_separation.mode()
+        except ValueError as exc:
+            sys.stderr.write(f"execute: {exc}\n")
+            return 2
+        if separation_mode != "off":
+            gate_ctx = RunContext.from_env()
+            gate_rc = _authorship_separation_gate(
+                workflow, root=root, home=home, run_dir=gate_ctx.run_dir or run_dir,
+                db=gate_ctx.db_or_default(), run_id=gate_ctx.run_id,
+                gate_mode=separation_mode)
+            if gate_rc is not None:
+                return gate_rc
 
     # One repair map for the round loop: a `retries` edge and an escalated
     # `escalates_to` edge mean the same thing to it -- send the findings back to
@@ -1403,6 +1574,20 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # the base already passes and the implementer changed nothing. ``main``
     # closes the run terminal ``not_needed`` instead of counting a failure.
     already_satisfied = False
+    # I8a memory: node ids that finished rc 0 in an earlier wave, loaded from
+    # ``<run_dir>/revise/ever-passed.json`` so a ``mini-ork recover`` (cost
+    # pause, review pause, crash) does not forget what passed before the
+    # restart. A corrupted record is fatal setup: silently starting empty
+    # would disable the guard on exactly the resumed run that needs it.
+    # Only a recipe that declares `recursion:` consults the guard, so only
+    # such a run reads or writes the record (no stray revise/ for the rest).
+    ever_passed: set[str] = set()
+    if recursion is not None:
+        try:
+            ever_passed = load_ever_passed(live_run_dir)
+        except ValueError as exc:
+            sys.stderr.write(f"execute: revise/ever-passed.json: {exc}\n")
+            return 2
 
     def _dispatch_dependency_graph():
         """Dispatch control/data dependencies in readiness waves.
@@ -1412,7 +1597,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         selected parent succeeded; failed parents block descendants without
         executing a publisher or consumer against partial state.
         """
-        nonlocal fail_count, abstain_count, pause_count, already_satisfied
+        nonlocal fail_count, abstain_count, pause_count, already_satisfied, ever_passed
         pending = {field[0]: field for field in work_fields}
         statuses: dict[str, str] = {}
         order = {field[0]: index for index, field in enumerate(work_fields)}
@@ -1798,6 +1983,22 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                         db, run_id,
                         f"spec-test-defect ({_defect_name}): {_defect_text}",
                     )
+            # I8a: identify this wave's regressions against the set of nodes
+            # that passed in EARLIER waves, then fold this wave's passes in.
+            # Order is load-bearing — computing after the update would classify
+            # a source that passed in an earlier wave and fails now as a miss.
+            _regressed_now = set(regressed_sources(
+                ever_passed, [f[0] for f, rc, _fr in outcomes if rc != 0]))
+            ever_passed |= {f[0] for f, rc, _fr in outcomes if rc == 0}
+            # Persist the memory so a resumed run starts from this wave, not
+            # from nothing. Saving is enrichment: a write failure warns and
+            # must not fail a run that otherwise succeeded.
+            if recursion is not None:
+                try:
+                    save_ever_passed(live_run_dir, ever_passed)
+                except OSError as exc:
+                    sys.stderr.write(
+                        f"  [warn] ever-passed record not saved: {exc}\n")
             if revise_groups:
                 for target, failed_sources in revise_groups.items():
                     _target_edge = repair_edges[failed_sources[0][0][0]]
@@ -1809,6 +2010,33 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     _escalation_fired = any(
                         _src_field[0] in escalation_edges
                         for _src_field, _src_rc, _src_fr in failed_sources)
+                    # In a recipe that declares `recursion:`, ANY repair round
+                    # is guarded — a `retries`-edge repair as well as an
+                    # `escalates_to` one. The budget cap below keeps its
+                    # escalation-only condition.
+                    if recursion is not None:
+                        _regressed = sorted(
+                            _src_field[0]
+                            for _src_field, _src_rc, _src_fr in failed_sources
+                            if _src_field[0] in _regressed_now)
+                        if _regressed:
+                            print(
+                                f"[revise] recursion regression for {target}: "
+                                f"{', '.join(_regressed)} passed in an earlier "
+                                "round and now fail — stopping the loop instead "
+                                "of revising a passing slice",
+                                file=sys.stderr,
+                            )
+                            from mini_ork.cli.execute_handlers import (  # noqa: PLC0415
+                                _append_run_note,
+                            )
+
+                            _append_run_note(
+                                db, run_id,
+                                f"recursion_regression: {target} "
+                                f"({', '.join(_regressed)})",
+                            )
+                            continue
                     if _escalation_fired and recursion is not None:
                         from mini_ork import cost_ledger as _cost_ledger  # noqa: PLC0415
 

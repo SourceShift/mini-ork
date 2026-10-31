@@ -393,6 +393,12 @@ def _llm_lenses_all_failed(
     A row for the panel itself with ``status == "error"`` means the panel
     raised mid-review. That is a degraded review whatever the per-lens rows
     say — a surviving ``ok`` lens must not hide the crash.
+
+    A read error (a locked or corrupt DB) reports ``(True, 0)``. The lens
+    evidence cannot be read, so the review is treated as degraded: it is
+    warned in the simple tier, refused in the secure tier, and never cached.
+    A missing table still reports ``(False, 0)``, because ``_lens_runs``
+    returns ``[]`` for it without raising.
     """
     try:
         rows = _lens_runs(review_id, db)
@@ -400,8 +406,8 @@ def _llm_lenses_all_failed(
             if fresh and _lens_table_exists(db):
                 return True, 0
             return False, 0
-    except Exception:  # noqa: BLE001 — evidence must not flip the decision
-        return False, 0
+    except Exception:  # noqa: BLE001 — unreadable evidence is degraded, not clean
+        return True, 0
     if any(lens == "llm.panel" and status == "error"
            for lens, status, _, _ in rows):
         return True, len(rows)

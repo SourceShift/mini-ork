@@ -1,0 +1,63 @@
+{
+  "base_sha": "e2e2c1e5092db2a8f5e6f4d5058be83a2a803817",
+  "fail_to_pass": [
+    "tests.unit.test_config_seam_env_overrides_py::test_coalition_gate_reads_the_agents_override",
+    "tests.unit.test_config_seam_env_overrides_py::test_profile_reads_the_agents_override",
+    "tests.unit.test_config_seam_env_overrides_py::test_validate_reads_the_providers_override",
+    "tests.unit.test_framework_edit_ground_truth_py::test_baseline_records_the_untracked_inventory",
+    "tests.unit.test_framework_edit_ground_truth_py::test_delegate_forwards_so_monkeypatches_stay_observable",
+    "tests.unit.test_framework_edit_ground_truth_py::test_empty_tree_without_a_diff_fails_the_node",
+    "tests.unit.test_framework_edit_ground_truth_py::test_guard_defers_when_it_cannot_read_the_tree",
+    "tests.unit.test_framework_edit_ground_truth_py::test_implementer_created_untracked_file_lands_in_the_diff",
+    "tests.unit.test_framework_edit_ground_truth_py::test_preexisting_untracked_dirt_is_not_claimed_as_the_implementers_work",
+    "tests.unit.test_framework_edit_ground_truth_py::test_run_mirror_evidence_is_never_harvested",
+    "tests.unit.test_framework_edit_ground_truth_py::test_tree_delta_wins_and_the_agents_artifact_is_preserved",
+    "tests.unit.test_framework_edit_ground_truth_py::test_tree_untouched_but_a_usable_agent_diff_is_applied",
+    "tests.unit.test_framework_edit_ground_truth_py::test_unusable_agent_diff_fails_immediately",
+    "tests.unit.test_revert_inplace_diff_py::test_a_diff_cannot_reach_outside_the_target_repo",
+    "tests.unit.test_revert_inplace_diff_py::test_created_file_is_removed_and_unstaged",
+    "tests.unit.test_revert_inplace_diff_py::test_no_diff_artifact_is_a_noop",
+    "tests.unit.test_revert_inplace_diff_py::test_paths_outside_the_diff_are_never_touched",
+    "tests.unit.test_revert_inplace_diff_py::test_rollback_handler_discards_the_inplace_diff",
+    "tests.unit.test_revert_inplace_diff_py::test_staged_edit_is_reverted",
+    "tests.unit.test_revert_inplace_diff_py::test_unstaged_edit_is_reverted"
+  ],
+  "fix_sha": "bc6d859eb94a4307644db679ee64095c32ce1746",
+  "pass_to_pass": [
+    "tests.test_recovery_closure::test_all_reusable_returns_empty_closure",
+    "tests.test_recovery_closure::test_escalates_to_edge_excluded_from_closure",
+    "tests.test_recovery_closure::test_execute_loop_dispatches_only_closure",
+    "tests.test_recovery_closure::test_execute_loop_no_dispatch_with_status_only",
+    "tests.test_recovery_closure::test_from_node_invalid_raises",
+    "tests.test_recovery_closure::test_from_node_widens_closure",
+    "tests.test_recovery_closure::test_resume_cost_pause_unchanged",
+    "tests.test_recovery_closure::test_scenario_1_closure_only_failed_node",
+    "tests.test_recovery_closure::test_scenario_5_parallel_branch_closure",
+    "tests.test_recovery_closure::test_status_prints_split_without_dispatch",
+    "tests.test_recovery_closure::test_strategy_pause_returns_zero_with_status",
+    "tests.unit.test_config_seam_env_overrides_py::test_coalition_gate_defaults_to_the_root_config",
+    "tests.unit.test_config_seam_env_overrides_py::test_profile_defaults_to_the_home_config",
+    "tests.unit.test_config_seam_env_overrides_py::test_validate_falls_back_to_the_home_config",
+    "tests.unit.test_revert_inplace_diff_py::test_rollback_handler_keeps_the_inplace_edit_when_an_outer_loop_owns_verify"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "change/R4/verdict",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-bc6d859eb9-1790739390"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-bc6d859eb9"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/test_recovery_closure.py",
+    "tests/unit/test_config_seam_env_overrides_py.py",
+    "tests/unit/test_framework_edit_ground_truth_py.py",
+    "tests/unit/test_revert_inplace_diff_py.py"
+  ]
+}

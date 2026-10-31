@@ -42,7 +42,12 @@ from mini_ork.runtime.run_roots import (
     require_run_target,
 )
 from mini_ork.verify import levels as _levels
-from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
+from mini_ork.cli.main import (
+    _cap_reflect_to_deadline,
+    _module_env,
+    _reflect_timeout,
+    _reflect_timeout_seconds,  # noqa: F401 -- kept as a re-export for callers
+)
 from mini_ork.observability.heartbeat import Heartbeat
 from mini_ork.observability.node_events import _now_ms, mo_node_emit, mo_node_end, mo_node_start
 from mini_ork.execute_compat import (
@@ -1406,6 +1411,19 @@ def _handle_planner_early(root):
     return 0, "done"
 
 
+def _early_reflect_bound() -> tuple[int, str]:
+    """``(seconds, why)`` for the reflector node: the derived bound, capped to an armed ``--deadline``."""
+    bound, why = _reflect_timeout()
+    armed, remaining = _deadline_state()
+    if not armed:
+        return bound, why
+    # ``_deadline_state`` already established that a deadline is armed; any
+    # positive ``deadline_seconds`` selects the capping branch.
+    return _cap_reflect_to_deadline(
+        bound, why, deadline_seconds=1, remaining_seconds=remaining, hit=remaining <= 0,
+    )
+
+
 def _handle_reflector_early(root):
     # Preserve bash's `… || true`: reflection is a side-channel and must
     # never fail the workflow node. Capturing output also prevents the
@@ -1416,19 +1434,20 @@ def _handle_reflector_early(root):
     # invisible in execute.log — run-1792151796-92942 was silent for 8978 s.
     started_at = time.time()
     started_clock = time.strftime("%H:%M:%S", time.localtime(started_at))
+    bound, why = _early_reflect_bound()
     try:
         try:
             proc = subprocess.run(
                 [sys.executable, "-m", "mini_ork.cli.reflect"],
                 capture_output=True,
-                timeout=_reflect_timeout_seconds(),
+                timeout=bound,
                 env={**_module_env(root), "MINI_ORK_ROOT": root},
             )
         except subprocess.TimeoutExpired:
             # Surface it: a silently-skipped reflection is how a gradient outage
             # stayed invisible for hours (the learning loop read as "nothing to
             # learn" while dispatch was actually refused).
-            print("  [reflect] timed out — reflection skipped this node "
+            print(f"  [reflect] timed out after {bound}s ({why}) — reflection skipped this node "
                   "(learning loop lags; run `mini-ork reflect` to catch up)",
                   file=sys.stderr)
             return 0, "done"
@@ -4066,6 +4085,12 @@ def _handle_eval(ctx: NodeDispatch):
     return 0, "done"
 
 
+def _handle_subgraph(ctx: NodeDispatch):
+    """One recipe as a node of another — see mini_ork.orchestration.subgraph."""
+    from mini_ork.orchestration import subgraph
+    return subgraph.handle(ctx)
+
+
 NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "researcher": _handle_researcher,
     "transform": _handle_transform,
@@ -4075,6 +4100,7 @@ NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "eval": _handle_eval,
     "publisher": _handle_publisher,
     "rollback": _handle_rollback,
+    "subgraph": _handle_subgraph,
 }
 
 

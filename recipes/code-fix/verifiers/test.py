@@ -153,6 +153,14 @@ except Exception:                       # pragma: no cover — defensive only
         return "pnpm" if shutil.which("pnpm") else ("npm" if shutil.which("npm") else "")
 
 
+try:
+    # Late import — same seam as replay_check above; the verifier must keep
+    # working in environments that do not have mini_ork installed.
+    from mini_ork.verify.pm import classify_suite_spawn as _classify_suite_spawn
+except Exception:                       # pragma: no cover — defensive only
+    _classify_suite_spawn = None        # type: ignore[assignment]
+
+
 def _child_env(environ=None):
     """Environment for the target repo's test command.
 
@@ -1292,6 +1300,18 @@ def first_fail_line(log):
     return "see log"
 
 
+def _suite_failure_kind(post_rc):
+    """``"toolchain"`` when the suite run never started its tool, else ``""`` (fail-closed)."""
+    if _classify_suite_spawn is None or not isinstance(post_rc, int) or post_rc == 0:
+        return ""
+    try:
+        with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(65536)
+    except OSError:
+        text = ""
+    return _classify_suite_spawn(CMD, post_rc, text)
+
+
 def emit(passed, reason, post_rc, replay=None, adequacy=None):
     summary = reason if passed else f"{reason}: {first_fail_line(LOG_PATH)}"
     payload = {
@@ -1309,6 +1329,10 @@ def emit(passed, reason, post_rc, replay=None, adequacy=None):
         payload["certify"] = CERTIFY
     if TARGET_WAIVER:
         payload["target_waiver"] = TARGET_WAIVER
+    if not passed:
+        kind = _suite_failure_kind(post_rc)
+        if kind:
+            payload["failure_kind"] = kind
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
     return 0 if passed else 1
 

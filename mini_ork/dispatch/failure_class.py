@@ -76,6 +76,12 @@ _MODEL_ACCESS_RE = re.compile(
     r"|(model|deployment)\s+[`'\"]?[\w.:/@-]+[`'\"]?\s+does not exist"
     r"|do(es)? not have access to (the )?model")
 
+# A 429 is quota (a spent plan or credit balance: no lane on that account
+# recovers this run) only when the body says so; anything else is a rate limit.
+_QUOTA_WORDS_RE = re.compile(
+    r"usage limit|quota|insufficient (credits|balance)|out of credits"
+    r"|credit (limit|balance)|billing|token plan|tokens-per-day|monthly")
+
 _RETRY_AFTER_RE = re.compile(r"retry-after[:=\s]+(\d+)", re.IGNORECASE)
 _TRY_AGAIN_IN_RE = re.compile(
     r"try again in\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|s|m)\b",
@@ -115,18 +121,68 @@ def wait_hint(text: str, *, now: datetime | None = None) -> float | None:
     return None
 
 
-def classify(text: str, rc: int | str = "") -> tuple[str, str]:
+def _status_int(http_status: int | str | None) -> int | None:
+    """The provider's HTTP status as an int, or ``None`` when absent/invalid."""
+    try:
+        value = int(str(http_status).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if 100 <= value <= 599 else None
+
+
+def _classify_status(status: int, low: str) -> tuple[str, str] | None:
+    """The class a provider-reported HTTP status decides on its own.
+
+    The text is consulted only for the two splits a status cannot make: a 429
+    is quota or a rate limit, and a 400/404 may name a model the account cannot
+    use. ``None`` hands the decision back to the text rules.
+    """
+    if status in (401, 403):
+        return ("credential", "auth")
+    if status == 429:
+        if _QUOTA_WORDS_RE.search(low):
+            return ("quota", "quota")
+        return ("rate_limit", "capacity")
+    if status in (400, 404) and _MODEL_ACCESS_RE.search(low):
+        return ("model_access", "config")
+    if status == 408:
+        return ("timeout", "network")
+    if status in (400, 413):
+        return ("caller_fault", "request")
+    if status == 422:
+        return ("caller_fault", "safety")
+    if status in (503, 529):
+        return ("transient", "capacity")
+    if 500 <= status <= 599:
+        return ("transient", "provider")
+    return None
+
+
+def classify(text: str, rc: int | str = "", *,
+             http_status: int | str | None = None) -> tuple[str, str]:
     """``(failure_class, db_category)`` for an error ``text`` and exit code.
 
     ``db_category`` is always one of the ten words the ``llm_calls`` CHECK
     constraint allows; the typed class only ever travels in ``metadata_json``.
-    The first matching rule wins (a timeout outranks a spawn failure it also
-    mentions). Anything the rules do not recognise is handed to the existing
-    ``classify_error`` and mapped onto the typed vocabulary.
+
+    ``http_status`` is the status the provider itself reported (the
+    ``api_error_status`` of a claude-code ``result`` object). When present it
+    decides first: reading it back out of a re-stringified message
+    ("HTTP 429: …") let a reworded body, or a stray "401" elsewhere in the
+    text, flip the class. Otherwise the first matching text rule wins (a
+    timeout outranks a spawn failure it also mentions), and anything the rules
+    do not recognise is handed to ``classify_error`` and mapped onto the typed
+    vocabulary.
     """
     body = text or ""
     low = body.lower()
     rc_s = str(rc).strip()
+
+    status = _status_int(http_status)
+    if status is not None:
+        decided = _classify_status(status, low)
+        if decided is not None:
+            return decided
 
     if rc_s == "124" or _TIMEOUT_RE.search(low):
         return ("timeout", "network")

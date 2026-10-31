@@ -1,0 +1,38 @@
+{
+  "base_sha": "cb7b9ddc2c6a1833e5c8ec63f54b4e1755854f8f",
+  "fail_to_pass": [
+    "tests.unit.test_mini_ork_plan_py::test_repair_exhausted_hard_fail",
+    "tests.unit.test_mini_ork_plan_py::test_repair_recovers_parse_error"
+  ],
+  "fix_sha": "24645375308aa1d30a83196cfc88d901f1b8b8fc",
+  "pass_to_pass": [
+    "tests.unit.test_mini_ork_plan_py::test_bad_node_type_rejected",
+    "tests.unit.test_mini_ork_plan_py::test_dry_run_parity",
+    "tests.unit.test_mini_ork_plan_py::test_fenced_and_zinsight_bleed",
+    "tests.unit.test_mini_ork_plan_py::test_flag_errors_parity",
+    "tests.unit.test_mini_ork_plan_py::test_missing_verifier_no_recipe_rejected",
+    "tests.unit.test_mini_ork_plan_py::test_mo_plan_deterministic_fallback_opt_in",
+    "tests.unit.test_mini_ork_plan_py::test_parse_error_no_recipe_rejected",
+    "tests.unit.test_mini_ork_plan_py::test_placeholder_rejected",
+    "tests.unit.test_mini_ork_plan_py::test_profile_gate_parity",
+    "tests.unit.test_mini_ork_plan_py::test_valid_given_plan"
+  ],
+  "provenance": {
+    "baseline_outcome": 0.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "change/R4/verdict",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [
+      "heldout-mo-2464537530-1790702280",
+      "heldout-mo-2464537530-1790713358"
+    ],
+    "source": "heldout-mined",
+    "task_id": "mo-2464537530"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_mini_ork_plan_py.py"
+  ]
+}

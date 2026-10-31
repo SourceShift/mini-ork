@@ -80,7 +80,12 @@ DEFAULT_ALLOW_PREFIXES: tuple[str, ...] = (
 #: this is the cycle-local, unconditional floor, and it is deliberately not
 #: configurable — an operator who wants a cycle to edit the gate does it by
 #: hand, with the gates off.
-DENY_PREFIXES: tuple[str, ...] = ("mini_ork/rsi/",)
+DENY_PREFIXES: tuple[str, ...] = (
+    "mini_ork/rsi/",
+    "evals/",
+    "scripts/verifier_replay.py",
+    "scripts/run_heldout.py",
+)
 
 #: Probe ids accepted as success commands although :func:`probes.default_specs`
 #: only builds them conditionally (``tests`` needs a configured pytest path).
@@ -110,6 +115,7 @@ SELECT_CODES: tuple[str, ...] = (
     "failed_signature",
     "low_severity",
     "worktree_claim_conflict",
+    "off_surface",
 )
 
 _ABSOLUTE_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/]|~)")
@@ -335,6 +341,11 @@ def registered_success_commands() -> frozenset[str]:
     ids |= set(_EXTRA_PROBES)
     for rules in (LEARNING_RULES, ROUTING_RULES, VERIFICATION_RULES):
         ids |= {f"{SYNTHETIC_PREFIX}{rule_id}" for rule_id, _ in rules}
+    # Lazy: importing the benchmark registry pulls in nothing heavy, but the
+    # select filter must stay import-light for the pure unit tests.
+    from mini_ork.rsi import benchmarks
+
+    ids |= {f"bench:{name}" for name in benchmarks.benchmark_names()}
     return frozenset(ids)
 
 
@@ -436,6 +447,22 @@ def select(
                        "the cycle may not edit the code that validates it: "
                        + ", ".join(denied))
 
+    if cand.kind == "technique_unadopted" and cand.success_command.startswith("bench:"):
+        from mini_ork.rsi import benchmarks
+
+        name = cand.success_command[len("bench:"):]
+        try:
+            bench = benchmarks.get_benchmark(name)
+        except KeyError:
+            return _reject(cand.candidate_id, "missing_success_command",
+                           f"unknown benchmark {name!r}")
+        surface = tuple(bench.surface or ())
+        if surface and not any(_allowlisted(path, surface) for path in files):
+            return _reject(
+                cand.candidate_id, "off_surface",
+                f"no proposed file is inside the {name} benchmark surface: "
+                f"{', '.join(surface)}")
+
     if len(files) > cfg.max_files:
         return _reject(cand.candidate_id, "blast_radius",
                        f"{len(files)} files > max {cfg.max_files}")
@@ -517,18 +544,40 @@ def build_kickoff(
     summary = proposal.summary.strip() or candidate.title
     root_cause = proposal.root_cause.strip() or candidate.detail.strip() or candidate.fix_hint
     noun = "file" if len(files) == 1 else "files"
+    bench_measured = verification_command.startswith("bench:")
+    if bench_measured:
+        gap_constraint = (
+            f"Impact is measured by the harness on a held-out benchmark "
+            f"(`{verification_command}`) that this run cannot see or run. "
+            "Add or update unit tests for the new behaviour; they are the run's own check."
+        )
+    else:
+        gap_constraint = (
+            f"The gap must stop reproducing: `{verification_command}` reports success."
+        )
     constraints = [
         f"Change only the {len(files)} {noun} listed under Files in scope — one diff.",
-        f"The gap must stop reproducing: `{verification_command}` reports success.",
+        gap_constraint,
         "Keep `ruff check --select F,E9 --line-length 110` clean on every changed `.py` file.",
         "Do not edit this kickoff, `.mini-ork/**`, or the gate code that validates the change.",
     ]
+    if bench_measured:
+        constraints.append(
+            "Do not edit `evals/`, `scripts/verifier_replay.py`, "
+            "`scripts/run_heldout.py`, `mini_ork/rsi/`, or any test that pins "
+            "existing behaviour.")
     if proposal.do_not_touch:
         constraints.append("Do not touch: " + ", ".join(proposal.do_not_touch) + ".")
 
+    first_acceptance = (
+        f"- {ac_ids[0]} The change implements the mechanism described under "
+        "Expected Edit, inside Files in scope."
+        if bench_measured
+        else f"- {ac_ids[0]} `{verification_command}` reports success on the fixed tree "
+        "and the same command does not on the unmodified tree."
+    )
     ac_lines = [
-        f"- {ac_ids[0]} `{verification_command}` reports success on the fixed tree "
-        "and the same command does not on the unmodified tree.",
+        first_acceptance,
         f"- {ac_ids[1] if len(ac_ids) > 1 else 'AC2'} Every changed path appears under "
         "Files in scope, and no other path changes.",
         f"- {ac_ids[2] if len(ac_ids) > 2 else 'AC3'} No new finding appears in "

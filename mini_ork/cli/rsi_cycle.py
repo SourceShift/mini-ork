@@ -46,12 +46,14 @@ Usage:
   mini-ork rsi-cycle revert <cycle_id>
   mini-ork rsi-cycle halt | resume
   mini-ork rsi-cycle doctor [--json]
+  mini-ork rsi-cycle research [--domain D] [--refresh] [--json]
+  mini-ork rsi-cycle impact [status | rotate <benchmark> | canary] [--json]
 
 Global: --db PATH  --home DIR  --root DIR
 
 The default verb runs one cycle. ``--dry-run`` prints the would-be kickoff and
 writes nothing; ``--suggest`` runs the paid SUGGEST stage but dispatches nothing.
-A cycle merges only when all eleven gates pass and an exogenous critic panel is
+A cycle merges only when all twelve gates pass and an exogenous critic panel is
 unanimous — otherwise it quarantines the branch and names the failing gate.
 
 ``plan`` is read-only and spends nothing: it runs the deterministic harvest
@@ -945,12 +947,246 @@ def _cmd_resume(args, root: Path, db: Path) -> int:
 
 
 # --------------------------------------------------------------------------
+# Research + impact: the operator surface of the research-driven loop
+# --------------------------------------------------------------------------
+
+
+def _technique_status_counts(db: Path, domain: str) -> dict[str, int]:
+    """``{status: count}`` of one domain's unadopted techniques, from the DB.
+
+    Read-only and table-tolerant: a fresh home has no ``state.db`` and an
+    un-migrated one has no ``rsi_candidates`` table. Neither is an error for a
+    *reporting* verb — both simply mean "nothing recorded".
+    """
+    import sqlite3
+
+    if not Path(db).exists():
+        return {}
+    try:
+        con = sqlite3.connect(str(db))
+        try:
+            rows = con.execute(
+                "SELECT status, COUNT(*) FROM rsi_candidates"
+                " WHERE kind='technique_unadopted' AND domain=? GROUP BY status",
+                (domain,)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    return {str(status): int(count) for status, count in rows}
+
+
+def _render_research(payload: Mapping[str, Any]) -> str:
+    domains = payload.get("domains") or []
+    if not domains:
+        return "no research domains\n"
+    lines: list[str] = []
+    for entry in domains:
+        lines.append(f"domain {entry['domain']}")
+        review = entry.get("review_id") or "(no review)"
+        lines.append(f"  review      {review} (age {entry.get('age_days')} day(s))")
+        lines.append(f"  ranked      {entry.get('ranked')} row(s); "
+                     f"{entry.get('eligible')} eligible")
+        statuses = entry.get("techniques_by_status") or {}
+        if statuses:
+            rendered = ", ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
+            lines.append(f"  unadopted   {rendered}")
+        if entry.get("error"):
+            lines.append(f"  error       {entry['error']}")
+        for row in entry.get("refresh") or []:
+            lines.append(f"  refresh     {row['action']} ({row.get('reason')})")
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_research(args, root: Path, db: Path) -> int:
+    from mini_ork.rsi import monitor, research
+
+    cfg = _load_config(args, root)
+    home = Path(args.home) if args.home else Path(db).parent
+    now = int(time.time())
+    wanted = [args.domain] if args.domain else None
+
+    entries: list[dict[str, Any]] = []
+    for domain in sorted(research.DEFAULT_SPECS):
+        if wanted is not None and domain not in wanted:
+            continue
+        spec = research.DEFAULT_SPECS[domain]
+        path = research.latest_review(home, spec.review_glob)
+        rows: list[dict] = []
+        error = None
+        if path is not None:
+            try:
+                rows = research.load_ranked(path)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                error = f"unreadable review {path}: {exc}"
+        eligible = sum(
+            1 for row in rows
+            if research.eligible(
+                row,
+                verdicts=cfg.research.verdicts,
+                skip_disagreement=cfg.research.skip_disagreement,
+                skip_single_rater=cfg.research.skip_single_rater))
+        entry: dict[str, Any] = {
+            "domain": domain,
+            "review": str(path) if path is not None else None,
+            "review_id": path.parent.name if path is not None else None,
+            "age_days": monitor.review_age_days(home, spec, now=now),
+            "ranked": len(rows),
+            "eligible": eligible,
+            "techniques_by_status": _technique_status_counts(db, domain),
+        }
+        if error:
+            entry["error"] = error
+        if args.refresh:
+            entry["refresh"] = monitor.maybe_refresh(
+                root, home, cfg, now=now, force=True, domains=[domain])
+        entries.append(entry)
+
+    payload = {"domains": entries}
+    if args.json:
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write(_render_research(payload))
+    return 0
+
+
+def _impact_status(home: Path, args) -> int:
+    from mini_ork.rsi import impact_state, monitor
+
+    try:
+        state = impact_state.load_state(home)
+    except impact_state.ImpactStateError as exc:
+        sys.stderr.write(f"rsi-cycle: {exc}\n")
+        return 1
+    halt = monitor.adoption_halted(home)
+
+    rows: list[dict[str, Any]] = []
+    for bench, entry in sorted((state.get("benchmarks") or {}).items()):
+        canaries = entry.get("canary") or []
+        scores = [float(item["score"]) for item in canaries if "score" in item]
+        rows.append({
+            "benchmark": bench,
+            "epoch": entry.get("epoch"),
+            "looks": entry.get("looks"),
+            "accepted": entry.get("accepted"),
+            "rejected": entry.get("rejected"),
+            "canaries": len(canaries),
+            "peak": max(scores) if scores else None,
+            "latest": scores[-1] if scores else None,
+        })
+
+    if args.json:
+        sys.stdout.write(json.dumps(
+            {"benchmarks": rows, "halted": halt}, indent=2, sort_keys=True) + "\n")
+        return 0
+
+    if rows:
+        sys.stdout.write(_table(
+            [(r["benchmark"], str(r["epoch"]), str(r["looks"]), str(r["accepted"]),
+              str(r["rejected"]), str(r["canaries"]), str(r["peak"]),
+              str(r["latest"])) for r in rows],
+            ("benchmark", "epoch", "looks", "accepted", "rejected", "canaries",
+             "peak", "latest")) + "\n")
+    if halt is not None:
+        sys.stdout.write("adoption halted: "
+                         + json.dumps(halt, sort_keys=True) + "\n")
+    if not rows and halt is None:
+        sys.stdout.write("no benchmarks recorded\n")
+    return 0
+
+
+def _impact_canary(args, root: Path, home: Path) -> int:
+    from mini_ork.rsi import config as cfg_mod
+    from mini_ork.rsi import monitor, research
+
+    try:
+        cfg = _load_config(args, root)
+    except _SetupError as exc:
+        # ``--root`` may name the checkout being scored, which need not carry the
+        # operator's config. The canary is a measurement, so fall back to the
+        # default knobs and every domain that has a benchmark instead of
+        # refusing to measure at all — loudly, so it is never a silent default.
+        if args.config:
+            raise
+        sys.stderr.write(
+            f"rsi-cycle: no config at {root} ({exc}); canary uses default "
+            "knobs and every known benchmark domain\n")
+        cfg = cfg_mod.CycleConfig(
+            budget=cfg_mod.BudgetConfig(daily_cap_usd=1.0, per_cycle_cap_usd=1.0),
+            decide=cfg_mod.DecideConfig(auto_merge=False),
+            research=cfg_mod.ResearchConfig(
+                enabled=True, domains=tuple(sorted(research.DEFAULT_SPECS))))
+
+    if not cfg.research.enabled:
+        sys.stdout.write("research is disabled; no canary run\n")
+        return 0
+
+    now = int(time.time())
+    results: list[dict[str, Any]] = []
+    for domain in cfg.research.domains:
+        spec = research.DEFAULT_SPECS.get(domain)
+        if spec is None:
+            continue
+        results.append(monitor.run_canary(
+            root, home, cfg, spec.benchmark, now=now))
+
+    if args.json:
+        sys.stdout.write(json.dumps(
+            {"canaries": results}, indent=2, sort_keys=True) + "\n")
+        return 0
+    if not results:
+        sys.stdout.write("no enabled research domain has a benchmark\n")
+    for result in results:
+        if result.get("status") == "error":
+            sys.stdout.write(
+                f"{result['bench']}: error ({result.get('reason')})\n")
+        else:
+            sys.stdout.write(
+                f"{result['bench']}: {result['status']} "
+                f"score={result.get('score')}\n")
+    return 0
+
+
+def _cmd_impact(args, root: Path, db: Path) -> int:
+    from mini_ork.rsi import impact_state
+
+    home = Path(db).parent
+    action = (args.ident or "status").lower()
+
+    if action == "status":
+        return _impact_status(home, args)
+
+    if action == "rotate":
+        bench = args.sub
+        if not bench:
+            sys.stderr.write(
+                "usage: mini-ork rsi-cycle impact rotate <benchmark>\n")
+            return 2
+        try:
+            state = impact_state.load_state(home)
+            entry = impact_state.rotate(state, bench)
+            impact_state.save_state(home, state)
+        except impact_state.ImpactStateError as exc:
+            sys.stderr.write(f"rsi-cycle: {exc}\n")
+            return 1
+        sys.stdout.write(f"{bench}: epoch {entry['epoch']}\n")
+        return 0
+
+    if action == "canary":
+        return _impact_canary(args, root, home)
+
+    sys.stderr.write(
+        "usage: mini-ork rsi-cycle impact [status | rotate <benchmark> | canary] [--json]\n")
+    return 2
+
+
+# --------------------------------------------------------------------------
 # Parser / entry point
 # --------------------------------------------------------------------------
 
 
 _VERBS = ("run", "plan", "list", "show", "doctor", "quarantine", "revert",
-          "halt", "resume", "help")
+          "halt", "resume", "research", "impact", "help")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -988,6 +1224,8 @@ def _parser() -> argparse.ArgumentParser:
                    help="run: per-cycle USD cap; may only lower the config's value")
     p.add_argument("--candidate", default=None,
                    help="run: work on this candidate id instead of the queue's top")
+    p.add_argument("--refresh", action="store_true",
+                   help="research: launch the domain's review recipe now")
     p.add_argument("--db", default=None)
     p.add_argument("--home", default=None)
     p.add_argument("--root", default=None)
@@ -1031,6 +1269,8 @@ def main(argv: Sequence[str] | None = None, *, root: str | Path | None = None) -
         "halt": _cmd_halt,
         "resume": _cmd_resume,
         "doctor": _cmd_doctor,
+        "research": _cmd_research,
+        "impact": _cmd_impact,
     }
     try:
         handler = verbs.get(args.verb, _cmd_run)

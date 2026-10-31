@@ -345,3 +345,22 @@ def test_wait_for_cooldowns_longest_value(tmp_path, monkeypatch):
     monkeypatch.setattr(time, "sleep", _boom)
     rc = tg.wait_for_cooldowns(0, "no-such-provider")
     assert rc == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (f) classify_error — a bare 401/529 inside ordinary output is not a verdict
+# ─────────────────────────────────────────────────────────────────────────────
+def test_classify_error_bare_status_numbers_are_not_verdicts(tmp_path):
+    cases = [
+        ("request took 401ms, retrying the stream\n", "unknown"),
+        ("processed 5290 tokens in 529 steps\n", "unknown"),
+        ("see line 401 of agent.py\n", "unknown"),
+        ("HTTP/1.1 401 Unauthorized\n", "auth_failed"),
+        ('{"status": 401, "message": "bad key"}\n', "auth_failed"),
+        ("status=529 upstream busy\n", "overloaded"),
+        ("529 Overloaded\n", "overloaded"),
+    ]
+    for content, expected in cases:
+        err = tmp_path / "err.log"
+        err.write_text(content)
+        assert tg.classify_error(str(err)) == expected, f"content={content!r}"

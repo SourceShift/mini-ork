@@ -27,7 +27,8 @@ import time
 from collections.abc import Callable
 
 from mini_ork.context import context_env
-from mini_ork.dispatch import failure_class, lane_affinity
+from mini_ork.dispatch import failure_class, harness_identity, lane_affinity
+from mini_ork.stores import audit_chain
 from mini_ork.dispatch.predicates import (
     SHAPE_REJECT_RC,
     looks_like_json,
@@ -75,7 +76,7 @@ def classify_error(message: str, rc: str | int = "") -> str:
                  r"|insufficient balance|out of credits|purchase credits"
                  r"|credit limit|credit balance", text):
         return "quota"
-    if re.search(r"429", text) and re.search(
+    if re.search(r"(^|[^0-9])429([^0-9]|$)", text) and re.search(
             r"monthly|tokens-per-day|billing|quota|token plan", text):
         return "quota"
     if re.search(r"(^|[^0-9])(429|503)([^0-9]|$)", text) and re.search(
@@ -208,7 +209,16 @@ def strip_protocol_blocks(out_file: str) -> None:
 
 
 def _provider_error_from_result(out_file: str) -> str:
-    """The real provider error from a claude-code ``result`` object on stdout.
+    """The provider error text from a claude-code ``result`` object on stdout.
+
+    Kept for callers that only want the message; see ``_provider_error_record``
+    for the typed status that travels alongside it.
+    """
+    return _provider_error_record(out_file)[1]
+
+
+def _provider_error_record(out_file: str) -> tuple[int | None, str]:
+    """``(api_error_status, message)`` from a claude-code ``result`` object.
 
     The claude-code wrapper prints a provider rejection as a JSON ``result``
     object (or a JSONL stream line) on stdout — ``{"type":"result",
@@ -217,12 +227,14 @@ def _provider_error_from_result(out_file: str) -> str:
     only, so the 429 sat invisible in stdout JSON and ``classify_error`` never
     saw the quota wording. Parse stdout for that object and return
     ``f"HTTP {status}: {result}"[:1000]`` (no ``HTTP`` part when there is no
-    status); return ``""`` when stdout has no such object.
+    status) together with the status as an int, so the classifier can decide
+    on the provider's own status rather than re-parse it from the message;
+    return ``(None, "")`` when stdout has no such object.
     """
     try:
         raw = open(out_file, encoding="utf-8", errors="replace").read()
     except OSError:
-        return ""
+        return (None, "")
     candidates: list[dict] = []
     # One whole-object document (a single result), plus each JSONL stream line.
     try:
@@ -241,7 +253,7 @@ def _provider_error_from_result(out_file: str) -> str:
             continue
         if isinstance(obj, dict):
             candidates.append(obj)
-    best = ""
+    best: tuple[int | None, str] = (None, "")
     for obj in candidates:
         if obj.get("is_error") is not True:
             continue
@@ -250,7 +262,11 @@ def _provider_error_from_result(out_file: str) -> str:
             continue
         status = obj.get("api_error_status")
         prefix = f"HTTP {status}: " if status is not None and str(status) else ""
-        best = (prefix + result)[:1000]
+        try:
+            status_int = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status_int = None
+        best = (status_int, (prefix + result)[:1000])
     return best
 
 
@@ -667,6 +683,15 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
     # attempts keep ``dispatch_attempt``/``chain``) — and this is the one choke
     # point every llm_calls writer here goes through.
     _md["placement"] = _current_placement()
+    if "harness" not in _md:
+        # Which harness, at which release, served this row. The lane name alone
+        # cannot say, and a harness swap moves cost and tokens by multiples.
+        try:
+            served_by = harness_identity.identity(str(model_id))
+        except Exception:  # noqa: BLE001 — identity must never cost the row
+            served_by = None
+        if served_by is not None:
+            _md["harness"] = served_by
     _sess = _md.get("session_id")
     metadata_json = _json.dumps(_md)
     try:
@@ -716,7 +741,19 @@ def _insert_llm_calls_row(con, provider, model_id, tier, feature_name, actor, st
         if name in cols:
             insert_cols.append(name); values.append(val)
     ph = ",".join("?" for _ in insert_cols)
-    con.execute(f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({ph})", values)
+    cur = con.execute(f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({ph})", values)
+    try:
+        served_by = json.loads(metadata_json or "{}").get("harness")
+    except (ValueError, AttributeError):
+        served_by = None
+    # The dispatch, its outcome, its cost and the harness that served it,
+    # sealed into the audit chain in the same transaction as the ledger row.
+    audit_chain.append_event_soft(
+        con, "dispatch", f"lane:{provider}", f"model:{model_id}",
+        {"llm_call_id": cur.lastrowid, "status": status, "error_category": error_category,
+         "cost_usd": float(cost_usd or 0.0), "feature": feature_name,
+         "run_id": context_env("MINI_ORK_RUN_ID") or None, "harness": served_by},
+    )
     con.commit()
 
 
@@ -1392,7 +1429,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     # ``result`` object (``is_error: true``, ``api_error_status``, ``result``).
     # Surface it so ``error_message``/``error_category`` carry the provider's
     # own words (the MiniMax 429 quota text) instead of the CLI's stderr chatter.
-    provider_err = _provider_error_from_result(out_file)
+    provider_status, provider_err = _provider_error_record(out_file)
     if provider_err:
         err = provider_err
     err = redact_secrets(err)
@@ -1403,10 +1440,13 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     class_text = err_full
     if provider_err:
         class_text = f"{class_text}\n{provider_err}" if class_text else provider_err
-    cls, category = failure_class.classify(class_text, rc)
+    cls, category = failure_class.classify(class_text, rc, http_status=provider_status)
     hint = failure_class.wait_hint(class_text)
     retryable = failure_class.retryable(cls)
     metadata = {"failure_class": cls}
+    if provider_status is not None:
+        # The status the class was decided on, so the ledger shows why.
+        metadata["http_status"] = provider_status
     if hint is not None:
         metadata["wait_hint_s"] = hint
     row_actor = actor

@@ -7,6 +7,7 @@ tests/test_calc.py::test_add. Two stored solves: one applies the real fix
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -134,3 +135,151 @@ def test_runner_kept_patches_are_replayed(tmp_path, capsys):
     c = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
     assert (c["scored"], c["false_reject"]) == (1, 1)  # the correct fix, rejected
+
+
+# ── RRL-3b: extra_env, test-path scoping, patch_files ──────────────────────
+
+
+def test_run_verifier_extra_env_and_fixed_keys_win(tmp_path, monkeypatch):
+    monkeypatch.delenv("X_RRL", raising=False)
+    script = tmp_path / "v_env.py"
+    script.write_text(
+        "import json, os\n"
+        "ok = (os.environ.get('X_RRL') == '1'\n"
+        "      and os.environ.get('MINI_ORK_RUN_ID') == 'verifier-replay')\n"
+        "print(json.dumps({'pass': ok, 'reason': 'env'}))\n")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    passed, reason = vr.run_verifier(
+        script, scratch, sys.executable, 60,
+        extra_env={"X_RRL": "1", "MINI_ORK_RUN_ID": "x"})
+    assert (passed, reason) == (True, "env")
+    assert "X_RRL" not in os.environ
+
+
+def test_run_verifier_scrubs_inherited_test_cmd(tmp_path, monkeypatch):
+    # The operator's shell may export MINI_ORK_TEST_CMD (this repo's own
+    # tooling does to scope green gates).  An unscoped replay must not inherit
+    # it: the command points at the operator's checkout, not the scratch tree.
+    monkeypatch.setenv("MINI_ORK_TEST_CMD", "pytest -q pinned/from/shell")
+    script = tmp_path / "v_cmd.py"
+    script.write_text(
+        "import json, os\n"
+        "print(json.dumps({'pass': os.environ.get('MINI_ORK_TEST_CMD') == '',\n"
+        "                  'reason': os.environ.get('MINI_ORK_TEST_CMD')}))\n")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    passed, _ = vr.run_verifier(script, scratch, sys.executable, 60)
+    assert passed is True
+
+
+def test_run_verifier_extra_env_can_opt_into_test_cmd(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINI_ORK_TEST_CMD", "pytest -q pinned/from/shell")
+    script = tmp_path / "v_cmd.py"
+    script.write_text(
+        "import json, os\n"
+        "print(json.dumps({'pass': os.environ.get('MINI_ORK_TEST_CMD')\n"
+        "                  == 'pytest -q tests/test_x.py'}))\n")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    passed, _ = vr.run_verifier(
+        script, scratch, sys.executable, 60,
+        extra_env={"MINI_ORK_TEST_CMD": "pytest -q tests/test_x.py"})
+    assert passed is True
+
+
+def test_test_suffix_and_is_test_path():
+    assert vr.TEST_SUFFIX == ".py"
+    assert vr.is_test_path("tests/unit/test_a.py") is True
+    assert vr.is_test_path("pkg/tests/x.py") is True
+    assert vr.is_test_path("test_b.py") is True
+    assert vr.is_test_path("mini_ork/a.py") is False
+    assert vr.is_test_path("tests/data.json") is False
+
+
+def test_patch_files_reads_numstat_third_column(tmp_path):
+    repo, _manifest, _runs = _setup(tmp_path)
+    patch = tmp_path / "x.patch"
+    patch.write_text(_git(repo, "diff", "HEAD~1", "HEAD", "--",
+                          "calc.py", "tests/test_calc.py") + "\n")
+    assert set(vr.patch_files(patch, repo)) == {"calc.py", "tests/test_calc.py"}
+    assert vr.patch_files(tmp_path / "missing.patch", repo) == []
+
+
+class _VerifierSpy:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, verifier, scratch, python, timeout, **kwargs):
+        self.calls.append(kwargs)
+        return True, "stub"
+
+
+def _scoped_repo(tmp_path: Path):
+    """A repo whose base has src.py + tests/test_old.py; ``patch`` edits src.py
+    and adds tests/test_new.py."""
+    repo = tmp_path / "srepo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "src.py").write_text("x = 1\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_old.py").write_text("def test_old():\n    assert True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "src.py").write_text("x = 2\n")
+    (repo / "tests" / "test_new.py").write_text("def test_new():\n    assert True\n")
+    _git(repo, "add", "-A")
+    diff = _git(repo, "diff", "--cached")
+    _git(repo, "reset", "-q", "--hard", "HEAD")
+    _git(repo, "clean", "-fdq")
+    patch = tmp_path / "item.patch"
+    patch.write_text(diff + "\n")
+    return repo, base, patch
+
+
+def test_replay_one_scoped_selects_task_and_patch_tests(tmp_path, monkeypatch):
+    repo, base, patch = _scoped_repo(tmp_path)
+    task = {"id": "item", "base_sha": base,
+            "test_files": ["tests/test_old.py", "tests/test_missing.py"]}
+    spy = _VerifierSpy()
+    monkeypatch.setattr(vr, "run_verifier", spy)
+    row = vr.replay_one(patch, task, repo=repo, verifier=tmp_path / "v.py",
+                        python=sys.executable, timeout=60, hidden=False,
+                        import_root=repo, scoped_tests=True)
+    assert row["scoped_tests"] == ["tests/test_new.py", "tests/test_old.py"]
+    cmd = spy.calls[0]["extra_env"]["MINI_ORK_TEST_CMD"]
+    assert "test_new.py" in cmd and "test_old.py" in cmd
+    assert "test_missing" not in cmd
+    assert spy.calls[0].get("import_root") == repo
+
+
+def test_replay_one_scoped_no_tests_skips(tmp_path, monkeypatch):
+    repo, base, patch = _scoped_repo(tmp_path)
+    task = {"id": "item", "base_sha": base, "test_files": []}
+    # A patch that touches no test: rebuild it from src.py alone.
+    (repo / "src.py").write_text("x = 3\n")
+    _git(repo, "add", "src.py")
+    patch.write_text(_git(repo, "diff", "--cached") + "\n")
+    _git(repo, "reset", "-q", "--hard", "HEAD")
+    spy = _VerifierSpy()
+    monkeypatch.setattr(vr, "run_verifier", spy)
+    row = vr.replay_one(patch, task, repo=repo, verifier=tmp_path / "v.py",
+                        python=sys.executable, timeout=60, hidden=False,
+                        scoped_tests=True)
+    assert row["skipped"] == "no runnable tests for a scoped verifier run"
+    assert spy.calls == []
+
+
+def test_replay_one_unscoped_passes_no_extra_env(tmp_path, monkeypatch):
+    repo, base, patch = _scoped_repo(tmp_path)
+    task = {"id": "item", "base_sha": base,
+            "test_files": ["tests/test_old.py"]}
+    spy = _VerifierSpy()
+    monkeypatch.setattr(vr, "run_verifier", spy)
+    row = vr.replay_one(patch, task, repo=repo, verifier=tmp_path / "v.py",
+                        python=sys.executable, timeout=60, hidden=False)
+    assert spy.calls[0].get("extra_env") is None
+    assert "scoped_tests" not in row

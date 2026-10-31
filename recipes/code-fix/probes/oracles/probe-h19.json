@@ -1,0 +1,28 @@
+{
+  "base_sha": "bd851072b3b83c3f5bb9caf7f3c19920bc3c73bf",
+  "fail_to_pass": [
+    "tests.unit.test_goal_loop_restart_worker_sync::test_merges_in_an_environment_with_no_git_identity"
+  ],
+  "fix_sha": "463d345d2a46ae96b2d56b7ff37da568dcb51054",
+  "pass_to_pass": [
+    "tests.unit.test_goal_loop_restart_worker_sync::test_a_conflict_leaves_the_tree_untouched",
+    "tests.unit.test_goal_loop_restart_worker_sync::test_merges_the_product_branch_forward",
+    "tests.unit.test_goal_loop_restart_worker_sync::test_never_drops_the_loops_own_commit",
+    "tests.unit.test_goal_loop_restart_worker_sync::test_opt_out_is_a_no_op"
+  ],
+  "provenance": {
+    "baseline_outcome": 1.0,
+    "baseline_source": "evals/heldout/results/2026-09-29-baseline-dev.json",
+    "cluster": "solved",
+    "harvested_at": "2026-10-30T17:02:21Z",
+    "harvester": "probe_harvest@1",
+    "recipe": "code-fix",
+    "run_ids": [],
+    "source": "heldout-mined",
+    "task_id": "mo-463d345d2a"
+  },
+  "schema": 1,
+  "test_files": [
+    "tests/unit/test_goal_loop_restart_worker_sync.py"
+  ]
+}

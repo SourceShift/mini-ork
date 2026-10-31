@@ -323,7 +323,7 @@ flowchart TD
   VR -->|next run| T
 ```
 
-Self-evolution is evidence-gated: a candidate must beat the current version on the benchmark suite before promotion. There is **no human branch** in that gate — an ambiguous or unmeasured candidate is quarantined with its reason, never escalated. A quarantine is not re-proposed automatically, and clearing one is a manual, Python-level operator step (`version_registry.clear_quarantine`); there is no CLI for it. The machine-readable trail is `version_registry` + `apply_attempts` + `promotion_records` — the `audit_log` table exists and is append-only by trigger, but nothing in the Python runtime writes to it yet. See [SAFETY.md](SAFETY.md).
+Self-evolution is evidence-gated: a candidate must beat the current version on the benchmark suite before promotion. There is **no human branch** in that gate — an ambiguous or unmeasured candidate is quarantined with its reason, never escalated. A quarantine is not re-proposed automatically, and clearing one is a manual, Python-level operator step (`version_registry.clear_quarantine`); there is no CLI for it. The machine-readable trail is `version_registry` + `apply_attempts` + `promotion_records`, and every promotion, rollback, quarantine and quarantine clearing also lands as a hash-chained row in `audit_log` (`mini_ork/stores/audit_chain.py`). See [SAFETY.md](SAFETY.md).
 
 ---
 

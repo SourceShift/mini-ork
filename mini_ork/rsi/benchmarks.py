@@ -30,9 +30,9 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +171,41 @@ def tree_key(root: Path) -> str | None:
     return digest.hexdigest()
 
 
+CACHE_VERSION = "2"
+
+
+def surface_key(root: Path, surface: Sequence[str], *, salt: str = "") -> str:
+    """A content key over ``surface`` entries under ``root``.
+
+    Unlike :func:`tree_key` it ignores everything outside ``surface``, so an
+    unrelated commit on ``main`` does not force a re-measure.  Files and
+    directories are hashed by content; a directory contributes each file's
+    relative path as well as its content, so renaming or moving a file inside
+    a surfaced directory changes the key.  A missing entry is hashed as
+    missing.  ``__pycache__`` / ``.pyc`` noise is skipped."""
+    root = Path(root)
+    digest = hashlib.sha256()
+    digest.update(f"{CACHE_VERSION}\n".encode())
+    digest.update(f"{salt}\n".encode())
+    for entry in sorted(surface):
+        path = root / entry
+        if path.is_file():
+            digest.update(
+                f"{entry}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n".encode())
+        elif path.is_dir():
+            files = [f for f in path.rglob("*") if f.is_file()]
+            for f in sorted(files, key=lambda p: p.relative_to(path).as_posix()):
+                rel = f.relative_to(path).as_posix()
+                if "__pycache__" in rel or rel.endswith(".pyc"):
+                    continue
+                digest.update(
+                    f"{entry}/{rel}:{hashlib.sha256(f.read_bytes()).hexdigest()}\n"
+                    .encode())
+        else:
+            digest.update(f"{entry}:missing\n".encode())
+    return digest.hexdigest()
+
+
 def _cache_path(ctx: BenchContext, name: str, key: str) -> Path:
     return ctx.home / "rsi" / "bench" / name / f"{key}.json"
 
@@ -226,7 +261,17 @@ def run_benchmark(name: str, root, *, ctx: BenchContext,
     bench = get_benchmark(name)
     root = Path(root)
     wanted = tuple(sorted(set(items))) if items is not None else None
-    key = tree_key(root)
+    # Cache on the declared surface when the benchmark has one, so an
+    # off-surface commit does not re-measure the base.  A non-git root stays
+    # uncached (tree_key is None), exactly as today.
+    tk = tree_key(root)
+    if bench.surface and tk is not None:
+        salt = json.dumps({"name": name,
+                           "options": dict(sorted(ctx.options.items()))},
+                          sort_keys=True)
+        key = surface_key(root, bench.surface, salt=salt)
+    else:
+        key = tk
     cache_path = _cache_path(ctx, name, key) if key is not None else None
 
     cached: Mapping[str, Any] | None = None
@@ -248,6 +293,9 @@ def run_benchmark(name: str, root, *, ctx: BenchContext,
     # rebuild it in full rather than pin a partial result beside unknown data.
     run_wanted = None if (use_cache and corrupt) else wanted
     result = bench.runner(root, run_wanted, ctx)
+    # The result's identity IS the cache key: replace the runner's own tree.
+    if key is not None:
+        result = replace(result, tree=key)
 
     if key is not None and cache_path is not None:
         _atomic_write_json(cache_path, _merge_cache(cached, result, run_wanted))
@@ -264,8 +312,12 @@ DEFAULT_PATCHES = "evals/heldout/results/2026-09-29-baseline-dev.patches"
 DEFAULT_MANIFEST = "evals/heldout/mined/manifest.json"
 DEFAULT_SEED = "evals/heldout/results/2026-09-30-replay-testverifier.jsonl"
 DEFAULT_VERIFIER = "recipes/code-fix/verifiers/test.py"
+# The measurement harness is part of the surface: a change to the replay or
+# grading logic changes the scores just as surely as a change to the verifier,
+# so it must invalidate the cached measurement too.
 VR_SURFACE = ("recipes/code-fix/verifiers", "mini_ork/certify", "mini_ork/verify",
-              "mini_ork/gates/suite_adequacy.py", "mini_ork/gates/suite_strengthen.py")
+              "mini_ork/gates/suite_adequacy.py", "mini_ork/gates/suite_strengthen.py",
+              "scripts/verifier_replay.py", "mini_ork/rsi/benchmarks.py")
 VR_GUARDS = ("false_accept", "false_reject", "no_verdict")
 
 _REPLAY_MODULES: dict[str, Any] = {}
@@ -293,11 +345,12 @@ def _resolve(repo: Path, value: str) -> Path:
 
 
 def _option_paths(ctx: BenchContext) -> tuple[Path, Path, Path]:
+    repo = Path(ctx.repo).resolve()
     opts = ctx.options
     return (
-        _resolve(ctx.repo, opts.get("patches_dir", DEFAULT_PATCHES)),
-        _resolve(ctx.repo, opts.get("manifest", DEFAULT_MANIFEST)),
-        _resolve(ctx.repo, opts.get("seed_labels", DEFAULT_SEED)),
+        _resolve(repo, opts.get("patches_dir", DEFAULT_PATCHES)),
+        _resolve(repo, opts.get("manifest", DEFAULT_MANIFEST)),
+        _resolve(repo, opts.get("seed_labels", DEFAULT_SEED)),
     )
 
 
@@ -306,7 +359,7 @@ def _tasks_and_patches(ctx: BenchContext) -> dict[str, tuple[Path, dict]]:
     patches_dir, manifest_path, _seed = _option_paths(ctx)
     manifest = json.loads(manifest_path.read_text())
     tasks = {t["id"]: t for t in manifest}
-    module = _replay_module(ctx.repo)
+    module = _replay_module(Path(ctx.repo).resolve())
     return {Path(p).stem: (Path(p), task)
             for p, task in module.stored_patches(patches_dir, tasks)}
 
@@ -354,6 +407,7 @@ def ensure_labels(ctx: BenchContext, ids) -> dict[str, bool]:
     in parallel.  A label whose patch sha no longer matches is re-graded, never
     re-seeded (the seed describes the old patch)."""
     ids = list(ids)
+    repo = Path(ctx.repo).resolve()
     pairs = _tasks_and_patches(ctx)
     _patches_dir, _manifest, seed_path = _option_paths(ctx)
     path = labels_path(ctx)
@@ -393,12 +447,12 @@ def ensure_labels(ctx: BenchContext, ids) -> dict[str, bool]:
             changed = True
 
     if need_grade:
-        module = _replay_module(ctx.repo)
+        module = _replay_module(repo)
         workers = max(1, ctx.workers)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(module.grade_one, pairs[i][0], pairs[i][1],
-                            repo=ctx.repo, python=ctx.python,
+                            repo=repo, python=ctx.python,
                             timeout=ctx.timeout_s): i
                 for i in need_grade
             }
@@ -431,13 +485,14 @@ def _vr_items(ctx: BenchContext) -> dict[str, str]:
 
 def _replay_one_with_retry(module, patch: Path, task: dict, *,
                            repo: Path, verifier: Path, python: str,
-                           timeout: int, root: Path) -> dict:
+                           timeout: int, root: Path, scoped_tests: bool) -> dict:
     last: Exception | None = None
     for _attempt in range(2):
         try:
             return module.replay_one(
                 patch, task, repo=repo, verifier=verifier, python=python,
-                timeout=timeout, import_root=root, hidden=False)
+                timeout=timeout, import_root=root, hidden=False,
+                scoped_tests=scoped_tests)
         except Exception as exc:  # noqa: BLE001 - retried once, then skipped
             last = exc
     assert last is not None
@@ -445,7 +500,8 @@ def _replay_one_with_retry(module, patch: Path, task: dict, *,
 
 
 def _vr_run(root, items, ctx: BenchContext) -> BenchResult:
-    root = Path(root)
+    root = Path(root).resolve()
+    repo = Path(ctx.repo).resolve()
     verifier = root / DEFAULT_VERIFIER
     if not verifier.exists():
         raise FileNotFoundError(str(verifier))
@@ -464,39 +520,49 @@ def _vr_run(root, items, ctx: BenchContext) -> BenchResult:
 
     ids = tuple(sorted(pairs))
     labels = ensure_labels(ctx, ids)
-    module = _replay_module(ctx.repo)
+    module = _replay_module(repo)
+    scoped = ctx.options.get("scoped_tests", "1") != "0"
 
     rows: dict[str, dict] = {}
-    failed: set[str] = set()
+    # An item whose replay raised (twice) is an *error*, not a skip: a skip is a
+    # fact about the item (the patch does not apply, nothing to run) and is cached
+    # with the result, while an error is a fact about this run — caching it as a
+    # skip would drop the item for every later run on the same surface.
+    errors: dict[str, str] = {}
     workers = max(1, ctx.workers)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_replay_one_with_retry, module, pairs[i][0], pairs[i][1],
-                        repo=ctx.repo, verifier=verifier, python=ctx.python,
-                        timeout=ctx.timeout_s, root=root): i
+                        repo=repo, verifier=verifier, python=ctx.python,
+                        timeout=ctx.timeout_s, root=root,
+                        scoped_tests=scoped): i
             for i in ids
         }
         for fut in as_completed(futures):
             item_id = futures[fut]
             try:
                 rows[item_id] = fut.result()
-            except Exception:  # noqa: BLE001 - a twice-failing item is skipped
-                failed.add(item_id)
+            except Exception as exc:  # noqa: BLE001 - recorded, never cached
+                errors[item_id] = f"{type(exc).__name__}: {exc}"[:300]
 
     scores: dict[str, float] = {}
     strata: dict[str, str] = {}
     reasons: dict[str, str] = {}
     false_accept = false_reject = no_verdict = 0
     for item_id in ids:
-        if item_id in failed:
-            skipped.append(item_id)
+        if item_id in errors:
             continue
         row = rows.get(item_id)
-        if not isinstance(row, dict) or "skipped" in row:
+        if not isinstance(row, dict):
+            errors[item_id] = "no replay row"
+            continue
+        if "skipped" in row:
             skipped.append(item_id)
             continue
         if item_id not in labels:
-            skipped.append(item_id)
+            # Ground truth could not be established this run; grading may succeed
+            # next time, so this is an error, not a cached skip.
+            errors[item_id] = "no ground-truth label"
             continue
         label = labels[item_id]
         strata[item_id] = "hard_negative" if not label else "correct"
@@ -525,7 +591,7 @@ def _vr_run(root, items, ctx: BenchContext) -> BenchResult:
                 "no_verdict": float(no_verdict)},
         skipped=tuple(skipped),
         meta={"verifier": DEFAULT_VERIFIER, "n": len(scores),
-              "accuracy": accuracy, "reasons": reasons},
+              "accuracy": accuracy, "reasons": reasons, "errors": errors},
     )
 
 
@@ -564,10 +630,11 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    root = Path(args.root)
-    home = (Path(args.home) if args.home
-            else Path(os.environ.get("MINI_ORK_HOME") or (root / ".mini-ork")))
-    repo = Path(args.repo) if args.repo else root
+    root = Path(args.root).resolve()
+    home = (Path(args.home).resolve() if args.home
+            else Path(os.environ.get("MINI_ORK_HOME")
+                      or (root / ".mini-ork")).resolve())
+    repo = Path(args.repo).resolve() if args.repo else root
     ctx = BenchContext(home=home, repo=repo, workers=args.workers)
 
     items = None

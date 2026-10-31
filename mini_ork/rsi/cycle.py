@@ -24,9 +24,12 @@ policy knob with a dangerous default — ``decide.auto_merge`` — has no defaul
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import random
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -35,19 +38,21 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import learn, ledger
+from . import benchmarks, impact, impact_state, learn, ledger, monitor, research
 from .candidates import Candidate
 from .config import CycleConfig
-from .gates import CriticVerdict, GateEvidence, ValidationReport, evaluate
+from .gates import BENCH_PREFIX, CriticVerdict, GateEvidence, ValidationReport, evaluate
 from .harvest import HarvestReport
 from .probes import ProbeResult
 from .queue import QueueConfig, QueuePlan, build_queue
 from .select import (
     DEFAULT_ALLOW_PREFIXES,
+    DENY_PREFIXES,
     Proposal,
     Selection,
     SelectConfig,
     SelectContext,
+    _allowlisted,
     select,
 )
 from .view import ledger_view
@@ -351,10 +356,21 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
             # ``fixed_externally`` on the cycle that first saw it.
             ledger.reconcile(con, [c.candidate_id for c in report.candidates],
                              now=rt.clock(),
-                             blind_sources=_blind_sources(report))
+                             blind_sources=_blind_sources(report, con))
+
+    # --- RESEARCH PREFLIGHT ------------------------------------------------
+    # The canary and the research refresh sit between HARVEST and QUEUE so that
+    # a canary regression and a stale review are both visible to *this* queue.
+    # The helper is a no-op unless ``research.enabled``, and a dry run never
+    # touches either — the default config therefore behaves exactly as before.
+    report = _research_preflight(req, rt, con, report)
 
     # --- QUEUE -------------------------------------------------------------
-    plan = _build_queue(req, con, report, rt.clock())
+    plan = _queue_for(req, con, report, rt.clock())
+    # HGM ordering: inside the selected list, technique candidates are re-ordered
+    # by clade Thompson sampling over family credit, with the collapse override
+    # forcing an untried family first. A plan with no technique item is unchanged.
+    plan = _order_research(req, con, plan)
     cand = _pick(req, plan)
     if cand is None:
         return _finish(req, rt, con, "no_candidate", rc=0,
@@ -435,43 +451,79 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
                                 reason=f"cycle {req.cycle_id}")
     _refresh(req, token)
 
-    # --- IMPLEMENT ---------------------------------------------------------
-    impl = (rt.implement or _default_implement)(req, cand, selection)
-    if impl is None or not impl.landed_something:
-        detail = (impl.detail if impl is not None else "the implementer produced nothing")
-        extra = {**_candidate_fields(cand),
-                 "child_run_id": getattr(impl, "child_run_id", "")}
-        if impl is not None:
-            # A cleanup that fails must not delete the rejection it was tidying.
-            # ``clean`` now raises when the worktree or its claims survive, and
-            # an exception escaping here would turn a decided ``rejected`` row
-            # into an opaque ``error`` — losing the reason AND leaving the same
-            # survivor in place. The row carries both facts instead; ``detail``
-            # is the column, because a made-up key is refused by the ledger.
-            try:
-                (rt.clean or _default_clean)(req, impl)
-            except Exception as exc:  # noqa: BLE001 - recorded in the row, not swallowed
-                detail += f"; cleanup failed ({type(exc).__name__}): {exc}"
-        # Same reason-code discipline as the SUGGEST rejection: a child that
-        # lands nothing is a *kind* of failure (`implement_empty`), and the
-        # operator needs it in the row to tell it from a pre-dispatch filter.
-        return _finish(req, rt, con, "rejected", rc=0, candidate_id=cand.candidate_id,
-                       halt_reason=f"implement_empty: {detail}", detail=detail,
-                       extra=extra)
+    # --- IMPLEMENT + VALIDATE (GEPA-style revision) ------------------------
+    # A technique candidate whose *only* failing deterministic gate is G12, and
+    # whose rejection is a measured no-gain, is re-dispatched with dev-only
+    # feedback rather than abandoned on the first look. ``selection`` carries the
+    # original kickoff on every revision; ``base_selection`` is the reference
+    # that keeps the appended section from stacking.
+    base_selection = selection
+    attempt = 0
+    total_cost = 0.0
+    history: list[dict[str, Any]] = []
+    while True:
+        if rt.implement is not None or attempt == 0:
+            impl = (rt.implement or _default_implement)(req, cand, selection)
+        else:
+            impl = _default_implement(req, cand, selection, attempt=attempt)
+        if impl is None or not impl.landed_something:
+            detail = (impl.detail if impl is not None
+                      else "the implementer produced nothing")
+            if attempt > 0:
+                detail = f"revision {attempt}: {detail}"
+            extra = {**_candidate_fields(cand),
+                     "child_run_id": getattr(impl, "child_run_id", "")}
+            if impl is not None:
+                # A cleanup that fails must not delete the rejection it was tidying.
+                # ``clean`` now raises when the worktree or its claims survive, and
+                # an exception escaping here would turn a decided ``rejected`` row
+                # into an opaque ``error`` — losing the reason AND leaving the same
+                # survivor in place. The row carries both facts instead; ``detail``
+                # is the column, because a made-up key is refused by the ledger.
+                try:
+                    (rt.clean or _default_clean)(req, impl)
+                except Exception as exc:  # noqa: BLE001 - recorded in the row, not swallowed
+                    detail += f"; cleanup failed ({type(exc).__name__}): {exc}"
+            # Same reason-code discipline as the SUGGEST rejection: a child that
+            # lands nothing is a *kind* of failure (`implement_empty`), and the
+            # operator needs it in the row to tell it from a pre-dispatch filter.
+            return _finish(req, rt, con, "rejected", rc=0,
+                           candidate_id=cand.candidate_id,
+                           halt_reason=f"implement_empty: {detail}", detail=detail,
+                           extra=extra)
 
-    # --- VALIDATE ----------------------------------------------------------
-    measurement = (rt.measure or _default_measure)(req, cand, impl, selection)
-    evidence = _evidence(req, report, cand, impl, selection, measurement, spend)
-    first = evaluate(evidence)
+        total_cost += float(impl.cost_usd or 0.0)
+        # G11 reads ``cycle_cost``: every attempt's spend is the same cycle's, so
+        # the cumulative total is what it must judge — not the last child's bill.
+        impl = replace(impl, cost_usd=total_cost)
+        measurement = (rt.measure or _default_measure)(req, cand, impl, selection)
+        evidence = _evidence(req, report, cand, impl, selection, measurement, spend)
+        first = evaluate(evidence)
 
-    # G10 is the last of eleven ANDed gates, so a panel verdict cannot rescue a
-    # cycle some other gate already failed — the merge decision is identical
-    # either way. Cycle 12 (2026-10-26) bought a critic panel after G8 had
-    # already failed and quarantined for the same reason; the panel is the most
-    # expensive part of VALIDATE, so the dead cycle must not pay for it.
-    deterministic = ValidationReport(tuple(r for r in first.results if r.gate != "G10"))
-    if not deterministic.passed:
-        return _quarantine(req, rt, con, cand, impl, deterministic, "gate_failed")
+        # G10 is the last of eleven ANDed gates, so a panel verdict cannot rescue a
+        # cycle some other gate already failed — the merge decision is identical
+        # either way. Cycle 12 (2026-10-26) bought a critic panel after G8 had
+        # already failed and quarantined for the same reason; the panel is the most
+        # expensive part of VALIDATE, so the dead cycle must not pay for it.
+        deterministic = ValidationReport(
+            tuple(r for r in first.results if r.gate != "G10"))
+        if deterministic.passed:
+            break
+        if not _revisable(req, deterministic, measurement, attempt, total_cost):
+            return _quarantine(req, rt, con, cand, impl, deterministic, "gate_failed")
+
+        history.append(_attempt_record(attempt, impl, measurement))
+        _archive_impact(req, attempt)
+        try:
+            (rt.clean or _default_clean)(req, impl)
+        except Exception as exc:  # noqa: BLE001 - recorded in the row, not swallowed
+            return _quarantine(req, rt, con, cand, impl, deterministic,
+                               "revise_cleanup_failed", detail=str(exc))
+        attempt += 1
+        selection = _revise_selection(req, base_selection, history)
+        measured = measurement.impact if isinstance(measurement.impact, Mapping) else {}
+        print(f"[rsi] revision {attempt}/{req.config.impact.max_revisions}: "
+              f"{measured.get('reason') or 'no measured gain'}", file=sys.stderr)
 
     raw = (rt.critics or _default_critics)(req, cand, impl, selection, first)
     evidence = _with_critics(evidence, raw)
@@ -550,6 +602,30 @@ def _queue_cfg(req: CycleRequest) -> QueueConfig:
     return replace(req.config.queue, max_candidates=req.max_candidates)
 
 
+def _queue_for(req: CycleRequest, con, report, now: int) -> QueuePlan:
+    """The QUEUE step's plan. ``research.first`` builds it from techniques alone.
+
+    ``_build_queue`` caps each domain at ``queue.per_domain_max`` by severity
+    *before* anything re-orders the selected list. When the harvest also holds
+    verification gaps (severity 60–86), those gaps fill that cap and every
+    ``technique_unadopted`` candidate is dropped with ``domain_cap`` — so the
+    research-first loop never sees one. Building the pool from the technique
+    candidates alone keeps the cap, the avoidance filters and credit all in
+    force; only the pool they run over narrows.
+
+    A technique-only pool that still yields nothing (every technique avoided)
+    is not an answer: fall back to the full candidate set rather than to an
+    empty cycle.
+    """
+    if req.config.research.first:
+        tech = tuple(c for c in report.candidates if c.kind == "technique_unadopted")
+        if tech:
+            plan = _build_queue(req, con, replace(report, candidates=tech), now)
+            if plan.top is not None:
+                return plan
+    return _build_queue(req, con, report, now)
+
+
 def _build_queue(req: CycleRequest, con, report, now: int) -> QueuePlan:
     view = ledger_view(con, report.candidates, root=req.root)
     return build_queue(
@@ -560,6 +636,194 @@ def _build_queue(req: CycleRequest, con, report, now: int) -> QueuePlan:
         credits=ledger.credit_stats(con, min_n=req.config.queue.credit_min_n),
         domains=req.domains,
     )
+
+
+def _order_research(req: CycleRequest, con, plan: QueuePlan) -> QueuePlan:
+    """HGM ordering of the technique candidates already in the selected list.
+
+    Inside the positions the queue assigned to ``technique_unadopted`` items, the
+    order comes from clade Thompson sampling over family credit
+    (:func:`impact.thompson_order`). When recent attempts plateau on one family,
+    :func:`impact.family_collapse` forces an untried family first — the
+    principle-level local optimum this ordering exists to break out of.
+
+    The plan is a *permutation*: no item is dropped or added, so a pinned
+    candidate still resolves through ``plan.find``.
+    """
+    positions = [i for i, item in enumerate(plan.selected)
+                 if item.candidate.kind == "technique_unadopted"]
+    if not positions:
+        return plan
+
+    try:
+        rows = con.execute(
+            "SELECT candidate_id, source, outcome FROM rsi_credit"
+            " WHERE source LIKE 'research:%' ORDER BY created_at, id").fetchall()
+    except sqlite3.Error:
+        rows = []
+    attempts = [
+        {
+            "family": str(source).split(":", 1)[1],
+            "technique": candidate_id or "",
+            "success": outcome == "merged",
+        }
+        for (candidate_id, source, outcome) in rows
+    ]
+
+    techniques = [plan.selected[i].candidate for i in positions]
+    pmax = max(float(c.evidence.get("priority") or 0) for c in techniques) or 1.0
+    options = [
+        {
+            "id": cand.candidate_id,
+            "family": (cand.source.split(":", 1)[1]
+                       if ":" in cand.source else cand.source),
+            "prior": float(cand.evidence.get("priority") or 0) / pmax,
+        }
+        for cand in techniques
+    ]
+    rng = random.Random(int(hashlib.sha256(req.cycle_id.encode()).hexdigest()[:8], 16))
+    order = impact.thompson_order(options, attempts, rng=rng)
+
+    col = impact.family_collapse([a["family"] for a in attempts],
+                                 [a["success"] for a in attempts])
+    if col["collapse"]:
+        recent = set(col["recent_families"])
+        family_of = {option["id"]: option["family"] for option in options}
+        order = ([oid for oid in order if family_of.get(oid) not in recent]
+                 + [oid for oid in order if family_of.get(oid) in recent])
+
+    by_id = {item.candidate.candidate_id: item for item in plan.selected}
+    if req.config.research.first:
+        selected = ([by_id[oid] for oid in order]
+                    + [item for item in plan.selected
+                       if item.candidate.kind != "technique_unadopted"])
+    else:
+        selected = list(plan.selected)
+        for position, oid in zip(positions, order):
+            selected[position] = by_id[oid]
+    selected = [replace(item, rank=i + 1) for i, item in enumerate(selected)]
+    print(f"[rsi] research order: {', '.join(order)}"
+          f" (collapse: {col['collapse']})", file=sys.stderr)
+    return replace(plan, selected=tuple(selected))
+
+
+def _revisable(req: CycleRequest, report: ValidationReport,
+               measurement: GateEvidence, attempt: int, total_cost: float) -> bool:
+    """Whether a failed attempt is a measured no-gain worth revising.
+
+    Only G12 may be red: any other failing gate is a defect the benchmark cannot
+    answer, and re-dispatching it would pay twice for the same rejection. A
+    sealed-budget exhaustion or an error is not a measurement of the change, so
+    neither is revisable, and a revision must stay under the cycle cap.
+    """
+    failing = [r.gate for r in report.results if not r.ok]
+    impact_out = measurement.impact
+    return (
+        attempt < req.config.impact.max_revisions
+        and failing == ["G12"]
+        and isinstance(impact_out, Mapping)
+        and impact_out.get("status") == "rejected"
+        and impact_out.get("reason") != "sealed_budget_exhausted"
+        and total_cost < float(req.config.budget.per_cycle_cap_usd)
+    )
+
+
+def _attempt_record(attempt: int, impl: Implementation,
+                    measurement: GateEvidence) -> dict[str, Any]:
+    """One history entry, built from the *public* impact view.
+
+    ``public_impact`` strips sealed counts, guards and flaky ids, so nothing a
+    revision prompt sees can overfit the split the change is measured on.
+    """
+    return {
+        "attempt": attempt + 1,
+        "impact": public_impact(measurement.impact),
+        "changed": list(impl.changed_files),
+        "diff": (impl.diff or "")[:6000],
+    }
+
+
+def _revise_section(req: CycleRequest, history: Sequence[Mapping[str, Any]]) -> str:
+    """The dev-only feedback appended to the kickoff for the next attempt."""
+    number = len(history) + 1
+    total = req.config.impact.max_revisions + 1
+    last = history[-1]
+    impact_out = last["impact"] or {}
+    dev = impact_out.get("dev") or {}
+
+    lines = [
+        f"## Revision {number} of {total} — the previous attempt showed no measured gain",
+        "",
+        "The harness measured each attempt on a held-out benchmark. You see only "
+        "its dev half; the sealed half reports a single bit.",
+        "",
+        "### Previous attempts",
+    ]
+    for entry in history:
+        entry_impact = entry["impact"] or {}
+        entry_dev = entry_impact.get("dev") or {}
+        lines.append(
+            f"- attempt {entry['attempt']}: stopped at "
+            f"{entry_impact.get('stage') or 'unknown'}: "
+            f"{entry_impact.get('reason') or 'unknown'}. Dev split: "
+            f"{entry_dev.get('wins') or 0} fixed, "
+            f"{entry_dev.get('losses') or 0} broken, "
+            f"{entry_dev.get('both_fail') or 0} still wrong."
+        )
+
+    lines += ["", "### Dev items the last attempt still gets wrong or broke"]
+    items = dev.get("items") or []
+    if not items:
+        lines.append("- (none)")
+    else:
+        for item in list(items)[:15]:
+            lines.append(
+                f"- `{item.get('item', '')}` ({item.get('stratum', '')}): "
+                f"base {item.get('base')}, now {item.get('head')}. "
+                f"Verifier said: {item.get('reason', '')}"
+            )
+
+    lines += ["", "### What the last attempt changed"]
+    changed = last.get("changed") or []
+    if not changed:
+        lines.append("- (none)")
+    else:
+        lines.extend(f"- `{path}`" for path in changed)
+
+    lines += [
+        "",
+        "```diff",
+        last.get("diff") or "",
+        "```",
+        "",
+        "### Rules for this revision",
+        "- These attempts were tried and rejected: do not resubmit the same change.",
+        "- Generalize. A change that special-cases the item ids above will fail the "
+        "sealed half, which holds different items.",
+        "- First check that the change implements the Mechanism under Expected Edit. "
+        "A no-gain result often means the mechanism was not implemented as described.",
+        "- If the dev split shows 0 fixed and 0 broken, the change altered no verdict: "
+        "it is probably outside the code path the benchmark exercises.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _revise_selection(req: CycleRequest, selection: Selection,
+                      history: Sequence[Mapping[str, Any]]) -> Selection:
+    """Append the revision section to the ORIGINAL kickoff and re-hash it."""
+    new = (selection.kickoff.rstrip() + "\n\n"
+           + _revise_section(req, history) + "\n")
+    return replace(selection, kickoff=new,
+                   kickoff_sha=hashlib.sha256(new.encode("utf-8")).hexdigest())
+
+
+def _archive_impact(req: CycleRequest, attempt: int) -> None:
+    """Keep each attempt's impact.json next to the one it superseded."""
+    source = _impact_path(req)
+    if not source.exists():
+        return
+    shutil.copyfile(source, source.parent / f"impact-attempt-{attempt + 1}.json")
 
 
 def _select_context(req: CycleRequest, con, report, cand: Candidate) -> SelectContext:
@@ -595,14 +859,19 @@ def _evidence(req: CycleRequest, report, cand: Candidate, impl: Implementation,
 
     cfg = req.config
     root = getattr(impl.worktree, "path", req.root)
+    existing_frozen = frozen_hits(list(impl.changed_files),
+                                  enforced_frozen_paths(str(root)))
+    # A candidate may not edit the evaluator surface either: ``select`` refuses
+    # the proposal pre-dispatch, and G3 re-checks the real diff here so a child
+    # that widened its own scope cannot slip a gate file past the filter.
+    denied = [p for p in impl.changed_files if _allowlisted(p, DENY_PREFIXES)]
     return replace(
         measured,
         harvest_ok=report.harvest_ok,
         required_probe_failures=tuple(
             p.probe_id for p in report.probes if p.failed and p.required),
         child_verdict=impl.verdict,
-        frozen_hits=tuple(frozen_hits(list(impl.changed_files),
-                                      enforced_frozen_paths(str(root)))),
+        frozen_hits=tuple(dict.fromkeys([*existing_frozen, *denied])),
         changed_files=tuple(impl.changed_files),
         scope_files=tuple(selection.files),
         allow_prefixes=cfg.gates.allow_prefixes or DEFAULT_ALLOW_PREFIXES,
@@ -862,9 +1131,107 @@ def _scoped_runner(req: CycleRequest):
 def _default_harvest(req: CycleRequest, con, now: int, probes):
     from .harvest import harvest
 
-    return harvest(req.root, con, now=now,
-                   cfg={"per_source_max": req.config.probes.per_source_max},
-                   probes=tuple(probes))
+    report = harvest(req.root, con, now=now,
+                     cfg={"per_source_max": req.config.probes.per_source_max},
+                     probes=tuple(probes))
+    rcfg = req.config.research
+    if not rcfg.enabled:
+        return report
+
+    from dataclasses import replace as _replace
+    from . import research
+
+    domains = [d for d in rcfg.domains if not req.domains or d in req.domains]
+    specs = {d: _replace(research.DEFAULT_SPECS[d],
+                         review_glob=rcfg.review_globs.get(
+                             d, research.DEFAULT_SPECS[d].review_glob))
+             for d in domains if d in research.DEFAULT_SPECS}
+    harvests = research.harvest_all(
+        req.home, specs, now=now, max_n=rcfg.max_candidates,
+        verdicts=rcfg.verdicts,
+        skip_disagreement=rcfg.skip_disagreement,
+        skip_single_rater=rcfg.skip_single_rater)
+    for harvest_result in harvests:
+        for text in (*harvest_result.notes, *((
+            harvest_result.error,) if harvest_result.error else ())):
+            print(f"[rsi] research {harvest_result.domain}: {text}",
+                  file=sys.stderr)
+    added = tuple(c for h in harvests for c in h.candidates)
+    return replace(report, candidates=tuple(report.candidates) + added)
+
+
+def _canary_benches(req: CycleRequest) -> tuple[str, ...]:
+    """The distinct benchmark names this cycle's research domains are scored on.
+
+    A domain the module does not know has no benchmark, and a domain the
+    operator left out of ``--domain`` this run is not scored. Distinct because
+    two domains may share one benchmark; scoring it twice would spend twice and
+    record two canaries for one tree.
+    """
+    benches: dict[str, None] = {}
+    for domain in req.config.research.domains:
+        if req.domains and domain not in req.domains:
+            continue
+        spec = research.DEFAULT_SPECS.get(domain)
+        if spec is not None:
+            benches.setdefault(spec.benchmark, None)
+    return tuple(benches)
+
+
+def _research_preflight(req: CycleRequest, rt: Runtime, con,
+                        report: HarvestReport) -> HarvestReport:
+    """Score the canary and relaunch stale reviews before the queue is drawn.
+
+    Both jobs belong to ``monitor``; the cycle only sequences them. They run
+    *after* HARVEST so a halt can drop the technique candidates and queue a
+    fix-forward regression for this cycle's QUEUE rather than the next one.
+
+    Research is off by default and a dry run spawns nothing, so with the stock
+    config this is a no-op. A refresh or canary failure is reported and ignored:
+    neither may halt a cycle, because neither is a measurement of the candidate
+    the cycle exists to fix. A halt marker, by contrast, is a decision already
+    made — the canary wrote it — so it is honoured here.
+    """
+    cfg = req.config
+    if not cfg.research.enabled or req.dry_run:
+        return report
+
+    try:
+        for entry in monitor.maybe_refresh(req.root, req.home, cfg,
+                                          now=rt.clock(), domains=req.domains):
+            if entry.get("action") == "launched":
+                print(f"[rsi] research refresh: {entry.get('domain')} launched"
+                      f" ({entry.get('log')})", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - a refresh never halts a cycle
+        print(f"[rsi] research refresh failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    if cfg.monitor.enabled:
+        for bench in _canary_benches(req):
+            try:
+                outcome = monitor.run_canary(req.root, req.home, cfg, bench,
+                                             now=rt.clock())
+            except Exception as exc:  # noqa: BLE001 - a canary never crashes a cycle
+                print(f"[rsi] canary {bench} failed: {type(exc).__name__}: {exc}",
+                      file=sys.stderr)
+                continue
+            print(f"[rsi] canary {bench}: {outcome.get('status')}"
+                  f" score={outcome.get('score')} peak={outcome.get('peak')}",
+                  file=sys.stderr)
+
+    halt = monitor.adoption_halted(req.home)
+    if halt is not None:
+        # The canary has decided technique adoption is unsafe until the score
+        # recovers, so the technique candidates never reach the queue.
+        report = replace(report, candidates=tuple(
+            c for c in report.candidates if c.kind != "technique_unadopted"))
+        print(f"[rsi] adoption halted: {halt.get('bench', '?')}"
+              " canary below its peak", file=sys.stderr)
+        if "bench" in halt:
+            reg = monitor.regression_candidate(halt, now=rt.clock())
+            ledger.upsert_candidate(con, reg, now=rt.clock())
+            report = replace(report, candidates=(*report.candidates, reg))
+    return report
 
 
 #: How long one SUGGEST run may take. Five model nodes, four of them in
@@ -1314,7 +1681,8 @@ def worktree_config(req: CycleRequest, *, slug: str, files: Sequence[str],
 
 
 def _default_implement(req: CycleRequest, cand: Candidate,
-                       selection: Selection) -> Implementation | None:
+                       selection: Selection, *,
+                       attempt: int = 0) -> Implementation | None:
     """Claim a worktree, dispatch the child inside it, land its diff."""
     from .worktree import (
         Abstain,
@@ -1333,7 +1701,11 @@ def _default_implement(req: CycleRequest, cand: Candidate,
 
     child_home = req.home / "rsi" / req.cycle_id / "child-home"
     child_home.mkdir(parents=True, exist_ok=True)
-    run_id, rc, out = _dispatch_child(req, wt, selection.kickoff, child_home)
+    if attempt:
+        run_id, rc, out = _dispatch_child(req, wt, selection.kickoff, child_home,
+                                          attempt=attempt)
+    else:
+        run_id, rc, out = _dispatch_child(req, wt, selection.kickoff, child_home)
 
     diff_path = child_home / "runs" / run_id / "framework-edit.diff"
     verdict_path = child_home / "runs" / run_id / "verdict.json"
@@ -1368,10 +1740,17 @@ def _default_implement(req: CycleRequest, cand: Candidate,
     )
 
 
-def _dispatch_child(req: CycleRequest, wt, kickoff: str, child_home: Path) -> tuple[str, int, str]:
-    """Run ``framework-edit`` inside the worktree, with its own home and DB."""
-    run_id = f"{req.cycle_id}-fe"
-    kickoff_path = child_home / "kickoff.md"
+def _dispatch_child(req: CycleRequest, wt, kickoff: str, child_home: Path, *,
+                    attempt: int = 0) -> tuple[str, int, str]:
+    """Run ``framework-edit`` inside the worktree, with its own home and DB.
+
+    Each revision is a distinct child run — ``<cycle>-fe-r<n>`` with its own
+    kickoff file — so the first attempt's artifacts and worktree diff stay
+    readable next to the revision that superseded them.
+    """
+    run_id = f"{req.cycle_id}-fe" if attempt == 0 else f"{req.cycle_id}-fe-r{attempt}"
+    kickoff_path = (child_home / "kickoff.md" if attempt == 0
+                    else child_home / f"kickoff-r{attempt}.md")
     kickoff_path.write_text(kickoff, encoding="utf-8")
     argv = [
         "timeout", str(req.config.implement.child_timeout_s),
@@ -1588,7 +1967,12 @@ def _default_measure(req: CycleRequest, cand: Candidate, impl: Implementation,
     lint_ok, lint_detail = _lint(wt, changed, req.config.gates.cmd_timeout_s)
     pytest_ok, pytest_detail = _pytest(wt, req, cand, changed)
     static_before, static_after, static_ran = _static_differential(req, wt)
-    gap_before, gap_after = _gap(req, cand, wt, changed=changed)
+    if cand.success_command.startswith(BENCH_PREFIX):
+        # G8 is about "the gap still reproduces"; a benchmark candidate has no
+        # `db:` gap to measure and is judged by G12 instead.
+        gap_before, gap_after = None, None
+    else:
+        gap_before, gap_after = _gap(req, cand, wt, changed=changed)
     failures_before, failures_after, probes_ran = _probe_differential(req, wt)
     return GateEvidence(
         lint_ok=lint_ok, lint_detail=lint_detail,
@@ -1597,7 +1981,196 @@ def _default_measure(req: CycleRequest, cand: Candidate, impl: Implementation,
         gap_before=gap_before, gap_after=gap_after,
         probe_failures_before=failures_before, probe_failures_after=failures_after,
         probes_ran=probes_ran,
+        impact=_impact(req, cand, impl),
     )
+
+
+def _impact_path(req: CycleRequest) -> Path:
+    return req.home / "rsi" / req.cycle_id / "impact.json"
+
+
+def _write_impact(req: CycleRequest, out: Mapping[str, Any]) -> None:
+    path = _impact_path(req)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+
+
+def _impact(req: CycleRequest, cand: Candidate, impl: Implementation,
+            *, base: Path | None = None) -> dict[str, Any] | None:
+    """Measure a ``bench:`` candidate's sealed impact; ``None`` if it is not one.
+
+    Dev first, spending no error budget; then one sealed look under SAGE with a
+    no-regression budget and guard metrics. The decision is written to
+    ``rsi/<cycle>/impact.json`` on every path, errors included, so an operator
+    can see what the acceptor saw and why it stopped. Only this function and the
+    operator artifact may read ``out["sealed"]``; ``public_impact`` is the view
+    the revise loop gets.
+    """
+    if not cand.success_command.startswith(BENCH_PREFIX):
+        return None
+    name = cand.success_command[len(BENCH_PREFIX):]
+    icfg = req.config.impact
+    wt = Path(getattr(impl.worktree, "path", req.root))
+    out: dict[str, Any] = {
+        "benchmark": name, "status": "error", "stage": "setup", "reason": "",
+        "epoch": None, "look": None, "alpha": None, "dev": None,
+        "sealed": None, "guards": None, "flaky": [],
+    }
+    try:
+        try:
+            bench = benchmarks.get_benchmark(name)
+        except KeyError:
+            out["reason"] = "unknown_benchmark"
+            return out
+        ctx = benchmarks.BenchContext(
+            home=req.home, repo=req.root, workers=icfg.workers,
+            timeout_s=icfg.timeout_s)
+        secret = impact_state.load_secret(
+            req.home, secure_store=req.config.secure.secret_store,
+            secret_name=icfg.secret_name)
+        items = dict(bench.items(ctx))
+        if not items:
+            out["reason"] = "empty_corpus"
+            return out
+        state = impact_state.load_state(req.home)
+        entry = impact_state.bench_state(
+            state, name, impact_state.corpus_hash(items))
+        out["epoch"] = entry["epoch"]
+        split = impact.split_items(
+            items, secret=secret, epoch=entry["epoch"],
+            dev_fraction=icfg.dev_fraction, strata=items)
+
+        base_tree = base or _detached_base(req, wt)
+        if base_tree is None:
+            out["reason"] = "no_base"
+            return out
+        try:
+            first = benchmarks.run_benchmark(name, base_tree, ctx=ctx)
+            stable: Any = None
+            stable_path: Path | None = None
+            if first.tree is not None:
+                stable_path = (impact_state.impact_dir(req.home)
+                               / f"stable-{name}-{first.tree}.json")
+                if stable_path.exists():
+                    try:
+                        loaded = json.loads(
+                            stable_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        loaded = None
+                    if isinstance(loaded, list):
+                        stable = loaded
+            if stable is None:
+                scores = [first.scores]
+                for _ in range(max(0, icfg.base_repeats - 1)):
+                    again = benchmarks.run_benchmark(
+                        name, base_tree, ctx=ctx, use_cache=False)
+                    scores.append(again.scores)
+                stable_set, flaky = impact.stable_items(scores)
+                stable = stable_set
+                out["flaky"] = sorted(flaky)
+                if stable_path is not None:
+                    stable_path.parent.mkdir(parents=True, exist_ok=True)
+                    stable_path.write_text(
+                        json.dumps(sorted(stable_set)), encoding="utf-8")
+        finally:
+            # Only a tree this function detached is this function's to remove.
+            if base is None:
+                _remove_detached(req, base_tree)
+
+        head = benchmarks.run_benchmark(name, wt, ctx=ctx)
+        dev_items = [i for i in split["dev"] if i in stable]
+        sealed_items = [i for i in split["sealed"] if i in stable]
+
+        dev_table = impact.paired_counts(
+            first.scores, head.scores, items=dev_items)
+        dev_dec = impact.sage_decision(
+            dev_table, alpha=0.5, lam=icfg.lam,
+            max_regression_rate=icfg.max_regression_rate)
+        out["dev"] = {
+            **dev_table.to_dict(),
+            "reason": dev_dec["reason"],
+            "items": _dev_feedback(dev_items, first, head),
+        }
+        if dev_dec["reason"] not in ("accepted", "not_significant"):
+            out.update(status="rejected", stage="dev",
+                       reason=f"dev_{dev_dec['reason']}")
+            return out
+
+        if entry["looks"] >= icfg.max_looks:
+            out.update(status="rejected", stage="sealed",
+                       reason="sealed_budget_exhausted")
+            return out
+
+        look = entry["looks"] + 1
+        alpha_k = impact.look_alpha(icfg.alpha, look, spending=icfg.spending)
+        sealed_table = impact.paired_counts(
+            first.scores, head.scores, items=sealed_items)
+        dec = impact.sage_decision(
+            sealed_table, alpha=alpha_k, lam=icfg.lam,
+            max_regression_rate=icfg.max_regression_rate)
+        guards = impact.guard_check(
+            first.guards, head.guards, tolerances=icfg.guard_tolerances,
+            lower_is_better=bench.lower_is_better)
+        accepted = bool(dec["accept"] and guards["ok"])
+        impact_state.record_look(state, name, accepted=accepted)
+        impact_state.save_state(req.home, state)
+        if accepted:
+            reason = "accepted"
+        elif not dec["accept"]:
+            reason = str(dec["reason"])
+        else:
+            reason = "guard_violation"
+        out.update(
+            status="accepted" if accepted else "rejected", stage="sealed",
+            look=look, alpha=alpha_k, reason=reason,
+            sealed={**sealed_table.to_dict(), "p_value": dec["p_value"],
+                    "delta": dec["delta"],
+                    "regression_rate": dec["regression_rate"]},
+            guards=guards,
+        )
+    except impact_state.ImpactStateError as exc:
+        out["reason"] = f"state_error: {exc}"
+    except Exception as exc:  # noqa: BLE001 - recorded, never raised at the gate
+        out["reason"] = f"measure_error: {type(exc).__name__}: {exc}"[:300]
+    finally:
+        _write_impact(req, out)
+    return out
+
+
+def _dev_feedback(items: Sequence[str], base, head) -> list[dict[str, Any]]:
+    """The dev items worth naming: changed outcomes, or a head failure."""
+    out: list[dict[str, Any]] = []
+    for item in sorted(items):
+        base_score = base.scores.get(item)
+        head_score = head.scores.get(item)
+        if base_score == head_score and head.scores.get(item, 0) >= 0.5:
+            continue
+        out.append({
+            "item": item,
+            "stratum": head.strata.get(item, ""),
+            "base": base_score,
+            "head": head_score,
+            "reason": str((head.meta.get("reasons") or {}).get(item, ""))[:200],
+        })
+        if len(out) >= 40:
+            break
+    return out
+
+
+def public_impact(out: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The revise-loop view: no sealed counts, no guards, no flaky ids.
+
+    The sealed split returns one bit; handing the counts to a node that may
+    rewrite the candidate would let it overfit the split it is measured on.
+    """
+    if out is None:
+        return None
+    view = dict(out)
+    view["sealed"] = None
+    view["guards"] = None
+    view.pop("flaky", None)
+    return view
 
 
 def _run(argv: Sequence[str], *, cwd: Path, timeout_s: int,
@@ -1827,16 +2400,34 @@ def _retire_stale_runs(con: sqlite3.Connection, req: CycleRequest, now: int) -> 
     return cursor.rowcount or 0
 
 
-def _blind_sources(report: HarvestReport) -> list[str]:
+def _blind_sources(report: HarvestReport, con=None) -> list[str]:
     """The ``source`` values whose absence this harvest cannot be read as a fix.
 
     A skipped DB rule names itself as ``db:<RULE>``; a probe that did not run to
     a verdict names ``probe:<id>``. Everything else (a probed rule, an AST rule,
     a rule that answered "closed") observed its subject and may be trusted.
+
+    Research is a second blind producer. When the report carries no technique
+    candidate — because research is switched off, or its review is missing — the
+    open ``research:*`` rows still name gaps nobody looked at this cycle, so the
+    ledger must not reconcile them away as ``fixed_externally``.
     """
     blind = [f"db:{rule}" for rule in report.skipped]
     blind += [f"probe:{probe.probe_id}" for probe in report.probes
               if probe.status not in ("ok", "findings")]
+    if con is not None and not any(
+            c.kind == "technique_unadopted" for c in report.candidates):
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT source FROM rsi_candidates"
+                " WHERE status = 'open' AND kind = 'technique_unadopted'"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            source = row[0] if row else None
+            if source and source not in blind:
+                blind.append(str(source))
     return blind
 
 

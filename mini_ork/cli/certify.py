@@ -37,6 +37,7 @@ from mini_ork.certify import (
 )
 from mini_ork.certify import image as cert_image
 from mini_ork.certify import llm as cert_llm
+from mini_ork.certify import seal as cert_seal
 from mini_ork.certify.certificate import build_certificate
 from mini_ork.certify.context import code_context
 from mini_ork.runtime import Crucible, RuntimeSpec
@@ -193,8 +194,31 @@ def _summary_lines(cert: dict, write_path: Path) -> list[str]:
 _EXIT = {PROVEN: 0, REFUTED: 1, UNVERIFIED: 2}
 
 
+def _seal_path(cert_path: Path) -> Path:
+    """``<certificate>.seal.json`` beside the certificate (``x.json`` → ``x.seal.json``)."""
+    return cert_path.with_suffix(".seal.json")
+
+
+def _write_seal(cert: dict, repo: Path, cert_path: Path) -> Path | None:
+    """Record the issuance in the audit chain and sign it (mini_ork.certify.seal).
+
+    The certificate is already on disk; a seal that cannot be written (a
+    locked state.db) is reported, never turned into a different verdict.
+    """
+    home = os.environ.get("MINI_ORK_HOME") or str(repo / ".mini-ork")
+    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    try:
+        seal = cert_seal.seal_certificate(cert, home=home, db=db if os.path.isfile(db) else None)
+    except Exception as exc:  # noqa: BLE001 — the certificate stands without its seal
+        sys.stderr.write(f"[certify] seal not written: {exc}\n")
+        return None
+    path = _seal_path(cert_path)
+    path.write_text(json.dumps(seal, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def _emit(cert: dict, args: argparse.Namespace, repo: Path, out) -> int:
-    """Write the certificate, print the summary (or JSON), return the verdict's exit code.
+    """Write the certificate and its seal, print the summary (or JSON), return the verdict's exit code.
 
     Every outcome — including the short-circuits — goes through here, so every run
     leaves a certificate at ``--out`` and CI always gets 0/1/2 from the verdict.
@@ -203,13 +227,63 @@ def _emit(cert: dict, args: argparse.Namespace, repo: Path, out) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(cert, indent=2, sort_keys=True)
     out_path.write_text(body, encoding="utf-8")
-    out.write(body + "\n" if args.json else "\n".join(_summary_lines(cert, out_path)) + "\n")
+    seal_path = _write_seal(cert, repo, out_path)
+    lines = _summary_lines(cert, out_path)
+    if seal_path is not None:
+        lines.append(f"  seal    {seal_path}")
+    out.write(body + "\n" if args.json else "\n".join(lines) + "\n")
     return _EXIT.get(cert["verdict"], 2)
+
+
+_VERIFY_EXIT = {"VERIFIED": 0, "FAILED": 1, "UNPINNED": 2, "UNSIGNED": 2}
+
+
+def _verify_main(argv: list[str], out, err) -> int:
+    """``mini-ork certify verify <certificate.json>`` — check a certificate as an outsider.
+
+    Needs only the certificate, its seal and the issuer's public key (and,
+    optionally, the state.db whose audit chain recorded it). Exit 0 VERIFIED,
+    1 FAILED, 2 UNPINNED/UNSIGNED (nothing failed, but nothing was proven).
+    """
+    p = argparse.ArgumentParser(prog="mini-ork certify verify")
+    p.add_argument("certificate", help="certificate JSON")
+    p.add_argument("--seal", default=None, help="seal JSON (default: <certificate>.seal.json)")
+    p.add_argument("--pubkey", default=None,
+                   help="issuer public key: a .pub file or the base64 key itself")
+    p.add_argument("--db", default=None, help="state.db holding the audit chain to check too")
+    p.add_argument("--json", action="store_true", help="print the full result as JSON")
+    args = p.parse_args(argv)
+    cert_path = Path(args.certificate)
+    seal_path = Path(args.seal) if args.seal else _seal_path(cert_path)
+    try:
+        cert = json.loads(cert_path.read_text(encoding="utf-8"))
+        seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        err.write(f"cannot read certificate or seal: {exc}\n")
+        return 1
+    pubkey = None
+    if args.pubkey:
+        key_file = Path(args.pubkey)
+        pubkey = key_file.read_text(encoding="utf-8").strip() if key_file.is_file() else args.pubkey.strip()
+    result = cert_seal.verify_certificate(cert, seal, pubkey_b64=pubkey, db=args.db)
+    if args.json:
+        out.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    else:
+        out.write(f"{result['verdict']}  {cert.get('id')}\n")
+        for name, ok in result["checks"].items():
+            mark = "ok" if ok else ("—" if ok is None else "FAIL")
+            out.write(f"  {name:<26}{mark}\n")
+        for failure in result["failures"]:
+            out.write(f"  ! {failure}\n")
+    return _VERIFY_EXIT[result["verdict"]]
 
 
 def main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["verify"]:
+        return _verify_main(raw[1:], out, err)
 
     parser = _build_parser(stdout=out, stderr=err)
     args = parser.parse_args(argv)

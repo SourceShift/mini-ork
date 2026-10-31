@@ -15,6 +15,7 @@ NodeType = Literal[
     "reflector",
     "publisher",
     "rollback",
+    "subgraph",
 ]
 
 DispatchMode = Literal["serial", "parallel", "partitioned", "speculative"]

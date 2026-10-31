@@ -227,8 +227,11 @@ version keeps a rollback pointer. The apply loop that rewrites prompts unattende
 | `mini-ork zed setup` / `cn status` | Editor wiring; ContextNest tier and reachability |
 
 Starting recipes: `code-fix`, `docs`, `refactor-audit`, `bug-audit-cmgk`,
-`research-synthesis`, `spec-driven-delivery`. See [recipes/](recipes/) and the
-[extension guide](docs/EXTENSION.md).
+`research-synthesis`, `spec-driven-delivery`, and `procedure` — the lightweight path for a
+fixed step-by-step task: one node runs the whole procedure in one context and a deterministic
+check grades its step report (changes stay uncommitted for review). See [recipes/](recipes/)
+and the [extension guide](docs/EXTENSION.md); a recipe can run another as a node
+(`type: subgraph`).
 
 ## Upgrade
 

@@ -30,7 +30,7 @@ if [ -n "${PYTHON:-}" ]; then
     fi
 else
     TRIED=""
-    for candidate in python3.12 python3.11 python3; do
+    for candidate in python3.13 python3.12 python3.11 python3; do
         if command -v "$candidate" >/dev/null 2>&1; then
             TRIED="$TRIED $candidate"
             if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
@@ -86,7 +86,12 @@ if ! git -C "$TARGET" submodule update --init --recursive --depth 1; then
 fi
 
 if [ "${INSTALL_SYSTEM_DEPS:-1}" = "1" ] && [ -e "$TARGET/scripts/install-system-deps.sh" ]; then
-    sh "$TARGET/scripts/install-system-deps.sh"
+    if command -v bash >/dev/null 2>&1; then
+        bash "$TARGET/scripts/install-system-deps.sh"
+    else
+        echo "mini-ork: scripts/install-system-deps.sh needs bash; install bash or re-run with INSTALL_SYSTEM_DEPS=0" >&2
+        exit 1
+    fi
 fi
 
 cd "$TARGET"

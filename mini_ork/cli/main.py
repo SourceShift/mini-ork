@@ -110,6 +110,7 @@ _NATIVE_MODULE_SUBS = {
     "harness-contrast": "mini_ork.cli.harness_contrast",
     "harness-edit": "mini_ork.cli.harness_edit",
     "harness-audit": "mini_ork.cli.harness_audit",
+    "harness-card": "mini_ork.cli.harness_card",
     "hack-probe": "mini_ork.cli.hack_probe",
     "oversight": "mini_ork.cli.oversight",
     "active-eval": "mini_ork.cli.active_eval",
@@ -2219,6 +2220,16 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             from mini_ork.recovery import retry_notify
             retry_notify.notify(Path(home), run_id)
         except Exception:  # noqa: BLE001
+            pass
+
+    # ── harness card: which harness, at which release, served each node ──
+    # Written before the verify gate can return, so a failed run discloses too.
+    if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
+        try:
+            from mini_ork.observability import harness_card
+            harness_card.write(_run_dir, run_id,
+                               db=context_env("MINI_ORK_DB") or os.path.join(home, "state.db"))
+        except Exception:  # noqa: BLE001 — disclosure must never change the run's outcome
             pass
 
     if not _gate("verify", artifact):

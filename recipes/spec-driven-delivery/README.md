@@ -130,6 +130,54 @@ It copies `tests/fixtures/sdd_e2e` (a target repo with `add()` and a spec for
 gets one row per gate. The SpecCard, gates and child run that the LLM nodes
 would write are planted from the fixture's golden card.
 
+## Ratifying the compiled contract
+
+The workflow declares `review_after_nodes: [contract_compiler]`, so the run
+parks after `contract_compiler` instead of dispatching straight into
+`ratification_check`. Nothing downstream of the compiled contract runs until a
+human looks at it, which is the point: today a spec with a real gap fails
+`ratification_check` before anyone gets a chance to ratify it.
+
+1. Inspect what the compiler produced. The SpecCards and ratification records
+   are in `<run_dir>/spec-cards/` and `<run_dir>/ratification/`; list them with
+
+   ```bash
+   bin/mini-ork specs ratify <run_id> --list
+   ```
+
+2. Acknowledge every real gap, one entry at a time or per spec:
+
+   ```bash
+   bin/mini-ork specs ratify <run_id> --spec <id> --entry N --note "…"
+   bin/mini-ork specs ratify <run_id> --spec <id> --all --note "…"
+   ```
+
+   The note is required: ratification records *why* a gap is acceptable, not
+   just that it was waved through.
+
+3. Continue the run. Approving the pause node resumes it:
+
+   ```bash
+   bin/mini-ork approvals approve <run_id> --node contract_compiler
+   ```
+
+4. To adjust, reject the pause with a note, edit the specs, and start a new
+   run:
+
+   ```bash
+   bin/mini-ork approvals reject <run_id> --node contract_compiler --note "…"
+   ```
+
+   Re-running only the compiler on the same run would trip
+   `ratification_check`'s source-hash drift check, so a changed spec means a
+   new run rather than a partial re-execute.
+
+Unattended runs set `MO_REVIEW_RECIPE_NODES=0`; it disables only the pauses a
+workflow declares and leaves `MO_REVIEW_AFTER_NODES` / `config/review.yaml`
+entries in force. A `review_after_nodes` name that is not one of the
+workflow's nodes is a fatal setup error (exit 2) rather than a silently
+dropped pause.
+
 ## Rules
 
 1. **Spec is the only mutable artifact.** Implementer lanes never edit specs

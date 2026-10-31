@@ -83,7 +83,7 @@ edges:
   - { from: reviewer,    to: publisher,   edge_type: depends_on }
 ```
 
-**Allowed node types:** `planner` `researcher` `implementer` `reviewer` `verifier` `reflector` `publisher` `rollback`
+**Allowed node types:** `planner` `researcher` `implementer` `reviewer` `verifier` `reflector` `publisher` `rollback` `subgraph` (runs another recipe as this node — `recipe:` is required; see `docs/LANGGRAPH_PARITY.md` row 10)
 
 **Common edge types:** `depends_on` `supplies_context_to` `verifies` `blocks` `retries` `escalates_to`. Some shipped recipes also use product-flow edges such as `human_decision_gate` and `verifies_user_choice`; treat those as live recipe dialect extensions until the schema is aligned.
 
@@ -170,9 +170,9 @@ nodes:
     dispatch_mode: serial
 ```
 
-Lane values resolve to `lib/providers/cl_<name>.sh` wrappers first, then to
-BYO entries in `config/providers.yaml` (your own Anthropic / OpenAI-compatible
-keys — see `docs/CONFIG.md` → "Bring-your-own providers"). Custom names like
+Lane values resolve to entries in the provider registry, `config/providers.yaml`
+(the committed lanes plus your own Anthropic / OpenAI-compatible keys — see
+`docs/CONFIG.md` → "Bring-your-own providers"). Custom names like
 `openai_api` or `openrouter` work anywhere a builtin lane value does.
 
 **Shell registration at runtime:**

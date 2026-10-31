@@ -54,6 +54,26 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _drop_repo_env() -> None:
+    """Remove the variables that bind a git process to THIS repository.
+
+    git exports GIT_DIR to hooks (in a linked worktree it is always set), and
+    every layer below inherits os.environ. The review lenses are agents that
+    may run the test suite; a test that does `git init` / `add -A` / `commit`
+    in a temp dir then writes to the pushing repo instead. On 2026-10-29 one
+    push left 5 fixture commits on the branch (the tree reduced to 8 files) and
+    `[user] name = t` in the shared .git/config. The hook has already chdir'd
+    to the worktree root, so git rediscovers the same repo without them.
+    `--local-env-vars` is git's own list: what it clears for a submodule.
+    """
+    names = _git("rev-parse", "--local-env-vars").stdout.split() or [
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY", "GIT_PREFIX",
+    ]
+    for name in names:
+        os.environ.pop(name, None)
+
+
 def _source_local_env(repo_root: Path) -> None:
     """Parse simple KEY=VALUE lines from $MINI_ORK_HOME/config/local.sh.
 
@@ -175,6 +195,8 @@ def main() -> int:
         os.chdir(REPO_ROOT)
     except OSError:
         return 0
+
+    _drop_repo_env()
 
     # Per-developer local env preferences (non-secret).
     _source_local_env(REPO_ROOT)

@@ -58,18 +58,26 @@ jobs:
   python-tests:
     name: python tests (${{ matrix.python-version }} / ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # The unit shards run 22-33 min and drift with every added test file (the
-    # odd/even split reshuffles); 35 cancelled a passing 3.12/unit-a at 35.4
-    # min on 2026-10-28 (a re-run took 28.6). Headroom, not a ceiling to aim at.
-    timeout-minutes: 50
+    # Each shard runs its tests on every runner core (pytest-xdist, below).
+    # Serially the unit shards spent 23-39 min in pytest under a 50 min
+    # timeout. On 4-vCPU runners with -n auto they spent 10.8-16.1 (PR #233,
+    # 2026-10-29); 30 keeps the old ~1.8x headroom over the slowest, and a
+    # shard that needs more is a hang or a regression worth seeing.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
-        # Sharding: the suite is ~2,090 tests dominated by bash<->python
-        # parity subprocess costs (~14-17 min as one job). Split the big
-        # tests/unit tier odd/even by file (interleave balances the slow
-        # clusters) and run everything else as a third shard.
+        # Sharding: tests/unit is ~14,000 tests whose time is spread thin —
+        # subprocess and git work in hundreds of files, the slowest file ~4%
+        # of the total — so parallelism, not trimming single tests, is what
+        # moves it. Split it odd/even by file and run everything else as a
+        # third shard; within a shard, xdist uses all cores (`-n auto`). Both
+        # tiers pass on 8 workers (unit: 14,000 passed, 0 failed; rest: 734
+        # passed, its one local failure reproduces serially; 2026-10-29), so
+        # tests do not share state across processes.
+        # `find`, not `ls tests/unit/*.py`: the glob never reached
+        # tests/unit/acp/, so its 28 tests ran in no shard at all.
         shard: [unit-a, unit-b, rest]
     steps:
       - uses: actions/checkout@v7
@@ -90,7 +98,7 @@ jobs:
           # tests/unit/test_acp_agent_py.py imports at module scope; without
           # the extra the whole shard dies at collection, not on an assertion.
           pip install -e ".[yaml,acp]"
-          pip install pytest fastapi uvicorn httpx2
+          pip install pytest "pytest-xdist>=3.5" fastapi uvicorn httpx2
 
       # The web smoke suite points the FastAPI route handlers at a real
       # state.db; init bootstraps the full schema so those tests run
@@ -100,15 +108,25 @@ jobs:
 
       - name: Run pytest (unit shard A)
         if: matrix.shard == 'unit-a'
-        run: ls tests/unit/*.py | awk 'NR % 2 == 1' | xargs python -m pytest -q -p no:cacheprovider
+        run: |
+          # pytest's default file patterns. An empty list must fail: `xargs`
+          # with no input would run bare pytest -- the whole suite -- green.
+          files=$(find tests/unit \( -name 'test_*.py' -o -name '*_test.py' \) | sort | awk 'NR % 2 == 1')
+          test -n "$files" || { echo "::error::unit shard A selected no test files"; exit 1; }
+          python -m pytest -q -p no:cacheprovider -n auto $files
 
       - name: Run pytest (unit shard B)
         if: matrix.shard == 'unit-b'
-        run: ls tests/unit/*.py | awk 'NR % 2 == 0' | xargs python -m pytest -q -p no:cacheprovider
+        run: |
+          # pytest's default file patterns. An empty list must fail: `xargs`
+          # with no input would run bare pytest -- the whole suite -- green.
+          files=$(find tests/unit \( -name 'test_*.py' -o -name '*_test.py' \) | sort | awk 'NR % 2 == 0')
+          test -n "$files" || { echo "::error::unit shard B selected no test files"; exit 1; }
+          python -m pytest -q -p no:cacheprovider -n auto $files
 
       - name: Run pytest (root + non-unit layers)
         if: matrix.shard == 'rest'
-        run: python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/unit
+        run: python -m pytest tests/ -q -p no:cacheprovider -n auto --ignore=tests/unit
 
   # The optional `runtime` extra pins `verifiers>=0.2.0,<0.5`, and that ceiling moves
   # by dependabot PR (it went <0.3 -> <0.5 on 2026-10-27 with no check on the API).

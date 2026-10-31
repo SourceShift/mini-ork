@@ -653,6 +653,7 @@ def test_harvest_dry_run(tmp_path, monkeypatch):
         "n_candidates",
         "admitted",
         "rejected",
+        "mined_rejected",
         "n_admitted_gate",
         "n_admitted_holdout",
         "diagnoses_available",

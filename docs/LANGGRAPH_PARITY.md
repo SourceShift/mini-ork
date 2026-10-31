@@ -9,8 +9,8 @@ mini-ork, with a status (parity, partial, divergent-by-design, or
 planned-P2) and at least one file:line citation into the working tree.
 
 The table is scoped to the twelve concepts a recipe author moving from
-LangGraph is most likely to ask about. Five of them — interrupts, Command,
-Send, subgraphs, time-travel — are intentionally marked **`planned-P2`**
+LangGraph is most likely to ask about. Four of them — interrupts, Command,
+Send, time-travel — are intentionally marked **`planned-P2`**
 per the P1.5 spec card: no partial implementation in the codebase counts as
 parity, even where a near-surface exists. See the "Absence evidence"
 section at the end of this doc for the exact grep commands that justify
@@ -39,7 +39,7 @@ The four status values mean:
   cites a near-surface where one exists and explains why it is a
   deliberate deferral rather than an oversight. Status does not flip to
   `parity` or `partial` mid-sprint; the five labelled rows will not
-  change without an explicit P2 spec.
+  change without an explicit P2 spec. (Subgraphs left this set on 2026-10-31: row 10 is now `partial`.)
 
 A file:line citation means **a real position in the working tree**. The
 verifier tier checks the file and the line range, so a stale citation is
@@ -59,7 +59,7 @@ wrong; re-author the row rather than letting the stale cite ship.
 | 7 | **interrupts** — long-pause / human-in-the-loop suspend + resume | none first-class. Closest surface: `human_gate` (a registered gate that blocks downstream edges until operator decision) | planned-P2 | No `Interrupt` class, `interrupt()` callable, or LangGraph-style suspend/resume primitive exists in `mini_ork/`. See `Absence evidence` below. `human_gate` is a registry key (`mini_ork/gates/gate_registry.py:70`) and a gate semantics — "block downstream edges until the human writes APPROVE to the inbox file" — but it does NOT pause and resume a node mid-execution. The five forced-P2 rows cannot be promoted to `parity` or `partial` without a dedicated P2 spec; this row is `planned-P2` by spec, regardless of incidental closeness to LangGraph's `interrupt()`. |
 | 8 | **Command** — explicit goto / dynamic-routing operator | none first-class. Closest surface: the 8-value `edge_type` enum + `condition:` predicates on `retries` edges | planned-P2 | No `Command(goto=...)` constructor or imperative-routing operator exists in `mini_ork/`. See `Absence evidence` below. mini-ork routes declaratively: every routing decision is an edge in `workflow.yaml`, and the closest dynamic-routing surface is the `condition:` predicate on a `retries` edge (`schemas/workflow.schema.json:286-317`). The `edge_type` enum at `schemas/workflow.schema.json:272-285` lists the eight declared routing shapes (`depends_on`, `supplies_context_to`, `verifies`, `blocks`, `retries`, `escalates_to`, `human_decision_gate`, `verifies_user_choice`); together with `condition:` they cover the routing decisions `Command` exists to express, but declaratively. Status is `planned-P2` per the P1.5 spec card. |
 | 9 | **Send / map-reduce** — fan out one input to multiple sub-nodes, merge results | none first-class. Closest surface: `dispatch_mode: parallel` (fan-out across same-declaration siblings) + `mini_ork.orchestration.item_fanout.run_items` (per-item worker pool + JSON result merge) | planned-P2 | No first-class `Send(..., input=...)` graph primitive exists in `mini_ork/`. See `Absence evidence` below. The closest surfaces are `_run_parallel_batch` at `mini_ork/cli/execute.py:489-522` (sibling nodes already declared in the DAG, one entry per `dispatch_fields` line) and `run_items` at `mini_ork/orchestration/item_fanout.py:206-270` (a recipe-side library imported by a driver script). Neither is a graph primitive a recipe author wires from `workflow.yaml` today — `dispatch_mode: parallel` requires the fan-out targets to be declared siblings up front (e.g. the four `tier4_*` lens nodes in `recipes/recursive-validate-impl/workflow.yaml:18-21`), the inverse of LangGraph's ad-hoc `Send(...)` invocations. Status is `planned-P2` per the P1.5 spec card, regardless of the partial fan-out surface. |
-| 10 | **subgraphs** — nested graph (one recipe uses another as a node) | none first-class. Closest surface: `register_implementer_submode` (recipe-side driver registration that binds an executable to one node) | planned-P2 | No "recipe-as-node" / nested-workflow registration exists in `mini_ork/`. The `WorkflowNode.type` enum at `schemas/workflow.schema.json:97-108` is a closed set of ten role types (`planner`, `researcher`, `transform`, `implementer`, `reviewer`, `verifier`, `eval`, `reflector`, `publisher`, `rollback`) — none of them references another workflow. `register_implementer_submode` at `recipes/goal-loop/register.py:48-58` registers a *driver script* for one node, never a nested `CompiledWorkflow`. See `Absence evidence` below. Status is `planned-P2` per the P1.5 spec card; a true "recipe-as-node" will require a `type: subgraph` enum entry plus a workflow-reference port — neither is planned-P2. |
+| 10 | **subgraphs** — nested graph (one recipe uses another as a node) | `type: subgraph` with `recipe:` (and an optional `kickoff:`, else the parent run's) runs that recipe as a child `mini-ork run` under run id `<parent>--<node>`, approved and bounded by the recursive spawn policy (`MINI_ORK_RECURSIVE_MAX_DEPTH`, child and descendant caps); the node passes exactly when the child run passes, and the child's source artifact is copied into the parent run dir (`mini_ork/orchestration/subgraph.py:110-154`, handler `mini_ork/cli/execute_handlers.py:4088-4103`, schema `schemas/workflow.schema.json:92-93`, `:114`, `:132-140`) | partial | Recipe-as-node exists (2026-10-31). LangGraph's shared-state subgraphs do not: there is no parent/child state-schema mapping and child events are not streamed into the parent — the two runs exchange only the kickoff going in and the child's source artifact coming out, and the child gets a clean environment (none of the parent's run- or node-scoped variables, grants or envelope). |
 | 11 | **streaming** — token-by-token / event-stream output to a consumer | `mini_ork.client.MiniOrk.stream` returning `Iterable[RunEvent]` + `mini_ork.dispatch.live_stream.LiveWriter` (line-level streaming) | partial | `MiniOrk.stream` (`mini_ork/client.py:143-145`) yields one `RunEvent(line, stream)` per stdout / stderr line; `RunEvent` is the frozen dataclass at `mini_ork/types.py:165-167`. Narrower than LangGraph's `astream` / `astream_events`: no `stream_mode="events"`, no chain-event surface (no `on_chain_start`, no `on_llm_new_token`), only line-level post-hoc delivery after the run completes. A live, mid-execution token stream is **not** exposed by the Python SDK today; consumers wanting token-level output read from `state.db.events` and reconstruct. |
 | 12 | **time-travel** — rewind state to an earlier checkpoint and replay | none first-class. Closest surface: `mini-ork run --resume <run_id> --checkpoint-id <id>` rewind on the CLI | planned-P2 | No first-class `get_state_history` / `update_state` / fork primitive exists in `mini_ork/`. See `Absence evidence` below. The closest surface is the `--checkpoint-id <id>` rewind at `mini_ork/cli/run_resume.py:276-285` (`rewound = set(order[order.index(checkpoint_id):])`), wired by `_run_handler` at `mini_ork/cli/main.py:1551-1564`. That rewind is a one-shot resume mask — there is no arbitrary `state_snapshot_at(step_id)` browse API, no history diff, no Python equivalent of `get_state_history` / `update_state`, and no branching from an arbitrary past step into a new run. Status is `planned-P2` per the P1.5 spec card, regardless of the partial CLI rewind. |
 
@@ -131,26 +131,7 @@ fan-out surface.
 
 ### 10. subgraphs
 
-```bash
-grep -rEn "sub_recipe|sub_workflow|include_recipe|compose_workflow|nested_workflow|subgraph" \
-  mini_ork/ recipes/ lib/ schemas/ 2>/dev/null \
-  | grep -v "infra_interrupt" \
-  | grep -v "comment-only"
-```
-
-Output: (only comment-level matches; no `WorkflowNode.type = "subgraph"`
-or recipe-reference port anywhere in the schema).
-
-The only `subgraph` string hit is an unrelated comment in
-`mini_ork/orchestration/runner_orchestrator.py:130` ("treated as
-subgraph-level" — referring to repair scope, not a graph-as-node
-registration). The `WorkflowNode.type` enum at
-`schemas/workflow.schema.json:97-108` is the closed set of ten role
-types and accepts no recipe reference. Closest surface is
-`register_implementer_submode` at `recipes/goal-loop/register.py:48-58`,
-which registers a driver *script* for one node, never a nested
-`CompiledWorkflow`. Status is `planned-P2` because the gap requires a
-schema change plus a runtime dispatch path, not just a config knob.
+No longer absent — see row 10. `grep -n '"subgraph"' schemas/workflow.schema.json mini_ork/cli/execute_handlers.py` lists the node type and its handler; `tests/unit/test_subgraph_node.py` pins the child run, the clean child environment, the spawn-policy depth bound and the schema requirement for `recipe`.
 
 ### 12. time-travel
 

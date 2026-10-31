@@ -195,3 +195,32 @@ def test_push_env_drops_an_ambient_precheck(monkeypatch, tmp_path):
     monkeypatch.setenv("MO_REVIEW_PRECHECKED_PATCH", "AMBIENT")
     assert "MO_REVIEW_PRECHECKED_PATCH" not in driver._push_env("")
     assert driver._push_env("PID42")["MO_REVIEW_PRECHECKED_PATCH"] == "PID42"
+
+
+
+# ── review 166: only a review written by THIS gate run is handed off ────────
+
+
+def test_a_stale_entry_from_an_earlier_run_is_not_handed_off(monkeypatch, tmp_path, capsys):
+    """Fresh within the TTL but written before this gate ran: it may be another
+    mode's review (heuristic-only), which the driver cannot judge."""
+    driver, wt, _ = _prepare(
+        monkeypatch, tmp_path,
+        cache={"PID42": {"review_id": 1, "mode": "heuristic", "target": "main",
+                         "at": int(time.time()) - 60}},
+    )
+    assert driver._prereview(wt) == ""
+    assert HANDOFF_MSG in capsys.readouterr().out
+
+
+def test_an_entry_the_gate_writes_during_this_run_is_handed_off(monkeypatch, tmp_path):
+    driver, wt, recorder = _prepare(monkeypatch, tmp_path)
+    home = tmp_path / "home"
+
+    def _gate_writes_its_review(*args, **kwargs):
+        _write_cache(home, {"PID42": {"review_id": 7, "mode": "hybrid",
+                                      "target": "main", "at": int(time.time())}})
+        return recorder(*args, **kwargs)
+
+    monkeypatch.setattr(driver.subprocess, "run", _gate_writes_its_review)
+    assert driver._prereview(wt) == "PID42"

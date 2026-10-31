@@ -144,6 +144,22 @@ def replay_kwargs(fake: FakeReplay, stem: str) -> list[dict]:
     return [kw for p, _t, kw in fake.replay_calls if p.stem == stem]
 
 
+def effective_cache_key(name: str, repo: Path, ctx) -> str:
+    """The key ``run_benchmark`` uses: surface-keyed when the benchmark has a
+    surface, else ``tree_key``.
+
+    RRL-3b changed this: a benchmark with a surface no longer pins
+    ``tree_key`` as its cache key, so the two cache-path assertions below
+    that used ``bm.tree_key(repo)`` are updated to this helper.
+    """
+    bench = bm.get_benchmark(name)
+    salt = json.dumps({"name": name,
+                       "options": dict(sorted(ctx.options.items()))},
+                      sort_keys=True)
+    return (bm.surface_key(repo, bench.surface, salt=salt)
+            if bench.surface else bm.tree_key(repo))
+
+
 # ── registry ────────────────────────────────────────────────────────────────
 
 
@@ -204,7 +220,7 @@ def test_cache_partial_hit_and_use_cache_false(tmp_path):
         r1 = bm.run_benchmark(name, repo, ctx=ctx)
         assert state["calls"] == 1
         assert r1.scores == {"a": 1.0, "b": 0.0}
-        cache_file = bm._cache_path(ctx, name, bm.tree_key(repo))
+        cache_file = bm._cache_path(ctx, name, effective_cache_key(name, repo, ctx))
         assert cache_file.is_file()
 
         r2 = bm.run_benchmark(name, repo, ctx=ctx, items=["a"])
@@ -241,7 +257,8 @@ def test_missing_id_runs_and_cache_holds_union(tmp_path):
         bm.run_benchmark(name, repo, ctx=ctx)
         bm.run_benchmark(name, repo, ctx=ctx, items=["a", "c"])
         assert state["calls"] == 2
-        cached = json.loads(bm._cache_path(ctx, name, bm.tree_key(repo)).read_text())
+        cached = json.loads(bm._cache_path(
+            ctx, name, effective_cache_key(name, repo, ctx)).read_text())
         assert cached["scores"] == {"a": 1.0, "b": 0.0, "c": 1.0}
         bm.run_benchmark(name, repo, ctx=ctx, items=["c"])
         assert state["calls"] == 2
@@ -364,7 +381,8 @@ def test_vr_run_no_verdict_scores_zero(tmp_path, monkeypatch):
     assert res.guards["no_verdict"] == 1.0
 
 
-def test_vr_run_retry_once_then_skip(tmp_path, monkeypatch):
+def test_vr_run_retry_once_then_error_not_skip(tmp_path, monkeypatch):
+    """A twice-raising item is an error of this run, never a cached skip."""
     root = make_root(tmp_path)
     ctx, fake, _ = vr_setup(tmp_path, ["t1", "t3"], seed_rows=[
         {"run": "t1.patch", "hidden_pass": True},
@@ -379,9 +397,32 @@ def test_vr_run_retry_once_then_skip(tmp_path, monkeypatch):
     fake._replay_impl = impl
     monkeypatch.setattr(bm, "_replay_module", lambda repo: fake.namespace())
     res = bm._vr_run(root, None, ctx)
-    assert "t3" in res.skipped
+    assert "t3" not in res.skipped
+    assert res.meta["errors"]["t3"] == "RuntimeError: boom"
     assert res.scores == {"t1": 1.0}
     assert replay_count(fake, "t3") == 2
+
+
+def test_errored_item_is_rerun_not_served_from_cache(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    ctx, fake, _ = vr_setup(tmp_path, ["t1", "t3"], seed_rows=[
+        {"run": "t1.patch", "hidden_pass": True},
+        {"run": "t3.patch", "hidden_pass": True}])
+    state = {"boom": True}
+
+    def impl(patch, task, kw):
+        if patch.stem == "t3" and state["boom"]:
+            raise RuntimeError("transient")
+        return {"run": patch.name, "task": task["id"], "verifier_pass": True,
+                "verifier_reason": "why"}
+
+    fake._replay_impl = impl
+    monkeypatch.setattr(bm, "_replay_module", lambda repo: fake.namespace())
+    first = bm.run_benchmark(bm.VERIFIER_REPLAY, root, ctx=ctx, items=["t1", "t3"])
+    assert first.scores == {"t1": 1.0}
+    state["boom"] = False
+    second = bm.run_benchmark(bm.VERIFIER_REPLAY, root, ctx=ctx, items=["t1", "t3"])
+    assert second.scores == {"t1": 1.0, "t3": 1.0}
 
 
 def test_vr_run_retry_once_then_success(tmp_path, monkeypatch):
@@ -437,3 +478,99 @@ def test_cli_list(capsys):
 def test_cli_run_unknown_returns_2(tmp_path, capsys):
     assert bm.main(["run", "nope", "--root", str(tmp_path)]) == 2
     assert capsys.readouterr().err.strip()
+
+
+# ── RRL-3b: surface key + resolved/scoped verifier-replay ───────────────────
+
+
+def test_cache_version_and_surface_key(tmp_path):
+    assert bm.CACHE_VERSION == "2"
+    (tmp_path / "s.py").write_text("a\n")
+    k1 = bm.surface_key(tmp_path, ["s.py"])
+    assert isinstance(k1, str) and len(k1) == 64
+    assert bm.surface_key(tmp_path, ["s.py"]) == k1
+    (tmp_path / "other.txt").write_text("1\n")  # outside the surface
+    assert bm.surface_key(tmp_path, ["s.py"]) == k1
+    assert bm.surface_key(tmp_path, ["s.py"], salt="x") != k1
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "a.py").write_text("a\n")
+    kd = bm.surface_key(tmp_path, ["d"])
+    (d / "__pycache__").mkdir()
+    (d / "__pycache__" / "x.pyc").write_text("junk\n")
+    (d / "x.pyc").write_text("junk\n")
+    assert bm.surface_key(tmp_path, ["d"]) == kd
+    (d / "a.py").write_text("b\n")
+    assert bm.surface_key(tmp_path, ["d"]) != kd
+    # a rename inside a surfaced directory changes the key: the relative path
+    # is part of the digest, not just each file's content.
+    before = bm.surface_key(tmp_path, ["d"])
+    (d / "a.py").rename(d / "b.py")
+    assert bm.surface_key(tmp_path, ["d"]) != before
+    (d / "b.py").rename(d / "sub")
+    assert bm.surface_key(tmp_path, ["d"]) != before
+    # a missing entry is hashed as missing, distinct from present content
+    assert bm.surface_key(tmp_path, ["gone.py"]) != bm.surface_key(tmp_path, ["s.py"])
+
+
+def test_vr_surface_includes_the_measurement_harness():
+    # Replay/grading logic decides the scores, so it must be in the surface —
+    # otherwise an edit to the harness reuses stale cached measurements.
+    assert "scripts/verifier_replay.py" in bm.VR_SURFACE
+    assert "mini_ork/rsi/benchmarks.py" in bm.VR_SURFACE
+
+
+def test_run_benchmark_surface_keyed_cache(tmp_path):
+    repo = make_repo(tmp_path)  # commits f.txt
+    name = "unit-surface-cache"
+    calls = {"n": 0}
+
+    def runner(root, items, ctx):
+        calls["n"] += 1
+        return bm.BenchResult(benchmark=name, tree="runner-tree", scores={},
+                              strata={}, guards={})
+
+    bm.register_benchmark(bm.Benchmark(name, runner, lambda c: {}, ("f.txt",)),
+                          replace=True)
+    ctx = bm.BenchContext(home=tmp_path / "home", repo=repo)
+    salt = json.dumps({"name": name, "options": {}}, sort_keys=True)
+    try:
+        r1 = bm.run_benchmark(name, repo, ctx=ctx)
+        assert calls["n"] == 1
+        assert r1.tree == bm.surface_key(repo, ("f.txt",), salt=salt)
+        assert r1.tree != "runner-tree"
+        (repo / "outside.txt").write_text("x\n")  # outside the surface
+        r2 = bm.run_benchmark(name, repo, ctx=ctx)
+        assert calls["n"] == 1 and r2.tree == r1.tree
+        (repo / "f.txt").write_text("changed\n")  # inside the surface
+        r3 = bm.run_benchmark(name, repo, ctx=ctx)
+        assert calls["n"] == 2 and r3.tree != r1.tree
+    finally:
+        bm._REGISTRY.pop(name, None)
+
+
+def test_vr_run_resolves_paths_and_defaults_scoped(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    ctx, fake, _ = vr_setup(tmp_path, ["t1"], seed_rows=[
+        {"run": "t1.patch", "hidden_pass": True}])
+    monkeypatch.setattr(bm, "_replay_module", lambda repo: fake.namespace())
+    bm._vr_run(root, None, ctx)
+    kw = fake.replay_calls[0][2]
+    assert kw.get("scoped_tests") is True
+    assert Path(kw["repo"]).is_absolute()
+    assert Path(kw["verifier"]).is_absolute()
+    assert Path(kw["import_root"]).is_absolute()
+
+    ctx_off = bm.BenchContext(home=ctx.home, repo=ctx.repo,
+                              options={**ctx.options, "scoped_tests": "0"})
+    bm._vr_run(root, None, ctx_off)
+    assert fake.replay_calls[-1][2].get("scoped_tests") is False
+
+
+def test_option_paths_use_resolved_repo(tmp_path):
+    ctx = bm.BenchContext(home=tmp_path / "home", repo=Path("."))
+    patches, manifest, seed = bm._option_paths(ctx)
+    resolved = Path(".").resolve()
+    assert patches == resolved / bm.DEFAULT_PATCHES
+    assert manifest == resolved / bm.DEFAULT_MANIFEST
+    assert seed == resolved / bm.DEFAULT_SEED

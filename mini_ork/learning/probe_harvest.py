@@ -38,6 +38,15 @@ MAX_SRC_FILES = 12
 DEFAULT_LANDING_REF = "origin/main"
 _SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 KICKOFF_TEST_RE = re.compile(r"(tests/(?:[\w-]+/)*test_\w+\.py)")
+# Files a run dir keeps that ARE (or contain) the change the run made. A probe
+# whose problem statement names such a run hands the arm its answer.
+ANSWER_ARTIFACTS = (
+    "framework-edit.diff", "framework-edit.diff.agent", "review-diff.patch",
+    "review-delta.patch", "salvage.patch",
+)
+# Run-id-shaped tokens: a slug with a run of at least 6 digits in it
+# (`<slug>-YYYYMMDDHHMMSS`, `<slug>-YYYYMMDD-HHMMSS`, `run-<epoch>-<pid>`).
+_RUN_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\d{6,}[A-Za-z0-9_.-]*")
 DEFAULT_MAX_NEW = 12
 MAX_PER_CLUSTER = 6
 HOLDOUT_FRACTION = 0.25
@@ -545,6 +554,79 @@ def _strip_frontmatter(text: str) -> str:
     return text[match.end():] if match else text
 
 
+def answer_pointers(text: str, home: str) -> list[str]:
+    """Run ids named in ``text`` whose ``<home>/runs/<id>/`` holds an answer artifact.
+
+    Sorted and de-duplicated. A token that is not an existing run dir is ignored;
+    a run dir with none of :data:`ANSWER_ARTIFACTS` is not a pointer.
+    """
+    found: set[str] = set()
+    for raw in _RUN_TOKEN.findall(text or ""):
+        token = raw.rstrip(".-_")
+        if token in found:
+            continue
+        run_dir = os.path.join(home, "runs", token)
+        if os.path.isdir(run_dir) and any(
+            os.path.exists(os.path.join(run_dir, name))
+            for name in ANSWER_ARTIFACTS
+        ):
+            found.add(token)
+    return sorted(found)
+
+
+def repo_checkouts(root: str) -> list[str]:
+    """Absolute paths of every checkout of the repo at ``root``, longest first.
+
+    That is ``root`` plus every ``worktree`` line of
+    ``git -C root worktree list --porcelain``, normalised with
+    :func:`os.path.realpath`, de-duplicated, and sorted longest first so a
+    nested checkout wins. On any git error, only ``root`` itself is returned.
+    """
+    paths = {os.path.realpath(root)}
+    out = _git_out(root, "worktree", "list", "--porcelain")
+    if out is None:
+        return sorted(paths, key=len, reverse=True)
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+            if path:
+                paths.add(os.path.realpath(path))
+    return sorted(paths, key=len, reverse=True)
+
+
+_VENV_PYTHON = re.compile(r"\S*/\.?venv/bin/(python[0-9.]*)")
+# An absolute POSIX path left in a probe after relativisation: something that
+# only exists on the harvesting host.
+# Host-specific roots only: `/usr` and `/etc` are deliberately absent — a
+# `#!/usr/bin/env bash` shebang is universal, and rejecting it would drop
+# every kickoff that carries a script.
+_HOST_PATH = re.compile(
+    r"(?<![\w.:-])/(?:Volumes|Users|home|private|tmp|var|opt|mnt|srv|root|"
+    r"workspaces?|data|media|scratch|Library|Applications)/"
+    r"[^\s`'\"),;]+"
+)
+
+
+def relativize_host_paths(
+    text: str, checkouts: list[str]
+) -> tuple[str, list[str]]:
+    """``(text', leftovers)`` — checkout paths made repo-relative, venv pythons -> ``python3``.
+
+    Every occurrence of ``<checkout>/`` is removed (so ``<checkout>/mini_ork/x.py`` ->
+    ``mini_ork/x.py``); a bare ``<checkout>`` (no trailing slash) becomes ``.``.
+    ``leftovers`` lists the absolute host paths still present afterwards
+    (``_HOST_PATH.findall``, sorted, de-duplicated) — another project's home, a /tmp
+    helper — which the caller treats as a rejection.
+    """
+    text = _VENV_PYTHON.sub("python3", text)
+    for checkout in checkouts:
+        text = text.replace(checkout + "/", "")
+    for checkout in checkouts:
+        text = re.sub(re.escape(checkout) + r"(?![\w/.-])", ".", text)
+    leftovers = sorted(set(_HOST_PATH.findall(text)))
+    return text, leftovers
+
+
 def failed_run_candidates(
     home: str, root: str, *, landing_ref: str = DEFAULT_LANDING_REF
 ) -> tuple[list[dict], list[dict]]:
@@ -555,7 +637,10 @@ def failed_run_candidates(
     ``landing_ref``, the landing commit's first parent is the base and the
     landing commit itself is the fix — a ready-made git oracle. Runs sharing a
     landing commit merge into one candidate. The first rule that fires gives the
-    rejection reason, so the order is load-bearing.
+    rejection reason, so the order is load-bearing (``no-pre-impl-fixture``,
+    ``baseline-unreachable``, ``layer:<name>``, ``kickoff-unrecoverable``,
+    ``no-test-named``, ``test-not-landed``, ``no-parent``,
+    ``landing-too-broad``, ``answer-pointer``, then ``host-path``).
     """
     if landing_ref.startswith("-"):
         raise ValueError(f"landing_ref must be a ref, not an option: {landing_ref!r}")
@@ -579,6 +664,8 @@ def failed_run_candidates(
     candidates: list[dict] = []
     by_fix_sha: dict[str, dict] = {}
     rejections: list[dict] = []
+    # Computed once per call: the checkout list is the same for every row.
+    checkouts = repo_checkouts(root)
 
     for run_id, kickoff_path, _created_at in rows:
         def reject(reason: str) -> None:
@@ -685,6 +772,18 @@ def failed_run_candidates(
             if blob is not None:
                 text = blob.decode("utf-8", "replace")
         problem_statement = _strip_frontmatter(text)
+
+        pointers = answer_pointers(problem_statement, home)
+        if pointers:
+            reject("answer-pointer")
+            continue
+
+        problem_statement, leftovers = relativize_host_paths(
+            problem_statement, checkouts
+        )
+        if leftovers:
+            reject("host-path")
+            continue
 
         candidate = {
             "task_id": f"fe-{fix_sha[:10]}",
@@ -854,6 +953,11 @@ def harvest(
         "n_candidates": n_candidates,
         "admitted": admitted_report,
         "rejected": rejected,
+        # Every mining-stage rejection, always. ``rejected`` keeps its
+        # this-run-only semantics; this key is the audit trail for the
+        # safety guards (``answer-pointer``, ``host-path``), which were
+        # otherwise visible only as a drop in ``n_candidates``.
+        "mined_rejected": list(mined_rejected),
         "n_admitted_gate": sum(1 for c in admitted if not c["holdout"]),
         "n_admitted_holdout": sum(1 for c in admitted if c["holdout"]),
         "diagnoses_available": diagnoses_available,

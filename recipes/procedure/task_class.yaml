@@ -1,0 +1,20 @@
+name: procedure
+description: "Lightweight path for a fixed, step-by-step procedure: one node runs the whole procedure in one context and reports each step; a deterministic check grades the report. Changes stay uncommitted for review."
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - procedure
+    - runbook
+    - step-by-step
+    - checklist task
+  path_globs: []
+  regex:
+    - "^## Procedure"
+
+default_gates:
+  - budget_gate
+
+risk_class: low
