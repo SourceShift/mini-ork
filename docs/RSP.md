@@ -98,9 +98,11 @@ Each safeguard maps to a specific mini-ork primitive referenced inline.
 
 ### 2.1 Entry-threshold safeguards (always required)
 
-1. **Append-only audit log** — every dispatch writes to `audit_log`
-   per docs/SAFETY.md:97. SQLite trigger at docs/SAFETY.md:116
-   enforces append-only.
+1. **Append-only audit log** — every dispatch, gate verdict, promotion,
+   rollback, quarantine, human override and certificate issuance writes a
+   hash-chained row to `audit_log` (`mini_ork/stores/audit_chain.py`; see
+   docs/SAFETY.md → Audit Log). SQLite triggers enforce append-only;
+   `audit_chain.verify_chain` detects an edit made around them.
 2. **Workspace sandbox** — every dispatch runs in a temporary workspace
    (default lib/sandbox/local.sh:1). The workspace is captured as a git
    diff via lib/harness_wrapper.sh:100 (commit a4bf298).

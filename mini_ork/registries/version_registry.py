@@ -31,6 +31,8 @@ import sys
 import time
 import uuid
 
+from mini_ork.stores import audit_chain
+
 _SCHEMA = """
     CREATE TABLE IF NOT EXISTS version_registry (
         version_id               TEXT PRIMARY KEY,
@@ -136,6 +138,12 @@ def register(kind: str, payload: str, db: str | None = None, now: int | None = N
          float(p.get("utility_score", 0.0)),
          now if status == "stable" else None, now),
     )
+    if status == "stable":
+        audit_chain.append_event_soft(
+            con, "promotion", str(p.get("promoted_by") or "version_registry"), f"{kind}:{name}",
+            {"version_id": vid, "previous_stable_version": prev_vid,
+             "utility_score": float(p.get("utility_score", 0.0))},
+        )
     con.commit()
     con.close()
     return vid
@@ -243,6 +251,10 @@ def rollback(kind: str, name: str, db: str | None = None, now: int | None = None
         "SELECT * FROM version_registry WHERE version_id=?", (prev_vid,)
     ).fetchone()
     new_row = dict(new_cur) if new_cur else None
+    audit_chain.append_event_soft(
+        con, "rollback", "version_registry", f"{kind}:{name}",
+        {"retired_version": cur["version_id"], "restored_version": prev_vid},
+    )
     con.commit()
     con.close()
     if new_row:
@@ -301,11 +313,16 @@ def quarantine(kind: str, version_id: str, reason: str, db: str | None = None,
     ensure_table(db)
     now = int(time.time()) if now is None else now
     con = sqlite3.connect(_db_path(db))
-    con.execute(
+    updated = con.execute(
         "UPDATE version_registry SET status='quarantined', quarantine_reason=?, "
         "quarantined_at=? WHERE version_id=? AND kind=?",
         (reason, now, version_id, kind),
-    )
+    ).rowcount
+    if updated:
+        audit_chain.append_event_soft(
+            con, "quarantine", "version_registry", f"{kind}:{version_id}",
+            {"version_id": version_id, "reason": reason},
+        )
     con.commit()
     con.close()
 
@@ -332,6 +349,11 @@ def clear_quarantine(version_id: str, approver: str, db: str | None = None) -> N
         "quarantine_reason=NULL WHERE version_id=? AND status='quarantined'",
         (approver, version_id),
     ).rowcount
+    if updated:
+        audit_chain.append_event_soft(
+            con, "human_override", f"human:{approver}", f"version:{version_id}",
+            {"version_id": version_id, "action": "clear_quarantine"},
+        )
     con.commit()
     con.close()
     if updated == 0:

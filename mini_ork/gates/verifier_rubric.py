@@ -62,6 +62,8 @@ import sys
 import time
 from typing import Optional
 
+from mini_ork.stores import audit_chain
+
 __all__ = [
     "rubric_register",
     "rubric_get",
@@ -146,6 +148,11 @@ def _insert_result_row(db_path: str, row: dict) -> None:
                 row.get("confidence"),
                 row.get("scored_axes_json"),
             ),
+        )
+        audit_chain.append_event_soft(
+            con, "gate_verdict", f"gate:{row['verifier_name']}", f"run:{row['run_id']}",
+            {"result_id": row["result_id"], "verdict": row["verdict"],
+             "confidence": row.get("confidence"), "rubric_id": row.get("rubric_id")},
         )
         con.commit()
     finally:

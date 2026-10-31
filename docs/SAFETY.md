@@ -64,7 +64,7 @@ Regardless of rung or benchmark result, the following are immutable without expl
 | Zero-fallback policies | The system must not add catch blocks that hide failures. Any proposed patch that adds fallback logic is rejected by the reviewer. |
 | User-data boundaries | Agent context packs must not cross user-data scope boundaries. |
 | Deployment / migration permissions | Changes that run `psql`, `kubectl`, `docker`, or equivalent in production require an explicit human step. |
-| `audit_log` schema | Append-only, enforced by a sqlite trigger (`trg_al_no_update` / `trg_al_no_delete`). No migration may DROP or ALTER the table without an explicit manual step by a human operator. (The table has no runtime writer yet — see [Audit Log](#audit-log).) |
+| `audit_log` schema | Append-only, enforced by a sqlite trigger (`trg_al_no_update` / `trg_al_no_delete`). No migration may DROP or ALTER the table without an explicit manual step by a human operator. Rows are hash-chained so an edit made around the triggers is detectable — see [Audit Log](#audit-log). |
 
 **On the "root of trust" that is not there.** Earlier revisions listed
 `config/safety.yaml` as the immutable safety-constraints file that the loop could
@@ -220,10 +220,50 @@ CREATE TABLE IF NOT EXISTS audit_log (
 -- trg_al_no_update / trg_al_no_delete raise ABORT on any UPDATE or DELETE.
 ```
 
-**The Python runtime does not currently write to it.** No module under `mini_ork/`
-inserts into `audit_log`; older revisions of this document claimed every
-promote/quarantine/rollback wrote a row, and that was never true of the Python
-code. Do not treat an empty `audit_log` as evidence that nothing happened.
+`mini_ork/stores/audit_chain.py` is its writer. Each row is appended in the same
+transaction as the change it records, and carries a hash chain inside its
+`payload` (the columns stay frozen):
+
+```json
+{"chain": "audit-chain/v1", "event": {...}, "prev_hash": "<hex>", "row_hash": "<hex>"}
+```
+
+`row_hash` is SHA-256 over the canonical `{prev_hash, event_type, actor, target,
+occurred_at, event}`, so the triggers stop an UPDATE or DELETE through SQLite and
+the chain makes an edit made around them (a rewritten file, a dropped trigger)
+detectable by anyone holding the database. `audit_chain.verify_chain(db)` recomputes
+every link; rows written before the chain existed are reported as an unchained
+prefix, and an unchained row after it begins is a break.
+
+| `event_type` | Written by | `event` carries |
+|---|---|---|
+| `dispatch` | `llm_dispatch._insert_llm_calls_row` (every `llm_calls` row) | `llm_call_id`, `status`, `error_category`, `cost_usd`, `feature`, `run_id` |
+| `gate_verdict` | `verifier_rubric._insert_result_row` (every `verifier_results` row) | `result_id`, `verdict`, `confidence`, `rubric_id` |
+| `promotion` / `rollback` / `quarantine` | `version_registry.register` (status `stable`) / `rollback` / `quarantine` | the version ids involved and the reason |
+| `human_override` | `version_registry.clear_quarantine` (actor `human:<approver>`) | `version_id`, `action` |
+| `certificate_issued` | `mini-ork certify` (via `mini_ork/certify/seal.py`) | the certificate id, digest, verdict and repo head |
+
+A write that fails (a locked database) is reported on stderr and never fails the
+change it records. Rows from before this writer existed were never written — an
+empty prefix is not evidence that nothing happened then.
+
+### Certificate seals
+
+`mini-ork certify` writes `<certificate>.seal.json` beside each certificate: the
+`audit_log` row that recorded the issuance and an Ed25519 signature over
+`{certificate_id, digest, audit}`, made with `$MINI_ORK_HOME/keys/certify-ed25519.pem`
+(minted on first use, mode 0600; publish the `.pub` file). An outside party checks
+it without trusting the runtime:
+
+```bash
+mini-ork certify verify cert.json --pubkey certify-ed25519.pub [--db state.db]
+```
+
+`VERIFIED` (exit 0) needs the digest, the seal, the signature against the pinned
+key and — with `--db` — the chain and the issuance row to hold; `UNPINNED` /
+`UNSIGNED` (exit 2) mean nothing failed but nothing was proven; `FAILED` is exit 1.
+Signing needs the optional `cryptography` package (`pip install 'mini-ork[integrations]'`);
+without it the seal is written unsigned and says so.
 
 The machine-readable record of what the loop decided lives in three tables that
 *are* written:

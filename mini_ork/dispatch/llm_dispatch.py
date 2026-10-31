@@ -28,6 +28,7 @@ from collections.abc import Callable
 
 from mini_ork.context import context_env
 from mini_ork.dispatch import failure_class, lane_affinity
+from mini_ork.stores import audit_chain
 from mini_ork.dispatch.predicates import (
     SHAPE_REJECT_RC,
     looks_like_json,
@@ -731,7 +732,15 @@ def _insert_llm_calls_row(con, provider, model_id, tier, feature_name, actor, st
         if name in cols:
             insert_cols.append(name); values.append(val)
     ph = ",".join("?" for _ in insert_cols)
-    con.execute(f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({ph})", values)
+    cur = con.execute(f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({ph})", values)
+    # The dispatch, its outcome and its cost, sealed into the audit chain in
+    # the same transaction as the ledger row.
+    audit_chain.append_event_soft(
+        con, "dispatch", f"lane:{provider}", f"model:{model_id}",
+        {"llm_call_id": cur.lastrowid, "status": status, "error_category": error_category,
+         "cost_usd": float(cost_usd or 0.0), "feature": feature_name,
+         "run_id": context_env("MINI_ORK_RUN_ID") or None},
+    )
     con.commit()
 
 
