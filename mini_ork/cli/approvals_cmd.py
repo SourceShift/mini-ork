@@ -22,9 +22,13 @@ recomputed and must match, so a stale decision cannot approve a moved diff.
 A node ``approve`` / ``reject`` that resolves the LAST pending row of a
 parked run ALSO resumes it: the executor parked the run with rc 9 and a
 ``.review-pause`` sentinel waiting on the inbox; once nothing is pending,
-``_spawn_recover`` launches ``mini-ork recover <run> --strategy resume``
-(or ``--from-node <node> --strategy retry`` for a request-changes) so the
-run picks up where it paused. ``--no-resume`` skips the spawn and prints
+``_spawn_recover`` launches ``mini-ork recover <run> --from-node
+<waiting_node> --strategy resume`` — the ``waiting_node`` the sentinel
+recorded, so the resume re-enters at the node that was waiting instead of
+letting the planner restart from the first node it cannot reuse. A sentinel
+without one (written by an older engine) falls back to plain ``--strategy
+resume`` with an explicit stderr note. A request-changes instead passes
+``--from-node <reviewed node> --strategy retry``. ``--no-resume`` skips the spawn and prints
 the manual command instead — handy for tests, debugging, or operators who
 want to inspect state before letting the run proceed.
 
@@ -258,6 +262,32 @@ def _review_pause_sentinel(home: Path, run_id: str) -> Path:
     released, even if the JSON body has aged out).
     """
     return home / "runs" / run_id / ".review-pause"
+
+
+def _waiting_node(home: Path, run_id: str) -> str | None:
+    """The ``waiting_node`` the executor recorded in ``.review-pause``, or ``None``.
+
+    ``None`` when the sentinel is missing, empty, not JSON, or has no non-empty
+    string ``waiting_node`` (sentinels written by an older engine). Never raises:
+    a degraded sentinel must fall back to a plain resume, not crash the CLI.
+    """
+    sentinel = _review_pause_sentinel(home, run_id)
+    try:
+        text = sentinel.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    node = payload.get("waiting_node")
+    if isinstance(node, str) and node:
+        return node
+    return None
 
 
 def _maybe_resume_parked_run(
@@ -645,17 +675,37 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         # was never parked — fall back to the pre-change hint so an
         # operator approving an un-parked run still gets the manual
         # command they used to.
+        #
+        # Resume FROM the node the executor recorded as ``waiting_node``
+        # (kickoff w2-review-resume): without an entry point the recovery
+        # planner restarts at the first node it cannot reuse and re-runs
+        # the whole run. ``_maybe_resume_parked_run`` renames the sentinel,
+        # so read it FIRST.
+        waiting_node = _waiting_node(home, args.run_id)
+        if waiting_node:
+            resume_args = ["--from-node", waiting_node, "--strategy", "resume"]
+        else:
+            resume_args = ["--strategy", "resume"]
+        # Only a parked run (sentinel present) resumes; an approval of a run
+        # that never parked must not claim it is "resuming".
+        if not waiting_node and _review_pause_sentinel(home, args.run_id).is_file():
+            sys.stderr.write(
+                "approvals approve: .review-pause has no waiting_node; "
+                "resuming without an entry point (the recovery planner "
+                "picks the first node it cannot reuse)\n"
+            )
         status_line = _maybe_resume_parked_run(
             home, args.run_id,
             db=db,
-            extra_args=["--strategy", "resume"],
+            extra_args=resume_args,
             no_resume=bool(getattr(args, "no_resume", False)),
         )
         if status_line:
             sys.stdout.write(status_line)
         else:
             sys.stdout.write(
-                f"resume with: mini-ork recover {args.run_id} --strategy resume\n"
+                f"resume with: mini-ork recover {args.run_id} "
+                f"{' '.join(resume_args)}\n"
             )
         return 0
 

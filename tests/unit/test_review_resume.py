@@ -260,7 +260,8 @@ def _stub_spawn(monkeypatch, approvals_module) -> list[tuple[str, list[str], str
 
 
 def test_approve_last_pending_spawns_resume(monkeypatch, tmp_path, capsys):
-    """One pending row → approve clears it → ``recover --strategy resume``."""
+    """One pending row → approve clears it → ``recover --from-node <waiting_node>
+    --strategy resume`` (w2-review-resume: resume at the node that was waiting)."""
     from mini_ork.cli import approvals_cmd
 
     run_id = "run-resume-1"
@@ -273,7 +274,7 @@ def test_approve_last_pending_spawns_resume(monkeypatch, tmp_path, capsys):
     assert rc == 0
     assert len(spawns) == 1, "exactly one spawn expected"
     _home_str, extra, _log = spawns[0]
-    assert extra == ["--strategy", "resume"]
+    assert extra == ["--from-node", "implementer", "--strategy", "resume"]
     assert "resumed " in out and run_id in out
     # The sentinel was renamed, not deleted (audit trail).
     assert not (tmp_path / "runs" / run_id / ".review-pause").exists()
@@ -325,7 +326,7 @@ def test_approve_no_resume_prints_command(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert spawns == [], "--no-resume must not spawn"
-    assert f"mini-ork recover {run_id} --strategy resume" in out
+    assert f"mini-ork recover {run_id} --from-node implementer --strategy resume" in out
     # The sentinel is renamed regardless (audit trail matters even when
     # the operator chose to drive the resume by hand).
     assert (tmp_path / "runs" / run_id / ".review-pause.resolved").exists()
