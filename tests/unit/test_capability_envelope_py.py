@@ -183,6 +183,35 @@ def test_dispatch_model_rejects_envelope_for_uhp_wire_acceptance(monkeypatch):
     assert result.rc != ENVELOPE_REJECT_RC
 
 
+def test_dispatch_model_rejects_envelope_on_a_direct_http_lane(monkeypatch):
+    """An openai-compat lane runs no harness, so nothing reads a granted skill
+    or MCP config. It borrows the claude engine for argv handling, whose
+    capabilities used to accept the grant — and the grant went unused."""
+    from mini_ork.dispatch import providers
+
+    spec = providers.ProviderSpec(model="openai_api", command=("false",))
+    monkeypatch.setattr(providers, "resolve_provider", lambda *a, **k: spec)
+    monkeypatch.setattr(providers, "_lane_kind", lambda *a, **k: "openai-compat")
+    request = DispatchRequest(model="openai_api", prompt="hi")
+    with run_context_scope({"MO_SKILLS": "doc-writer"}):
+        result = dispatch_model(request, None, preflight_check=False)
+    assert result.rc == ENVELOPE_REJECT_RC
+    assert "skills" in result.error
+    assert dispatch_model(request, None, preflight_check=False).rc != ENVELOPE_REJECT_RC
+
+
+def test_a_claude_harness_lane_still_accepts_skills(monkeypatch):
+    from mini_ork.dispatch import providers
+
+    spec = providers.ProviderSpec(model="glm", command=("false",))
+    monkeypatch.setattr(providers, "resolve_provider", lambda *a, **k: spec)
+    monkeypatch.setattr(providers, "_lane_kind", lambda *a, **k: "anthropic-compat")
+    request = DispatchRequest(model="glm", prompt="hi")
+    with run_context_scope({"MO_SKILLS": "doc-writer"}):
+        result = dispatch_model(request, None, preflight_check=False)
+    assert result.rc != ENVELOPE_REJECT_RC
+
+
 def test_dispatch_model_without_envelope_is_unchanged(monkeypatch):
     """Ratchet: no envelope published → no capability check fires; the
     dispatch behaves exactly as before B2 (fails here only at the stub

@@ -522,6 +522,18 @@ A name no registry defines is a warning, not a failure — the same posture the
 MCP registry takes with an unconfigured server, so a typo costs a line of
 stderr rather than a run.
 
+Which lanes honour a grant is decided per lane kind at dispatch. A grant the
+lane cannot honour fails the node with rc 66 (`capability envelope not
+supported`) instead of running it without the capability the recipe asked
+for; in a fallback chain the walk moves to the next lane.
+
+| Lane kind | `skills` | `mcp_servers` | `agent_doc` |
+| --- | --- | --- | --- |
+| `anthropic-native`, `anthropic-compat` (Claude Code CLI) | linked into `<cwd>/.claude/skills/` | `--mcp-config` | refused |
+| `uhp` | passed on the wire; the harness router translates | passed on the wire | passed on the wire |
+| `codex-native`, `opencode-native` | refused — not yet placed where those CLIs read them | refused | refused |
+| `openai-compat`, `openai-chat` | refused — a direct HTTP call has no harness to read them | refused | refused |
+
 A registry entry is a directory that contains a `SKILL.md` (with `name:`
 and `description:` frontmatter — the same file the Zed editor's skill system
 reads). A directory without one is not a skill: it is skipped at load time,

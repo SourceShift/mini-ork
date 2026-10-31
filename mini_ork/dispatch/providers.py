@@ -1630,7 +1630,8 @@ def dispatch_model(
     envelope = envelope_from_env(context_env)
     if not envelope.is_empty():
         effective_env = {**effective_env, **envelope.as_env()}
-        unsupported = envelope.unsupported_axes(engine.capabilities())
+        unsupported = envelope.unsupported_axes(
+            _envelope_capabilities(engine, request.model, root))
         if unsupported:
             return DispatchResult(
                 ok=False,
@@ -1701,6 +1702,21 @@ def dispatch_model(
     result = backend(effective, spec)
     _stash_session_id(result.session_id, merged_env)
     return result
+
+
+# Lanes served by mini-ork's own HTTP transports run no harness: nothing reads
+# a materialized skill, an MCP config or an agent doc. They borrow the claude
+# engine for argv handling only, so its capabilities must not stand in for
+# theirs — a grant there was accepted and then silently unused.
+_HARNESSLESS_KINDS = frozenset({"openai-compat", "openai-chat"})
+
+
+def _envelope_capabilities(engine: "HarnessEngine", model: str,
+                           root: str | os.PathLike[str] | None) -> "Capabilities":
+    """The capabilities a node's envelope is checked against for ``model``."""
+    if _lane_kind(model, root) in _HARNESSLESS_KINDS:
+        return Capabilities()
+    return engine.capabilities()
 
 
 def _stash_session_id(session_id: str, env: Mapping[str, str]) -> None:
