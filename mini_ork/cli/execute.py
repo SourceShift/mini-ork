@@ -1200,6 +1200,55 @@ def _declared_review_nodes(workflow_path, node_names, environ) -> tuple[tuple[st
     return tuple(merged), message
 
 
+_AUTHORSHIP_GATE_FILE = "authorship-separation-gate.json"
+
+
+def _authorship_separation_gate(workflow_path, *, root, home, run_dir, db, run_id,
+                                gate_mode) -> int | None:
+    """I2a authorship-separation gate: ``2`` to refuse the run, ``None`` to proceed.
+
+    Only called with ``gate_mode`` ``shadow`` or ``enforce`` (``off`` reads and
+    writes nothing). The families are resolved from the agents config the
+    dispatcher itself reads (run snapshot / home / root template + the
+    per-user overlay), so the gate judges the lanes the nodes will be routed
+    to. ``shadow`` records ``authorship-separation-gate.json`` and, when it
+    would block, a task_runs note; it never refuses. An unreadable workflow or
+    agents config is fatal under ``enforce`` (a gate that cannot look must not
+    pass) and recorded under ``shadow``.
+    """
+    import yaml
+
+    from mini_ork.dispatch.agents_config import lane_families
+    from mini_ork.dispatch.llm_dispatch import _effective_lanes
+    from mini_ork.verify import authorship_separation as _as
+    from mini_ork.verify.probe_validity import record_note
+
+    shadow = gate_mode == "shadow"
+    try:
+        with open(workflow_path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle) or {}
+        if not isinstance(document, dict):
+            raise ValueError(f"workflow at {workflow_path} must be a mapping")
+        lanes = _effective_lanes(root, home) or {}
+        ok, reason, detail = _as.check_separation(document, lane_families({"lanes": lanes}))
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        ok, reason, detail = False, f"authorship_separation_unreadable: {exc}", {}
+
+    if shadow:
+        report = {"mode": "shadow", "would_block": not ok, "reason": reason, **detail}
+        with contextlib.suppress(OSError):
+            with open(os.path.join(run_dir, _AUTHORSHIP_GATE_FILE), "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=1, default=str)
+        if not ok:
+            record_note(db, run_id, f"[shadow] authorship separation would block: {reason}")
+        return None
+    if not ok:
+        sys.stderr.write(f"execute: authorship separation refused: {reason}\n")
+        record_note(db, run_id, f"authorship_separation_refused: {reason}")
+        return 2
+    return None
+
+
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -1315,6 +1364,25 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             sys.stderr.write(f"[review] pausing after: {review_message}\n")
         elif review_message:
             sys.stderr.write(f"[review] {review_message}\n")
+
+        # I2a (MO_AUTHORSHIP_SEPARATION=shadow|1, default OFF): the probe
+        # author's model family must differ from the implementer's. Runs before
+        # any node is dispatched; `off` reads and writes nothing.
+        from mini_ork.verify import authorship_separation
+
+        try:
+            separation_mode = authorship_separation.mode()
+        except ValueError as exc:
+            sys.stderr.write(f"execute: {exc}\n")
+            return 2
+        if separation_mode != "off":
+            gate_ctx = RunContext.from_env()
+            gate_rc = _authorship_separation_gate(
+                workflow, root=root, home=home, run_dir=gate_ctx.run_dir or run_dir,
+                db=gate_ctx.db_or_default(), run_id=gate_ctx.run_id,
+                gate_mode=separation_mode)
+            if gate_rc is not None:
+                return gate_rc
 
     # One repair map for the round loop: a `retries` edge and an escalated
     # `escalates_to` edge mean the same thing to it -- send the findings back to
