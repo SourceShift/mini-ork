@@ -1,46 +1,49 @@
 {
-  "base_sha": "2c2e619c49f8f73357d183adf812d2af8dac4b14",
+  "base_sha": "18ffcae717c743b366307216defa8f8b1dee371c",
   "fail_to_pass": [
-    "tests.unit.test_codefix_strengthen_verifier::test_adequate_does_not_call_or_emit",
-    "tests.unit.test_codefix_strengthen_verifier::test_error_record_keeps_verdict",
-    "tests.unit.test_codefix_strengthen_verifier::test_mode_off_does_not_call_or_emit",
-    "tests.unit.test_codefix_strengthen_verifier::test_no_base_worktree_does_not_call_or_emit",
-    "tests.unit.test_codefix_strengthen_verifier::test_no_kickoff_does_not_call_or_emit",
-    "tests.unit.test_codefix_strengthen_verifier::test_skipped_record_not_emitted",
-    "tests.unit.test_codefix_strengthen_verifier::test_strong_path_fake_kwargs",
-    "tests.unit.test_codefix_strengthen_verifier::test_strong_path_inadequate_emits_record",
-    "tests.unit.test_codefix_strengthen_verifier::test_weak_path_rounds_remaining_keeps_failure",
-    "tests.unit.test_suite_strengthen::test_budget_s_default_floor_and_typo",
-    "tests.unit.test_suite_strengthen::test_empty_answer",
-    "tests.unit.test_suite_strengthen::test_full_run",
-    "tests.unit.test_suite_strengthen::test_full_run_leaves_trees_untouched",
-    "tests.unit.test_suite_strengthen::test_mode_parsing",
-    "tests.unit.test_suite_strengthen::test_no_import_no_admission",
-    "tests.unit.test_suite_strengthen::test_partial_match",
-    "tests.unit.test_suite_strengthen::test_prompt_contents",
-    "tests.unit.test_suite_strengthen::test_settings_defaults_and_clamps",
-    "tests.unit.test_suite_strengthen::test_skips_never_dispatch",
-    "tests.unit.test_suite_strengthen::test_strengthen_threads_one_deadline_to_lane_and_runner",
-    "tests.unit.test_suite_strengthen::test_targeting_is_capped"
+    "tests.unit.test_code_findings_landing::test_annotate_landing_fails_open_without_table",
+    "tests.unit.test_code_findings_landing::test_annotate_landing_marks_landed_and_unknown",
+    "tests.unit.test_code_findings_landing::test_check_landing_cli_runs_the_real_check",
+    "tests.unit.test_code_findings_landing::test_check_landing_fails_open_without_a_diff",
+    "tests.unit.test_code_findings_landing::test_check_landing_missing_home_or_runs_dir",
+    "tests.unit.test_code_findings_landing::test_check_landing_records_and_is_idempotent",
+    "tests.unit.test_code_findings_landing::test_ensure_schema_creates_the_landing_table",
+    "tests.unit.test_code_findings_landing::test_landed_patch_ids_empty_for_non_git_and_unknown_ref",
+    "tests.unit.test_code_findings_landing::test_landed_patch_ids_returns_both_commits_of_history",
+    "tests.unit.test_code_findings_landing::test_landed_patch_ids_since_bounds_the_walk",
+    "tests.unit.test_code_findings_landing::test_landing_enabled_default_on_and_gated",
+    "tests.unit.test_code_findings_landing::test_migration_applies_after_ensure_schema",
+    "tests.unit.test_code_findings_landing::test_migration_applies_on_a_fresh_db",
+    "tests.unit.test_code_findings_landing::test_pack_reports_n_findings_landed",
+    "tests.unit.test_code_findings_landing::test_run_patch_id_differs_for_a_different_diff",
+    "tests.unit.test_code_findings_landing::test_run_patch_id_falls_back_to_a_diff_file",
+    "tests.unit.test_code_findings_landing::test_run_patch_id_missing_or_empty_diff_yields_none",
+    "tests.unit.test_code_findings_landing::test_run_patch_id_roundtrips_into_landed_patch_ids",
+    "tests.unit.test_code_findings_landing::test_scope_findings_drops_landed_keeps_plain",
+    "tests.unit.test_code_findings_landing::test_scope_findings_flag_off_restores_landed",
+    "tests.unit.test_code_findings_landing::test_tab_flag_off_shows_the_landed_row",
+    "tests.unit.test_code_findings_landing::test_tab_hides_landed_with_its_own_count_line"
   ],
-  "fix_sha": "564ce92f1b154631eb3d872ab866c8383fb0fb09",
-  "pass_to_pass": [],
+  "fix_sha": "220faf02583e1e6135a883a41af0c4b66fda2375",
+  "pass_to_pass": [
+    "tests.unit.test_code_findings_landing::test_scope_findings_without_landing_table_fails_open",
+    "tests.unit.test_code_findings_landing::test_tab_no_landed_line_when_nothing_landed"
+  ],
   "provenance": {
     "baseline_outcome": 0.0,
     "baseline_source": "task_runs.status=failed",
-    "cluster": "change/R5/spec-tests",
-    "harvested_at": "2026-10-30T23:35:33Z",
+    "cluster": "change/R4/reviewer",
+    "harvested_at": "2026-10-31T00:33:10Z",
     "harvester": "probe_harvest@1",
     "recipe": "framework-edit",
     "run_ids": [
-      "rsi-t1-suite-strengthening-20261027-134701"
+      "lf-r11b-20261017-105523"
     ],
     "source": "failed-run",
-    "task_id": "fe-564ce92f1b"
+    "task_id": "fe-220faf0258"
   },
   "schema": 1,
   "test_files": [
-    "tests/unit/test_codefix_strengthen_verifier.py",
-    "tests/unit/test_suite_strengthen.py"
+    "tests/unit/test_code_findings_landing.py"
   ]
 }
