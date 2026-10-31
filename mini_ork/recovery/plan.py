@@ -481,6 +481,47 @@ def _invalidate_on_failed_verifiers(
         reason[p] = f"verifier_failed:{v}"
 
 
+def _passed_verifiers(
+    db_path: str,
+    run_id: str,
+    node_types: dict[str, str],
+    reason: dict[str, str],
+) -> set[str]:
+    """Verifier nodes that ran and PASSED in this run but carry no checkpoint row.
+
+    A node qualifies when node_types[nid] == "verifier", reason[nid] == "no_row",
+    and its latest node_attempts row for run_id (highest id) has result == 'success'.
+    Any DB error returns set() and writes one stderr line (today's behaviour applies
+    unchanged).
+    """
+    if not db_path or not os.path.isfile(db_path):
+        return set()
+    try:
+        con = sqlite3.connect(db_path, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            passed: set[str] = set()
+            for nid, typ in node_types.items():
+                if typ != "verifier":
+                    continue
+                if reason.get(nid, "") != "no_row":
+                    continue
+                vrow = con.execute(
+                    "SELECT result FROM node_attempts"
+                    " WHERE run_id=? AND node_id=?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (run_id, nid),
+                ).fetchone()
+                if vrow and vrow[0] == "success":
+                    passed.add(nid)
+            return passed
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        sys.stderr.write(f"recovery plan: passed-verifier check skipped: {e}\n")
+        return set()
+
+
 def _sku(run_id: str, recipe: str, task_class: str) -> str:
     return hashlib.sha256(
         f"{run_id}|{recipe}|{task_class}".encode()
@@ -551,24 +592,30 @@ def compute_recovery(
          nodes whose direct verifier failed after their output (the
          verifier's verdict is not in ``node_checkpoints``), unless
          ``from_node`` is set or ``check_verifiers`` is False.
-      3. The earliest non-reusable node in topo order is the
+      3. Identify verifier nodes that ran and passed in this run (they
+         carry no checkpoint row, so are invisible to step 2). These are
+         re-run (cheap validation) but excluded from the failed_node search,
+         so they don't force downstream re-runs. Only when ``from_node``
+         is set are passed verifiers skipped.
+      4. The earliest non-reusable node in topo order is the
          ``failed_node`` (reported to the operator as the root cause).
          It is the FIRST node whose upstream chain is still intact but
          whose own outputs are not safe to skip.
-      4. The closure starts at ``failed_node + its descendants`` and grows
+      5. The closure starts at ``failed_node + its descendants`` and grows
          to a fixpoint: any non-reusable node that gates a node already in
          the closure joins it. A node whose only "data flow" path runs
          through a non-reusable node must rerun; a parallel branch that is
          itself reusable does NOT, and neither does an unexecuted control
-         node (``rollback``) that gates nothing.
-      5. If ``from_node`` is supplied, the closure is overridden to
+         node (``rollback``) that gates nothing. Passed verifiers are then
+         added to the closure.
+      6. If ``from_node`` is supplied, the closure is overridden to
          ``from_node + descendants(from_node)`` — operator wants a
          wider rerun. ``failed_node`` is recomputed to ``from_node``
          so ``--status`` prints a coherent picture.
-      6. If every node is reusable (reuse == all), closure = empty,
-         failed_node = None. ``mini-ork recover`` returns rc=0 with a
-         "nothing to do" message — distinct from "no plan", so the
-         operator can tell a clean run from a missing one.
+      7. If every node is reusable (reuse == all) and no verifiers passed,
+         closure = empty, failed_node = None. ``mini-ork recover`` returns
+         rc=0 with a "nothing to do" message — distinct from "no plan", so
+         the operator can tell a clean run from a missing one.
     """
     if not run_id:
         raise ValueError("compute_recovery: run_id is required")
@@ -594,6 +641,14 @@ def compute_recovery(
         _invalidate_on_failed_verifiers(
             db_path, run_id, dag, node_types, reuse, reason,
         )
+
+    # Passed verifiers are re-run (cheap validation) but don't force downstream
+    # nodes to re-run. Exclude them from non_reusable before computing failed_node,
+    # then add them back to the closure after the fixpoint so execute dispatches them.
+    passed = set()
+    if not from_node:
+        passed = _passed_verifiers(db_path, run_id, node_types, reason)
+
     all_set = set(dag.node_ids)
 
     # A node may only be skipped when nothing downstream of it reruns.
@@ -608,7 +663,11 @@ def compute_recovery(
     # is a parentless root (its `escalates_to` edge is excluded as control
     # flow) and gates nothing, so it stays out. Pulling it in would legitimately
     # revert the branch. Only a node that GATES an already-rerunning node does.
-    non_reusable = [nid for nid in dag.topo if nid not in reuse]
+    #
+    # Passed verifiers are excluded from non_reusable (so they don't become
+    # closure roots) but added back to the closure after the fixpoint (so
+    # execute re-runs them without forcing downstream re-runs).
+    non_reusable = [nid for nid in dag.topo if nid not in reuse and nid not in passed]
     failed_node: str | None = non_reusable[0] if non_reusable else None
 
     if from_node:
@@ -633,6 +692,11 @@ def compute_recovery(
                 if dag.descendants(nid) & closure:
                     closure |= dag.descendants(nid)
                     changed = True
+
+    # Add passed verifiers to the closure (re-run them) after fixpoint.
+    closure |= passed
+    for v in passed:
+        reason[v] = "passed_verifier"
 
     # No node may appear in BOTH reuse and rerun (kickoff §3 fix 2):
     # the status printer and downstream consumers assume the sets are
