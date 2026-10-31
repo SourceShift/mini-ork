@@ -6,7 +6,6 @@ and the state.db is freshly migrated. No provider, no network.
 """
 from __future__ import annotations
 
-import io
 import json
 import sqlite3
 from pathlib import Path
