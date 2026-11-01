@@ -4,6 +4,8 @@ import * as vscode from 'vscode';
 import { CliLine, runCli } from '../cli/runner';
 import { warn } from '../log';
 
+import { COSTLY_VERBS, DESTRUCTIVE_VERBS, verbOf } from './verbs';
+
 /**
  * One action from the page spec. The shapes are documented in
  * `mini_ork/ide_pages/spec.py`: every button, row, chip and node carries one.
@@ -56,41 +58,6 @@ export interface ActionHost {
   applySet(args: Record<string, string>): Promise<void>;
   /** Re-fetch the page that is currently open (after a CLI touched its state). */
   reload(): Promise<void>;
-}
-
-/**
- * Verbs whose effect cannot be undone from the IDE. The spec usually attaches
- * its own `confirm`, but a page that forgets one must still not let a single
- * click stop a run or discard a worktree.
- */
-const DESTRUCTIVE_VERBS: ReadonlySet<string> = new Set([
-  'stop',
-  'discard',
-  'dismiss',
-  'reject',
-  'rollback',
-  'undo',
-  'delete',
-  'remove',
-  'prune',
-  'reset',
-]);
-
-/** Verbs that spend money or start paid work. Always confirmed. */
-const COSTLY_VERBS: ReadonlySet<string> = new Set(['run', 'race', 'retry', 'repair', 'recover', 'resume', 'poll', 'certify']);
-
-function verbOf(args: string[] | undefined): string | undefined {
-  if (!args || !args.length) {
-    return undefined;
-  }
-  // `board retry <id>` — the verb is the second token for the board family.
-  if (args[0] === 'board' && args.length > 1) {
-    return args[1];
-  }
-  if (args[0] === 'automations' && args.length > 1) {
-    return args[1];
-  }
-  return args[0];
 }
 
 export class ActionDispatcher {

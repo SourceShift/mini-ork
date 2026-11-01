@@ -2,7 +2,7 @@
   "name": "mini-ork",
   "displayName": "mini-ork",
   "description": "Task operating system for agents \u2014 launch, steer, and observe mini-ork runs from VS Code.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "sourceshift",
   "license": "Apache-2.0",
   "repository": {

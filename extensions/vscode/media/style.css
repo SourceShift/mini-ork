@@ -272,7 +272,9 @@ button {
 .dot.idle { background: var(--dim); }
 .dot.busy { background: var(--blue); }
 
-.body {
+/* The shell's own row. Scoped to the root so it cannot reach `.card .body`,
+   which is a plain padded block inside every card. */
+#root > .body {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -420,8 +422,85 @@ button {
 .pagehead .actions {
   margin-left: auto;
   display: flex;
+  align-items: center;
   gap: 6px;
   flex: none;
+}
+.pagehead .desc {
+  color: var(--sub);
+  font-size: 11.5px;
+  max-width: 78ch;
+  margin-top: 3px;
+  line-height: 1.5;
+}
+.pagehead .updated {
+  color: var(--dim);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+/* Page › tab › run, each crumb a target when the spec gave it one. */
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 3px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.crumbs .crumb {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--dim);
+}
+.crumbs .crumb.do {
+  cursor: pointer;
+  color: var(--sub);
+}
+.crumbs .crumb.do:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+.crumbs .sep {
+  color: var(--dim);
+  opacity: 0.7;
+}
+
+/* ── header menu (▾) ─────────────────────────────────────────────────── */
+.menu {
+  position: relative;
+  display: inline-flex;
+}
+.menupop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 40;
+  min-width: 180px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--line2);
+  border-radius: 7px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+}
+.menuitem {
+  display: block;
+  width: 100%;
+  padding: 6px 9px;
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.menuitem:hover {
+  background: var(--raised);
+}
+.menuitem.danger {
+  color: var(--red);
 }
 
 .chiprow {

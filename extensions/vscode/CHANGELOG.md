@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1
+
+Second pass over the console, from the pre-push review and the rest of the
+page contract.
+
+- **The shell poll no longer rebuilds the page.** It carries a `pageRev` stamp
+  and only re-renders the body when that stamp moves, so a sentence half-typed
+  into a composer survives the five-second poll. Composer drafts are also
+  keyed by page + section, and the caret returns to the same field when a page
+  that asked to refresh does re-render.
+- **`page.refresh` is honoured.** A page that asks to be re-fetched (a run in
+  flight, a lane burning budget) now gets a timer in the host; the timer
+  belongs to the page, so switching tabs cancels it.
+- **Stale responses are dropped.** Rapid page switches increment a fetch
+  sequence, so the slower, older page can no longer land on top of the newer.
+- **Contract v2.1 header fields render:** `desc` under the subtitle, `crumbs`
+  above the title, `updated_at` beside the actions, and `menu` behind a `▾`.
+- **Tab badges read `count` + `tone`** (the engine's shape) instead of `n`.
+- **Destructive-action guard is wider:** `kill`, `merge`, `cancel`, `revert`,
+  `unset-env`, and `race-*` sub-commands now force a confirm sheet, and the
+  verb is found where it actually sits (`board kill`, `pm remove`). The rule
+  moved to a `vscode`-free `actions/verbs.ts` so it has unit tests.
+- **CSS:** the shell's `.body { display: flex }` is scoped to `#root > .body`;
+  it was leaking into every `.card .body` and laying card contents in a row.
+
 ## 0.2.0
 
 The Dispatch Console: the IDE from the design brief, implemented over the

@@ -31,7 +31,22 @@
     logOpen: false,
     runs: [],
     storyOpen: {},
+    // Which page revision is on screen. The host bumps `pageRev` only when the
+    // page actually changed, so a shell poll (header + counts, every few
+    // seconds) updates the top bar without tearing down the body — otherwise a
+    // sentence half-typed into a composer would vanish mid-keystroke.
+    pageRev: -1,
+    renderedRev: -1,
+    renderedLoading: false,
   };
+
+  /**
+   * Composer drafts, keyed by page + section. A genuine re-render (a page that
+   * asked to refresh, an action that changed state) rebuilds the textarea, and
+   * the user's unfinished sentence has to survive that.
+   */
+  const drafts = {};
+  let focusedDraft = null;
 
   const root = document.getElementById('root');
   const viewport = document.getElementById('viewport');
@@ -104,6 +119,43 @@
       box.appendChild(btn(b.label, b.do, b.kind));
     });
     return box;
+  }
+
+  /** `menu` from the page header: secondary actions behind a ▾ popover. */
+  function menuButton(items) {
+    const wrap = el('div', 'menu');
+    const trigger = el('button', 'btn default', '▾');
+    trigger.title = 'More actions';
+    const pop = el('div', 'menupop');
+    pop.style.display = 'none';
+    items.forEach(function (m) {
+      if (!m || !m.label) return;
+      const b = el('button', 'menuitem', m.label);
+      if (m.kind) b.classList.add(m.kind);
+      if (m.note) b.title = m.note;
+      b.addEventListener('click', function () {
+        pop.style.display = 'none';
+        act(m.do);
+      });
+      pop.appendChild(b);
+    });
+    trigger.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      pop.style.display = pop.style.display === 'none' ? 'block' : 'none';
+    });
+    wrap.appendChild(trigger);
+    wrap.appendChild(pop);
+    return wrap;
+  }
+
+  /** "12s" / "4m" / "2h" — coarse on purpose, matching the tree views. */
+  function relativeTime(epochSeconds) {
+    const delta = Math.max(0, Math.floor(Date.now() / 1000 - Number(epochSeconds)));
+    if (!Number.isFinite(delta)) return '';
+    if (delta < 60) return delta + 's';
+    if (delta < 3600) return Math.floor(delta / 60) + 'm';
+    if (delta < 86400) return Math.floor(delta / 3600) + 'h';
+    return Math.floor(delta / 86400) + 'd';
   }
 
   // ── markdown (DOM-only: never innerHTML) ─────────────────────────────
@@ -923,6 +975,18 @@
     const ta = el('textarea');
     ta.placeholder = sec.placeholder || '';
     ta.rows = 3;
+    // A draft outlives the DOM node it was typed into.
+    const draftKey = (ui.page && ui.page.key) + '::' + (sec.title || '') + '::' + (sec.cli || []).join(' ');
+    if (drafts[draftKey]) ta.value = drafts[draftKey];
+    ta.dataset.draftKey = draftKey;
+    ta.addEventListener('input', function () {
+      if (ta.value) drafts[draftKey] = ta.value;
+      else delete drafts[draftKey];
+    });
+    // A re-render replaces this node; remembering which field had the caret
+    // lets the rebuild put the cursor back where the user left it.
+    ta.addEventListener('focus', function () { focusedDraft = draftKey; });
+    ta.addEventListener('blur', function () { if (focusedDraft === draftKey) focusedDraft = null; });
     box.appendChild(ta);
     const row = el('div', 'row');
     const send = btn(sec.action_label || 'Run', null, 'primary');
@@ -954,6 +1018,9 @@
     function submit() {
       const a = argv();
       if (!a.length) return;
+      // The text became a command; keeping it would make the next run repeat it.
+      delete drafts[draftKey];
+      focusedDraft = null;
       act({ cli: a, home: sec.home !== false });
     }
     send.addEventListener('click', submit);
@@ -1164,6 +1231,11 @@
   }
 
   function renderPage() {
+    ui.renderedRev = ui.pageRev;
+    ui.renderedLoading = ui.loading;
+    // Rebuilding the body must not move the reader: restore the scroll offset
+    // and the caret that the teardown would otherwise discard.
+    const scroll = viewport.scrollTop;
     viewport.textContent = '';
     const page = ui.page;
 
@@ -1186,17 +1258,36 @@
 
     const head = el('div', 'pagehead');
     const left = el('div');
+    // `crumbs` is contract v2.1 and optional: page › tab › run, each a target.
+    if (page.crumbs && page.crumbs.length) {
+      const trail = el('div', 'crumbs');
+      page.crumbs.forEach(function (c, i) {
+        if (i) trail.appendChild(el('span', 'sep', '›'));
+        const node = c.do ? el('button', 'crumb do', c.t) : el('span', 'crumb', c.t);
+        if (c.do) node.addEventListener('click', function () { act(c.do); });
+        trail.appendChild(node);
+      });
+      left.appendChild(trail);
+    }
     const title = el('h1');
     title.appendChild(el('span', 'secicon', GLYPH[page.key] || '◇'));
     title.appendChild(document.createTextNode(' ' + (page.title || LABEL[page.key] || page.key)));
     left.appendChild(title);
     if (page.sub) left.appendChild(el('div', 'sub', page.sub));
+    if (page.desc) left.appendChild(el('div', 'desc', page.desc));
     head.appendChild(left);
-    if (page.actions && page.actions.length) {
-      const acts = el('div', 'actions');
-      page.actions.forEach(function (a) { acts.appendChild(btn(a.label, a.do, a.kind)); });
-      head.appendChild(acts);
+    const acts = el('div', 'actions');
+    if (page.updated_at) {
+      acts.appendChild(el('span', 'updated', 'updated ' + relativeTime(page.updated_at)));
     }
+    if (page.actions && page.actions.length) {
+      page.actions.forEach(function (a) { acts.appendChild(btn(a.label, a.do, a.kind)); });
+    }
+    // Secondary actions live behind a ▾ rather than crowding the header.
+    if (page.menu && page.menu.length) {
+      acts.appendChild(menuButton(page.menu));
+    }
+    if (acts.childNodes.length) head.appendChild(acts);
     viewport.appendChild(head);
 
     if (page.chips && page.chips.length) {
@@ -1218,7 +1309,13 @@
       page.tabs.forEach(function (t) {
         const b = el('button', 'pagetab' + (t.key === page.tab ? ' on' : ''));
         b.appendChild(document.createTextNode(t.label || t.key));
-        if (t.n) b.appendChild(el('span', 'n', String(t.n)));
+        // The engine emits `count` + `tone`; a bare `n` is the older shape.
+        const badge = t.count !== undefined ? t.count : t.n;
+        if (badge !== undefined && badge !== null && badge !== '' && badge !== 0) {
+          const s = el('span', 'n', String(badge));
+          if (t.tone) s.classList.add('c-' + t.tone);
+          b.appendChild(s);
+        }
         b.addEventListener('click', function () {
           post('openPage', { key: page.key, tab: t.key, args: page.args, keepTab: true });
         });
@@ -1264,6 +1361,20 @@
     });
     flushPending();
     viewport.appendChild(grid);
+    viewport.scrollTop = scroll;
+
+    if (focusedDraft) {
+      const again = viewport.querySelector('textarea[data-draft-key="' + cssEscape(focusedDraft) + '"]');
+      if (again) {
+        again.focus();
+        again.setSelectionRange(again.value.length, again.value.length);
+      }
+    }
+  }
+
+  /** Escape a value for use inside a quoted attribute selector. */
+  function cssEscape(value) {
+    return String(value).replace(/["\\]/g, '\\$&');
   }
 
   /** A section type this build does not know: show its shape, never drop it. */
@@ -1464,8 +1575,22 @@
         if (p.tabs !== undefined) ui.tabs = p.tabs || [];
         if (p.active !== undefined) ui.active = p.active || 0;
         if (p.page !== undefined) ui.page = p.page;
+        if (p.pageRev !== undefined) ui.pageRev = p.pageRev;
         if (p.loading !== undefined) ui.loading = p.loading;
-        render();
+        // The shell polls every few seconds with the same page stamped the same
+        // way. Rebuilding the body for that would throw away a half-typed
+        // composer sentence and the scroll position of a long page.
+        renderTopbar();
+        renderRail();
+        renderTabs();
+        if (
+          p.pageRev === undefined ||
+          ui.pageRev !== ui.renderedRev ||
+          ui.loading !== ui.renderedLoading
+        ) {
+          renderPage();
+        }
+        renderDrawer();
         break;
       case 'page':
         ui.page = p.page;
@@ -1503,6 +1628,10 @@
   });
 
   // ── local handlers ───────────────────────────────────────────────────
+  // One listener for every menu popover, rather than one per render.
+  document.addEventListener('click', function () {
+    document.querySelectorAll('.menupop').forEach(function (p) { p.style.display = 'none'; });
+  });
   document.getElementById('search').addEventListener('click', function () {
     post('search', {});
     openPalette();

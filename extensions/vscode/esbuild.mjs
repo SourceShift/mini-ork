@@ -24,7 +24,11 @@ if (tests) {
   // without a transpiler in the loop.
   await esbuild.build({
     ...shared,
-    entryPoints: { 'sse.test': 'test/sse.test.ts', 'discovery.test': 'test/discovery.test.ts' },
+    entryPoints: {
+      'sse.test': 'test/sse.test.ts',
+      'discovery.test': 'test/discovery.test.ts',
+      'verbs.test': 'test/verbs.test.ts',
+    },
     outdir: 'dist/test',
     outExtension: { '.js': '.mjs' },
     format: 'esm',

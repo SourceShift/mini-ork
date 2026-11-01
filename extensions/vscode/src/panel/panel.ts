@@ -91,12 +91,26 @@ export class MiniOrkPanel implements vscode.Disposable {
   private tabs: PageTab[] = [];
   private active = 0;
   private page: PageDoc | null = null;
+  /**
+   * Bumped whenever `page` changes. The webview gets a structured clone, so it
+   * cannot compare object identity — this is the stamp it compares instead, and
+   * it is what keeps the shell poll from rebuilding a page that did not change.
+   */
+  private pageRev = 0;
   private header: unknown = null;
   private counts: Record<string, number> = {};
   private loading = false;
   private readonly dispatcher: ActionDispatcher;
   private readonly pending = new Map<string, PendingConfirm>();
   private pollTimer?: NodeJS.Timeout;
+  /** Timer for a page that asked to be re-fetched (`page.refresh`, seconds). */
+  private pageTimer?: NodeJS.Timeout;
+  /**
+   * Increments on every fetch. A response whose token is no longer current is
+   * dropped, so switching pages quickly can never let the slower, older page
+   * land on top of the newer one.
+   */
+  private fetchSeq = 0;
   private backendStatus: BackendStatus;
 
   private constructor(
@@ -257,6 +271,7 @@ export class MiniOrkPanel implements vscode.Disposable {
     if (!this.tabs.length) {
       this.active = 0;
       this.page = null;
+      this.pageRev += 1;
       void this.openPage({ key: 'orch' });
       return;
     }
@@ -268,11 +283,73 @@ export class MiniOrkPanel implements vscode.Disposable {
     const tab = this.tabs[this.active];
     if (!tab) {
       this.page = null;
+      this.pageRev += 1;
+      this.clearPageTimer();
       await this.pushState();
       return;
     }
+    const seq = ++this.fetchSeq;
     this.loading = true;
     await this.pushState();
+    const args = tab.args
+      ? Object.entries(tab.args).map(([k, v]) => `${k}=${v}`)
+      : [];
+    let doc: PageDoc;
+    try {
+      doc = (await this.instanceApi.page(tab.key, {
+        tab: tab.tab,
+        args,
+        spec: '2',
+      })) as PageDoc;
+    } catch (err) {
+      doc = {
+        ok: false,
+        key: tab.key,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (seq !== this.fetchSeq) {
+      // A newer fetch started while this one was in flight — its answer wins.
+      return;
+    }
+    this.page = doc;
+    this.pageRev += 1;
+    if (doc && typeof doc.label === 'string' && doc.label) {
+      // The engine knows the page's own name better than our table does.
+      const t = this.tabs[this.active];
+      if (t) {
+        t.label = labelFor(tab.key, tab.args, doc.title ?? doc.label);
+      }
+    }
+    this.armPageTimer(doc);
+    this.loading = false;
+    await this.pushState();
+  }
+
+  /**
+   * A page may ask to be re-fetched (contract v2.1 `refresh`, in seconds) —
+   * a run in flight, a lane burning budget. The timer belongs to the page, so
+   * switching tabs cancels it rather than leaving a stale poll running.
+   */
+  private armPageTimer(doc: PageDoc | null): void {
+    this.clearPageTimer();
+    const seconds = Number(doc?.refresh ?? 0);
+    if (!Number.isFinite(seconds) || seconds < 2) {
+      return;
+    }
+    this.pageTimer = setTimeout(() => {
+      this.pageTimer = undefined;
+      void this.refreshInPlace();
+    }, seconds * 1_000);
+  }
+
+  /** Re-fetch the open page without the loading flicker the first open shows. */
+  private async refreshInPlace(): Promise<void> {
+    const seq = this.fetchSeq;
+    const tab = this.tabs[this.active];
+    if (!tab) {
+      return;
+    }
     const args = tab.args
       ? Object.entries(tab.args).map(([k, v]) => `${k}=${v}`)
       : [];
@@ -282,23 +359,25 @@ export class MiniOrkPanel implements vscode.Disposable {
         args,
         spec: '2',
       })) as PageDoc;
-      this.page = doc;
-      if (doc && typeof doc.label === 'string' && doc.label) {
-        // The engine knows the page's own name better than our table does.
-        const t = this.tabs[this.active];
-        if (t) {
-          t.label = labelFor(tab.key, tab.args, doc.title ?? doc.label);
-        }
+      if (seq !== this.fetchSeq) {
+        return;
       }
-    } catch (err) {
-      this.page = {
-        ok: false,
-        key: tab.key,
-        error: err instanceof Error ? err.message : String(err),
-      };
+      this.page = doc;
+    this.pageRev += 1;
+      this.armPageTimer(doc);
+      await this.pushState();
+    } catch {
+      // A refresh that fails leaves the last good page on screen and tries
+      // again on the same cadence — that is what the badge is for.
+      this.armPageTimer(this.page);
     }
-    this.loading = false;
-    await this.pushState();
+  }
+
+  private clearPageTimer(): void {
+    if (this.pageTimer) {
+      clearTimeout(this.pageTimer);
+      this.pageTimer = undefined;
+    }
   }
 
   async reload(): Promise<void> {
@@ -359,6 +438,7 @@ export class MiniOrkPanel implements vscode.Disposable {
       tabs: this.tabs,
       active: this.active,
       page: this.page,
+      pageRev: this.pageRev,
       loading: this.loading,
     });
   }
@@ -513,6 +593,7 @@ export class MiniOrkPanel implements vscode.Disposable {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
     }
+    this.clearPageTimer();
     this.panel.dispose();
     while (this.disposables.length) {
       this.disposables.pop()?.dispose();
