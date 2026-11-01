@@ -1,0 +1,297 @@
+{
+  "name": "mini-ork",
+  "displayName": "mini-ork",
+  "description": "Task operating system for agents \u2014 launch, steer, and observe mini-ork runs from VS Code.",
+  "version": "0.1.0",
+  "publisher": "sourceshift",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SourceShift/mini-ork",
+    "directory": "extensions/vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Other",
+    "Testing",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "agents",
+    "orchestration",
+    "llm",
+    "mini-ork"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "workspaceContains:.mini-ork"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "miniOrk",
+          "title": "mini-ork",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "miniOrk": [
+        {
+          "id": "miniOrk.runs",
+          "name": "Runs",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "miniOrk.recipes",
+          "name": "Recipes",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "miniOrk.learnings",
+          "name": "Learnings",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "miniOrk.runs",
+        "contents": "No mini-ork project found in this workspace.\n\nmini-ork keeps its state in a `.mini-ork` directory.\n[Initialize mini-ork](command:miniOrk.init)\n[Pick a different home\u2026](command:miniOrk.pickHome)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "miniOrk.init",
+        "title": "Initialize Project",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.pickHome",
+        "title": "Pick Home Directory\u2026",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.startServer",
+        "title": "Start Backend",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.stopServer",
+        "title": "Stop Backend",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.restartServer",
+        "title": "Restart Backend",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.showOutput",
+        "title": "Show Backend Log",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.openDashboard",
+        "title": "Open Dashboard",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.launchRun",
+        "title": "Launch Run\u2026",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.launchRunSelection",
+        "title": "Launch Run From Selection",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.steerRun",
+        "title": "Steer Run\u2026",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.pauseCost",
+        "title": "Pause Run (Cost Cap)",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.resumeCost",
+        "title": "Resume Run",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.recoverRun",
+        "title": "Recover Run",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.openTrajectory",
+        "title": "Open Run Trajectory",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.openArtifacts",
+        "title": "Open Run Artifacts",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.attachTerminal",
+        "title": "Attach to Node Terminal",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.copyRunId",
+        "title": "Copy Run ID",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.refreshAll",
+        "title": "Refresh",
+        "category": "mini-ork",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "miniOrk.openSettings",
+        "title": "Open Settings",
+        "category": "mini-ork"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "miniOrk.refreshAll",
+          "when": "view == miniOrk.runs || view == miniOrk.recipes || view == miniOrk.learnings",
+          "group": "navigation"
+        },
+        {
+          "command": "miniOrk.openDashboard",
+          "when": "view == miniOrk.runs",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "miniOrk.steerRun",
+          "when": "view == miniOrk.runs && viewItem == miniOrk.run",
+          "group": "inline@1"
+        },
+        {
+          "command": "miniOrk.openTrajectory",
+          "when": "view == miniOrk.runs && viewItem == miniOrk.run",
+          "group": "navigation@2"
+        },
+        {
+          "command": "miniOrk.copyRunId",
+          "when": "view == miniOrk.runs && viewItem == miniOrk.run",
+          "group": "9_meta"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "miniOrk.launchRunSelection",
+          "when": "editorHasSelection",
+          "group": "miniOrk@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "miniOrk.launchRunSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "mini-ork",
+      "properties": {
+        "miniOrk.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `mini-ork` executable. Empty means discover it (PATH, then the workspace `bin/mini-ork`, then `~/.local/bin/mini-ork`)."
+        },
+        "miniOrk.home": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `.mini-ork` home directory. Empty means `${workspaceFolder}/.mini-ork`, falling back to `MINI_ORK_HOME`."
+        },
+        "miniOrk.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Spawn and manage the backend (`mini-ork serve`) when the extension activates."
+        },
+        "miniOrk.attachToExisting": {
+          "type": "boolean",
+          "default": true,
+          "description": "If a healthy mini-ork server already answers on the configured port, attach to it instead of spawning a second one."
+        },
+        "miniOrk.serverPort": {
+          "type": "number",
+          "default": 0,
+          "description": "Port for the backend. 0 means auto-select a free port above 7090."
+        },
+        "miniOrk.serverHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Bind address for the backend. Keep 127.0.0.1 unless you deliberately expose it."
+        },
+        "miniOrk.startupTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "description": "How long to wait for `/api/v1/health` to answer before declaring the backend failed."
+        },
+        "miniOrk.refreshIntervalMs": {
+          "type": "number",
+          "default": 5000,
+          "description": "Poll interval for tree views and the status bar. 0 disables polling."
+        },
+        "miniOrk.authToken": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token for write endpoints. Empty means read the first token from `<home>/auth-tokens.txt` (see `mini-ork auth`)."
+        },
+        "miniOrk.releaseChannel": {
+          "type": "string",
+          "enum": [
+            "production",
+            "staging",
+            "dev"
+          ],
+          "default": "production",
+          "description": "Channel label shown in the status bar; informational only."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "miniOrk.openDashboard",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node esbuild.mjs --tests && node --test dist/test/*.mjs",
+    "package": "node esbuild.mjs --production && vsce package --no-dependencies",
+    "vscode:prepublish": "node esbuild.mjs --production"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "@vscode/vsce": "^2.24.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}
