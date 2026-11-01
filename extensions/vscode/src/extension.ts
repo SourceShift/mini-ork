@@ -4,6 +4,7 @@ import { MiniOrkApi } from './backend/api';
 import { readFileToken } from './backend/discovery';
 import { BackendManager } from './backend/manager';
 import { registerCommands } from './commands';
+import { MiniOrkPanel } from './panel/panel';
 import { readConfig, resolveHome } from './config';
 import { disposeLog, info, warn } from './log';
 import { StatusBar } from './statusBar';
@@ -67,6 +68,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     manager.onDidChangeState((next) => {
       status.setBackend(next);
+      MiniOrkPanel.notifyBackend(next);
       if (next.state === 'ready') {
         refreshAll();
       } else if (next.state === 'stopped' || next.state === 'failed') {

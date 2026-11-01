@@ -5,7 +5,7 @@ import { BackendManager } from '../backend/manager';
 import { findBinary } from '../backend/discovery';
 import { resolveHome, resolveWorkspaceRoot, readConfig } from '../config';
 import { info, report, warn } from '../log';
-import { MiniOrkPanel, PanelAction } from '../panel/panel';
+import { MiniOrkPanel } from '../panel/panel';
 import { StatusBar } from '../statusBar';
 import { RemotePty } from '../terminal/ptyTerminal';
 import { LearningsTreeProvider } from '../views/learningsTree';
@@ -115,10 +115,45 @@ export function registerCommands(
 
   reg('miniOrk.refreshAll', () => deps.refreshAll());
 
+  // The IDE is a renderer over the backend's page spec: opening it needs the
+  // binary + home so its buttons can run the argv the pages carry.
+  const showIde = (): MiniOrkPanel =>
+    MiniOrkPanel.show(deps.extensionUri, api, manager, {
+      binary: () => findBinary(readConfig().binaryPath, resolveWorkspaceRoot()),
+      home: () => resolveHome(),
+      cwd: () => resolveWorkspaceRoot() ?? process.cwd(),
+      intervalMs: readConfig().refreshIntervalMs,
+    });
+
   const openDashboard = (): void => {
-    MiniOrkPanel.show(deps.extensionUri, api, (action) => handlePanelAction(action));
+    showIde();
   };
   reg('miniOrk.openDashboard', openDashboard);
+
+  reg('miniOrk.openOrchestrator', async () => {
+    await showIde().openPage({ key: 'orch', tab: 'dispatch' });
+  });
+
+  /** `miniOrk.openPage { key, tab?, args?, run? }` — the IDE's one entry point. */
+  reg('miniOrk.openPage', async (arg?: unknown) => {
+    const panel = showIde();
+    const req = (arg ?? {}) as {
+      key?: string;
+      tab?: string;
+      args?: Record<string, string>;
+      run?: string;
+      title?: string;
+    };
+    if (req.run) {
+      await panel.openRun(req.run, req.title, req.tab);
+      return;
+    }
+    await panel.openPage({
+      key: req.key ?? 'orch',
+      tab: req.tab,
+      args: req.args,
+    });
+  });
 
   reg('miniOrk.launchRun', async (arg?: unknown) => {
     if (!(await requireReady())) {
@@ -243,11 +278,7 @@ export function registerCommands(
       return;
     }
     try {
-      const [page, dag] = await Promise.all([
-        api.page(`run:${runId}`).catch((err) => ({ error: String(err) })),
-        api.dag(runId).catch((err) => ({ error: String(err) })),
-      ]);
-      await showJson(`trajectory-${runId}.json`, { page, dag });
+      await showIde().openRun(runId, undefined, 'dag');
     } catch (err) {
       report(`trajectory failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -290,33 +321,6 @@ export function registerCommands(
     void vscode.window.setStatusBarMessage(`copied ${runId}`, 2_000);
   });
 
-  // Keep the dashboard's own buttons working through the same code paths.
-  async function handlePanelAction(action: PanelAction): Promise<void> {
-    switch (action.action) {
-      case 'launch':
-        await vscode.commands.executeCommand('miniOrk.launchRun', {
-          recipe: action.recipe,
-        });
-        break;
-      case 'steer':
-        await vscode.commands.executeCommand('miniOrk.steerRun', { runId: action.runId });
-        break;
-      case 'pauseCost':
-        await vscode.commands.executeCommand('miniOrk.pauseCost', { runId: action.runId });
-        break;
-      case 'resumeCost':
-        await vscode.commands.executeCommand('miniOrk.resumeCost', { runId: action.runId });
-        break;
-      case 'openTrajectory':
-        await vscode.commands.executeCommand('miniOrk.openTrajectory', {
-          runId: action.runId,
-        });
-        break;
-      case 'copyRunId':
-        await vscode.env.clipboard.writeText(action.runId);
-        break;
-    }
-  }
 }
 
 // --- helpers ---------------------------------------------------------------

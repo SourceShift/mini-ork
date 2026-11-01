@@ -2,7 +2,7 @@
   "name": "mini-ork",
   "displayName": "mini-ork",
   "description": "Task operating system for agents \u2014 launch, steer, and observe mini-ork runs from VS Code.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "sourceshift",
   "license": "Apache-2.0",
   "repository": {
@@ -99,6 +99,16 @@
       {
         "command": "miniOrk.openDashboard",
         "title": "Open Dashboard",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.openOrchestrator",
+        "title": "Open Dispatch (orchestrator)",
+        "category": "mini-ork"
+      },
+      {
+        "command": "miniOrk.openPage",
+        "title": "Open page in mini-ork IDE",
         "category": "mini-ork"
       },
       {
@@ -270,6 +280,11 @@
     "keybindings": [
       {
         "command": "miniOrk.openDashboard",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o"
+      },
+      {
+        "command": "miniOrk.openOrchestrator",
         "key": "ctrl+alt+o",
         "mac": "cmd+alt+o"
       }
