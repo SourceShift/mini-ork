@@ -902,17 +902,29 @@ def judge(
             # auditor can rerun them with a corrected expectation.
             reason = (f"{inconclusive} of {n} invariants failed in a way the "
                       f"buggy code did not — the patch changed the behaviour "
-                      f"they test, so they cannot judge it; {holds} of {n} hold")
+                      f"they test, so they cannot judge it; {holds} of {denom} hold")
             verdict = UNVERIFIED
         # else: keep mr.score's UNVERIFIED reason verbatim.
 
-    # A would-be PROVEN built partly on unmeasurable evidence cannot be proven:
-    # withhold-only (never create PROVEN, never emit REFUTED).
-    if verdict == PROVEN and unmeasured:
-        verdict = UNVERIFIED
-        reason = (f"{unmeasured} of {n} invariants claimed passed but their "
-                  f"execution evidence was self-contradictory — cannot measure "
-                  f"them; {holds} of {denom} measured invariant(s) hold")
+    # Unmeasurable evidence is withhold-only: it can never create PROVEN, and
+    # it can never be the reason a patch is convicted — a REFUTED must rest on
+    # at least two CONCLUSIVE failures, never on excluding passes we could not
+    # read. (Excluding them raises the measured rate, so a REFUTED that only
+    # the exclusion produced would be evidence we do not have.)
+    if unmeasured:
+        conclusive_refutation = n_eff >= 2 and (holds / n_eff) < 0.5
+        downgraded = verdict == PROVEN or (verdict == REFUTED and not conclusive_refutation)
+        if downgraded:
+            verdict = UNVERIFIED
+        if downgraded or denom == 0:
+            # ``mr.score``'s "no informative invariant could be built" text
+            # would blame the probe generator; every invariant here was built,
+            # and every one of them claimed a pass its own evidence denied.
+            reason = (f"{unmeasured} of {n} invariants claimed passed but their "
+                      f"execution evidence was self-contradictory — cannot measure "
+                      f"them; {holds} of {denom} measured invariant(s) hold")
+        elif verdict == UNVERIFIED:
+            reason = f"{reason} ({unmeasured} invariant(s) could not be measured)"
 
     # ── Term 4: metamorphic relations (veto a would-be PROVEN) ──────────────
     # A special-cased patch passes every invariant yet breaks a relation BETWEEN two

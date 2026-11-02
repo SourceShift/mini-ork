@@ -273,10 +273,13 @@ class _IncoherentInvariantRunner:
 
     up = True
 
-    def __init__(self, incoherent: set[int] | None = None) -> None:
+    def __init__(self, incoherent: set[int] | None = None,
+                 broken: set[int] | None = None) -> None:
         # Default: every invariant lies. A caller can let some of them pass
-        # coherently to pin the mixed measured/unmeasured accounting.
+        # coherently, or fail identically on patch and base (a conclusive
+        # "broken"), to pin the mixed accounting.
         self.incoherent = {1, 2, 3} if incoherent is None else incoherent
+        self.broken = broken or set()
 
     def run_test(self, src: str, patch: str = "") -> ExecOutcome:
         passed = _outcome()
@@ -289,6 +292,8 @@ class _IncoherentInvariantRunner:
             if not patch:
                 return failed                      # informative on base
             index = int(hit.group(1).rsplit("_", 1)[1])
+            if index in self.broken:
+                return failed                      # same signature on patch
             if index in self.incoherent:
                 # Claims a pass while its bookkeeping says every attempt errored.
                 return _outcome(meta={"final_attempt_status": "error"})
@@ -313,9 +318,12 @@ def test_metamorphic_loop_withholds_proven_on_incoherent_passes():
     assert v.verdict == "UNVERIFIED"
     assert v.detail["unmeasured"] >= 1
     assert any(rec.get("outcome") == "unmeasured" for rec in v.detail["invariants"])
-    # All-unmeasured evidence scores on an empty denominator, not 0 of 3.
+    # All-unmeasured evidence scores on an empty denominator, not 0 of 3, and
+    # the reason names the contradiction rather than blaming the generator.
     assert v.mr_n == v.detail["n_effective"] == 0
     assert v.mr_pass_rate is None
+    assert "self-contradictory" in v.reason
+    assert "no informative invariant" not in v.reason
 
 
 def test_measured_denominator_pairs_mr_pass_rate_with_mr_n():
@@ -331,3 +339,29 @@ def test_measured_denominator_pairs_mr_pass_rate_with_mr_n():
     assert v.detail["invariants"] and v.detail["n_effective"] == 2
     assert v.mr_n == 2
     assert v.mr_pass_rate == 1.0
+    assert "self-contradictory" in v.reason
+
+
+def test_unmeasured_evidence_never_convicts_the_patch():
+    # One conclusive failure plus two forged passes: without the rule, the
+    # single failure would be scored as "0 of 1" and REFUTED. A harness defect
+    # must not convict the patch on evidence we could not read.
+    v = oracle.judge(
+        _ISSUE, _PATCH,
+        runner=_IncoherentInvariantRunner(incoherent={2, 3}, broken={1}),
+        dispatch=_mr_dispatch, poc=_POC,
+    )
+    assert v.verdict == "UNVERIFIED"
+    assert "self-contradictory" in v.reason
+
+
+def test_two_conclusive_failures_still_refute():
+    # Unmeasured evidence withholds, it does not veto: two invariants that
+    # conclusively fail on the patch and on base are a real refutation.
+    v = oracle.judge(
+        _ISSUE, _PATCH,
+        runner=_IncoherentInvariantRunner(incoherent={3}, broken={1, 2}),
+        dispatch=_mr_dispatch, poc=_POC,
+    )
+    assert v.verdict == "REFUTED"
+    assert v.detail["unmeasured"] == 1
