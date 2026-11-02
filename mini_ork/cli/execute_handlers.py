@@ -1022,24 +1022,34 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             return 1, "config"
         publish_env(_node_overrides)
 
-    # (E4 turn-resume) During an active recovery, restore this node's persisted
-    # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the
-    # interrupted conversation (`--resume <id>`, via providers.dispatch_model)
-    # instead of starting the node over. Strictly recovery-scoped and fail-soft:
-    # off recovery, for codex/gemini, or with no session it is a no-op and the
-    # node runs normally.
-    if (context_env("MINI_ORK_RECOVERY_CLOSURE").strip()
-            or context_env("MINI_ORK_RECOVERY_FROM").strip()):
+    # (E4 turn-resume) Restore a persisted transcript and export
+    # MO_RESUME_SESSION_ID so a claude lane continues an existing conversation
+    # (`--resume <id>`, via providers.dispatch_model) instead of starting the
+    # node over. Two triggers share the machinery — see `_resume_trigger`.
+    # Fail-soft in both: for codex/gemini, with no session, or when the
+    # transcript cannot be resolved, it is a no-op and the node runs normally.
+    # A resume the lane cannot honour would fail the node, so "" is the safe
+    # answer and is the default.
+    _trigger = _resume_trigger(run_dir_eff or run_dir)
+    if _trigger:
         try:
-            from mini_ork.recovery.resume_prep import prepare_node_resume  # noqa: PLC0415
-            _resume_sid = prepare_node_resume(
-                db, run_id, node_id, run_dir=run_dir, model=lane,
-                cwd=context_env(ENV_TARGET_CWD) or None,
-            )
+            if _trigger == "recovery":
+                from mini_ork.recovery.resume_prep import prepare_node_resume as _prep  # noqa: PLC0415
+                _resume_sid = _prep(
+                    db, run_id, node_id, run_dir=run_dir, model=lane,
+                    cwd=context_env(ENV_TARGET_CWD) or None,
+                )
+            else:
+                from mini_ork.recovery.resume_prep import prepare_round_resume as _prep  # noqa: PLC0415
+                _resume_sid = _prep(
+                    run_dir_eff or run_dir, node_id, model=lane,
+                    cwd=context_env(ENV_TARGET_CWD) or None,
+                )
             if _resume_sid:
                 publish_env({ENV_RESUME_SESSION_ID: _resume_sid})
                 print(f"  [resume] node_id={node_id} continuing session "
-                      f"{_resume_sid[:12]}… via --resume", file=sys.stderr)
+                      f"{_resume_sid[:12]}… via --resume ({_trigger})",
+                      file=sys.stderr)
         except Exception as e:  # noqa: BLE001 — resume is best-effort
             print(f"  [resume] skipped for node_id={node_id}: {e}", file=sys.stderr)
 
@@ -1756,6 +1766,27 @@ _RECIPES_REQUIRING_TREE_CHANGES = frozenset({"code-fix", "docs"})
 _IMPLEMENTER_COMPLETION_ARTIFACTS: dict[str, tuple[str, ...]] = {
     "recursive-validate-impl": ("implementer-summary.json",),
 }
+
+
+def _resume_trigger(run_dir: str) -> str:
+    """Which resume path this dispatch takes: ``"recovery"``, ``"revise"``, ``""``.
+
+    Recovery wins because it has durable state behind it. A revise round — the
+    same node re-dispatched against the same target with a delta-sized fix
+    instruction — is the other case where continuing an existing conversation
+    is both correct and dramatically cheaper: the revise prompt deliberately
+    drops the first attempt's background, and that is only safe when the lane
+    already holds it in its transcript.
+
+    ``MO_REVISE_RESUME=0`` opts back to a cold start. Never the source of a
+    failure: every step downstream is fail-soft and "" just means "run normally".
+    """
+    if (context_env("MINI_ORK_RECOVERY_CLOSURE").strip()
+            or context_env("MINI_ORK_RECOVERY_FROM").strip()):
+        return "recovery"
+    if context_env("MO_REVISE_RESUME", "1") != "1":
+        return ""
+    return "revise" if _read_revise_feedback(run_dir) is not None else ""
 
 
 def _read_revise_feedback(run_dir: str) -> dict | None:

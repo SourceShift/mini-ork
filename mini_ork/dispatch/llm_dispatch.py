@@ -692,6 +692,14 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
             served_by = None
         if served_by is not None:
             _md["harness"] = served_by
+    # A resumed dispatch continues an existing conversation instead of paying
+    # for the background again. Stamp it on the row: without this the saving is
+    # only inferable from an unexpectedly small input-token count, and a resume
+    # that silently did not happen looks identical to one that did. Recovery
+    # (E4) and revise rounds (P11) set the same variable.
+    _resume_sid = context_env("MO_RESUME_SESSION_ID").strip()
+    if _resume_sid:
+        _md["resumed"] = _resume_sid
     _sess = _md.get("session_id")
     metadata_json = _json.dumps(_md)
     try:

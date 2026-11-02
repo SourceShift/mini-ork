@@ -17,6 +17,16 @@ and the node re-runs from scratch (E1/E2 already guarantee that is safe).
 codex/gemini lanes: these run their own session model and do not use the
 claude transcript store — ``prepare_node_resume`` returns "" for them, so the
 recovery falls back to node-level resume (documented, not faked).
+
+``prepare_round_resume`` is the same continuation for a **revise round** rather
+than a recovery. A revise round re-dispatches the same node against the same
+target with a delta-sized instruction, and the implementer prompt deliberately
+drops the first attempt's background to avoid re-paying for it. That slimming is
+only correct if the lane still holds the background — which it does exactly when
+the next attempt continues the previous attempt's conversation. The id comes
+from the per-node sidecar the dispatcher writes on every attempt
+(``<run_dir>/.sessions/<node_id>.session``), so it works for a *failed* attempt
+too; durable ``node_attempts`` rows only exist for successful ones.
 """
 from __future__ import annotations
 
@@ -25,7 +35,7 @@ import sqlite3
 import sys
 from typing import Optional
 
-__all__ = ["node_session_ref", "prepare_node_resume"]
+__all__ = ["node_session_ref", "prepare_node_resume", "prepare_round_resume"]
 
 # Lanes that route through the claude binary share the transcript store and can
 # turn-resume; codex/gemini have their own session model → node-level resume
@@ -116,5 +126,56 @@ def prepare_node_resume(
         ok = restore_session(run_dir, session_ref, session_id, cwd=cwd)
     except Exception as e:  # noqa: BLE001 — best-effort
         _log(f"prepare_node_resume: restore errored ({e})")
+        return ""
+    return session_id if ok else ""
+
+
+def prepare_round_resume(
+    run_dir: str,
+    node_id: str,
+    *,
+    model: str = "",
+    cwd: Optional[str] = None,
+) -> str:
+    """Return the previous attempt's session id for a **revise round**, or "".
+
+    Same continuation as :func:`prepare_node_resume`, different source: a revise
+    round has no durable ``node_attempts`` row for the attempt that failed, but
+    the dispatcher stashes every attempt's session id in
+    ``<run_dir>/.sessions/<node_id>.session``. This reads that sidecar, persists
+    the live transcript into the run dir (so a later round can still resume if
+    the run moves to a fresh home), restores it if the current home lost it, and
+    returns the id only when the transcript is actually resolvable — a resume the
+    lane cannot honour would fail the node, which is worse than a cold start.
+
+    Never raises; "" means "run the round from scratch", which is always safe.
+    """
+    # codex/gemini run their own session model (same split as recovery). Every
+    # other lane is claude-family; providers.apply_resume leaves a non-claude
+    # command untouched, so this exclusion is an optimization, not a guard.
+    if (model or "").split("_")[0] in {"codex", "gemini"}:
+        return ""
+    if not run_dir or not node_id:
+        return ""
+    try:
+        session_id = open(
+            os.path.join(run_dir, ".sessions", f"{node_id}.session"), encoding="utf-8"
+        ).read().strip()
+    except OSError:
+        return ""
+    if not session_id:
+        return ""
+    try:
+        from mini_ork.stores.session_store import persist_session, restore_session  # lazy
+
+        # Capture the live transcript first: at this point it is the previous
+        # round's, so persisting here is what makes round N+2 resumable even
+        # after the run dir moves or the claude home is rebuilt.
+        ref = persist_session(run_dir, session_id, cwd=cwd)
+        if not ref:
+            return ""
+        ok = restore_session(run_dir, ref, session_id, cwd=cwd)
+    except Exception as e:  # noqa: BLE001 — resume is best-effort
+        _log(f"prepare_round_resume: {e}")
         return ""
     return session_id if ok else ""

@@ -173,6 +173,39 @@ Two common extension selectors are:
 `escalates_to` rollback edges fire. Set it to `0` to restore the pre-revise
 behaviour (a failed node blocks its descendants and rollback runs).
 
+### Revise-round resume
+
+A revise round is the same node, against the same target, with a delta-sized fix
+instruction. Its implementer prompt deliberately drops the first attempt's
+background so the round does not re-pay for it — which is only safe if the lane
+still holds that background. So the round **continues the previous attempt's
+conversation** (`claude --resume <id>`) instead of cold-starting, using the
+session id the dispatcher stashes at `<run_dir>/.sessions/<node>.session` on
+every attempt (including failed ones). `mini-ork recover` uses the same
+machinery from durable state.
+
+| Variable | Purpose |
+|---|---|
+| `MO_REVISE_RESUME` | `1` (default) resumes the previous attempt on a revise round. `0` cold-starts every round. |
+
+The resume is fail-soft in one specific way that matters: it is only attempted
+when the transcript is actually resolvable, because a `--resume` the lane cannot
+honour fails the node — worse than paying for the background again. No session,
+a codex/gemini lane (which runs its own session model), or a missing transcript
+all mean the round simply runs from scratch.
+
+To see whether the saving happened rather than infer it from an
+unexpectedly small input-token count, every resumed dispatch stamps
+`resumed: <session id>` into `llm_calls.metadata_json`:
+
+```bash
+sqlite3 "$MINI_ORK_HOME/state.db" \
+  "SELECT model_id, input_tokens, json_extract(metadata_json,'\$.resumed')
+     FROM llm_calls
+    WHERE json_extract(metadata_json,'\$.resumed') IS NOT NULL
+    ORDER BY id DESC LIMIT 10"
+```
+
 ### Interactive dispatch
 
 A node dispatched on a person's behalf is not batch work: a human is waiting,
