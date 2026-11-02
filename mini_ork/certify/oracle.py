@@ -43,6 +43,7 @@ from pathlib import Path
 
 from mini_ork.certify import differential
 from mini_ork.certify import discrimination
+from mini_ork.certify import evidence
 from mini_ork.certify import hidden_checks
 from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
@@ -700,6 +701,11 @@ def judge(
         return Verdict(REFUTED,
                        f"the reported bug still reproduces after the patch ({post.status}/{post.exc})",
                        poc_plus=poc_src)
+    # A pass is proof only when the outcome's own fields corroborate it. An
+    # incoherent pass is a harness fact — abstain, never blame the patch.
+    incoherent = evidence.defect(post)
+    if incoherent is not None:
+        return Verdict(UNVERIFIED, f"{incoherent} — cannot judge", poc_plus=poc_src)
 
     # ── Term 2.5: hidden regenerable ground truth ───────────────────────────
     # The visible reproduction test can be special-cased by identity (function
@@ -731,7 +737,13 @@ def judge(
             trial = runner.run_test(variant, patch=patch)
             status = getattr(trial, "status", None)
             if status == "passed":
-                measured += 1
+                # A trial measures something only if its pass is coherent. An
+                # incoherent pass is unmeasured harness noise, never identity
+                # evidence against the patch.
+                if evidence.defect(trial) is None:
+                    measured += 1
+                else:
+                    unmeasured += 1
             elif status == "failed":
                 # Same test, different identity: the patch depends on the
                 # identity it was visible under.
@@ -801,11 +813,23 @@ def judge(
                        detail=no_cands_detail)
 
     kept, dropped, holds, broken, inconclusive = [], [], 0, 0, 0
+    unmeasured = 0
     for name, src in cands:                               # already validated informative
         res = runner.run_test(src, patch=patch)
         hit = res.status == "passed"
         rec = {"mr": name, "on_patch": res.status, "holds": hit, "src": src}
         if hit:
+            # A pass counts only when its own fields corroborate it. An
+            # incoherent pass is a harness fact: record it as unmeasured and
+            # continue WITHOUT a base re-run (a re-run cannot make it coherent).
+            incoherent = evidence.defect(res)
+            if incoherent is not None:
+                rec["holds"] = False
+                rec["outcome"] = "unmeasured"
+                rec["detail"] = incoherent
+                unmeasured += 1
+                kept.append(rec)
+                continue
             # Passing invariants do not need a base re-run: they hold on the
             # patch and would also hold on base (otherwise mr.build dropped them).
             rec["outcome"] = "holds"
@@ -851,8 +875,15 @@ def judge(
 
     n = len(kept)
     n_eff = holds + broken
-    rate = (holds / n) if n else 0.0
-    verdict, reason = mr.score(rate, n)
+    if unmeasured:
+        # An invariant whose own evidence contradicts itself measured nothing:
+        # it must not dilute the pass rate (which would convict the patch for a
+        # harness fact) nor pad the denominator. Score only what was measured.
+        rate = (holds / n_eff) if n_eff else 0.0
+        verdict, reason = mr.score(rate, n_eff)
+    else:
+        rate = (holds / n) if n else 0.0
+        verdict, reason = mr.score(rate, n)
 
     # Asymmetric verdict (certify C6). PROVEN is byte-identical to today's
     # mr.score on (rate, n) — precision cannot move; the change can only turn
@@ -877,12 +908,21 @@ def judge(
             verdict = UNVERIFIED
         # else: keep mr.score's UNVERIFIED reason verbatim.
 
+    # A would-be PROVEN built partly on unmeasurable evidence cannot be proven:
+    # withhold-only (never create PROVEN, never emit REFUTED).
+    if verdict == PROVEN and unmeasured:
+        verdict = UNVERIFIED
+        reason = (f"{unmeasured} of {n} invariants claimed passed but their "
+                  f"execution evidence was self-contradictory — cannot measure "
+                  f"them; {holds} of {n} hold")
+
     # ── Term 4: metamorphic relations (veto a would-be PROVEN) ──────────────
     # A special-cased patch passes every invariant yet breaks a relation BETWEEN two
     # executions. This can only turn PROVEN -> REFUTED (it cannot create PROVEN, and it
     # never runs on a would-be REFUTED/UNVERIFIED). Knobs off => no dispatch, no key.
     detail = {"invariants": kept, "dropped": dropped,
-              "n_effective": n_eff, "inconclusive": inconclusive}
+              "n_effective": n_eff, "inconclusive": inconclusive,
+              "unmeasured": unmeasured}
     if hidden_detail is not None:
         detail["hidden_checks"] = hidden_detail
     proven_before_vetoes = verdict == PROVEN
