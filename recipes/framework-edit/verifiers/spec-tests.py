@@ -501,6 +501,13 @@ def write_probe_manifest(run_dir: str, probes: list[dict], log=None) -> str | No
     Returns the path, or ``None`` when nothing was written. A failed write is
     reported and never changes the gate verdict — it removes an audit record,
     it does not make the suite pass or fail.
+
+    This record keeps every clause, held-out ones included, and that is
+    deliberate: it is what a person checks the split against afterwards. The
+    split withholds the answer from the HANDOUT the revise round is given (the
+    payload, the evidence log), not from the run directory — the spec test
+    source sits in the same directory and always keeps its docstring. Redacting
+    a second copy would buy nothing and cost the audit its point.
     """
     if not probes:
         return None
@@ -706,20 +713,73 @@ def shadowed_selections(selected: list[str], targets: list[str]) -> list[str]:
     return out
 
 
+_HELD_OUT_PLACEHOLDER = ("[held-out probe: its clause and assertion output are "
+                         "withheld by the authorship split]")
+
+
+def redact_held_out(output: str, withheld: set[str]) -> str:
+    """``output`` with each held-out probe's pytest failure block replaced.
+
+    pytest prints the failing test's SOURCE in its failure block — the
+    docstring clause included — followed by the assertion's expected values
+    (``assert 7 == 42``). The evidence log is text the revise round reads, so an
+    unredacted block hands back exactly what the split withheld. The header
+    stays: the probe is still named, its content is not.
+
+    Walked the same way `harness_defects` walks the output: a header line opens
+    a block, the unit is stripped of the `ERROR at setup of ` prefix (a held-out
+    test that dies in a fixture is still that test), and a ``=====`` banner
+    closes it — which is what keeps the ``-rA`` summary, whose ``FAILED
+    <nodeid>`` lines name the probe and nothing else, out of the hiding state."""
+    if not withheld:
+        return output
+    kept: list[str] = []
+    hiding = False
+    for line in output.splitlines():
+        header = _TRACEBACK_HEADER_RE.match(line.strip())
+        if header:
+            name = header.group(1)
+            if any(ch.isalnum() for ch in name):
+                for prefix in _SETUP_ERROR_PREFIXES:
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]
+                        break
+                hiding = _unit_key(name) in withheld
+                kept.append(line)
+                if hiding:
+                    kept.append(_HELD_OUT_PLACEHOLDER)
+                continue
+        if hiding and line.strip().startswith("==="):
+            hiding = False
+        if hiding:
+            continue
+        kept.append(line)
+    return "\n".join(kept) + ("\n" if output.endswith("\n") else "")
+
+
 def run_spec_tests(spec_dir_path: str, deselected: list[str],
-                   timeout: int, log) -> tuple[int | None, bool, str]:
+                   timeout: int, log, withheld: set[str] | None = None
+                   ) -> tuple[int | None, bool, str]:
     """Run pytest over the spec dir. ``(rc, timed_out, output_text)``.
 
     ``--deselect`` keeps a docstring-less test from EVER running (hard
     constraint c:0); ``-rA`` is what lets ``evaluate`` prove it afterwards.
     ``--continue-on-collection-errors``: one spec module that fails to import
     (the kickoff-named module is missing) must not hide every other module's
-    verdict from the revise round."""
+    verdict from the revise round.
+
+    ``withheld`` are the held-out probe units: their failure blocks are written
+    to the log REDACTED. The raw text is still returned, because the parsers
+    below it (`failure_exceptions`, `harness_defects`) need the real signal —
+    RB-18 has to see a usage error or the run burns its revise rounds. The
+    redaction is applied to what LANDS ON DISK, which is what the revise round
+    reads."""
     extra = ["-rA", "--continue-on-collection-errors"]
     for nodeid in deselected:
         extra += ["--deselect", nodeid]
     rc, timed_out, text = _run_pytest(_pytest_argv(spec_dir_path, *extra), timeout)
-    log.write(text if text.endswith("\n") else text + "\n")
+    logged = redact_held_out(text, withheld or set())
+    log.write(logged if logged.endswith("\n") else logged + "\n")
     log.flush()
     return rc, timed_out, text
 
@@ -1036,7 +1096,14 @@ def evaluate(run_dir: str, log) -> dict:
             result["error"])]
         return result
 
-    rc, timed_out, output = run_spec_tests(path, targets, timeout, log)
+    # Bare unit names, because that is all pytest's failure headers carry: a
+    # header reads `___ test_x ___`, never `test_a.py::test_x`. `_unit_key` also
+    # drops the `[case-id]` a parametrized case appends, so every case inherits
+    # the function's mark. Two modules reusing one test name over-withholds —
+    # the visible one is hidden too — which is the safe direction: it costs the
+    # implementer evidence, never gives it the answer.
+    withheld = {_unit_key(probe["id"]) for probe in probes if probe.get("held_out")}
+    rc, timed_out, output = run_spec_tests(path, targets, timeout, log, withheld)
     result["rc"] = rc
     result["timed_out"] = timed_out
     result["deselected_reported"] = deselected_count(output)
@@ -1058,14 +1125,13 @@ def evaluate(run_dir: str, log) -> dict:
         return result
 
     exceptions = failure_exceptions(output)
-    withheld = {probe_function(probe["id"]) for probe in probes if probe.get("held_out")}
     for nodeid in failed_items(output, selected):
         # A held-out probe still counts in the verdict — it is in `failures`
         # and still reds `spec-tests-pass` — but its clause is WITHHELD from the
         # evidence the implementer's revise round reads. That is the whole
         # point of the split: the implementer must satisfy probes it cannot
         # read the answers to.
-        is_held_out = probe_function(nodeid) in withheld
+        is_held_out = _unit_key(nodeid) in withheld
         failure: dict = {"test": nodeid,
                          "kickoff": "" if is_held_out else kickoff_quote(path, nodeid)}
         if is_held_out:

@@ -315,6 +315,62 @@ def test_held_out_fails():
     assert "secret expectation" not in json.dumps(payload["failures"])
 
 
+# ── the evidence log is a file the revise round can open ───────────────────
+
+SECRET_ASSERTION = '''\
+def test_visible_fails():
+    """Kickoff: 'a rejected input fails closed'."""
+    assert False, "visible detail"
+
+
+def test_held_out_fails():
+    """Kickoff: 'the fail-closed knob never returns an empty value'.
+
+    Held-out: yes
+    """
+    assert 7 == 42, "secret expectation"
+'''
+
+
+def test_evidence_log_withholds_the_held_out_block(tmp_path) -> None:
+    """pytest prints the failing test's SOURCE: a raw log is the clause, again.
+
+    The verifier names `verifier-spec-tests.log` as evidence, so whatever it
+    holds is the handout. The block goes; the probe's name stays.
+    """
+    run = _run_dir(tmp_path, {"test_spec_split.py": SECRET_ASSERTION})
+    _invoke(run, _target(tmp_path))
+    log = (run / "verifier-spec-tests.log").read_text()
+
+    # The visible probe's block is untouched — it is the actionable evidence.
+    assert "visible detail" in log
+    assert "fails closed" in log
+
+    # The held-out one contributes its nodeid and nothing else.
+    assert "test_held_out_fails" in log
+    assert "empty value" not in log
+    assert "secret expectation" not in log
+    assert "assert 7 == 42" not in log
+    assert "[held-out probe" in log
+
+
+def test_redaction_hides_a_setup_error_and_spares_the_summary() -> None:
+    """A held-out test that dies in a fixture is still that test.
+
+    The `-rA` summary repeats the nodeid below a `=====` banner; it is what
+    keeps the probe in the verdict, so the banner must end the hidden block.
+    """
+    output = (
+        "____ ERROR at setup of test_hidden ____\n"
+        "fixture 'the empty-value knob' not found\n"
+        "=== short test summary info ===\n"
+        "FAILED test_spec.py::test_hidden\n")
+    redacted = VT.redact_held_out(output, {"test_hidden"})
+    assert "empty-value knob" not in redacted
+    assert "FAILED test_spec.py::test_hidden" in redacted
+    assert "[held-out probe" in redacted
+
+
 # ── parametrized probes inherit the mark ───────────────────────────────────
 
 PARAMETRIZED = '''\
@@ -339,9 +395,10 @@ def test_held_out_cases(key):
 def test_parametrized_cases_inherit_the_held_out_mark(tmp_path) -> None:
     """A parametrized probe is ONE probe: one manifest entry, one held-out mark.
 
-    `classify` walks the AST, so `selected` holds the function while pytest
-    reports a case. Both sides are compared through `probe_function`, so a
-    failing case inherits the mark instead of reading as visible.
+    `classify` walks the AST, so the manifest lists the function while pytest
+    reports a case. Both sides are compared through `_unit_key`, which drops
+    the `[case-id]`, so a failing case inherits the mark — in the payload and
+    in the redacted evidence log alike.
     """
     run = _run_dir(tmp_path, {"test_spec_param.py": PARAMETRIZED})
     proc = _invoke(run, _target(tmp_path))
