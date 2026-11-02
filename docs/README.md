@@ -15,6 +15,9 @@ previous one.
 
 ## The pages people look for by name
 
+- **[Setup, for an agent](../SETUP.md)** — the protocol to hand a coding agent
+  instead of this page: its own attention budget, one plan, one confirmation,
+  and no secret ever typed into the conversation.
 - **[Architecture](architecture/)** — the system's shape, with the verification
   stack and the artifact-graph contracts.
 - **[UI and API](UI.md)** — the IDE, the JSON API, and the attention taxonomy
@@ -39,3 +42,4 @@ tests, and they are the ones to trust without re-reading the code:
 | Every module, knob and state row in the verification-stack table | `tests/unit/test_verification_stack_doc_py.py` |
 | The learning loop is closed and default-ON, cold start included | `tests/unit/test_learning_loop_closure_py.py` |
 | Every `mini-ork <verb>` this guide cites exists, every link resolves, and every recipe declares a task class | `tests/unit/test_docs_commands_py.py` |
+| `SETUP.md` names only real commands and flags, states a budget it keeps, and gives no way to type a secret into a chat | `tests/unit/test_setup_doc_py.py` |
