@@ -425,15 +425,27 @@ def render(result: Mapping) -> str:
     return "\n".join(lines) + "\n"
 
 
-def main(argv: Iterable[str] | None = None, root: str | None = None) -> int:
+def build_parser():
+    """The one declaration of this command's flags.
+
+    ``main`` parses with it, and so does ``tests/unit/test_ide_pages_actions.py``
+    — every ``{"cli": [...]}`` a page offers must parse against the parser the
+    command actually uses, and an inline ``ArgumentParser`` is invisible to it.
+    """
     import argparse
-    import sys
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--profile")
     parser.add_argument("--home")
     parser.add_argument("-h", "--help", action="store_true")
+    return parser
+
+
+def main(argv: Iterable[str] | None = None, root: str | None = None) -> int:
+    import sys
+
+    parser = build_parser()
     try:
         args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     except SystemExit:

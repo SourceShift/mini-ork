@@ -14,6 +14,56 @@ compile it. It reaches mini-ork only through the CLI (`mini-ork board …`,
 below. There is no web frontend here any more — the old React SPA and the
 OpenHands `agent-canvas` fork it was replaced with have both been removed.
 
+## What needs a person: the attention taxonomy
+
+Every surface that says "needs you" says it through one declared table,
+`mini_ork.attention.TAXONOMY`. A run is always in exactly one of four stages:
+
+| stage | meaning |
+|---|---|
+| `person` | nothing moves until a human acts |
+| `working` | the run is moving; waiting is the only action |
+| `idle` | nothing has started |
+| `ended` | over — done, or failed in a way that cannot be retried as-is |
+
+`stage_of(run_id)` answers from the stores that already hold the facts
+(`task_runs.status`, `mo_inbox_gates`, the cost-pause sentinel, the workspace
+records, the retry hint); it is derived, never persisted, so the terminal and
+the IDE cannot drift. The IDE's `outcome.resolve` words map onto it exactly:
+`running → working`, `needs_you → person`, `failed → retry` (when the hint is
+retryable, otherwise `ended`), `done → ended`.
+
+The rows, in the order the inbox prints them — severity, not arrival:
+
+| key | label | waits for | what to do | command |
+|---|---|---|---|---|
+| `cost_pause` | Paused | your budget decision | raise the budget, then resume | `mini-ork resume <run>` |
+| `merge_approval` | Needs you | your approval to merge | read the diff, approve or reject | `mini-ork approvals approve <run>` |
+| `node_review` | Needs you | your review of one node | accept the node or send it back | `mini-ork approvals approve <run> --node <node>` |
+| `worktree` | Needs you | your keep-or-discard decision | inspect, then merge or discard | `mini-ork board merge <run>` |
+| `retry` | Failed | your retry decision | read the retry hint, then retry | `mini-ork board retry <run>` |
+| `oversight_gate` | Needs you | your resolution of a gate | approve or reject the gate | `mini-ork oversight --resolve <inbox> --status approved` |
+
+Oversight is last on purpose: resolving one does not unblock a run, and it is
+the only channel that accumulates (`oversight --calibrate` measures exactly
+that).
+
+`mini-ork inbox` prints the union — the six rows above, one row per run, never
+two decisions for the same run:
+
+```bash
+mini-ork inbox            # human page, capped at 40 with a "showing N of M"
+mini-ork inbox --json     # {"rows": [...], "total": N}; each row has run_id,
+                          # what, why, next, label, state
+mini-ork inbox --limit 5
+```
+
+Both tiers use the same command. It is read-only and needs no server: it
+resolves `MINI_ORK_HOME` like every other subcommand, opens `state.db`
+read-only, and never writes a retry hint into a run directory. The mutation is
+always the `next:` command on the row — the inbox tells you what to run and
+runs nothing itself.
+
 ## Building the IDE
 
 The crate cannot be built from this repo: it is a member of the fork's cargo

@@ -23,6 +23,13 @@ from mini_ork.stores import migrate as mig
 
 REPO = Path(__file__).resolve().parents[2]
 
+#: In-process handlers whose argparse lives outside ``mini_ork.cli``. A name
+#: missing from this map AND from ``_NATIVE_MODULE_SUBS`` is a page action with
+#: no parser to check, which is what the test below exists to catch.
+_INPROCESS_PARSER_MODULES = {
+    "doctor": "mini_ork.doctor",
+}
+
 
 @pytest.fixture()
 def home(tmp_path: Path) -> Path:
@@ -109,6 +116,12 @@ def _parser_for_action(head: str) -> argparse.ArgumentParser | None:
     # built-in that is not in ``_NATIVE_MODULE_SUBS``.
     module_map = getattr(cli_main, "_NATIVE_MODULE_SUBS", None) or {}
     module_name = module_map.get(head)
+    if module_name is None:
+        # In-process handlers (`registry["doctor"]`, `registry["board"]`, …) are
+        # not in the native table because they are not module dispatches. The
+        # ones whose module lives outside `mini_ork.cli` are named here so a
+        # page action still has a parser to check against.
+        module_name = _INPROCESS_PARSER_MODULES.get(head)
     if module_name is None:
         module_name = f"mini_ork.cli.{head.replace('-', '_')}"
     try:

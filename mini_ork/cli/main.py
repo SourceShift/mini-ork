@@ -179,6 +179,11 @@ Lifecycle:
   vault                          Report which secret sources are wired, and where a key lives
   validate                       Pre-run static checks with Fix: hints
   garden                         Drift detection (collisions, orphans, stale runs)
+  inbox [--json] [--limit N]     Everything waiting on you, in one ordered list:
+                                   paused runs, merge and node approvals,
+                                   worktrees to keep or discard, retryable
+                                   failures, oversight gates — each with the
+                                   command that resolves it
   supervise [--once]             Sweep parked self-driving runs: revive when the
                                    fix landed, label diagnoses, clear orphans
   graph-patch list|propose|validate|apply|credit
@@ -2623,6 +2628,16 @@ def _board_handler(rest, root):
     return board_cmd.main(rest, root=root)
 
 
+def _inbox_handler(rest, root):
+    # One attention surface, derived from the existing sources rather than
+    # re-derived: the taxonomy and the stage resolver live in
+    # ``mini_ork/attention.py`` so the IDE's outcome page and this command
+    # answer "what needs a person?" with the same four words.
+    from mini_ork import attention
+
+    return attention.main(rest, root=root)
+
+
 def _build_default_registry() -> dict:
     registry = {sub: _native_module_handler(f"mini_ork.cli.{sub}") for sub in _NATIVE_SUBS}
     # "recipe-eval" is native too, but the dash is not importable in a module
@@ -2646,6 +2661,11 @@ def _build_default_registry() -> dict:
     # MINI_ORK_ROOT and cwd=root itself, so it does not need the child-env
     # protection `_module_env` adds.
     registry["board"] = _board_handler
+    # `inbox` is in-process for the same reason `board` is: it is a read-only
+    # union of five stores, and the IDE can poll it at the rate it polls the
+    # board. Registered here and not in `_NATIVE_MODULE_SUBS`, whose exact
+    # mapping is pinned by tests/unit/test_native_dispatch_py.py.
+    registry["inbox"] = _inbox_handler
     registry["run"] = _run_handler
     registry["doctor"] = _doctor_handler
     registry["install"] = _install_handler
