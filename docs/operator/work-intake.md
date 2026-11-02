@@ -41,7 +41,7 @@ mandate (`mini_ork/intake/mandate.py`):
 | `scope_ref` | the ticket uid |
 | `rule_ids` | the trigger rules in force, as `key:value` — `[]` means none were configured |
 | `policy_version` | `tv-<hash>` over the source's trigger settings only |
-| `strength` | `granted`, `refused` (rules did not select it) or `denied` (a policy said no) |
+| `strength` | `granted`, `refused` (the rules do not select it now) or `denied` (a policy said no) |
 | `detail` | the refusal reason, the policy's reason, or the dispatch detail |
 | `decided_by` / `decision_id` | the policy that decided, and its `policy_decisions` row |
 | `thread_id`, `at` | where it landed, and when |
@@ -63,15 +63,31 @@ The mandate is a **record**, never an input: nothing reads it to decide whether
 to run. It exists so an operator can tell "no rule matched" from "the poller
 never ran", and so a denial can be followed into its policy decision.
 
+## The rules are re-read on every arrival
+
+`dispatch_issue` re-runs the trigger check against the ticket the source serves
+*now*, before choosing launch, continue or steer. The poll's mirror is a cache;
+this is the authoritative check. It is also what makes the mandate live rather
+than historical: if the label was removed, the next arrival is `refused` and the
+thread is neither continued nor steered — a run does not keep receiving work
+under an authority nobody grants any more.
+
+The expensive path is unchanged: the poll still filters the mirror first, so an
+unmatching board costs one sync and zero dispatches. The re-check only runs for
+a ticket that already passed the mirror filter.
+
 ## Refusals are promoted, dispatches are final
 
 A refused arrival is recorded — that is what stops silence from being ambiguous.
+Its ledger action is `refused` (a rule did not match, or a policy said no), and
+its mandate says which of the two and why.
+
 But a refusal is a judgement about the ticket's *current* state, and some
 sources do not move `updated_at` when a label is added. So when the same
 delivery id arrives again and now dispatches, the refused row is **promoted in
 place** (`record_intake_event`) instead of being folded into the refusal. Once a
 row says `launched` / `continued` / `steered`, a replay folds into it and is
-reported as `duplicate`.
+reported as `duplicate` — a completed action is final.
 
 ## Running it
 

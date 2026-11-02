@@ -125,9 +125,16 @@ INTAKE_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 #: The actions that mean "this arrival put work on the machine". A ledger row
-#: holding one of these is final: a replay folds into it. ``skipped`` is not
-#: final — see :func:`record_intake_event`.
+#: holding one of these is final: a replay folds into it.
 DISPATCH_ACTIONS: frozenset[str] = frozenset({"launched", "continued", "steered"})
+
+#: The actions that mean "this arrival was looked at and not dispatched". They
+#: are *judgements about the ticket's state*, not completed work, so a later
+#: arrival of the same delivery may replace them — see
+#: :func:`record_intake_event`. ``refused`` is a trigger that no longer matches
+#: (or a policy that said no); ``skipped`` is the same kind of non-event
+#: recorded by a poll that did not even dispatch.
+NON_FINAL_ACTIONS: frozenset[str] = frozenset({"skipped", "refused"})
 
 
 def _db_path(db: str | None) -> str:
@@ -712,13 +719,13 @@ def record_intake_event(
     ``mandate`` is the admission record (:mod:`mini_ork.intake.mandate`),
     stored as JSON. It is a record, never an input.
 
-    **A skip is promoted, a dispatch is final.** A refused arrival is recorded
-    so "no rule matched" stops looking like "never polled". But a refusal is a
-    judgement about the ticket's *current* state, and some sources do not move
-    ``updated_at`` when a label is added — so the same delivery id can arrive
-    again after the ticket became eligible. When the stored action is
-    ``skipped`` and the new one dispatched work, the row is updated in place
-    instead of being folded into the refusal forever.
+    **A refusal is promoted, a dispatch is final.** A refused arrival is
+    recorded so "no rule matched" stops looking like "never polled". But a
+    refusal is a judgement about the ticket's *current* state, and some sources
+    do not move ``updated_at`` when a label is added — so the same delivery id
+    can arrive again after the ticket became eligible. When the stored action
+    is in :data:`NON_FINAL_ACTIONS` and the new one dispatched work, the row is
+    updated in place instead of being folded into the refusal forever.
     """
     now = _now()
     with _write(db) as con:
@@ -735,7 +742,7 @@ def record_intake_event(
             (provider, delivery_id),
         ).fetchone()
         if (action in DISPATCH_ACTIONS and stored is not None
-                and (stored["action"] or "") == "skipped"):
+                and (stored["action"] or "") in NON_FINAL_ACTIONS):
             con.execute(
                 "UPDATE intake_events SET payload_hash = ?, issue_uid = ?, "
                 "thread_id = ?, action = ?, detail = ?, run_id = ?, mandate_json = ? "

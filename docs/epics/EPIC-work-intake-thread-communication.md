@@ -162,9 +162,13 @@ and a policy that refused admission left no trace.
   source's trigger settings), `strength` (`granted`/`refused`/`denied`),
   `decided_by`, `decision_id`. `refused` rows are written on a non-match and a
   closed-since-sync ticket, so silence always has a reason.
-- A refusal is **promoted in place** when the same delivery later dispatches
-  (some sources add a label without bumping `updated_at`); a dispatched row is
-  final and a replay folds into it.
+- The trigger rules are **re-read on the freshly fetched ticket** before the
+  launch/continue/steer branch, so a removed label stops the continuation and
+  the steer too — the mandate is a live check, not a historical note
+  (`Delivery`/`Dispatch` action `refused`; no second `thread_runs` row).
+- A refusal (`action='refused'`) is **promoted in place** when the same delivery
+  later dispatches (some sources add a label without bumping `updated_at`); a
+  dispatched row is final and a replay folds into it.
 - `threads show <id>` prints the mandate history; `--json` carries it under
   `intake`. Column added by `0086_intake_events_mandate_json.sql` plus the
   `_ensure_intake_columns` runtime twin.

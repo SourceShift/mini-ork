@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mini_ork.intake import mandate as mandate_mod
-from mini_ork.intake.trigger import Trigger
+from mini_ork.intake.trigger import NO_TRIGGER, Trigger, matches_trigger
 from mini_ork.pm.model import Comment, Issue, Priority, split_uid
 from mini_ork.pm.provider import Provider, ProviderError
 from mini_ork.pm.store import IssueRow
@@ -253,6 +253,55 @@ def _admit(
     return allowed, detail, decided_by, decision_id
 
 
+def _refuse(
+    provider: Provider,
+    issue: Issue,
+    delivery_id: str,
+    *,
+    source: str,
+    trigger: Trigger | None,
+    detail: str,
+    db: str | None,
+    strength: str = "refused",
+    decided_by: str = "",
+    decision_id: str = "",
+) -> Dispatch:
+    """End an arrival without dispatching it, and say so in the ledger.
+
+    ``strength`` separates the two reasons a selected ticket can still be
+    refused: the rules no longer match it (``refused``) or a policy said no
+    (``denied``). Both leave the same trace, because both are the answer to
+    "why is nothing running?".
+    """
+    store.record_intake_event(
+        provider.id,
+        delivery_id,
+        payload_hash(f"{issue.uid}@{issue.updated_at or ''}"),
+        issue_uid=issue.uid,
+        thread_id=None,
+        action="refused",
+        detail=detail,
+        mandate=mandate_mod.build(
+            actor=provider.id,
+            source=source,
+            scope_ref=issue.uid,
+            trigger=trigger,
+            strength=strength,
+            detail=detail,
+            decided_by=decided_by,
+            decision_id=decision_id,
+        ),
+        db=db,
+    )
+    return Dispatch(
+        issue_uid=issue.uid,
+        delivery_id=delivery_id,
+        thread_id="",
+        action="refused",
+        detail=detail,
+    )
+
+
 def record_refusal(
     *,
     provider_id: str,
@@ -277,7 +326,7 @@ def record_refusal(
         delivery_id,
         payload_hash(f"{issue_uid}@{updated_at}"),
         issue_uid=issue_uid,
-        action="skipped",
+        action="refused",
         detail=detail,
         mandate=mandate_mod.build(
             actor=provider_id,
@@ -329,11 +378,17 @@ def dispatch_issue(
     handed, so the decision "does this ticket already have one" has to be made
     here, from the ledger and the origin ref rather than from the id.
 
-    **Admission comes before all three.** ``intake_admission`` events are
-    evaluated against the registered policies first; a DENY (or a policy that
-    raises, which counts as one) ends the call here with a ``skipped`` dispatch
-    and a refusal in the ledger. ``deliver`` is never reached, so no thread, no
-    run and no spend exist for a ticket the operator's rules refused.
+    **Two gates come before all three.** The trigger rules are re-run on the
+    freshly read ticket — a stale mirror row, or a label removed since the last
+    arrival, must not continue or steer a run nobody permits any more — and then
+    the ``intake_admission`` policies are evaluated. Either one saying no ends
+    the call here with a ``refused`` dispatch and a ledger row. ``deliver`` is
+    never reached, so no thread, no run and no spend exist for a ticket the
+    rules or the policies refused.
+
+    Re-validation is what makes the mandate a *live* check: without it a rule
+    change would leave every existing thread running under an authority nobody
+    grants any longer, because ``deliver`` decides from run liveness alone.
 
     The ledger row is written here rather than by the caller because here is
     where both halves are known — the delivery id that identifies the arrival
@@ -348,36 +403,31 @@ def dispatch_issue(
     say *that* admission was allowed but not *by what*.
     """
     delivery_id = delivery_id or delivery_id_for(issue)
+
+    # The rules are re-run here, on the freshly read ticket, even when the
+    # caller already filtered a mirror row: a mirror is a cache, and this is the
+    # only place that sees the ticket the source serves now. It is also what
+    # makes the mandate a *live* check rather than a historical note — a label
+    # removed since the last arrival stops the continuation and the steer too,
+    # not just the first launch.
+    if trigger is not None:
+        permitted, why = matches_trigger(issue, trigger)
+        if not permitted:
+            return _refuse(
+                provider, issue, delivery_id,
+                source=source, trigger=trigger, db=db,
+                detail=f"no longer permitted: {why}" if why != NO_TRIGGER else why,
+            )
+
     allowed, denied_detail, decided_by, decision_id = _admit(
         provider, issue, source=source, recipe=recipe, trigger=trigger, db=db,
     )
     if not allowed:
-        store.record_intake_event(
-            provider.id,
-            delivery_id,
-            payload_hash(f"{issue.uid}@{issue.updated_at or ''}"),
-            issue_uid=issue.uid,
-            thread_id=None,
-            action="skipped",
-            detail=denied_detail,
-            mandate=mandate_mod.build(
-                actor=provider.id,
-                source=source,
-                scope_ref=issue.uid,
-                trigger=trigger,
-                strength="denied",
-                detail=denied_detail,
-                decided_by=decided_by,
-                decision_id=decision_id,
-            ),
-            db=db,
-        )
-        return Dispatch(
-            issue_uid=issue.uid,
-            delivery_id=delivery_id,
-            thread_id="",
-            action="skipped",
-            detail=denied_detail,
+        return _refuse(
+            provider, issue, delivery_id,
+            source=source, trigger=trigger, db=db,
+            detail=denied_detail, strength="denied",
+            decided_by=decided_by, decision_id=decision_id,
         )
 
     live = store.live_run_for_issue(issue.uid, db=db)

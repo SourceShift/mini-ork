@@ -149,6 +149,11 @@ class PollReport:
         appeared on someone's ticket. A report that was skipped (write-back off)
         or merely previewed does not — like a skipped dispatch, it is the
         ordinary state.
+
+        ``refused`` counts: the ticket *was* selected and something then said no
+        (a rule re-read on the live ticket, or an admission policy). That is a
+        change in what the board permits, not the ordinary silence of an
+        unmatching ticket.
         """
         return bool(self.error) or any(
             outcome.action not in ("skipped", "duplicate") for outcome in self.outcomes

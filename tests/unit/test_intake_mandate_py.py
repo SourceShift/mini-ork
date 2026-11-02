@@ -55,7 +55,7 @@ class _Source:
         return ()
 
 
-def _issue(*, updated_at: str = "2026-10-11T09:00:00Z") -> Issue:
+def _issue(*, updated_at: str = "2026-10-11T09:00:00Z", labels: tuple[str, ...] = ("agent",)) -> Issue:
     return Issue(
         identity=ProviderIdentity(
             provider="github",
@@ -68,7 +68,7 @@ def _issue(*, updated_at: str = "2026-10-11T09:00:00Z") -> Issue:
         native_state="open",
         description="Retries drop 429s on the second attempt.",
         priority=Priority.NONE,
-        labels=("agent",),
+        labels=labels,
         assignee="amir",
         updated_at=updated_at,
     )
@@ -116,6 +116,20 @@ def launches(monkeypatch) -> list[dict]:
     return calls
 
 
+@pytest.fixture
+def steers(monkeypatch) -> list[dict]:
+    import mini_ork.web.control as control
+
+    calls: list[dict] = []
+
+    def fake(db, task_run_id, message, **kwargs):
+        calls.append({"run_id": task_run_id, "message": message, **kwargs})
+        return {"ok": True, "steering_id": 7}
+
+    monkeypatch.setattr(control, "steer_run", fake)
+    return calls
+
+
 def _deny(event, config=None):
     return {"result": "DENY", "reason": "not now", "policy_name": "deny_all"}
 
@@ -139,7 +153,7 @@ def test_a_deny_never_reaches_deliver(home, db, launches):
     engine.register_policy("deny_all", _deny)
     outcome = dispatch_issue(home, _Source(_issue()), _issue(), trigger=RULES, db=db)
 
-    assert outcome.action == "skipped"
+    assert outcome.action == "refused"
     assert outcome.started is False
     assert outcome.run_id is None
     assert launches == [], "a refused ticket must not start a run"
@@ -157,7 +171,7 @@ def test_a_denial_is_recorded_as_a_mandate(home, db, launches):
 
     event = store.intake_event("github", outcome.delivery_id, db=db)
     assert event is not None
-    assert event.action == "skipped"
+    assert event.action == "refused"
     assert event.thread_id is None
     assert event.mandate is not None
     assert event.mandate["strength"] == "denied"
@@ -179,7 +193,7 @@ def test_a_raising_policy_fails_closed(home, db, launches):
     engine.register_policy("broken", boom)
     outcome = dispatch_issue(home, _Source(_issue()), _issue(), db=db)
 
-    assert outcome.action == "skipped"
+    assert outcome.action == "refused"
     assert launches == []
     assert "config unreadable" in (outcome.detail or "")
     assert _decisions(db) == [("intake_admission", "broken", "DENY")]
@@ -195,7 +209,7 @@ def test_require_approval_does_not_start_work(home, db, launches):
         },
     )
     outcome = dispatch_issue(home, _Source(_issue()), _issue(), db=db)
-    assert outcome.action == "skipped"
+    assert outcome.action == "refused"
     assert launches == []
 
 
@@ -237,6 +251,56 @@ def test_the_mandate_without_a_trigger_says_so(home, db, launches):
     assert mandate["policy_version"] == ""
 
 
+# ── the rules are re-read on the ticket the source serves now ──────────────
+
+
+def test_a_ticket_that_lost_its_label_is_refused_not_continued(home, db, launches):
+    """The resumed-run hole: `deliver` decides from liveness alone, so without
+    a re-check a label removed yesterday would keep the thread alive today."""
+    first = dispatch_issue(home, _Source(_issue()), _issue(), trigger=RULES, db=db)
+    assert first.action == "launched"
+    store.settle_run(first.run_id, store.RunStatus.FINISHED, db=db)
+
+    # The label was taken off between the two arrivals.
+    relabelled = _issue(updated_at="2026-10-12T09:00:00Z", labels=())
+    outcome = dispatch_issue(home, _Source(relabelled), relabelled, trigger=RULES, db=db)
+
+    assert outcome.action == "refused"
+    assert "no longer permitted" in (outcome.detail or "")
+    assert launches == [launches[0]], "a refused resume must not start attempt 2"
+    assert [run.attempt for run in store.runs_for(first.thread_id, db=db)] == [1]
+
+    event = store.intake_event("github", outcome.delivery_id, db=db)
+    assert event.action == "refused"
+    assert event.mandate["strength"] == "refused"
+    assert event.mandate["rule_ids"] == ["trigger_label:agent", "trigger_recipe:code-fix"]
+
+
+def test_a_ticket_that_lost_its_label_is_not_steered(home, db, launches, steers):
+    """A live run is not a licence to keep feeding it work either."""
+    started = dispatch_issue(home, _Source(_issue()), _issue(), trigger=RULES, db=db)
+    relabelled = _issue(updated_at="2026-10-12T09:00:00Z", labels=())
+    outcome = dispatch_issue(home, _Source(relabelled), relabelled, trigger=RULES, db=db)
+
+    assert started.action == "launched"
+    assert outcome.action == "refused"
+    assert steers == []
+
+
+def test_a_refusal_on_revalidation_is_promoted_once_the_label_returns(home, db, launches):
+    """Refused rows are not final: the same delivery arriving after the ticket
+    is eligible again dispatches, and the ledger says so."""
+    relabelled = _issue(labels=())
+    first = dispatch_issue(home, _Source(relabelled), relabelled, trigger=RULES, db=db)
+    assert first.action == "refused"
+
+    again = dispatch_issue(
+        home, _Source(_issue()), _issue(), trigger=RULES, delivery_id=first.delivery_id, db=db
+    )
+    assert again.action == "launched"
+    assert store.intake_event("github", first.delivery_id, db=db).action == "launched"
+
+
 # ── refusals, and their promotion ──────────────────────────────────────────
 
 
@@ -251,7 +315,7 @@ def test_a_refusal_records_the_rules_it_was_tested_against(home, db):
         db=db,
     )
     event = store.intake_event("github", "d-1", db=db)
-    assert event.action == "skipped"
+    assert event.action == "refused"
     assert event.mandate["strength"] == "refused"
     assert event.mandate["rule_ids"] == ["trigger_label:agent"]
 
