@@ -87,10 +87,13 @@ edges:
 
 **Common edge types:** `depends_on` `supplies_context_to` `verifies` `blocks` `retries` `escalates_to`. Some shipped recipes also use product-flow edges such as `human_decision_gate` and `verifies_user_choice`; treat those as live recipe dialect extensions until the schema is aligned.
 
-There is no top-level `mini-ork validate` command yet. Until recipe validation is wired, use an existing recipe as the reference, then dry-run the recipe:
+Validate the recipe before running it — `mini-ork validate` checks the recipe's
+files and workflow for the failures that otherwise surface as a hollow plan
+twenty minutes into a run:
 
 ```bash
-MINI_ORK_DRY_RUN=1 bin/mini-ork run my-recipe kickoff.md
+mini-ork validate --recipe my-recipe      # static checks, each with a Fix: hint
+MINI_ORK_DRY_RUN=1 mini-ork run my-recipe kickoff.md
 ```
 
 ### Node type dispatch semantics

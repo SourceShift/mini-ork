@@ -4,9 +4,13 @@ How mini-ork records what happened on a run and uses it to route the **next**
 run better — the full write → store → read cycle, the five learning signals,
 and how to prove the loop is closed.
 
-> **Status (2026-06-23):** Closed and **default-ON** for real runs. Verified by
-> `scripts/learning-loop-closure-gate.sh` (14/14) and
-> `scripts/smoke-learning-loops.sh` (10/10).
+> **Status (2026-11-02):** Closed and **default-ON** for real runs. The proof is
+> `tests/unit/test_learning_loop_closure_py.py`, which runs on a freshly
+> migrated database — including the cold-start path — and makes no model call:
+>
+> ```bash
+> python3 -m pytest -q tests/unit/test_learning_loop_closure_py.py
+> ```
 
 ---
 
@@ -52,7 +56,7 @@ existed.
 
 | Signal | Table | Writer | When | What it captures |
 |---|---|---|---|---|
-| **PRM** (Process Reward) | `execution_traces.process_reward` | `lib/process_reward.sh::prm_score_trace` | inline, per node | heuristic 0–1 quality of one node's work |
+| **PRM** (Process Reward) | `execution_traces.process_reward` | `mini_ork/learning/process_reward.py::score_trace` | inline, per node | heuristic 0–1 quality of one node's work |
 | **GRPO** (Group Relative Policy Opt.) | `agent_performance_memory.relative_advantage` | `mo_learning_write_grpo_advantages` (`mini_ork/cli/execute.py`) | end-of-run | which lane beats its peers on a task class |
 | **RHO** (prompt win rates) | `prompt_win_rates` | `mini_ork/learning/rho_aggregator.py::aggregate_win_rates` (native and called by the Python reflect entrypoint) | reflect / conductor | which prompt version wins per task class |
 | **Conductor writeback** | `conductor_decisions.outcome` / `realized_score` | `mo_learning_update_conductor_outcomes` (`mini_ork/cli/execute.py`) | end-of-run | did the chosen topology/recipe pay off |
@@ -60,7 +64,8 @@ existed.
 
 A sixth, longer-horizon loop — **self-improve / gradient** (`gradient_records`,
 4597 live rows) — is produced by `mini_ork/learning/reflection_pipeline.py`,
-`mini_ork/learning/gradient_extractor.py`, and `lib/cross_epic_gradient.sh`. It proposes
+`mini_ork/learning/gradient_extractor.py`, and the scheduler's carry-over
+builder. It proposes
 prompt/role/recipe *changes* rather than per-run lane routing, and is documented
 separately in `docs/RECURSIVE-SELF-IMPROVE.md`.
 
@@ -97,10 +102,10 @@ the same card for a script. Route `source=pinned` is called out in words,
 because a recipe pin beats the router and no learning signal is attributable to
 it.
 
-### 3.2 PRM scoring (`lib/process_reward.sh`)
+### 3.2 PRM scoring (`mini_ork/learning/process_reward.py`)
 
-Immediately after the trace lands, `_trace_write_node_rich` calls
-`prm_score_trace` (gated on `MO_PRM_SCORE`, **default 1**, `:1103`). The
+Immediately after the trace lands, the trace writer calls
+`score_trace` (gated on `MO_PRM_SCORE`, **default 1**). The
 heuristic, additive, capped at 1.0:
 
 | Signal | Points |
@@ -145,10 +150,10 @@ Rows upsert on `(agent_version_id, task_class)`.
 
 ## 4. Read half — how the next run uses the signal
 
-### 4.1 The routing seam (`_mo_policy_route_lane`, `mini_ork/cli/execute.py`)
+### 4.1 The routing seam (`policy_route_lane`, `mini_ork/dispatch/routing.py`)
 
-```bash
-local policy="${MO_ROUTING_POLICY:-learning_governed}"   # default ON
+```python
+policy = os.environ.get("MO_ROUTING_POLICY") or "learning_governed"   # default ON
 ```
 
 Policies: `workflow_default` (use recipe lane verbatim), `frontier_only`,
@@ -156,30 +161,34 @@ Policies: `workflow_default` (use recipe lane verbatim), `frontier_only`,
 `trace_governed` (escalate after a prefix failure), and **`learning_governed`**
 (the default).
 
-### 4.2 `learning_governed` (`_mo_learning_governed_lane`, `:157`)
+### 4.2 `learning_governed` (`lane_router._pick_lane`)
 
-It first computes a **static-hybrid baseline**, then tries to improve it from the
-data with a **strict AND-gate**:
+It walks the **narrowest slice with enough evidence** and falls back to the
+dispatcher's static lane:
 
 ```mermaid
 flowchart TD
-    A[node + task_class] --> B{prompt_win_rates row?<br/>sample_size >= MO_LEARNING_MIN_SAMPLES}
-    B -- no --> F[return static fallback lane]
-    B -- yes --> C{agent_performance_memory row?<br/>relative_advantage > 0<br/>runs_count >= min_samples}
-    C -- no --> F
-    C -- yes --> W[return that agent_version_id<br/>the learned winning lane]
+    A[node + task_class + objective_domain] --> R{region slice<br/>runs >= MO_LEARNING_MIN_SAMPLES}
+    R -- yes --> W[rank candidates<br/>relative_advantage, UCB]
+    R -- no --> D{domain slice<br/>runs >= min_samples}
+    D -- yes --> W
+    D -- no --> G{global slice<br/>runs >= min_samples}
+    G -- yes --> W
+    G -- no --> F[return the recipe's configured lane]
+    W --> S[return the winning lane + margin]
 ```
 
-Both conditions must hold:
-1. a `prompt_win_rates` row exists for this `task_class` with
-   `sample_size >= MO_LEARNING_MIN_SAMPLES` (default **3**), **and**
-2. an `agent_performance_memory` row with `relative_advantage > 0` and
-   `runs_count >= min_samples`.
+The evidence is `agent_performance_memory.relative_advantage` — the GRPO write
+— per `(lane, task_class)` and optionally per `(objective_domain, code_region)`.
+`prompt_win_rates` is **not** read on this path: RHO feeds the reflector and the
+learning dashboard, not the router. (An earlier revision of this doc claimed a
+`prompt_win_rates` precondition; no query ever implemented it, so the claim was
+deleted rather than the routing decision changed.)
 
-If either misses — a **cold or vacuous** learning store — it returns the static
-fallback. This is what makes default-ON safe: with no data, `learning_governed`
-behaves exactly like the recipe's configured lane. Learning can only *add* a
-routing override once it has earned the evidence; it can never subtract.
+With no row at or above the sample floor — a **cold or vacuous** learning store
+— the configured lane comes back unchanged. That is what makes default-ON safe:
+learning can only *add* an override once it has earned the evidence; it never
+subtracts one.
 
 ---
 
@@ -200,31 +209,27 @@ ON in `mini_ork/cli/execute.py`:
 
 ## 6. Validation
 
-Two repeatable checks, both read-only and run on a temp/live DB without
-dispatching:
+One repeatable check, read-only, no dispatch and no model call:
 
 ```bash
-# Source defaults + live schema/data are all green (14 assertions)
-bash scripts/learning-loop-closure-gate.sh
-# → "LEARNING LOOP: CLOSED — default-ON for real runs"
-
-# End-to-end machinery on a throwaway DB copy (10 assertions): PRM seeds,
-# GRPO swaps cheap_lens→frontier_lens, conductor writeback marks success,
-# grounded_rejections records a refuted draft
-bash scripts/smoke-learning-loops.sh
-# → "SUMMARY 10 passed, 0 failed"
+python3 -m pytest -q tests/unit/test_learning_loop_closure_py.py
 ```
 
-The closure gate proves **two** evidence classes — neither alone is sufficient:
+It proves **two** evidence classes — neither alone is sufficient:
 
-- `[CODE]` — grep the source to prove the policy/PRM/writeback fire by default
-  (machinery is *on*, not opt-in).
-- `[LIVE]` — query `state.db` to prove the schema + data exist to record and
-  read learnings (the DB can actually *store* a result).
+- `[CODE]` — the source lines that make the policy, PRM scoring and writeback
+  fire by default, so "on" is not an opt-in the operator forgot to set.
+- `[LIVE]` — the columns and tables the loop needs, asserted on a **freshly
+  migrated** database. Cold start is the tested path: the loop must be closed
+  on a project that has never run anything, which is the state a new user is
+  in.
+- Behaviour, where a grep would be weak: PRM separates success from failure,
+  the GRPO writer is a no-op (not a crash) on an empty store, and an unset
+  `MO_ROUTING_POLICY` really does select `learning_governed`.
 
-A loop is "closed always" only when both are green: otherwise you have machinery
-that could learn but is switched off, or switched on against a DB that cannot
-store the outcome.
+A loop is "closed always" only when every class is green: otherwise you have
+machinery that could learn but is switched off, or switched on against a DB
+that cannot store the outcome.
 
 ---
 
@@ -256,15 +261,14 @@ Two honest caveats:
 
 | Concern | Location |
 |---|---|
-| Routing seam + policies | `mini_ork/cli/execute.py` (`_mo_policy_route_lane`) |
-| Learning-governed gate | `mini_ork/cli/execute.py` (`_mo_learning_governed_lane`) |
-| Lane stamping onto trace | `mini_ork/cli/execute.py`, `:1079`, `:1037` |
-| PRM scorer | `lib/process_reward.sh` |
-| GRPO writer | `mini_ork/cli/execute.py` (`mo_learning_write_grpo_advantages`) |
-| Conductor writeback | `mini_ork/cli/execute.py` (`mo_learning_update_conductor_outcomes`) |
-| RHO aggregator | `mini_ork/learning/rho_aggregator.py` (native, used by the Python-sole reflect entrypoint) |
+| Routing seam + policies | `mini_ork/dispatch/routing.py` (`policy_route_lane`) |
+| Learning-governed gate | `mini_ork/lane_router.py` (`_pick_lane`) |
+| Lane stamping onto trace | `mini_ork/cli/execute.py` (`extra["agent_version_id"] = lane`) |
+| PRM scorer | `mini_ork/learning/process_reward.py` (`score_trace`) |
+| GRPO writer | `mini_ork/learning/writeback.py` (`write_grpo_advantages`) |
+| Conductor writeback | `mini_ork/learning/writeback.py` (`learning_update_conductor_outcomes`) |
+| RHO aggregator | `mini_ork/learning/rho_aggregator.py` (feeds the reflector, not the router) |
 | End-of-run writeback callsite | `mini_ork/cli/execute.py` |
-| Closure proof gate | `scripts/learning-loop-closure-gate.sh` |
-| Machinery smoke harness | `scripts/smoke-learning-loops.sh` |
+| Closure proof | `tests/unit/test_learning_loop_closure_py.py` |
 | Schema | `db/migrations/0039_learning_column_repairs.sql`, `0040_grounded_rejections.sql` |
 | Self-improve / gradient loop | `docs/RECURSIVE-SELF-IMPROVE.md` |
