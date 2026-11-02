@@ -605,3 +605,80 @@ def test_gate_unmeasured_reports_status_and_promotes(tmp_path,
     assert "reason" in result["judge_validity"]
     sidecar = tmp_path / "judge-validity"
     assert not sidecar.exists() or not any(sidecar.glob("*.json"))
+
+
+# ── shadow mode (measures, never quarantines) ───────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, "off"),
+        ("", "off"),
+        ("0", "off"),
+        ("false", "off"),
+        ("no", "off"),
+        ("off", "off"),
+        ("shadow", "shadow"),
+        ("Shadow", "shadow"),
+        ("SHADOW", "shadow"),
+        ("1", "enforce"),
+        ("true", "enforce"),
+        ("enforce", "enforce"),
+        ("yes", "enforce"),
+    ],
+)
+def test_mode_and_enabled_pairing(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("MO_JUDGE_VALIDITY", raising=False)
+    else:
+        monkeypatch.setenv("MO_JUDGE_VALIDITY", raw)
+    assert judge_validity.mode() == expected
+    assert judge_validity.enabled() == (expected != "off")
+
+
+def test_gate_shadow_records_below_floor_without_quarantining(
+        tmp_path, isolated_gate_env, monkeypatch):
+    db = _gate_db(tmp_path, judge_history="failing")
+    monkeypatch.setenv("MO_JUDGE_VALIDITY", "shadow")
+    result = promotion_evaluate(db, "cand-1")
+
+    assert result["decision"] == "promoted", "shadow never quarantines"
+    block = result["judge_validity"]
+    assert block["mode"] == "shadow"
+    assert block["status"] == "measured"
+    assert block["admit"] is False, "the below-floor measurement is recorded"
+    assert "judge_validity_below_threshold" not in json.dumps(result)
+    # Envelopes are the evidence shadow exists to gather.
+    assert (tmp_path / "judge-validity" / "glm.json").is_file()
+
+
+def test_gate_shadow_and_enforce_same_fixture(tmp_path, isolated_gate_env,
+                                              monkeypatch):
+    (tmp_path / "shadow").mkdir()
+    (tmp_path / "enforce").mkdir()
+    shadow = _gate_db(tmp_path / "shadow", judge_history="failing")
+    enforce = _gate_db(tmp_path / "enforce", judge_history="failing")
+
+    monkeypatch.setenv("MO_JUDGE_VALIDITY", "shadow")
+    shadow_result = promotion_evaluate(shadow, "cand-1")
+    assert shadow_result["decision"] == "promoted"
+    assert shadow_result["judge_validity"]["mode"] == "shadow"
+
+    monkeypatch.setenv("MO_JUDGE_VALIDITY", "1")
+    enforce_result = promotion_evaluate(enforce, "cand-1")
+    assert enforce_result["decision"] == "quarantined"
+    assert "mode" not in enforce_result["judge_validity"], (
+        "enforce keeps the pre-shadow record shape"
+    )
+
+
+def test_gate_shadow_unmeasured_records_mode_and_promotes(
+        tmp_path, isolated_gate_env, monkeypatch):
+    db = _gate_db(tmp_path, judge_history=None)
+    monkeypatch.setenv("MO_JUDGE_VALIDITY", "shadow")
+    result = promotion_evaluate(db, "cand-1")
+
+    assert result["decision"] == "promoted"
+    assert result["judge_validity"]["status"] == "unmeasured"
+    assert result["judge_validity"]["mode"] == "shadow"

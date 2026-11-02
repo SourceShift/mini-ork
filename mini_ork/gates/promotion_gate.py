@@ -477,18 +477,20 @@ def promotion_evaluate(
                 # against verifier_results; a measured lane below the agreement
                 # floor quarantines the would-be promote. Unmeasured never
                 # blocks, and envelopes are written only for measured lanes.
+                # `shadow` runs the same audit and records it, but never
+                # quarantines: it measures before anyone enforces.
                 try:
                     from mini_ork.gates import judge_validity
 
-                    jv_enabled = judge_validity.enabled()
+                    jv_mode = judge_validity.mode()
                 except Exception as exc:  # noqa: BLE001 — fail-open
                     print(
                         f"promotion_evaluate: judge-validity import failed: "
                         f"{exc}",
                         file=sys.stderr,
                     )
-                    jv_enabled = False
-                if jv_enabled:
+                    jv_mode = "off"
+                if jv_mode != "off":
                     jv: dict[str, Any] | None = None
                     try:
                         jv = judge_validity.promotion_check(db_path)
@@ -504,6 +506,8 @@ def promotion_evaluate(
                             "reason": jv.get("reason", ""),
                             "admit": jv.get("admit"),
                         }
+                        if jv_mode == "shadow":
+                            judge_val["mode"] = "shadow"
                         try:
                             judge_validity.write_envelopes(db_path, jv)
                         except Exception as exc:  # noqa: BLE001 — fail-open
@@ -512,7 +516,11 @@ def promotion_evaluate(
                                 f"write failed: {exc}",
                                 file=sys.stderr,
                             )
-                        if jv.get("admit") is False and decision == "promoted":
+                        if (
+                            jv_mode == "enforce"
+                            and jv.get("admit") is False
+                            and decision == "promoted"
+                        ):
                             decision = "quarantined"
                             rationale += (
                                 " judge_validity_below_threshold:"
@@ -533,6 +541,8 @@ def promotion_evaluate(
                         except Exception as exc:  # noqa: BLE001 — fail-open
                             reason = f"audit unavailable: {exc}"
                         judge_val = {"status": "unmeasured", "reason": reason}
+                        if jv_mode == "shadow":
+                            judge_val["mode"] = "shadow"
 
         # ── Oracle-integrity consumer (vt8) ───────────────────────────────
         # The verdict judge is itself an instrument; an audit that could be

@@ -274,6 +274,10 @@ def score(observable: dict, *, runner=None) -> dict:
         entries.append({"name": name, "outcome": outcome, "status": status})
 
     denominator = killed + survived
+    # ``measured`` means "a kill score exists", not "the scoring loop ran": an
+    # observable that every mutation skips (a ``function`` surface carries no
+    # ``body``/``expect_status`` field to corrupt) yields an empty denominator,
+    # and reporting that as measured would publish a null score as a result.
     return {
         "kill_score": (killed / denominator) if denominator else None,
         "killed": killed,
@@ -281,7 +285,7 @@ def score(observable: dict, *, runner=None) -> dict:
         "abstained": abstained,
         "total": len(entries),
         "mutations": entries,
-        "measured": True,
+        "measured": denominator > 0,
     }
 
 

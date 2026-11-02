@@ -65,9 +65,29 @@ _REJECT_TOKENS = frozenset(
 _FAMILY_TOKENS = ("opus", "glm", "minimax", "deepseek", "kimi", "codex")
 
 _OFF_VALUES = frozenset({"", "0", "off", "false", "no"})
+_SHADOW_VALUES = frozenset({"shadow"})
 
 
 # ── env knobs ────────────────────────────────────────────────────────────────
+
+
+def mode() -> str:
+    """``"off" | "shadow" | "enforce"`` from ``MO_JUDGE_VALIDITY``.
+
+    ``shadow`` measures and records the audit but never quarantines; any other
+    non-off value (``1``, ``true``, ``enforce``, …) is ``enforce`` and keeps
+    today's quarantine path. ``off`` covers unset and ``0``/``false``/``no``/
+    ``off``.
+    """
+    raw = os.environ.get("MO_JUDGE_VALIDITY")
+    if raw is None:
+        return "off"
+    token = str(raw).strip().lower()
+    if token in _OFF_VALUES:
+        return "off"
+    if token in _SHADOW_VALUES:
+        return "shadow"
+    return "enforce"
 
 
 def enabled() -> bool:
@@ -76,10 +96,7 @@ def enabled() -> bool:
     The guard is off by default: an unset knob must leave the promotion result
     dict byte-identical to the pre-guard shape.
     """
-    raw = os.environ.get("MO_JUDGE_VALIDITY")
-    if raw is None:
-        return False
-    return str(raw).strip().lower() not in _OFF_VALUES
+    return mode() != "off"
 
 
 def rows_limit() -> int:

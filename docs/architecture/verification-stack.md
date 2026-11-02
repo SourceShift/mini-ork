@@ -4,7 +4,8 @@
 (`recipes/verification-technique-review/`, run `verify-review-20261005-122958`),
 each built by a mini-ork `framework-edit` run with RSI on and proven by a real
 mini-ork run. Each is on by default **where it runs**, but most do not run
-in a plain `mini-ork run`; see "Where each instrument runs today" below.*
+in a plain `mini-ork run`; see "Where each instrument runs today" (checked
+2026-10-27) below.*
 
 *Scope of ① and ② specifically: they are ON in `mini-ork certify`, and in
 `mini-ork run code-fix` they run in **shadow** — the verifier executes both
@@ -79,7 +80,18 @@ flowchart TB
 
 "On by default" means on inside the path that calls the instrument. Only ③,
 ④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
-at promotion, or when a recipe opts in, or they have no producer yet.
+at promotion, or when a recipe opts in, or their producer is a manual command.
+
+Two instruments have a consumer but no automatic producer; `mini-ork
+instruments` is that producer. ⑦: `mini-ork instruments oracle-integrity
+[--db PATH]` writes `<db dir>/oracle-integrity/latest.json`, and exits `2`
+rather than write a record it could not measure. ⑩: `mini-ork instruments
+verifier-mutation --observable <observable.json> --card <card.json>` writes
+`<card>.mutation.json`, the sidecar the verify catalog reads; without `--card`
+it prints the score and writes nothing. ⑧ has no separate producer —
+`MO_JUDGE_VALIDITY=shadow` runs the audit from the promotion path, records the
+per-lane envelopes, and never quarantines, so an operator can see a lane's
+agreement before switching to enforcement.
 
 | # | Instrument | Runs in | State |
 |---|---|---|---|
@@ -89,10 +101,10 @@ at promotion, or when a recipe opts in, or they have no producer yet.
 | ④ | Level vector | the publisher, for recipes that declare levels (code_fix) | **live** |
 | ⑤ | Gate hackability | read by the promotion gate; records come only from a manual `mini-ork gate-fuzz --hackability` | consumer on, producer manual |
 | ⑥ | Equivalence operator | the behavioral verifier, for recipes whose contract declares an operator | opt-in per recipe |
-| ⑦ | Oracle integrity | read by the promotion gate; nothing writes it | no producer |
-| ⑧ | Judge validity | panel gates | off (`MO_JUDGE_VALIDITY`) |
+| ⑦ | Oracle integrity | read by the promotion gate; records come only from a manual `mini-ork instruments oracle-integrity` | consumer on, producer manual |
+| ⑧ | Judge validity | the promotion gate | off by default; `shadow` measures without enforcing |
 | ⑨ | Reward↔evidence pairing | every GRPO writeback | **live** |
-| ⑩ | Verifier mutation | read by the verify catalog; nothing writes scores | no producer |
+| ⑩ | Verifier mutation | read by the verify catalog; records come only from a manual `mini-ork instruments verifier-mutation --card` | consumer on, producer manual |
 | ⑪ | Conformal abstention | — | removed (669c181c) |
 | ⑫ | Discrimination evidence | `mini-ork certify`, and only when candidates are passed | certify only |
 | ⑬ | Behavioral recomputation | the behavioral verifier, declared recipes | opt-in per recipe |
@@ -318,7 +330,7 @@ flowchart TB
 **Knobs.**
 - `MO_ORACLE_INTEGRITY` (ON): promotion consumer of the audit.
 
-**Evidence.** Writes `<db dir>/oracle-integrity/latest.json`. When `MO_ORACLE_INTEGRITY` is on and the latest record failed, the promotion decision is `quarantined` with reason `oracle_integrity_failed`.
+**Evidence.** Writes `<db dir>/oracle-integrity/latest.json`, produced by `mini-ork instruments oracle-integrity [--db PATH]` (never run automatically; exit `2` means the audit could not run and no record was written). A *failing* record is written on purpose — it is a real measurement — and the producer says so on stderr, because the consumer is on by default: until a passing record replaces it, every would-be promotion quarantines. Point `--db` at a scratch `state.db`, or set `MO_ORACLE_INTEGRITY=0`, to run the check without arming the gate. When `MO_ORACLE_INTEGRITY` is on and the latest record failed, the promotion decision is `quarantined` with reason `oracle_integrity_failed`.
 
 ## ⑧ Judge validity (G10-T03): `mini_ork/gates/judge_validity.py`
 
@@ -327,10 +339,11 @@ flowchart TB
 **How it decides.**
 - **Per-lane accuracy** uses a Wilson lower bound. Below `MO_JUDGE_VALIDITY_MIN` the gate quarantines the promotion with reason `judge_validity_below_threshold`.
 - **Abstention.** A lane with fewer than 30 overlapping rows is unmeasured and admits; the gate never converts abstention into a pass.
-- **Off by default.** `MO_JUDGE_VALIDITY` unset disables it; `1` enables it.
+- **Off by default.** `MO_JUDGE_VALIDITY` unset disables it; `shadow` measures and records without enforcing; `1` enables enforcement.
+- **Shadow.** The same audit runs and its envelopes are written, and the promotion result carries `judge_validity` with `"mode": "shadow"`, but a below-floor lane never quarantines the promote. Use it to gather agreement evidence before enforcing.
 
 **Knobs.**
-- `MO_JUDGE_VALIDITY` (unset → off): master switch.
+- `MO_JUDGE_VALIDITY` (unset → off; `shadow` → measure only; `1`/`enforce` → quarantine below floor): master switch.
 - `MO_JUDGE_VALIDITY_MIN` (0.80): agreement floor; tighten-only (lower values clamp up).
 - `MO_JUDGE_VALIDITY_ROWS` (200): history rows audited per promotion check.
 
@@ -362,7 +375,7 @@ flowchart TB
 - `MO_VERIFIER_MUTATION` (ON): mutation-discrimination scoring.
 - `MO_VERIFIER_MUTATION_MIN` (0.8): minimum kill score for a verifier card.
 
-**Evidence.** Writes a `<card>.mutation.json` sidecar; the certificate may carry `mutation_kill_score`.
+**Evidence.** Writes a `<card>.mutation.json` sidecar via `mini-ork instruments verifier-mutation --observable <observable.json> --card <card.json>` (without `--card` it prints the score and writes nothing; exit `2` means the verifier was not measured and no sidecar was written). "Not measured" includes the case where **no mutation applies at all** — a `function`-surface observable carries no `body`/`expect_status` field to corrupt, so it has no kill score; that exits `2` rather than writing a null one, because a null sidecar would replace a real earlier score and `admit(None)` is `True`. The certificate may carry `mutation_kill_score`.
 
 ## ⑪ Conformal abstention — removed (2026-10)
 

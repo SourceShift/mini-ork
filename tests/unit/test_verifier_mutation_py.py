@@ -202,6 +202,18 @@ def test_all_mutations_abstaining_does_not_crash():
     assert result["survived"] == 0
     assert result["abstained"] == 6
     assert result["kill_score"] is None
+    # No kill score exists, so this is not a measurement. Saying "measured"
+    # here would publish a null score as a result and ``admit(None)`` is True.
+    assert result["measured"] is False
+
+
+def test_observable_no_mutation_applies_is_unmeasured():
+    """A function-surface observable has no body/status field to corrupt."""
+    result = verifier_mutation.score({"surface": "function"},
+                                     runner=lambda obs: _verdict(PROVEN))
+    assert result["total"] == 0
+    assert result["kill_score"] is None
+    assert result["measured"] is False
 
 
 # --------------------------------------------------------------------------- #

@@ -112,6 +112,7 @@ _NATIVE_MODULE_SUBS = {
     "harness-audit": "mini_ork.cli.harness_audit",
     "harness-card": "mini_ork.cli.harness_card",
     "hack-probe": "mini_ork.cli.hack_probe",
+    "instruments": "mini_ork.cli.instruments",
     "oversight": "mini_ork.cli.oversight",
     "active-eval": "mini_ork.cli.active_eval",
     "certify": "mini_ork.cli.certify",
@@ -183,6 +184,11 @@ Lifecycle:
                                    through `recover --workflow`
   verifier list|annotate         Inspect verifier results and label false
                                    positives/negatives (abstain-gate calibration)
+  instruments oracle-integrity [--db PATH] [--json]
+  instruments verifier-mutation --observable FILE [--card FILE] [--json]
+                                 Write the verification instruments' records
+                                   (oracle integrity, verifier mutation); exits 2
+                                   rather than record a measurement it could not make
   recipe-eval                    Static evaluation of recipe definitions
   reviewer-eval [list|add-case|run|status|score]
                                    Score the framework-edit reviewer on incidents + clean changes.
