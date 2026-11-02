@@ -3,7 +3,7 @@
 The spec-test author writes probes from the kickoff alone. Without a split, the
 implementer's revise round reads every failing clause, so it can satisfy each
 probe by reading the answers to the exam it is sitting. The split withholds the
-CLAUDE of some probes while keeping them in the verdict — the implementation is
+CLAUSE of some probes while keeping them in the verdict — the implementation is
 still graded on them, it just cannot read what they say.
 
 Two things must be true together, and each has its own way of silently
@@ -11,11 +11,15 @@ breaking:
 
 * a held-out probe is still RUN and still counted (`spec-tests-pass` reads it),
   otherwise "held out" quietly means "ignored";
-* its clause never reaches the revise round, otherwise the split is decorative.
+* nothing about it reaches the revise round — not its clause, and not the
+  assertion's expected values, which the pytest exception text carries;
+* and it must reach EVERY consumer. A parametrized case reports a nodeid the
+  manifest never listed, so a raw-nodeid lookup marks it visible.
 
-`gates/acceptance-probes.json` is the machine-readable probe set. It is written
-in the shape `mini_ork.verify.probe_validity.load_probes` already reads for
-`gates/*.json`, so I1's validity gate binds to it with no new plumbing.
+`<run_dir>/acceptance-probes.json` is the audit record of the split. It is
+deliberately NOT under `gates/`: `probe_validity.load_probes` globs
+`gates/*.json`, treats each entry's `probe` as an executable command and runs it
+against the base tree, so a pytest nodeid there fails the I1 gate outright.
 """
 from __future__ import annotations
 
@@ -223,14 +227,14 @@ def test_held_out_failure_still_reaches_needs_change_without_its_clause(tmp_path
     assert "empty value" not in rendered
 
 
-# ── AC3: acceptance-probes.json is readable by probe_validity ──────────────
+# ── the manifest: an audit record, deliberately outside gates/ ─────────────
 
-def test_acceptance_probes_manifest_is_written_and_loadable(tmp_path) -> None:
+def test_acceptance_probes_manifest_is_written_outside_the_gates_dir(tmp_path) -> None:
     run = _run_dir(tmp_path, {"test_spec_split.py": TWO_PASSING})
     proc = _invoke(run, _target(tmp_path))
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    manifest_path = run / "gates" / "acceptance-probes.json"
+    manifest_path = run / "acceptance-probes.json"
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text())
     assert manifest["spec_id"] == RUN_ID
@@ -240,26 +244,147 @@ def test_acceptance_probes_manifest_is_written_and_loadable(tmp_path) -> None:
         "test_spec_split.py::test_visible_holds",
         "test_spec_split.py::test_held_out_holds",
     ]
-    # Every probe quotes its kickoff clause: a probe with an empty clause is
-    # not a probe of a criterion, and load_probes' own rule depends on it.
     assert all(p["clause"] for p in probes)
     assert [p["held_out"] for p in probes] == [False, True]
 
-    # AC3 — I1's validity gate binds to the file with no new plumbing.
+    # The bug this guards: `load_probes` globs `gates/*.json`, treats each
+    # entry's `probe` as an EXECUTABLE command with an `expect`, and runs it
+    # against the base tree. A pytest nodeid there fails the I1 validity gate
+    # for every run, so the manifest must stay out of `gates/`.
+    assert not (run / "gates").exists()
     from mini_ork.verify.probe_validity import load_probes
 
     _acceptance, loaded = load_probes(str(run), {})
-    loaded_ids = {p.get("id") for p in loaded}
-    assert loaded_ids == {p["id"] for p in probes}
-    assert all(p["clause"] for p in loaded)
+    assert loaded == []
 
 
 def test_manifest_is_written_even_when_the_suite_fails(tmp_path) -> None:
-    """A failing suite must still declare its probes — I1 judges them either way."""
+    """A failing suite must still record its probes and the split it declared."""
     run = _run_dir(tmp_path, {"test_spec_split.py": TWO_FAILING})
     _invoke(run, _target(tmp_path))
-    manifest = json.loads((run / "gates" / "acceptance-probes.json").read_text())
+    manifest = json.loads((run / "acceptance-probes.json").read_text())
     assert len(manifest["probes"]) == 2
+
+
+# ── the payload the revise round is pointed at must not carry the answer ───
+
+def test_payload_redacts_held_out_clauses_the_audit_record_keeps_them(tmp_path) -> None:
+    run = _run_dir(tmp_path, {"test_spec_split.py": TWO_PASSING})
+    _invoke(run, _target(tmp_path))
+    payload = _payload(run)
+
+    by_id = {p["id"]: p for p in payload["probes"]}
+    assert by_id["test_spec_split.py::test_visible_holds"]["clause"].startswith("Kickoff:")
+    withheld = by_id["test_spec_split.py::test_held_out_holds"]
+    assert withheld["held_out"] is True
+    assert withheld["clause"] == ""
+
+    # `verifier_spec-tests.json` is NAMED by the revise evidence, so a clause
+    # in it is a clause the implementer can read. The audit record is not.
+    assert "empty value" not in (run / "verifier_spec-tests.json").read_text()
+    assert "empty value" in (run / "acceptance-probes.json").read_text()
+    # No pointer to the audit record either — see `write_probe_manifest`.
+    assert "probe_manifest" not in payload
+
+
+def test_held_out_failure_withholds_the_assertion_error(tmp_path) -> None:
+    """The pytest exception text carries the expected values — the answer."""
+    body = '''\
+def test_visible_fails():
+    """Kickoff: 'a rejected input fails closed'."""
+    assert False, "visible detail"
+
+
+def test_held_out_fails():
+    """Kickoff: 'the fail-closed knob never returns an empty value'.
+
+    Held-out: yes
+    """
+    assert 7 == 42, "secret expectation"
+'''
+    run = _run_dir(tmp_path, {"test_spec_split.py": body})
+    _invoke(run, _target(tmp_path))
+    payload = _payload(run)
+
+    visible = next(f for f in payload["failures"] if not f.get("held_out"))
+    hidden = next(f for f in payload["failures"] if f.get("held_out"))
+    # The visible probe keeps its error text; the held-out one keeps nothing.
+    assert "error" in visible
+    assert "error" not in hidden
+    assert hidden["kickoff"] == ""
+    assert "secret expectation" not in json.dumps(payload["failures"])
+
+
+# ── parametrized probes inherit the mark ───────────────────────────────────
+
+PARAMETRIZED = '''\
+import pytest
+
+
+def test_visible_holds():
+    """Kickoff: 'a rejected input fails closed'."""
+    assert True
+
+
+@pytest.mark.parametrize("key", ["", "x"])
+def test_held_out_cases(key):
+    """Kickoff: 'the fail-closed knob never returns an empty value'.
+
+    Held-out: yes
+    """
+    assert key
+'''
+
+
+def test_parametrized_cases_inherit_the_held_out_mark(tmp_path) -> None:
+    """A parametrized probe is ONE probe: one manifest entry, one held-out mark.
+
+    `classify` walks the AST, so `selected` holds the function while pytest
+    reports a case. Both sides are compared through `probe_function`, so a
+    failing case inherits the mark instead of reading as visible.
+    """
+    run = _run_dir(tmp_path, {"test_spec_param.py": PARAMETRIZED})
+    proc = _invoke(run, _target(tmp_path))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    payload = _payload(run)
+
+    failing = [f for f in payload["failures"] if "test_held_out_cases" in f["test"]]
+    assert failing, payload["failures"]
+    for failure in failing:
+        assert failure.get("held_out") is True, failure
+        assert failure["kickoff"] == ""
+        assert "error" not in failure
+    assert "empty value" not in json.dumps(payload["failures"])
+    # One manifest entry per FUNCTION, not per case: the bound counts probes.
+    manifest = json.loads((run / "acceptance-probes.json").read_text())
+    assert [p["id"] for p in manifest["probes"]] == [
+        "test_spec_param.py::test_visible_holds",
+        "test_spec_param.py::test_held_out_cases",
+    ]
+    assert [p["held_out"] for p in manifest["probes"]] == [False, True]
+
+
+# ── a typo is a failing check, never a crashed verifier ────────────────────
+
+def test_malformed_marker_reds_a_check_instead_of_crashing(tmp_path) -> None:
+    """A verifier owes its caller one JSON verdict; a traceback is neither."""
+    body = '''\
+def test_typo():
+    """Kickoff: 'the clause'.
+
+    Held-out: yess
+    """
+    assert True
+'''
+    run = _run_dir(tmp_path, {"test_spec_split.py": body})
+    proc = _invoke(run, _target(tmp_path))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Traceback" not in (proc.stderr or "")
+    payload = _payload(run)
+    assert payload["pass"] is False
+    check = next(c for c in payload["checks"] if c["name"] == "held-out-marker")
+    assert check["pass"] is False
+    assert "yess" in check["actual"]
 
 
 # ── the bound ───────────────────────────────────────────────────────────────

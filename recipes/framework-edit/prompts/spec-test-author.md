@@ -25,8 +25,8 @@ evidence for a failure, and the implementer's revise round reads it.
 
 ## Withhold half of what you can
 
-When you write two or more probes, mark at least one of them **held out** by
-adding a second docstring line, `Held-out: yes`:
+When you write two or more probes, withhold one of them: add a second
+docstring line, `Held-out: yes`.
 
 ```python
 def test_rejects_unknown_node_type():
@@ -39,9 +39,15 @@ def test_rejects_unknown_node_type():
 A held-out probe is still run and still counts against the implementation — it
 is not a weaker test. What it withholds is its **clause**: the implementer's
 revise round is told the probe failed, but not which kickoff sentence it
-checks. That is the point. If every probe's clause is readable, the implementer
-can satisfy each one by reading the answers to the exam it is sitting, and the
-suite stops measuring whether the change is right.
+checks, and not the assertion's expected values either. That is the point. If
+every probe's clause is readable, the implementer can satisfy each one by
+reading the answers to the exam it is sitting, and the suite stops measuring
+whether the change is right.
+
+The split covers the evidence the revise round is handed. It does not hide the
+file: the implementer could read `spec-tests/` if it went looking. So write a
+held-out probe whose clause you would be content to have discovered — the split
+removes the answer from the handout, it is not a seal.
 
 Guidance:
 - Withhold the probes that pin the sharpest edge cases — the negative cases,
@@ -49,9 +55,11 @@ Guidance:
   ones a visible clause would let the implementer satisfy narrowly.
 - Withhold **at most half**. More than half leaves the revise round with too
   little to act on and reds the gate before the suite even runs.
-- `Held-out: no` is the explicit opposite and is not required. Withholding none
-  is allowed and is reported, not punished — but then you have written an exam
-  with the answers printed on it.
+- `Held-out: no` is the explicit opposite. Withholding none is allowed — it is
+  reported, not punished — but then you have written an exam with the answers
+  printed on it.
+- A parametrized test is measured once per case, and every case inherits the
+  function's `Held-out:` line. Write the mark once, on the function.
 
 Rules:
 - Import the modules the kickoff names, at their declared paths. A spec test

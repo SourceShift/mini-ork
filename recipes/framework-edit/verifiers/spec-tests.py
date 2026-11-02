@@ -97,8 +97,13 @@ DEFAULT_TIMEOUT_S = 900
 # from the evidence the implementer's revise round reads, so the implementer
 # cannot satisfy every probe by reading the answers it is being graded on.
 HELD_OUT_MARKER = "Held-out:"
+# Deliberately NOT under `gates/`: `mini_ork/verify/probe_validity.load_probes`
+# globs `<run_dir>/gates/*.json`, treats every entry's `probe` as an EXECUTABLE
+# command with an `expect`, and runs it against the base tree. A pytest nodeid
+# is neither, so a manifest there made the I1 validity gate execute
+# `test_x.py::test_y` as a shell command and fail the run. This file is an
+# audit record of what the split was, not an I1 probe set.
 _PROBE_MANIFEST_NAME = "acceptance-probes.json"
-_PROBE_MANIFEST_DIR = "gates"
 _YES_VALUES = frozenset({"yes", "true", "1"})
 _NO_VALUES = frozenset({"no", "false", "0"})
 
@@ -407,16 +412,30 @@ def _probe_files(spec_dir_path: str, files: list[str]) -> list[tuple[str, str, s
     return out
 
 
-def probe_manifest(spec_dir_path: str, selected: list[str]) -> list[dict]:
-    """The probe set the run declared, in the shape ``gates/*.json`` carries.
+def probe_function(nodeid: str) -> str:
+    """The probe FUNCTION a pytest nodeid belongs to.
 
-    ``selected`` is ``classify``'s list; a nodeid that is not in it is not a
-    probe (no ``Kickoff:`` clause) and is left out. ``clause`` is the verbatim
-    kickoff quote, so ``probe_validity.load_probes`` binds it with no new
-    plumbing and a probe with an empty clause is visibly not a probe of a
-    criterion.
+    pytest reports one nodeid per case — ``file.py::test_x[a-1]`` — while the
+    ``Kickoff:`` docstring, the ``Held-out:`` mark and the manifest entry all
+    live on the function, ``file.py::test_x``. Comparing raw nodeids made every
+    parametrized case read as visible, so the split was silently bypassed for
+    exactly the probes most likely to be parameterized.
     """
-    wanted = set(selected)
+    return nodeid.partition("[")[0]
+
+
+def probe_manifest(spec_dir_path: str, selected: list[str]) -> list[dict]:
+    """The probe set the run declared: one entry per probe FUNCTION.
+
+    ``selected`` is ``classify``'s list, and ``classify`` walks the AST rather
+    than pytest's collected items, so it is already function-granular: a
+    parametrized probe is declared once and every case inherits its mark.
+
+    Raises ``ValueError`` when an author wrote a ``Held-out:`` value that is
+    neither yes nor no; the caller turns that into a failing check rather than
+    letting the exception escape (a verifier owes its caller one JSON verdict).
+    """
+    wanted = {probe_function(nodeid) for nodeid in selected}
     probes: list[dict] = []
     filenames = list(dict.fromkeys(nodeid.partition("::")[0] for nodeid in selected))
     for nodeid, clause, doc in _probe_files(spec_dir_path, filenames):
@@ -430,6 +449,18 @@ def probe_manifest(spec_dir_path: str, selected: list[str]) -> list[dict]:
             "expect": "pass",
         })
     return probes
+
+
+def public_probes(probes: list[dict]) -> list[dict]:
+    """The probe set as the revise round may read it: no clause on a held-out one.
+
+    The verifier payload is a file the revise evidence NAMES, so anything in it
+    is reachable by the implementer. The nodeid is already in ``failures``, so
+    redacting the clause gives away nothing new and closes the one path that
+    handed the implementer the sentence it was supposed to be blind to.
+    """
+    return [{**probe, "clause": "" if probe.get("held_out") else probe.get("clause", "")}
+            for probe in probes]
 
 
 def held_out_bounds_violation(probes: list[dict]) -> str:
@@ -465,18 +496,16 @@ def held_out_note(probes: list[dict]) -> str:
 
 
 def write_probe_manifest(run_dir: str, probes: list[dict], log=None) -> str | None:
-    """Persist the probe set to ``<run_dir>/gates/acceptance-probes.json``.
+    """Persist the probe set to ``<run_dir>/acceptance-probes.json``.
 
     Returns the path, or ``None`` when nothing was written. A failed write is
-    reported and never changes the gate verdict — it removes evidence from I1's
-    validity gate, it does not make the suite pass or fail.
+    reported and never changes the gate verdict — it removes an audit record,
+    it does not make the suite pass or fail.
     """
     if not probes:
         return None
-    gates = os.path.join(run_dir, _PROBE_MANIFEST_DIR)
-    path = os.path.join(gates, _PROBE_MANIFEST_NAME)
+    path = os.path.join(run_dir, _PROBE_MANIFEST_NAME)
     try:
-        os.makedirs(gates, exist_ok=True)
         payload = {
             "spec_id": (os.environ.get("MINI_ORK_RUN_ID") or "").strip(),
             "probes": probes,
@@ -945,12 +974,22 @@ def evaluate(run_dir: str, log) -> dict:
             result["error"])]
         return result
 
-    # The declared probe set, written BEFORE the suite runs: I1's validity gate
-    # reads `gates/*.json`, so the manifest has to exist whether or not this
-    # gate goes on to pass.
-    probes = probe_manifest(path, selected)
-    result["probes"] = probes
-    result["probe_manifest"] = write_probe_manifest(run_dir, probes, log)
+    # The declared probe set, written BEFORE the suite runs, so the split is on
+    # record whether or not this gate goes on to pass.
+    try:
+        probes = probe_manifest(path, selected)
+    except ValueError as exc:
+        # A malformed `Held-out:` line must not escape as a traceback: the
+        # verifier owes its caller one JSON verdict, and a crash reads as an
+        # engine fault rather than a spec-test defect a person can fix.
+        result["error"] = str(exc)
+        result["checks"] = [_fail(
+            "held-out-marker",
+            "every `Held-out:` line in a spec test docstring reads yes or no",
+            str(exc))]
+        return result
+    result["probes"] = public_probes(probes)
+    write_probe_manifest(run_dir, probes, log)
     result["held_out"] = held_out_note(probes)
     split_error = held_out_bounds_violation(probes)
     if split_error:
@@ -1019,21 +1058,29 @@ def evaluate(run_dir: str, log) -> dict:
         return result
 
     exceptions = failure_exceptions(output)
-    withheld = {probe["id"] for probe in probes if probe.get("held_out")}
+    withheld = {probe_function(probe["id"]) for probe in probes if probe.get("held_out")}
     for nodeid in failed_items(output, selected):
         # A held-out probe still counts in the verdict — it is in `failures`
         # and still reds `spec-tests-pass` — but its clause is WITHHELD from the
         # evidence the implementer's revise round reads. That is the whole
         # point of the split: the implementer must satisfy probes it cannot
         # read the answers to.
-        is_held_out = nodeid in withheld
+        is_held_out = probe_function(nodeid) in withheld
         failure: dict = {"test": nodeid,
                          "kickoff": "" if is_held_out else kickoff_quote(path, nodeid)}
         if is_held_out:
+            # A held-out probe contributes its nodeid and nothing else. The
+            # pytest exception text carries the assertion's expected values —
+            # `assert got == 42` is the requirement, in the clear — so the same
+            # split that withholds the clause has to withhold the error too.
+            # `harness_defect` is still attached below: that names a defect in
+            # the TEST, not in the requirement, and RB-18 needs it to stop the
+            # revise rounds instead of burning them.
             failure["held_out"] = True
-        error = exceptions.get(_unit_key(nodeid))
-        if error:
-            failure["error"] = error
+        else:
+            error = exceptions.get(_unit_key(nodeid))
+            if error:
+                failure["error"] = error
         result["failures"].append(failure)
 
     harness = harness_defects(output)
@@ -1204,11 +1251,13 @@ def _normal(run_dir: str) -> int:
         "manifest": result["manifest"],
         "missing": result["missing"],
         "failures": result["failures"],
-        # The declared probe set and its split. `probe_manifest` is the path on
-        # disk (absent when no probe was declared); `held_out` is the honest
+        # The declared probe set and its split. Held-out clauses are redacted
+        # here (see `public_probes`): this file is named by the revise evidence,
+        # so anything in it is reachable by the implementer. The full set,
+        # clauses included, is `<run_dir>/acceptance-probes.json` — an audit
+        # record the revise text never points at. `held_out` is the honest
         # one-line split summary, including "no split declared".
         "probes": result.get("probes", []),
-        "probe_manifest": result.get("probe_manifest"),
         "held_out": result.get("held_out", ""),
         "harness_defects": result["harness_defects"],
         "author_node_end": result["author_node_end"],
