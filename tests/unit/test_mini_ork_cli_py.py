@@ -75,8 +75,11 @@ def test_launcher_is_executable_python_only_and_symlink_safe(tmp_path):
             "MINI_ORK_ROOT", "MINI_ORK_HOME",
         }},
     )
-    assert pointer_run.returncode == 0
+    # A home that exists but has no state.db is `needs_person` (exit 2): the
+    # doctor is a gate now, and "ready" is not the same as "printed some rows".
+    assert pointer_run.returncode == 2
     assert f"MINI_ORK_HOME={home.resolve()}" in pointer_run.stdout
+    assert "Next: mini-ork init" in pointer_run.stdout
 
 
 def test_version_help_and_unknown_golden_contract():
@@ -104,14 +107,28 @@ def test_version_help_and_unknown_golden_contract():
 
 
 def test_doctor_golden_sections():
+    # A home that does not exist cannot be ready: exit 2 and one Next line.
     raw_home = "/tmp/mini-ork-doctor-home"
     run = _launcher("doctor", env={"MINI_ORK_HOME": raw_home})
-    assert run.returncode == 0
+    assert run.returncode == 2
     assert run.stdout.startswith("=== mini-ork doctor ===\n")
     assert "\nLib presence:\n" not in run.stdout
     assert "\nProvider preflight:\n" in run.stdout
     assert f"  [OK]      MINI_ORK_HOME={Path(raw_home).resolve()}\n" in run.stdout
     assert "  [WARN]    glm ($GLM_API_KEY unset; run: mini-ork providers configure glm)\n" in run.stdout
+    assert "verdict: needs_person\n" in run.stdout
+    assert run.stdout.rstrip("\n").splitlines()[-1].startswith("Next: ")
+    assert run.stdout.count("Next: ") == 1
+
+
+def test_doctor_json_mode_matches_the_human_verdict():
+    run = _launcher("doctor", "--json", env={"MINI_ORK_HOME": "/tmp/mini-ork-doctor-home"})
+    assert run.returncode == 2
+    doc = json.loads(run.stdout)
+    assert doc["verdict"] == "needs_person"
+    assert doc["next"] == "mini-ork init"
+    assert {check["status"] for check in doc["checks"]} <= {"ok", "warn", "fail"}
+    assert all(check["section"] and check["detail"] for check in doc["checks"])
 
 
 def test_deadline_validation_golden_contract(capsys):

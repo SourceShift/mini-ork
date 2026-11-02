@@ -14,6 +14,7 @@ target repositories, or enable an explicitly documented runtime behavior.
 | `MINI_ORK_PROJECT_HOME` | current project | Identifies the project MiniOrk is operating for. |
 | `MINI_ORK_TARGET_REPO` | current project | Identifies the repository available to agent and verifier work. |
 | `MINI_ORK_ENGINE_ROOT` | resolved engine root | Overrides engine discovery for installed launchers. |
+| `MINI_ORK_PROFILE` | unset | Selects `config/profile.<name>.yaml`: its `defaults` fill unset knobs, its `required` knobs fail closed. `simple` is the laptop tier; see [CONFIG.md](../CONFIG.md#profiles-one-file-per-tier). |
 
 `MINI_ORK_DB` takes precedence over the database path derived from
 `MINI_ORK_HOME`. Keep each concurrent project or test run on its own home and

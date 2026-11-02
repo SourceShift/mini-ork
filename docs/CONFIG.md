@@ -255,6 +255,62 @@ lanes:
 See `config/providers.yaml` for the full schema and commented examples
 (OpenRouter, custom gateways, executable scripts).
 
+## Profiles: one file per tier
+
+mini-ork has to be usable on one laptop with no daemon, **and** safe in a shared
+deployment. Those are different configurations, not different products, so the
+choice is one variable — `MINI_ORK_PROFILE` — and one file per tier.
+
+```bash
+export MINI_ORK_PROFILE=simple        # config/profile.simple.yaml
+mini-ork doctor --profile simple      # same thing for one invocation
+```
+
+| | Simple tier | Secure tier |
+|---|---|---|
+| Where defaults come from | `config/profile.<name>.yaml` | same file, different contents |
+| Credentials | `env`, then `config/secrets.local.sh` (0600) | `config/vault.yaml` chain (sops, command, openbao) |
+| State | local `state.db` | per-run DB path, scoped per node/agent |
+| Costs | `MO_DAILY_BUDGET_USD=10`, `MO_PAUSE_EVERY_USD=5` | whatever the deployment sets |
+| Restart story | run `mini-ork serve` when you want the UI | supervised process |
+
+**Fill-if-absent.** A profile's `defaults:` apply only to knobs the environment
+leaves unset. An `export` always wins, so the same call sites serve both tiers:
+start on `simple`, add a vault and a scoped credential, and nothing in the code
+changes.
+
+**Fail closed.** `required:` is different — it names what the tier refuses to
+guess. `required.all` must be set; `required.any_of` needs at least one member.
+An unset member is a clear error, never a silent empty string. `profile.simple`
+requires `MO_TARGET_CWD` (lanes run git operations there; guessing it from the
+shell's cwd has corrupted a framework checkout) and one provider key from
+`GLM/KIMI/MINIMAX/DEEPSEEK/ANTHROPIC_API_KEY`.
+
+**The honest ratio.** `profile.simple` fixes eight knobs and requires three
+values out of ~274 `MO_*` / `MINI_ORK_*` variables. It is not a complete
+configuration: everything else keeps its built-in default, and a user who needs
+a different value still has to read `docs/operator/env-vars.md`. What the file
+buys is that the *dangerous* knobs — where lanes run, which account pays, how
+much can be spent unattended, whether the gates run — are decided in one place
+and checked.
+
+### `doctor` reports the verdict
+
+`mini-ork doctor` checks the same facts and returns a status a script can
+branch on:
+
+| Exit | Verdict | Meaning |
+|---|---|---|
+| 0 | `ready` | nothing is failing |
+| 1 | `restartable` | only failures a restart fixes (a `serve` running code older than the tree on disk) |
+| 2 | `needs_person` | a missing tool, an unmigrated home, no lane credential, an unset required knob |
+
+The report ends with exactly one `Next: <command>` line, derived from the first
+blocking check (`needs_person` outranks `restartable`). `--json` prints the same
+document — `{verdict, next, profile, applied_defaults, checks[]}` — so the IDE
+Setup page and CI read one source instead of re-implementing the rows.
+Warnings never change the verdict.
+
 ## MCP Server Registry
 
 A node reaches an MCP server **by name** — `tools.mcp: [arxiv, codegraph]` or

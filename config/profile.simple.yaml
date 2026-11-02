@@ -1,0 +1,39 @@
+# The laptop tier: one file, no server, no daemon, no cloud account.
+#
+# Pick it up with `MINI_ORK_PROFILE=simple` (or `mini-ork doctor --profile simple`).
+# Every `defaults:` key is applied ONLY when the environment does not already set
+# it, so exporting one of these yourself still wins. Every `required:` key must
+# be set explicitly — the profile never guesses a value that shapes what lanes
+# edit or which account pays.
+#
+# The secure tier is the same shape: a vault-backed profile in
+# `config/vault.example.yaml`, chosen by the same variable. Start here, switch
+# later without rewriting call sites.
+profile: simple
+description: >-
+  One machine, one provider key, no background services. Enough to run a
+  kickoff through classify -> plan -> execute -> verify with the learning loop
+  on and a hard budget.
+
+required:
+  all:
+    # Lanes run git operations in MO_TARGET_CWD. If it is unset the dispatcher
+    # falls back to the process cwd, and a lane started from the wrong directory
+    # has been observed rewriting the framework repo. Never infer this.
+    MO_TARGET_CWD: "the repository lanes edit; must be an absolute path, never inferred from the shell's cwd"
+  any_of:
+    - [GLM_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY, DEEPSEEK_API_KEY, ANTHROPIC_API_KEY]
+
+defaults:
+  # Concurrency that a laptop survives, and a spend ceiling a person can watch.
+  MINI_ORK_MAX_PARALLEL: "2"
+  MO_DAILY_BUDGET_USD: "10"
+  MO_PAUSE_EVERY_USD: "5"
+  # The learning loop and its gates, on by default — the point of the framework.
+  MO_ROUTING_POLICY: learning_governed
+  MO_SUITE_ADEQUACY: "1"
+  MO_LANE_AFFINITY: "1"
+  MO_LEARNING_WRITEBACK: "1"
+  # Measure the certify terms but do not let them veto yet: a first user has no
+  # baseline, so a blocking term would refuse work nobody has calibrated.
+  MO_CODEFIX_CERTIFY: shadow

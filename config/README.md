@@ -14,6 +14,7 @@ config/
     minimax.yaml
     human.yaml
   providers.yaml               # BYO provider registry (use your own API keys/endpoints)
+  profile.simple.yaml          # The laptop tier: MINI_ORK_PROFILE=simple (defaults + required knobs)
   secrets.example.sh           # Template → copy to .mini-ork/config/secrets.local.sh
   scope-patterns.yaml.example  # Template for per-project scope guards
   README.md                    # This file

@@ -118,10 +118,29 @@ def _lane_row(home: Path) -> dict[str, Any]:
     return S.ok("Worker lanes", ", ".join(ready) + " have keys")
 
 
+def _doctor_row(home: Path) -> dict[str, Any]:
+    """The same verdict `mini-ork doctor --json` reports, so the page and CI
+    cannot disagree about whether this install is ready."""
+    try:
+        from mini_ork import doctor
+
+        result = doctor.run(home=str(home))
+    except Exception as exc:  # noqa: BLE001 — a page must render, never crash
+        return S.warn("doctor: could not run", str(exc))
+    verdict = result["verdict"]
+    detail = result["next"] or "every check passed"
+    button = [S.btn("Run doctor", S.cli("doctor"), "ghost")]
+    if verdict == "ready":
+        return S.ok("doctor: ready", detail, button)
+    if verdict == "restartable":
+        return S.warn("doctor: restart fixes it", detail, button)
+    return S.bad("doctor: needs a person", detail, button)
+
+
 def _readiness(home: Path) -> dict[str, Any]:
     from mini_ork.acp import setup as acp_setup
 
-    items = []
+    items = [_doctor_row(home)]
     project = acp_setup._check_project(home)
     if project.ok:
         n, latest = _migrations(home)

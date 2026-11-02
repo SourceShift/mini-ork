@@ -35,7 +35,6 @@ from mini_ork.context import (
 from mini_ork.dispatch import agents_config, config_resolve, deadline_budget
 from mini_ork.dispatch.run_env import RunEnvError, load_run_env
 from mini_ork.dispatch.secrets import SecretStoreError
-from mini_ork.dispatch.vault import VaultError
 from mini_ork.features import gate_env
 from mini_ork.kickoff_scope import heading_kind
 from mini_ork.runtime.placement_env import (
@@ -171,7 +170,10 @@ Lifecycle:
   init                           Bootstrap project (creates .mini-ork/)
   install                        Install or repair the per-user mini-ork command
   update                         Apply migrations + report config drift
-  doctor                         Check deps, environment, and provider preflight
+  doctor [--json] [--profile <name>]
+                                 Preflight with a verdict: exit 0 ready, 1 a
+                                   restart fixes it, 2 a person has to act; ends
+                                   with one `Next: <command>` line
   providers                      Configure or inspect credentials for workflow lanes
   mcp                            Manage the MCP server registry nodes grant by name
   vault                          Report which secret sources are wired, and where a key lives
@@ -2481,6 +2483,19 @@ def main(argv=None, *, root=None) -> int:
     os.environ["MINI_ORK_ROOT"] = root
     _load_feature_defaults()
     _load_secret_store_env()
+    # The selected profile (``MINI_ORK_PROFILE``) fills the knobs its tier sets
+    # and leaves an operator's export alone. Applied here, once, so every
+    # subcommand and every spawned child sees the same values — the execute
+    # stage is not early enough for the planner's routing and budget knobs.
+    # A profile that is requested but unreadable is a hard error: falling
+    # through would silently drop the tier's guarantees.
+    from mini_ork import profile as _profile
+
+    try:
+        _profile.apply_if_requested(root=root)
+    except _profile.ProfileError as exc:
+        sys.stderr.write(f"profile: {exc}\n")
+        return 2
     # NOTE: main() deliberately does NOT publish a derived MINI_ORK_DB. A
     # process-wide default here is indistinguishable from an operator-set one,
     # so it would (a) shadow ``--home`` for subcommands that re-point the home
@@ -2562,84 +2577,13 @@ def _run_handler(rest, root):
 
 
 def _doctor_handler(rest, root):
-    del rest
-    import shutil
-    # The native path contract defaults project home to cwd/.mini-ork.
-    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
-    print("=== mini-ork doctor ===")
-    for d in ("sqlite3", "git", "curl", "claude", "codex", "python3"):
-        print(f"  [OK]      {d}" if shutil.which(d) else f"  [MISSING] {d}")
-    if os.environ.get("MINI_ORK_HOME"):
-        print(f"  [OK]      MINI_ORK_HOME={os.environ['MINI_ORK_HOME']}")
-    elif home:
-        print(f"  [OK]      MINI_ORK_HOME={home}")
-    if os.environ.get("MINI_ORK_DB"):
-        print(f"  [OK]      MINI_ORK_DB={os.environ['MINI_ORK_DB']}")
-    else:
-        print("  [WARN]    MINI_ORK_DB unset (default: $MINI_ORK_HOME/state.db)")
-    # Which engine is running, and which one last wrote this home. Two engines
-    # can serve one project (the IDE's serve, the copy vendored in the project's
-    # .mini-ork) and they drift; the commit is what separates two checkouts of
-    # the same release, the recorded DB version is what separates a home from a
-    # newer engine that never migrated it.
-    print("")
-    print("Engine:")
-    engine_root = os.environ.get("MINI_ORK_ROOT") or root
-    engine_ver = engine_version(engine_root)
-    engine_commit = _engine_commit(engine_root)
-    print(f"  [OK]      root: {engine_root} "
-          f"(v{engine_ver or '?'}{f' @{engine_commit}' if engine_commit else ''})")
-    recorded = _db_engine_version(home)
-    if not recorded:
-        print("  [WARN]    home DB records no engine version "
-              "(never migrated by a versioned engine, or no schema_migrations row)")
-    elif not engine_ver:
-        print(f"  [WARN]    home DB last migrated by v{recorded}; this engine's "
-              "version could not be read")
-    elif recorded == engine_ver:
-        print(f"  [OK]      home DB last migrated by v{recorded} (this engine)")
-    else:
-        print(f"  [WARN]    home DB last migrated by v{recorded}, this engine is "
-              f"v{engine_ver} — a newer engine has written this home; run "
-              "`mini-ork migrate` from the engine you mean to use")
-    print("")
-    print("Provider preflight:")
-    for tool, name in (("claude", "anthropic"), ("codex", "codex")):
-        if shutil.which(tool):
-            print(f"  [OK]      {name} ({tool} CLI present)")
-        else:
-            print(f"  [WARN]    {name} ({tool} CLI missing)")
-    from mini_ork.dispatch.providers import provider_environment
-    from mini_ork.dispatch.secrets import SecretStoreError
+    # A verdict, not a status dump: exit 0 ready, 1 a restart fixes it, 2 a
+    # person has to act, and one `Next: <command>` line for the first failure.
+    # The checks live in mini_ork/doctor.py so the IDE Setup page and CI read
+    # the same document (`--json`) instead of re-implementing the rows.
+    from mini_ork import doctor
 
-    try:
-        provider_env = provider_environment()
-    except SecretStoreError as exc:
-        print(f"  [WARN]    local credential store unavailable: {exc}")
-        provider_env = dict(os.environ)
-    for env_var, family in (("GLM_API_KEY", "glm"), ("KIMI_API_KEY", "kimi"),
-                            ("MINIMAX_API_KEY", "minimax"), ("DEEPSEEK_API_KEY", "deepseek")):
-        if provider_env.get(env_var):
-            print(f"  [OK]      {family} (${env_var} set)")
-        else:
-            print(f"  [WARN]    {family} (${env_var} unset; run: mini-ork providers configure {family})")
-
-    print("")
-    print("Secret vault:")
-    from mini_ork.dispatch.vault import vault_environment
-
-    try:
-        environment = vault_environment()
-    except VaultError as exc:
-        print(f"  [WARN]    vault config: {exc}")
-    else:
-        for backend_status in environment.status():
-            tag = "[OK]      " if backend_status.ready else "[WARN]    "
-            print(f"  {tag}{backend_status.backend}: {backend_status.detail}")
-        gap = environment.protection_gap()
-        if gap:
-            print(f"  [WARN]    {gap}")
-    return 0
+    return doctor.main(rest, root=root)
 
 
 def _version_handler(rest, root):

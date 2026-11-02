@@ -128,7 +128,7 @@ See [docs/ZED.md](docs/ZED.md) and [docs/UI.md](docs/UI.md).
 cd ~/my-project
 mini-ork onboard                      # initialize the project
 mini-ork providers configure <lane>   # hidden prompt; keys never touch argv
-mini-ork doctor                       # dependencies, environment, provider preflight
+mini-ork doctor                       # preflight with a verdict; ends with one Next: command
 
 cp ~/.local/share/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md
 

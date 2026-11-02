@@ -112,8 +112,19 @@ class RunContext:
         return {k: v for k, v in out.items() if v}
 
     def apply(self, env: MutableMapping[str, str] | None = None) -> None:
-        """Publish the non-empty fields into ``env`` (default: process env)."""
+        """Publish the non-empty fields into ``env`` (default: process env).
+
+        Also fills the selected profile's defaults (``MINI_ORK_PROFILE``) for
+        knobs the environment leaves unset — the simple tier works without the
+        user exporting a dozen MO_* variables by hand. A profile that is
+        requested but unreadable raises ``ProfileError`` here: a clear error is
+        better than a run that silently loses the tier's guarantees. No profile
+        selected means no-op, so the import stays lazy.
+        """
         apply_env_overrides(self.as_env(), env=env)
+        from mini_ork import profile as profile_mod
+
+        profile_mod.apply_if_requested(env, root=self.root or None)
 
     def child_env(self, **overrides: str | None) -> dict[str, str]:
         """A fresh env mapping: process env + this context + ``overrides``.

@@ -118,7 +118,8 @@ def write_runtime_pointer(root: Path, venv: Path, *, dry_run: bool) -> Path:
     return pointer
 
 
-def _run(command: Sequence[str], *, root: Path, dry_run: bool) -> None:
+def _run(command: Sequence[str], *, root: Path, dry_run: bool,
+         allow: tuple[int, ...] = (0,)) -> None:
     rendered = " ".join(str(part) for part in command)
     print(f"+ {rendered}")
     if dry_run:
@@ -128,6 +129,9 @@ def _run(command: Sequence[str], *, root: Path, dry_run: bool) -> None:
     except OSError as exc:
         raise InstallError(f"cannot run {command[0]}: {exc}") from exc
     except subprocess.CalledProcessError as exc:
+        if exc.returncode in allow:
+            print(f"  (exit {exc.returncode}; accepted for this step)")
+            return
         raise InstallError(f"command failed with exit {exc.returncode}: {rendered}") from exc
 
 
@@ -142,8 +146,13 @@ def install(root: Path, venv: Path, *, install_args: Sequence[str], dry_run: boo
     for command in commands[:3]:
         _run(command, root=root, dry_run=dry_run)
     write_runtime_pointer(root, venv, dry_run=dry_run)
-    for command in commands[3:]:
+    for command in commands[3:-1]:
         _run(command, root=root, dry_run=dry_run)
+    # The doctor step is a verdict now: 0 ready, 2 something only a person can
+    # fix (a lane credential, an unmigrated home). Exit 2 does not mean the
+    # install failed — it prints the one command that finishes the setup — so
+    # the installer accepts it and lets the user read the `Next:` line.
+    _run(commands[-1], root=root, dry_run=dry_run, allow=(0, 2))
     if not dry_run:
         print(f"✓ MiniOrk full runtime installed in {venv}")
         print("  Configure provider lanes with: mini-ork providers status <lane>")
