@@ -88,6 +88,20 @@ AUTHOR_NODE = "spec_test_author"
 DOCSTRING_MARKER = "Kickoff:"
 DEFAULT_TIMEOUT_S = 900
 
+# ── held-out split (I2b) ─────────────────────────────────────────────────────
+# A probe is held out when its docstring carries a `Held-out:` line whose value
+# reads as yes (any case; `no` is the explicit opposite, an absent line is the
+# default). The mark lives in the test file the author writes, so there is one
+# source of truth and no sidecar the author could contradict. A held-out probe
+# is still run and still counts in the verdict — only its clause is withheld
+# from the evidence the implementer's revise round reads, so the implementer
+# cannot satisfy every probe by reading the answers it is being graded on.
+HELD_OUT_MARKER = "Held-out:"
+_PROBE_MANIFEST_NAME = "acceptance-probes.json"
+_PROBE_MANIFEST_DIR = "gates"
+_YES_VALUES = frozenset({"yes", "true", "1"})
+_NO_VALUES = frozenset({"no", "false", "0"})
+
 # pytest's own default discovery prefix, and the name the kickoff tells the
 # author to use (`test_spec_*.py`). A file that is not collected by the plain
 # `pytest <dir>` invocation below is not a spec test.
@@ -349,6 +363,132 @@ def classify(files: list[str], spec_dir_path: str) -> tuple[list[str], list[str]
             nodeid = f"{name}::{unit}"
             (selected if has_kickoff_docstring(doc) else deselected).append(nodeid)
     return selected, deselected, unparsable
+
+
+def held_out(doc: str | None) -> bool:
+    """True iff the docstring marks this probe held out.
+
+    The mark is a line reading ``Held-out: yes`` (case-insensitive value). An
+    absent line, or ``no``/``false``/``0``, is visible — the default, and the
+    behaviour every probe had before the split existed. An unrecognised value
+    raises ``ValueError`` rather than guessing: a typo must not silently make a
+    probe visible when its author meant to withhold it.
+    """
+    for line in (doc or "").splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith(HELD_OUT_MARKER.lower()):
+            continue
+        value = stripped.split(":", 1)[1].strip().strip("`*_ ").lower()
+        if value in _YES_VALUES:
+            return True
+        if value in _NO_VALUES or not value:
+            return False
+        raise ValueError(f"{HELD_OUT_MARKER} value must be yes or no; got {value!r}")
+    return False
+
+
+def _probe_files(spec_dir_path: str, files: list[str]) -> list[tuple[str, str, str | None]]:
+    """``[(nodeid, clause, doc)]`` for every selected probe, in file order.
+
+    Raises ``SyntaxError``/``OSError`` for a file that will not parse — the
+    caller already reports unparsable files before reaching here.
+    """
+    out: list[tuple[str, str, str | None]] = []
+    for name in files:
+        for unit, doc in _test_units(os.path.join(spec_dir_path, name)):
+            if not has_kickoff_docstring(doc):
+                continue
+            clause = ""
+            for line in (doc or "").splitlines():
+                if line.strip():
+                    clause = " ".join(line.split())
+                    break
+            out.append((f"{name}::{unit}", clause, doc))
+    return out
+
+
+def probe_manifest(spec_dir_path: str, selected: list[str]) -> list[dict]:
+    """The probe set the run declared, in the shape ``gates/*.json`` carries.
+
+    ``selected`` is ``classify``'s list; a nodeid that is not in it is not a
+    probe (no ``Kickoff:`` clause) and is left out. ``clause`` is the verbatim
+    kickoff quote, so ``probe_validity.load_probes`` binds it with no new
+    plumbing and a probe with an empty clause is visibly not a probe of a
+    criterion.
+    """
+    wanted = set(selected)
+    probes: list[dict] = []
+    filenames = list(dict.fromkeys(nodeid.partition("::")[0] for nodeid in selected))
+    for nodeid, clause, doc in _probe_files(spec_dir_path, filenames):
+        if nodeid not in wanted:
+            continue
+        probes.append({
+            "id": nodeid,
+            "probe": nodeid,
+            "clause": clause,
+            "held_out": held_out(doc),
+            "expect": "pass",
+        })
+    return probes
+
+
+def held_out_bounds_violation(probes: list[dict]) -> str:
+    """Why the held-out split is out of bounds, or ``""`` when it is fine.
+
+    Only the UPPER bound is a failure: at most half of the probes may be held
+    out, or the revise round is left with almost no signal. Declaring no split
+    at all is not a failure — it is the pre-split behaviour, and the author may
+    legitimately judge that every probe is one the implementer must see. That
+    mirrors ``MO_AUTHORSHIP_SEPARATION``'s ``no_separation_declared``: an
+    absent declaration is reported, never punished. A split that is BEGUN and
+    then over-applied is a real defect and reds the gate.
+    """
+    total = len(probes)
+    withheld = sum(1 for probe in probes if probe.get("held_out"))
+    if withheld == 0:
+        return ""
+    if withheld * 2 > total:
+        return (f"{withheld} of {total} probes held out: at most half may be "
+                "held out")
+    return ""
+
+
+def held_out_note(probes: list[dict]) -> str:
+    """The one-line split summary the checks carry (always truthful)."""
+    total = len(probes)
+    withheld = sum(1 for probe in probes if probe.get("held_out"))
+    if total == 0:
+        return "no probes"
+    if withheld == 0:
+        return f"no split declared ({total} probe(s), all visible)"
+    return f"{withheld} of {total} probe(s) held out"
+
+
+def write_probe_manifest(run_dir: str, probes: list[dict], log=None) -> str | None:
+    """Persist the probe set to ``<run_dir>/gates/acceptance-probes.json``.
+
+    Returns the path, or ``None`` when nothing was written. A failed write is
+    reported and never changes the gate verdict — it removes evidence from I1's
+    validity gate, it does not make the suite pass or fail.
+    """
+    if not probes:
+        return None
+    gates = os.path.join(run_dir, _PROBE_MANIFEST_DIR)
+    path = os.path.join(gates, _PROBE_MANIFEST_NAME)
+    try:
+        os.makedirs(gates, exist_ok=True)
+        payload = {
+            "spec_id": (os.environ.get("MINI_ORK_RUN_ID") or "").strip(),
+            "probes": probes,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=1, sort_keys=False)
+            fh.write("\n")
+    except OSError as exc:
+        if log is not None:
+            log(f"{NAME}: could not write {path}: {exc}")
+        return None
+    return path
 
 
 def kickoff_quote(spec_dir_path: str, nodeid: str) -> str:
@@ -805,6 +945,22 @@ def evaluate(run_dir: str, log) -> dict:
             result["error"])]
         return result
 
+    # The declared probe set, written BEFORE the suite runs: I1's validity gate
+    # reads `gates/*.json`, so the manifest has to exist whether or not this
+    # gate goes on to pass.
+    probes = probe_manifest(path, selected)
+    result["probes"] = probes
+    result["probe_manifest"] = write_probe_manifest(run_dir, probes, log)
+    result["held_out"] = held_out_note(probes)
+    split_error = held_out_bounds_violation(probes)
+    if split_error:
+        result["error"] = split_error
+        result["checks"] = [_fail(
+            "held-out-bounds",
+            "at most half of the declared probes are held out",
+            split_error)]
+        return result
+
     timeout, terr = spec_timeout()
     if terr:
         result["error"] = terr
@@ -863,8 +1019,18 @@ def evaluate(run_dir: str, log) -> dict:
         return result
 
     exceptions = failure_exceptions(output)
+    withheld = {probe["id"] for probe in probes if probe.get("held_out")}
     for nodeid in failed_items(output, selected):
-        failure = {"test": nodeid, "kickoff": kickoff_quote(path, nodeid)}
+        # A held-out probe still counts in the verdict — it is in `failures`
+        # and still reds `spec-tests-pass` — but its clause is WITHHELD from the
+        # evidence the implementer's revise round reads. That is the whole
+        # point of the split: the implementer must satisfy probes it cannot
+        # read the answers to.
+        is_held_out = nodeid in withheld
+        failure: dict = {"test": nodeid,
+                         "kickoff": "" if is_held_out else kickoff_quote(path, nodeid)}
+        if is_held_out:
+            failure["held_out"] = True
         error = exceptions.get(_unit_key(nodeid))
         if error:
             failure["error"] = error
@@ -912,6 +1078,13 @@ def evaluate(run_dir: str, log) -> dict:
          "expected": "pytest exits 0 over the selected spec tests",
          "actual": _pass_actual(rc, result["failures"]),
          "pass": rc == 0, "gating": True},
+        # Informational: the split is the AUTHOR's call, and declaring none is
+        # reported rather than punished. Only over-applying it reds the gate,
+        # and that happens before the suite runs.
+        {"name": "held-out-split",
+         "expected": "at most half of the declared probes are held out",
+         "actual": result["held_out"],
+         "pass": True, "gating": False},
     ]
     result["checks"] = checks
     result["pass"] = all(c["pass"] for c in checks if c["gating"])
@@ -936,7 +1109,12 @@ def _failure_clause(failure: dict) -> str:
         parts.append(f"[harness defect: {failure['harness_defect']}]")
     elif failure.get("error"):
         parts.append(f"[{failure['error']}]")
-    if failure["kickoff"]:
+    if failure.get("held_out"):
+        # Say that a clause is being withheld, never what it says: the
+        # implementer must know the probe is a real requirement it cannot
+        # read, not one it can ignore.
+        parts.append("[held-out clause withheld]")
+    elif failure["kickoff"]:
         parts.append(f"← {failure['kickoff']}")
     return " ".join(parts)
 
@@ -1026,6 +1204,12 @@ def _normal(run_dir: str) -> int:
         "manifest": result["manifest"],
         "missing": result["missing"],
         "failures": result["failures"],
+        # The declared probe set and its split. `probe_manifest` is the path on
+        # disk (absent when no probe was declared); `held_out` is the honest
+        # one-line split summary, including "no split declared".
+        "probes": result.get("probes", []),
+        "probe_manifest": result.get("probe_manifest"),
+        "held_out": result.get("held_out", ""),
         "harness_defects": result["harness_defects"],
         "author_node_end": result["author_node_end"],
         "rc": result["rc"],

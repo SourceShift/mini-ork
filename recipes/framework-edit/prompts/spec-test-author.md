@@ -23,6 +23,36 @@ def test_unknown_node_type_rejected():
 Quote the clause, do not paraphrase it: the verifier reports the quote as the
 evidence for a failure, and the implementer's revise round reads it.
 
+## Withhold half of what you can
+
+When you write two or more probes, mark at least one of them **held out** by
+adding a second docstring line, `Held-out: yes`:
+
+```python
+def test_rejects_unknown_node_type():
+    """Kickoff: 'workflow edge rejects an unknown node type'.
+
+    Held-out: yes
+    """
+```
+
+A held-out probe is still run and still counts against the implementation — it
+is not a weaker test. What it withholds is its **clause**: the implementer's
+revise round is told the probe failed, but not which kickoff sentence it
+checks. That is the point. If every probe's clause is readable, the implementer
+can satisfy each one by reading the answers to the exam it is sitting, and the
+suite stops measuring whether the change is right.
+
+Guidance:
+- Withhold the probes that pin the sharpest edge cases — the negative cases,
+  the fail-closed knob, the "must stay absent" assertion. Those are exactly the
+  ones a visible clause would let the implementer satisfy narrowly.
+- Withhold **at most half**. More than half leaves the revise round with too
+  little to act on and reds the gate before the suite even runs.
+- `Held-out: no` is the explicit opposite and is not required. Withholding none
+  is allowed and is reported, not punished — but then you have written an exam
+  with the answers printed on it.
+
 Rules:
 - Import the modules the kickoff names, at their declared paths. A spec test
   asserts the CONTRACT the kickoff states, never the implementer's summary of it.
