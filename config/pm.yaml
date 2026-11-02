@@ -61,6 +61,14 @@
 # vault reports a protection gap, i.e. while the secret resolves from `env` or a
 # plain file. A shared secret that guards an inbound port wants sops, `command`
 # or OpenBao behind it. The trigger rules above apply identically either way.
+#
+# ADMISSION. Rules select a ticket; a *policy* can still refuse it. Before any
+# thread or run exists, every registered `intake_admission` policy is evaluated
+# (see mini_ork/policies/), and DENY or REQUIRE_APPROVAL ends the arrival there.
+# The statuses and the outcome are recorded per arrival as a mandate — who
+# admitted it, which trigger rules it was judged by, which policy decided — in
+# `intake_events.mandate_json`; `mini-ork threads show <id>` prints it. With no
+# policy registered every arrival is allowed, which is the laptop tier.
 
 sources:
   local:

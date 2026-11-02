@@ -148,3 +148,7 @@ class IntakeEvent:
     #: before the column existed — ``thread_id`` is not a proxy, because one
     #: thread can carry several runs.
     run_id: str | None = None
+    #: Who let this arrival become work, under which rules — see
+    #: :mod:`mini_ork.intake.mandate`. ``None`` for rows written before the
+    #: mandate existed; the record is additive and never decides anything.
+    mandate: dict | None = None

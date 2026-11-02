@@ -164,12 +164,14 @@ def _cmd_show(argv: list[str]) -> int:
         return 1
     turns = store.messages(args.id, db=db)
     runs = store.runs_for(args.id, db=db)
+    arrivals = store.intake_events_for_thread(args.id, db=db)
 
     if args.json:
         payload = {
             "thread": asdict(thread),
             "messages": [asdict(m) for m in turns],
             "runs": [asdict(r) for r in runs],
+            "intake": [asdict(e) for e in arrivals],
         }
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0
@@ -197,7 +199,36 @@ def _cmd_show(argv: list[str]) -> int:
             f"  recipe       {r.recipe or '-'}\n"
             f"  kickoff      {r.kickoff_path or '-'}\n"
         )
+
+    # "Why is this thread running at all?" — answerable only from the ledger,
+    # and the reason it is printed last: the transcript is what a person came for.
+    sys.stdout.write("\n## Intake\n")
+    if not arrivals:
+        sys.stdout.write("(none — not opened by intake)\n")
+    for e in arrivals:
+        source = (e.mandate or {}).get("source") or e.provider
+        sys.stdout.write(f"\n{e.delivery_id}  {e.action or '-'}  ({source})\n")
+        if e.detail:
+            sys.stdout.write(f"  detail       {e.detail}\n")
+        if e.mandate:
+            _print_mandate(e.mandate)
     return 0
+
+
+def _print_mandate(mandate: dict) -> None:
+    rules = ", ".join(mandate.get("rule_ids") or []) or "(no rules configured)"
+    sys.stdout.write(
+        f"  mandate      {mandate.get('strength') or '-'} by {mandate.get('actor') or '-'}"
+        f" via {mandate.get('source') or '-'}\n"
+        f"  rules        {rules}\n"
+    )
+    if mandate.get("policy_version"):
+        sys.stdout.write(f"  ruleset      {mandate['policy_version']}\n")
+    if mandate.get("decided_by"):
+        line = f"  decided by   {mandate['decided_by']}"
+        if mandate.get("decision_id"):
+            line += f" ({mandate['decision_id']})"
+        sys.stdout.write(line + "\n")
 
 
 def _cmd_deliver(verb: str, argv: list[str]) -> int:

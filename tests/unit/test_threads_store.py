@@ -252,24 +252,34 @@ def test_an_unknown_origin_or_status_reads_as_the_safe_default(db: str):
     assert thread.origin is ThreadOrigin.IDE
 
 
-# ── 0075: the ledger records which run an arrival started ───────────────────
+# ── the ledger widens one column at a time (0075 run_id, 0086 mandate_json) ─
 
 RUN_ID_MIGRATION = REPO / "db" / "migrations" / "0075_intake_events_run_id.sql"
 
 
+def _declaring_migration(name: str, declaration: str) -> str | None:
+    """The migration whose text declares this column, if any."""
+    statement = f"ALTER TABLE intake_events ADD COLUMN {name} {declaration};"
+    statement = re.sub(r"\s+", " ", statement)
+    for path in sorted((REPO / "db" / "migrations").glob("*.sql")):
+        text = re.sub(r"--[^\n]*", " ", path.read_text(encoding="utf-8"))
+        if statement in re.sub(r"\s+", " ", text):
+            return path.name
+    return None
+
+
 def test_the_widened_columns_agree_with_their_migration():
-    """``INTAKE_COLUMNS`` and ``0075`` are two writers for one schema.
+    """``INTAKE_COLUMNS`` and the migrations are two writers for one schema.
 
     The same rule as :func:`test_schema_matches_the_migration`: a runtime twin
-    is only safe while it writes the migration's own text, and this is what
-    keeps them agreeing.
+    is only safe while it writes a migration's own text, and this is what keeps
+    them agreeing. Each column is checked against the migration that declares
+    it, so adding a column means adding its migration — not just the tuple.
     """
-    text = RUN_ID_MIGRATION.read_text(encoding="utf-8")
-    without_comments = re.sub(r"--[^\n]*", " ", text)
-    normalized = re.sub(r"\s+", " ", without_comments).strip()
+    assert _declaring_migration("run_id", "TEXT") == RUN_ID_MIGRATION.name
     for name, declaration in store.INTAKE_COLUMNS:
-        statement = f"ALTER TABLE intake_events ADD COLUMN {name} {declaration};"
-        assert re.sub(r"\s+", " ", statement) in normalized, statement
+        assert _declaring_migration(name, declaration) is not None, (
+            f"no db/migrations/*.sql declares intake_events.{name} {declaration}")
 
 
 def test_a_ledger_written_before_the_column_is_widened_on_the_first_write(tmp_path: Path):

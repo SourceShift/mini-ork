@@ -96,7 +96,8 @@ Commits **`e29fa1b3`** (tier A, polling) and **`5dd61439`** (tier B, signed webh
 |---|---|
 | `intake/trigger.py` | The rules — **all opt-in** (`trigger_label`, `trigger_assignee`, `trigger_states`, `trigger_recipe`), ANDed. With none set `matches_trigger` returns `(False, "no trigger configured")`. A half-configured source starts **nothing** rather than the whole backlog |
 | `intake/poll.py` | One pass = sync → filter the mirror → dispatch. Filtering reads only `state`/`labels`/`assignee`, all on a mirror row, so a hundred-ticket board costs **zero** extra requests |
-| `intake/dispatch.py` | `dispatch_issue` — the *one* place a ticket becomes work, shared by both tiers so they cannot drift. **"Never two at once, and the second one continues the same thread."** |
+| `intake/dispatch.py` | `dispatch_issue` — the *one* place a ticket becomes work, shared by both tiers so they cannot drift. **"Never two at once, and the second one continues the same thread."** Admission policies run here, before any thread or run exists |
+| `intake/mandate.py` | The admission record — actor, source, rules in force, ruleset hash, `granted`/`refused`/`denied`, deciding policy. Written to `intake_events.mandate_json`; **a record, never an input** |
 | `intake/webhooks.py` | Tier B cryptography + decision — **no fastapi import**, so the HMAC is testable without a server |
 | `cli/intake_cmd.py` | `mini-ork intake {once,poll,status}` — tier A entry point |
 | `web/routes/intake.py` | `POST /api/v1/intake/{source}` — the HTTP shell; owns status codes only |
@@ -144,6 +145,31 @@ Per `CLAUDE.md`, both tiers are part of done, one config file chooses, and a mis
 | Secrets | `env` / `$MINI_ORK_HOME/config/secrets.local.sh` | `sops` / `command` / OpenBao |
 | Replay | `payload_hash` folds a re-poll | `UNIQUE(provider, delivery_id)` + `payload_hash` |
 | Failure mode | missing token ⇒ hard error naming the key | webhook route refuses **503** while the vault reports a protection gap |
+
+### 1.7 Admission mandates (2026-11-02)
+
+The ledger said *that* an arrival acted. It could not say **why it was allowed**,
+so "no trigger is configured" and "the poller has not run" were the same silence,
+and a policy that refused admission left no trace.
+
+- `intake_admission` is a policy event type (`policies/schema.py`). Every
+  `dispatch_issue` evaluates it **before** `service.deliver`, with
+  `deny_on_error=True` — a raising rule fails closed, because admitting work
+  nobody authorized costs a machine and a budget. `DENY` and `REQUIRE_APPROVAL`
+  both stop the arrival; there is no approval queue at intake.
+- Every ledger row carries a **mandate**: `actor`, `source`, `scope_ref`,
+  `rule_ids` (`[]` = no rules configured), `policy_version` (`tv-<hash>` over the
+  source's trigger settings), `strength` (`granted`/`refused`/`denied`),
+  `decided_by`, `decision_id`. `refused` rows are written on a non-match and a
+  closed-since-sync ticket, so silence always has a reason.
+- A refusal is **promoted in place** when the same delivery later dispatches
+  (some sources add a label without bumping `updated_at`); a dispatched row is
+  final and a replay folds into it.
+- `threads show <id>` prints the mandate history; `--json` carries it under
+  `intake`. Column added by `0086_intake_events_mandate_json.sql` plus the
+  `_ensure_intake_columns` runtime twin.
+
+Operator documentation: [`docs/operator/work-intake.md`](../operator/work-intake.md).
 
 ---
 

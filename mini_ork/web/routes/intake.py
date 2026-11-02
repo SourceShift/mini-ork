@@ -34,7 +34,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from mini_ork.intake import webhooks
-from mini_ork.intake.dispatch import dispatch_issue
+from mini_ork.intake.dispatch import dispatch_issue, record_refusal
 from mini_ork.intake.poll import trigger_for
 from mini_ork.intake.trigger import matches_trigger
 from mini_ork.pm import config as pm_config
@@ -146,12 +146,36 @@ async def receive(source: str, request: Request) -> JSONResponse:
     rules = trigger_for(source, config=configuration)
     matched, reason = matches_trigger(issue, rules)
     if not matched:
+        # The sender may retry this delivery; only a delivery id can make the
+        # refusal addressable later (a label added without an `updated_at` bump
+        # re-arrives under the *same* id), so it is recorded only when we have
+        # one.
+        if delivery_id:
+            record_refusal(
+                provider_id=source,
+                issue_uid=uid,
+                delivery_id=delivery_id,
+                trigger=rules,
+                detail=reason,
+                source="intake-webhook",
+                updated_at=issue.updated_at or "",
+                db=db,
+            )
         return _says(reason)
     if not issue.is_open:
-        return _says(f"the source reports it as {issue.state}")
-
-    home: Path = get_default_home()
-    db = resolve_db(home)
+        detail = f"the source reports it as {issue.state}"
+        if delivery_id:
+            record_refusal(
+                provider_id=source,
+                issue_uid=uid,
+                delivery_id=delivery_id,
+                trigger=rules,
+                detail=detail,
+                source="intake-webhook",
+                updated_at=issue.updated_at or "",
+                db=db,
+            )
+        return _says(detail)
 
     dispatch = dispatch_issue(
         home,
@@ -162,6 +186,7 @@ async def receive(source: str, request: Request) -> JSONResponse:
         # `uid@updated_at` because it is what GitHub itself retries on.
         delivery_id=delivery_id or None,
         source="intake-webhook",
+        trigger=rules,
         db=db,
     )
     return _json({"ok": True, **dispatch.to_dict()})

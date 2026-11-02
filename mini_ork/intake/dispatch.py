@@ -32,13 +32,19 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from mini_ork.intake import mandate as mandate_mod
+from mini_ork.intake.trigger import Trigger
 from mini_ork.pm.model import Comment, Issue, Priority, split_uid
 from mini_ork.pm.provider import Provider, ProviderError
 from mini_ork.pm.store import IssueRow
+from mini_ork.policies.engine import evaluate_policies, record_decision
 from mini_ork.threads import service, store
 from mini_ork.threads.model import ThreadOrigin
 
@@ -187,6 +193,104 @@ def ticket_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
+#: Policy results that do **not** start work at intake. ``REQUIRE_APPROVAL``
+#: belongs here: there is no admission approval queue, so "wait for a person"
+#: and "no" are the same outcome for this call — the ticket does not run.
+_BLOCKING_RESULTS = frozenset({"DENY", "REQUIRE_APPROVAL"})
+
+
+def _admit(
+    provider: Provider,
+    issue: Issue,
+    *,
+    source: str,
+    recipe: str | None,
+    trigger: Trigger | None,
+    db: str | None,
+) -> tuple[bool, str, str, str]:
+    """Ask the registered admission policies whether this ticket may become work.
+
+    Returns ``(allowed, detail, decided_by, decision_id)``. Failing open is not
+    an option here: a policy that raises is treated as a DENY (the engine's
+    ``deny_on_error``), because the failure mode of admitting a ticket nobody
+    authorized is a run on the operator's machine and budget.
+
+    The decision is appended to ``policy_decisions`` when the state database
+    exists. A missing database is *not* a reason to refuse — the ledger row
+    already records the decision, and refusing every first-run ticket on a home
+    that has not been initialised would make the simple tier useless. It is
+    reported on stderr so it is not silent either.
+    """
+    event = {
+        "type": "intake_admission",
+        "data": {
+            "provider": provider.id,
+            "issue_uid": issue.uid,
+            "title": issue.title,
+            "source": source,
+            "recipe": recipe,
+            "rule_ids": mandate_mod.rule_ids(trigger) if trigger is not None else [],
+        },
+        "run_id": "",
+        "timestamp": int(time.time()),
+    }
+    response = evaluate_policies(event, deny_on_error=True)
+    decided_by = str(response.get("policy_name") or "")
+    reason = str(response.get("reason") or "")
+    result = str(response.get("result") or "ALLOW")
+
+    decision_id = ""
+    try:
+        decision_id = record_decision(event, response, store.db_path(db))
+    except (FileNotFoundError, sqlite3.Error, OSError) as exc:
+        sys.stderr.write(
+            f"intake: admission decision for {issue.uid} was not archived "
+            f"({exc}); the mandate row still records it\n"
+        )
+
+    allowed = result not in _BLOCKING_RESULTS
+    detail = "" if allowed else f"{result.lower()} by policy {decided_by}: {reason}"
+    return allowed, detail, decided_by, decision_id
+
+
+def record_refusal(
+    *,
+    provider_id: str,
+    issue_uid: str,
+    delivery_id: str,
+    trigger: Trigger | None,
+    detail: str,
+    source: str = "intake",
+    updated_at: str = "",
+    db: str | None = None,
+) -> None:
+    """Record that an arrival was looked at and not dispatched — a ``refused`` mandate.
+
+    Without this row "no rule matched" and "the poller has not run" are the same
+    absence in the ledger. A refusal is not final: the row is promoted in place
+    if the same delivery later dispatches (``store.record_intake_event``), which
+    is why a ticket whose label is added without an ``updated_at`` bump is not
+    stuck as refused forever.
+    """
+    store.record_intake_event(
+        provider_id,
+        delivery_id,
+        payload_hash(f"{issue_uid}@{updated_at}"),
+        issue_uid=issue_uid,
+        action="skipped",
+        detail=detail,
+        mandate=mandate_mod.build(
+            actor=provider_id,
+            source=source,
+            scope_ref=issue_uid,
+            trigger=trigger,
+            strength="refused",
+            detail=detail,
+        ),
+        db=db,
+    )
+
+
 def _comments(provider: Provider, uid: str) -> tuple[tuple[Comment, ...], str | None]:
     """The tail of the discussion, or the reason there is none.
 
@@ -208,6 +312,7 @@ def dispatch_issue(
     recipe: str | None = None,
     delivery_id: str | None = None,
     source: str = "intake",
+    trigger: Trigger | None = None,
     db: str | None = None,
 ) -> Dispatch:
     """Start, steer or continue the run that works ``issue``.
@@ -224,14 +329,57 @@ def dispatch_issue(
     handed, so the decision "does this ticket already have one" has to be made
     here, from the ledger and the origin ref rather than from the id.
 
+    **Admission comes before all three.** ``intake_admission`` events are
+    evaluated against the registered policies first; a DENY (or a policy that
+    raises, which counts as one) ends the call here with a ``skipped`` dispatch
+    and a refusal in the ledger. ``deliver`` is never reached, so no thread, no
+    run and no spend exist for a ticket the operator's rules refused.
+
     The ledger row is written here rather than by the caller because here is
     where both halves are known — the delivery id that identifies the arrival
     and the action it produced. A second call for the same arrival folds into
     the first row (:data:`~mini_ork.threads.store.record_intake_event` is
     ``INSERT OR IGNORE``), which is belt-and-braces: the poller folds earlier
     still, before it spends a network call on the ticket.
+
+    Every row carries a :mod:`~mini_ork.intake.mandate` — who admitted it and
+    under which rules. ``trigger`` is the rule set the ticket was selected by
+    (``None`` when the caller dispatched by hand); without it the mandate can
+    say *that* admission was allowed but not *by what*.
     """
     delivery_id = delivery_id or delivery_id_for(issue)
+    allowed, denied_detail, decided_by, decision_id = _admit(
+        provider, issue, source=source, recipe=recipe, trigger=trigger, db=db,
+    )
+    if not allowed:
+        store.record_intake_event(
+            provider.id,
+            delivery_id,
+            payload_hash(f"{issue.uid}@{issue.updated_at or ''}"),
+            issue_uid=issue.uid,
+            thread_id=None,
+            action="skipped",
+            detail=denied_detail,
+            mandate=mandate_mod.build(
+                actor=provider.id,
+                source=source,
+                scope_ref=issue.uid,
+                trigger=trigger,
+                strength="denied",
+                detail=denied_detail,
+                decided_by=decided_by,
+                decision_id=decision_id,
+            ),
+            db=db,
+        )
+        return Dispatch(
+            issue_uid=issue.uid,
+            delivery_id=delivery_id,
+            thread_id="",
+            action="skipped",
+            detail=denied_detail,
+        )
+
     live = store.live_run_for_issue(issue.uid, db=db)
     if live is not None:
         thread_id = live.thread_id
@@ -271,6 +419,17 @@ def dispatch_issue(
         # known — ``delivery`` is what started or steered the run, so this is
         # the one place the arrival and its run meet.
         run_id=delivery.run_id,
+        mandate=mandate_mod.build(
+            actor=provider.id,
+            source=source,
+            scope_ref=issue.uid,
+            trigger=trigger,
+            strength="granted",
+            detail=delivery.detail or "",
+            thread_id=thread_id,
+            decided_by=decided_by,
+            decision_id=decision_id,
+        ),
         db=db,
     )
     return Dispatch(

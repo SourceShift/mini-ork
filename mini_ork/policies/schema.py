@@ -40,6 +40,7 @@ PolicyEventType = Literal[
     "file_write",         # agent is about to write to a file
     "cost_threshold",     # cumulative cost crossed a threshold
     "verifier_result",    # a verifier emitted pass/fail
+    "intake_admission",   # a ticket is about to become a run
 ]
 
 

@@ -119,7 +119,15 @@ SCHEMA_SQL: tuple[str, ...] = (
 #: ``mini_ork/stores/migrate.py``. So an existing ledger is widened by
 #: :func:`_ensure_intake_columns` instead — the same shape ``mini_ork/pm/store.py``
 #: uses for its body-cache columns.
-INTAKE_COLUMNS: tuple[tuple[str, str], ...] = (("run_id", "TEXT"),)
+INTAKE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("run_id", "TEXT"),
+    ("mandate_json", "TEXT"),
+)
+
+#: The actions that mean "this arrival put work on the machine". A ledger row
+#: holding one of these is final: a replay folds into it. ``skipped`` is not
+#: final — see :func:`record_intake_event`.
+DISPATCH_ACTIONS: frozenset[str] = frozenset({"launched", "continued", "steered"})
 
 
 def _db_path(db: str | None) -> str:
@@ -251,7 +259,24 @@ def _intake_from(record: sqlite3.Row) -> IntakeEvent:
         detail=record["detail"],
         created_at=record["created_at"],
         run_id=record["run_id"],
+        mandate=_mandate(record["mandate_json"]),
     )
+
+
+def _mandate(value: str | None) -> dict | None:
+    """Decode ``mandate_json``; a corrupt value is no mandate, never a crash.
+
+    The ledger is read by a board and by ``threads show`` — a row written by a
+    half-finished write should degrade to "no mandate recorded", not take the
+    whole history down with it.
+    """
+    if not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _thread_state(value: str) -> ThreadState:
@@ -670,6 +695,7 @@ def record_intake_event(
     action: str | None = None,
     detail: str | None = None,
     run_id: str | None = None,
+    mandate: dict | None = None,
     db: str | None = None,
 ) -> IntakeEvent:
     """Record what an intake trigger did with one event. Idempotent per delivery.
@@ -682,22 +708,66 @@ def record_intake_event(
     not a proxy for it — one thread carries several attempts — so a caller that
     knows the run passes it; the default keeps every older caller writing the
     same row it always did.
+
+    ``mandate`` is the admission record (:mod:`mini_ork.intake.mandate`),
+    stored as JSON. It is a record, never an input.
+
+    **A skip is promoted, a dispatch is final.** A refused arrival is recorded
+    so "no rule matched" stops looking like "never polled". But a refusal is a
+    judgement about the ticket's *current* state, and some sources do not move
+    ``updated_at`` when a label is added — so the same delivery id can arrive
+    again after the ticket became eligible. When the stored action is
+    ``skipped`` and the new one dispatched work, the row is updated in place
+    instead of being folded into the refusal forever.
     """
     now = _now()
     with _write(db) as con:
         con.execute(
             "INSERT OR IGNORE INTO intake_events "
             "(provider, delivery_id, payload_hash, issue_uid, thread_id, action, detail, "
-            "run_id, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "run_id, mandate_json, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (provider, delivery_id, payload_hash, issue_uid, thread_id, action, detail,
-             run_id, now),
+             run_id, json.dumps(mandate) if mandate is not None else None, now),
         )
+        stored = con.execute(
+            "SELECT action FROM intake_events WHERE provider = ? AND delivery_id = ?",
+            (provider, delivery_id),
+        ).fetchone()
+        if (action in DISPATCH_ACTIONS and stored is not None
+                and (stored["action"] or "") == "skipped"):
+            con.execute(
+                "UPDATE intake_events SET payload_hash = ?, issue_uid = ?, "
+                "thread_id = ?, action = ?, detail = ?, run_id = ?, mandate_json = ? "
+                "WHERE provider = ? AND delivery_id = ?",
+                (payload_hash, issue_uid, thread_id, action, detail, run_id,
+                 json.dumps(mandate) if mandate is not None else None,
+                 provider, delivery_id),
+            )
         record = con.execute(
             "SELECT * FROM intake_events WHERE provider = ? AND delivery_id = ?",
             (provider, delivery_id),
         ).fetchone()
         return _intake_from(record)
+
+
+def intake_events_for_thread(thread_id: str, db: str | None = None) -> list[IntakeEvent]:
+    """Every arrival that touched a thread, oldest first — the mandate history."""
+    con = _conn(db)
+    try:
+        ensure_schema(db)
+        rows = con.execute(
+            "SELECT * FROM intake_events WHERE thread_id = ? ORDER BY id",
+            (thread_id,),
+        ).fetchall()
+        return [_intake_from(row) for row in rows]
+    finally:
+        con.close()
+
+
+def db_path(db: str | None = None) -> str:
+    """The resolved state database path — public for callers that must write elsewhere."""
+    return _db_path(db)
 
 
 def intake_event(

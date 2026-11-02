@@ -25,7 +25,7 @@ import os
 import sqlite3
 import time
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from mini_ork.policies.schema import PolicyEvent, PolicyResponse
 
@@ -66,6 +66,8 @@ def evaluate_policies(
     event: PolicyEvent,
     session_state: dict[str, Any] | None = None,
     task_class: str | None = None,
+    *,
+    deny_on_error: bool = False,
 ) -> PolicyResponse:
     """Evaluate registered policies against an event.
 
@@ -73,6 +75,11 @@ def evaluate_policies(
     every policy abstains. ``session_state`` is passed through to
     policy callables that accept the two-argument form; policies that
     only take ``event`` ignore it.
+
+    ``deny_on_error`` flips what a *raising* policy means: LOG_ONLY (skip it
+    and keep going) by default, DENY when the decision guards admission and
+    failing open would start work nobody authorized. The exception text rides
+    in ``reason`` so the denial is explainable rather than mysterious.
     """
     session_state = session_state or {}
 
@@ -88,7 +95,15 @@ def evaluate_policies(
             except TypeError:
                 response = callable_(event)
         except Exception as exc:  # noqa: BLE001
-            # A buggy policy should not crash the engine. Log + skip.
+            # A buggy policy should not crash the engine. Log + skip — unless
+            # the caller is guarding admission, where an unanswerable rule must
+            # fail closed rather than let the ticket through.
+            if deny_on_error:
+                return cast(PolicyResponse, {
+                    "result": "DENY",
+                    "reason": f"policy {name} raised: {exc!r}",
+                    "policy_name": name,
+                })
             response = {
                 "result": "LOG_ONLY",
                 "reason": f"policy {name} raised: {exc!r}",

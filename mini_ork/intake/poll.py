@@ -53,7 +53,7 @@ from mini_ork.pm.model import CLOSED_STATES, OPEN_STATES, Issue, IssueState
 from mini_ork.pm.provider import Provider, ProviderError, Query
 from mini_ork.threads import store as thread_store
 
-from mini_ork.intake.dispatch import dispatch_issue, delivery_id_for
+from mini_ork.intake.dispatch import delivery_id_for, dispatch_issue, record_refusal
 from mini_ork.intake.report import ReportOutcome, report_pass
 from mini_ork.intake.trigger import Trigger, matches_trigger
 
@@ -228,12 +228,28 @@ def poll_once(
     for row in rows:
         matched, reason = matches_trigger(row, rules)
         if not matched:
+            # A refusal is recorded, not inferred from silence — see
+            # `record_refusal`. It is not final: a later pass that does select
+            # this delivery promotes the row.
+            if not dry_run:
+                record_refusal(
+                    provider_id=source_id,
+                    issue_uid=row.uid,
+                    delivery_id=delivery_id_for(row),
+                    trigger=rules,
+                    detail=reason,
+                    updated_at=row.updated_at or "",
+                    db=db,
+                )
             outcomes.append(Outcome(row.uid, "skipped", reason))
             continue
 
         delivery_id = delivery_id_for(row)
         seen = thread_store.intake_event(source_id, delivery_id, db=db)
-        if seen is not None:
+        # A refusal is a judgement about the ticket's state, not a completed
+        # action: when the same delivery is selected now, it must be allowed to
+        # dispatch, and `record_intake_event` rewrites the refused row.
+        if seen is not None and (seen.action or "") != "skipped":
             # Folded, not re-dispatched: the ticket's text changed (or a webhook
             # replayed) and the ledger remembers what was done with this arrival.
             outcomes.append(
@@ -266,13 +282,23 @@ def poll_once(
             # filter could not see — and the source is the authority on whether
             # a ticket is still work. Checked here, on the one read that was
             # already being made, so it costs nothing.
-            outcomes.append(
-                Outcome(row.uid, "skipped", f"the source now reports it as {issue.state}")
+            detail = f"the source now reports it as {issue.state}"
+            record_refusal(
+                provider_id=source_id,
+                issue_uid=row.uid,
+                delivery_id=delivery_id,
+                trigger=rules,
+                detail=detail,
+                updated_at=row.updated_at or "",
+                db=db,
             )
+            outcomes.append(Outcome(row.uid, "skipped", detail))
             continue
 
         acted += 1
-        dispatch = dispatch_issue(home, adapter, issue, recipe=rules.recipe, db=db)
+        dispatch = dispatch_issue(
+            home, adapter, issue, recipe=rules.recipe, trigger=rules, db=db
+        )
         outcomes.append(
             Outcome(
                 row.uid,

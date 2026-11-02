@@ -132,6 +132,35 @@ def test_json_output_is_parseable(home: Path, capsys) -> None:
     payload = json.loads(out)
     assert payload["thread"]["id"] == "t1"
     assert payload["messages"][0]["text"] == "hi"
+    assert payload["intake"] == []
+
+
+def test_show_prints_the_intake_mandate_behind_a_thread(home: Path, capsys) -> None:
+    """The ledger is the only place "why is this running?" is answerable, so
+    ``show`` must render it — not just the transcript."""
+    _run(capsys, "send", "t1", "--text", "hi", "--home", str(home))
+    from mini_ork.intake import mandate as mandate_mod
+
+    stored = mandate_mod.build(
+        actor="github", source="intake-webhook", scope_ref="github:o/r#1",
+        trigger=None, strength="granted", thread_id="t1",
+        decided_by="allow_agent", decision_id="pd-abc",
+    )
+    stored["rule_ids"] = []
+    store.record_intake_event(
+        "github", "d-1", "h", issue_uid="github:o/r#1", thread_id="t1",
+        action="launched", mandate=stored, db=str(home / "state.db"),
+    )
+
+    code, out, _ = _run(capsys, "show", "t1", "--home", str(home))
+    assert code == 0
+    assert "## Intake" in out
+    assert "granted by github via intake-webhook" in out
+    assert "(no rules configured)" in out
+    assert "decided by   allow_agent (pd-abc)" in out
+
+    _, out, _ = _run(capsys, "show", "t1", "--json", "--home", str(home))
+    assert json.loads(out)["intake"][0]["mandate"]["strength"] == "granted"
 
 
 def test_show_of_an_unknown_thread_is_an_error(home: Path, capsys) -> None:
