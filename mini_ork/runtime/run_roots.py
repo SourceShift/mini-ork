@@ -94,6 +94,11 @@ class RunRoots:
     home: str
     engine: str
     exec_cwd: str | None = None
+    #: ``"worktree"`` when the run edits a checkout minted for it (see
+    #: :mod:`mini_ork.runtime.placement`); ``""`` for the shared tree. Every
+    #: consumer already reads ``target``, so this records *how* it was chosen
+    #: rather than changing where anything points.
+    placement: str = ""
 
 
 def _git_toplevel(path: str) -> str:
@@ -493,6 +498,13 @@ def persist_run_roots(run_dir: str) -> RunRoots | None:
     :func:`resolve_run_roots` fails the run closed with rc 2 and the reason on
     stderr and in ``task_runs.notes``, instead of letting the run start with
     roots that fell back onto some other tree.
+
+    It is also where per-run worktree placement is applied
+    (:mod:`mini_ork.runtime.placement`): when the run declared it, the target is
+    replaced with a checkout minted for this run before anything is recorded, so
+    the record every node reads is the isolated tree. A declared worktree that
+    cannot be created fails the start the same way a dead target does — the run
+    never silently falls back to the shared checkout.
     """
     if not run_dir:
         return None
@@ -511,6 +523,21 @@ def persist_run_roots(run_dir: str) -> RunRoots | None:
     try:
         roots = resolve_run_roots(run_dir)
     except RunRootsError as exc:
+        _fail_run_start(run_dir, str(exc))
+        raise SystemExit(2) from exc
+    # Per-run worktree placement: declared by the recipe's ``placement`` block or
+    # ``MO_WORKTREE_PLACEMENT=1``, and a no-op otherwise. It runs HERE, at the
+    # pinning boundary, so the record every node reads is the worktree rather
+    # than the shared checkout — which is the whole point: a gate that reads the
+    # shared tree grades whatever another session left in it.
+    from mini_ork.runtime import placement as _placement  # local: stdlib-only module
+
+    try:
+        roots = _placement.prepare(run_dir, roots)
+    except (_placement.PlacementError, OSError) as exc:
+        # Deliberately narrow: a declared-but-impossible worktree fails the start
+        # with a message; an actual bug in this code should traceback rather than
+        # be dressed up as a placement refusal.
         _fail_run_start(run_dir, str(exc))
         raise SystemExit(2) from exc
     prof["roots"] = asdict(roots)

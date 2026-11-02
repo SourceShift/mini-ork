@@ -206,6 +206,43 @@ sqlite3 "$MINI_ORK_HOME/state.db" \
     ORDER BY id DESC LIMIT 10"
 ```
 
+### Worktree placement
+
+Normally the implementer edits the target checkout in place. When another
+session is also working in that tree, the diff a reviewer reads can contain work
+this run did not do — a correct gate grading the wrong artifact.
+
+Declaring placement makes the run edit its own git worktree (branch
+`mini-ork/<run_id>`, recorded at `$MINI_ORK_HOME/worktrees/<run_id>.json`) and
+points the run's roots at it, so every node, verifier and git step sees one tree
+only this run can write. The base is the target's HEAD at run-start, recorded in
+the workspace record.
+
+| Variable | Purpose |
+|---|---|
+| `MO_WORKTREE_PLACEMENT` | `1` isolates this run; `0` runs in place **even if the recipe asks for isolation**. Unset: the recipe's `placement.worktree` decides. |
+
+A recipe declares it once, so every run of it is isolated:
+
+```yaml
+# recipes/my-recipe/workflow.yaml
+placement:
+  worktree: true
+```
+
+Declared but impossible (target is not a git repo, `MINI_ORK_HOME` unset) **fails
+the run start** with rc 2 and names the opt-out. It never falls back to the
+shared checkout: that fallback is the defect, since the run would look isolated
+and be graded on someone else's tree.
+
+Finishing is deliberate, not automatic. The run's commits land on
+`mini-ork/<run_id>`, your checkout is untouched, and `mini-ork inbox` lists the
+keep-or-discard decision once the run ends — merge or discard from the board.
+
+Two tiers, one switch: this needs no server, no daemon and no account, so the
+laptop tier is `MO_WORKTREE_PLACEMENT=1` on one command; the shared-machine tier
+is `placement.worktree: true` in the recipe, which no operator has to remember.
+
 ### Interactive dispatch
 
 A node dispatched on a person's behalf is not batch work: a human is waiting,

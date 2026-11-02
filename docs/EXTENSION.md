@@ -96,6 +96,22 @@ mini-ork validate --recipe my-recipe      # static checks, each with a Fix: hint
 MINI_ORK_DRY_RUN=1 mini-ork run my-recipe kickoff.md
 ```
 
+**Optional: isolate every run of this recipe.** If its implementer edits a tree
+other sessions also use, the reviewed diff can contain work this run did not
+author — a correct gate grading the wrong artifact. One key fixes it for every
+run of the recipe:
+
+```yaml
+placement:
+  worktree: true     # mint a per-run checkout; roots point at it for the whole run
+```
+
+The run gets its own git worktree on `mini-ork/<run_id>`, your checkout is not
+touched, and `mini-ork inbox` offers the merge-or-discard decision when the run
+ends. `MO_WORKTREE_PLACEMENT=1` turns it on for a single run and `=0` turns it
+off even when the recipe asks for it. See
+[env vars](operator/env-vars.md#worktree-placement).
+
 ### Node type dispatch semantics
 
 The `workflow.yaml` fields above describe the *shape* of a node. They don't

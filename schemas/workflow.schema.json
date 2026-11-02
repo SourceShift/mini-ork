@@ -25,6 +25,18 @@
         "$ref": "#/$defs/WorkflowNode"
       }
     },
+    "placement": {
+      "type": "object",
+      "description": "Where this recipe's runs edit. `{worktree: true}` mints a per-run git worktree (branch mini-ork/<run_id>) and points the run's roots at it, so the implementer's diff cannot contain another session's uncommitted work. Read at run start by mini_ork.runtime.placement; MO_WORKTREE_PLACEMENT overrides it in both directions.",
+      "additionalProperties": false,
+      "properties": {
+        "worktree": {
+          "type": "boolean",
+          "default": false,
+          "description": "Mint a checkout only this run can write. Off by default: a copy costs disk and a submodule fetch, and the shared tree is right for a single-session project."
+        }
+      }
+    },
     "edges": {
       "type": "array",
       "description": "Directed edges connecting nodes. The graph must be a DAG (no cycles).",
