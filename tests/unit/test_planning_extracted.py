@@ -146,7 +146,11 @@ def test_recipe_fallback_plan_builds_from_workflow(tmp_path):
     assert p["decomposition"][1]["depends_on"] == ["implement"]
     assert p["dependencies"] == [{"from": "implement", "to": "verify"}]
     assert p["artifact_contract"] == {"outputs": ["plan.json"],
-                                      "success_verifiers": ["verifiers/test.py"]}
+                                      "success_verifiers": ["verifiers/test.py"],
+                                      # No artifact_contract.yaml in this recipe
+                                      # dir: the plan says where the contract
+                                      # came from instead of guessing one.
+                                      "contract_source": "missing"}
     assert p["verifier_contract"]["checks"]  # non-empty → validate_plan ok
     assert plan_schema.validate_plan(out) == "ok"
 
