@@ -352,6 +352,19 @@ def test_verifier_mutation_measured_no_score_reports_a_reason(
     assert "reason: no mutation applied" in captured.out
 
 
+def test_verifier_mutation_all_abstained_is_not_blamed_on_the_observable(
+        tmp_path, monkeypatch, capsys):
+    """Mutants that ran and abstained are a different story from none applying."""
+    _stub_score(monkeypatch, dict(MEASURED_NO_SCORE, abstained=6, total=6))
+    obs = _observable(tmp_path)
+
+    assert _cli(["verifier-mutation", "--observable", str(obs)]) == 2
+
+    captured = capsys.readouterr()
+    assert "all abstained" in captured.out
+    assert "no mutation applied" not in captured.out
+
+
 def test_verifier_mutation_missing_observable_exits_two(tmp_path, monkeypatch,
                                                         capsys):
     calls = _stub_score(monkeypatch, MEASURED_ADMITTED)

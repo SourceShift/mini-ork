@@ -273,11 +273,22 @@ def _verifier_mutation(argv: list[str]) -> int:
     admitted = verifier_mutation.admit(kill_score) if measured else None
     if not measured and not result.get("reason"):
         result = dict(result)
-        result["reason"] = (
-            "no mutation applied to this observable — it carries none of the "
-            "fields the mutations corrupt (body/expect_status), so there is "
-            "no kill score to report"
-        )
+        drawn = int(result.get("total") or 0)
+        if drawn == 0:
+            result["reason"] = (
+                "no mutation applied to this observable — it carries none of "
+                "the fields the mutations corrupt (body/expect_status), so "
+                "there is no kill score to report"
+            )
+        else:
+            # Mutants were built and run, they just never returned a decisive
+            # verdict. Saying "no mutation applied" here would be a different
+            # (and false) claim about why there is no number.
+            result["reason"] = (
+                f"the verifier returned no decisive verdict on any of the "
+                f"{drawn} mutant(s) (all abstained), so there is no kill score "
+                "to report"
+            )
 
     sidecar = None
     if card_path is not None and measured:
