@@ -785,6 +785,37 @@ def _isolated_dispatch_worker(payload):
     return rc, finish_reason, stdout.getvalue(), stderr.getvalue()
 
 
+def _is_interactive(field) -> bool:
+    """Is this node dispatched on a person's behalf, not the batch's?
+
+    ``MO_INTERACTIVE=1`` marks a whole invocation (``mini-ork recover`` sets
+    it); ``MO_INTERACTIVE_NODES=a,b`` marks individual nodes so a mixed batch
+    can carry one. Both are read at dispatch time, so a wrapper can add the
+    marker to one batch without changing the executor.
+    """
+    if os.environ.get("MO_INTERACTIVE") == "1":
+        return True
+    names = {n.strip() for n in (os.environ.get("MO_INTERACTIVE_NODES") or "").split(",")
+             if n.strip()}
+    return field[0] in names
+
+
+def _plan_batch(fields) -> tuple[list[int], int]:
+    """``(dispatch order, worker count)`` for one batch.
+
+    Person-initiated nodes go to the front and buy ONE extra worker beyond
+    ``MINI_ORK_MAX_PARALLEL``. A full batch of four must not make a human who
+    just asked for a rerun wait behind it. The extra slot is per batch, not a
+    global semaphore: nothing here can see another process's workers, and a
+    claim that it did would be a promise this code cannot keep.
+    """
+    interactive = [index for index, field in enumerate(fields) if _is_interactive(field)]
+    if not interactive:
+        return list(range(len(fields))), min(_max_parallel(), len(fields))
+    rest = [index for index in range(len(fields)) if index not in set(interactive)]
+    return interactive + rest, min(_max_parallel() + 1, len(fields))
+
+
 def _run_parallel_batch(
     fields,
     *,
@@ -800,21 +831,26 @@ def _run_parallel_batch(
     """Dispatch a bounded batch and return each node's outcome in field order."""
     if not fields:
         return []
+    order, workers = _plan_batch(fields)
     payloads = [
-        (field, root, run_dir, plan_path, task_class, db, run_id, recipe, workflow)
-        for field in fields
+        (fields[index], root, run_dir, plan_path, task_class, db, run_id, recipe, workflow)
+        for index in order
     ]
     try:
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=min(_max_parallel(), len(payloads))
-        ) as pool:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(_isolated_dispatch_worker, payloads))
     except Exception as exc:
         print(f"  [warn] parallel worker pool unavailable; falling back to serial: {exc}",
               file=sys.stderr)
         results = [_isolated_dispatch_worker(payload) for payload in payloads]
+    # `pool.map` returns in submission order, which is `order`, not field order.
+    # Put each outcome back where its field was: every consumer downstream
+    # (failure counting, revise rounds, the run-level verdict) pairs outcomes
+    # with fields positionally.
+    by_index = {index: result for index, result in zip(order, results)}
     outcomes = []
-    for field, (rc, finish_reason, out, err) in zip(fields, results):
+    for index, field in enumerate(fields):
+        (rc, finish_reason, out, err) = by_index[index]
         sys.stdout.write(out)
         sys.stderr.write(err)
         outcomes.append((field, rc, finish_reason))
@@ -854,6 +890,7 @@ class ExecuteArgs:
     from_node: str
     recovery_active: bool
     repair_budget: str
+    interactive: bool
 
 
 def _parse_execute_argv(argv: list[str]) -> tuple[ExecuteArgs | None, int]:
@@ -871,6 +908,7 @@ def _parse_execute_argv(argv: list[str]) -> tuple[ExecuteArgs | None, int]:
     from_node = ""
     recovery_active = False
     repair_budget = ""
+    interactive = os.environ.get("MO_INTERACTIVE", "0") == "1"
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -891,6 +929,8 @@ def _parse_execute_argv(argv: list[str]) -> tuple[ExecuteArgs | None, int]:
             from_node = a.split("=", 1)[1].strip(); i += 1
         elif a == "--recovery":
             recovery_active = True; i += 1
+        elif a == "--interactive":
+            interactive = True; i += 1
         elif a == "--repair-budget":
             if i + 1 >= len(argv):
                 sys.stderr.write("--repair-budget requires <usd>\n"); return None, 2
@@ -907,7 +947,8 @@ def _parse_execute_argv(argv: list[str]) -> tuple[ExecuteArgs | None, int]:
     if positional_plan is not None:
         plan_path = positional_plan
     return ExecuteArgs(dry_run, filter_node_type, dispatch_mode_override,
-                       plan_path, from_node, recovery_active, repair_budget), 0
+                       plan_path, from_node, recovery_active, repair_budget,
+                       interactive), 0
 
 
 def _resolve_plan_path(plan_path: str, home: str, *, from_node: str,
@@ -1259,6 +1300,11 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         return rc
     dry_run = args.dry_run
     filter_node_type = args.filter_node_type
+    # `--interactive` and `MO_INTERACTIVE=1` are one contract: the flag is just
+    # the argv spelling, so publish it into the env every batch reads rather
+    # than threading a second parameter through every dispatch path.
+    if args.interactive:
+        publish_env({"MO_INTERACTIVE": "1"})
 
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
     # Publish the documented DB default so _learned_block — which reads

@@ -1555,6 +1555,12 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
         "MINI_ORK_WORKFLOW": handoff["workflow"],
         "MINI_ORK_RECIPE": handoff["recipe"] or None,
     }
+    # A revival is person-initiated even when the operator launched it from a
+    # script: someone is waiting on this run. Mark it so the batch dispatcher
+    # reserves its +1 slot and dispatches these nodes first (P9). An operator
+    # value wins — MO_INTERACTIVE=0 is how a scheduled repair opts out.
+    if not context_env("MO_INTERACTIVE").strip():
+        _overrides["MO_INTERACTIVE"] = "1"
     # ── The closure must grade the run's own repo, not the operator's cwd ──
     # ``MO_TARGET_CWD`` is written by the run *lifecycle* (``cli/main.py``,
     # beside the workspace resolution) into the process env the executor and its

@@ -172,6 +172,22 @@ Two common extension selectors are:
 `escalates_to` rollback edges fire. Set it to `0` to restore the pre-revise
 behaviour (a failed node blocks its descendants and rollback runs).
 
+### Interactive dispatch
+
+A node dispatched on a person's behalf is not batch work: a human is waiting,
+so it goes to the front of its batch and the pool is sized one wider than
+`MINI_ORK_MAX_PARALLEL` (default 4) while such a node is in it. `mini-ork
+recover` marks itself interactive automatically.
+
+| Variable | Purpose |
+|---|---|
+| `MO_INTERACTIVE` | `1` marks the whole invocation interactive. `execute --interactive` sets it. |
+| `MO_INTERACTIVE_NODES` | Comma-separated node ids to mark inside an otherwise batch invocation. |
+| `MINI_ORK_MAX_PARALLEL` | The batch limit. An interactive node buys one slot beyond it, never more. |
+
+The extra slot is per batch; nothing here arbitrates between separate
+processes.
+
 ### Certify lane calls
 
 `mini-ork certify` calls its model lane several times per verdict (reproduction,
