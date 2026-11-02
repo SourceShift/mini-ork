@@ -15,7 +15,12 @@ Definitions (all load-bearing):
 
 A verifier that rejects the valid artifact is never scored: the baseline
 must be ``PROVEN`` or the result is ``measured=False`` with
-``kill_score=None``.
+``kill_score=None``. The same holds when there is no denominator to score:
+an observable no mutation can act on (a ``function`` surface carries no
+``body``/``expect_status`` field) yields ``total=0``, and an observable whose
+mutants all come back undecided yields ``killed=survived=0``. Both are
+``measured=False`` with ``kill_score=None`` — ``measured`` means "a kill score
+exists", never "the scoring loop ran", because ``admit(None)`` is ``True``.
 
 Import-time contract: stdlib only. :mod:`mini_ork.verify.behavioral` is
 imported lazily inside :func:`score` only when no runner is injected.
