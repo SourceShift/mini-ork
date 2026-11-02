@@ -710,18 +710,124 @@ def all_levels_ok(vector, *, required):
     return publish_decision(vector, required=required) == "publish"
 
 
+def _suite_survivors(run_dir: str) -> list[dict]:
+    """Survivor rows from ``<run_dir>/suite_adequacy.json``, or ``[]``."""
+    path = os.path.join(run_dir, "suite_adequacy.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    rows = doc.get("survivors") if isinstance(doc, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def write_summary(run_dir: str, task_class: str, *, vector: dict, reasons: dict,
+                  required, decision: str) -> str:
+    """Write ``<run_dir>/summary.md`` — plain prose for whoever inherits the run.
+
+    The level vector withholds a publish and keeps the change in the tree "for
+    inspection", but the inspector is handed a diff and no reason: the JSON
+    stamp names the UNVERIFIED level, the instrument that abstained and the
+    mutant survivors, and none of it is readable by someone who does not open a
+    JSON file. This writes the same facts as four short sections and returns the
+    path ("" when nothing was written).
+
+    An abstention that does not explain itself reads as a bug. The dsh teardown
+    (`docs/research/dsh-superagent-vs-mini-ork.md`, P5) is the source of this
+    shape: their every interruption carries a reason, a fix and an action.
+    """
+    if not run_dir or not os.path.isdir(run_dir):
+        return ""
+
+    withheld = decision != "publish"
+    survivors = _suite_survivors(run_dir)
+    required_set = set(required or ())
+
+    lines = [
+        "# " + ("Why this run was withheld" if withheld else "Run verification summary"),
+        "",
+        f"**Decision:** `{decision}`  ",
+        f"**Task class:** `{task_class or 'unknown'}`  ",
+        f"**Run directory:** `{run_dir}`",
+        "",
+    ]
+
+    if withheld:
+        blocking = [lvl for lvl in LEVELS
+                    if lvl in required_set
+                    and vector.get(lvl, UNVERIFIED) not in (PROVEN, NA)]
+        if blocking:
+            lines += [
+                "The run produced a change, but the machine verdict would not "
+                "publish it. Nothing is wrong with your checkout yet: the "
+                "change is still in the tree for inspection.",
+                "",
+                "## What blocked the publish",
+                "",
+            ]
+            for lvl in blocking:
+                verdict = vector.get(lvl, UNVERIFIED)
+                lines.append(f"- **{lvl}: {verdict}** — {reasons.get(lvl, 'no reason recorded')}")
+            lines.append("")
+
+    lines += [
+        "## Every level",
+        "",
+        "| Level | Verdict | Required | Reason |",
+        "|---|---|---|---|",
+    ]
+    for lvl in LEVELS:
+        mark = "yes" if lvl in required_set else "no"
+        reason = str(reasons.get(lvl, "")).replace("|", "\\|") or "—"
+        lines.append(f"| {lvl} | {vector.get(lvl, UNVERIFIED)} | {mark} | {reason} |")
+    lines.append("")
+
+    if survivors:
+        lines += [
+            "## Suite adequacy — mutants the suite did not notice",
+            "",
+            "Each row is a change made to your code that the test suite still "
+            "passed against. A green suite that survives these is not evidence "
+            "that the change under review is tested.",
+            "",
+        ]
+        for row in survivors[:20]:
+            lines.append(
+                f"- `{row.get('file', '?')}:{row.get('line', '?')}` "
+                f"{row.get('operator', '?')} — `{row.get('original', '?')}` → "
+                f"`{row.get('mutated', '?')}`")
+        if len(survivors) > 20:
+            lines.append(f"- … and {len(survivors) - 20} more in `suite_adequacy.json`")
+        lines.append("")
+
+    path = os.path.join(run_dir, "summary.md")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines).rstrip() + "\n")
+    except OSError:
+        return ""
+    return path
+
+
 def level_report(run_dir, task_class):
     """The run-level report stamped into verdict.json and read by the publisher.
 
     Returns exactly these keys, in order: ``levels``, ``levels_reasons``,
     ``levels_required``, ``levels_ok``, ``levels_decision``.
+
+    Side effect: writes `<run_dir>/summary.md` (see :func:`write_summary`). It is
+    a record for the human inheriting the run; nothing reads it to decide.
     """
     vector, reasons = derive_levels(run_dir, task_class)
     required = list(required_levels(task_class))
+    decision = publish_decision(vector, required=required)
+    write_summary(run_dir, task_class, vector=vector, reasons=reasons,
+                  required=required, decision=decision)
     return {
         "levels": vector,
         "levels_reasons": reasons,
         "levels_required": required,
         "levels_ok": all_levels_ok(vector, required=required),
-        "levels_decision": publish_decision(vector, required=required),
+        "levels_decision": decision,
     }
