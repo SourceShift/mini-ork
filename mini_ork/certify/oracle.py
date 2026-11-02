@@ -875,15 +875,13 @@ def judge(
 
     n = len(kept)
     n_eff = holds + broken
-    if unmeasured:
-        # An invariant whose own evidence contradicts itself measured nothing:
-        # it must not dilute the pass rate (which would convict the patch for a
-        # harness fact) nor pad the denominator. Score only what was measured.
-        rate = (holds / n_eff) if n_eff else 0.0
-        verdict, reason = mr.score(rate, n_eff)
-    else:
-        rate = (holds / n) if n else 0.0
-        verdict, reason = mr.score(rate, n)
+    # An invariant whose own evidence contradicts itself measured nothing: it
+    # must not dilute the pass rate (which would convict the patch for a
+    # harness fact) nor pad the denominator. ``denom`` is what the verdict was
+    # actually scored on, so ``mr_pass_rate`` and ``mr_n`` stay a matching pair.
+    denom = n_eff if unmeasured else n
+    rate = (holds / denom) if denom else 0.0
+    verdict, reason = mr.score(rate, denom)
 
     # Asymmetric verdict (certify C6). PROVEN is byte-identical to today's
     # mr.score on (rate, n) — precision cannot move; the change can only turn
@@ -914,7 +912,7 @@ def judge(
         verdict = UNVERIFIED
         reason = (f"{unmeasured} of {n} invariants claimed passed but their "
                   f"execution evidence was self-contradictory — cannot measure "
-                  f"them; {holds} of {n} hold")
+                  f"them; {holds} of {denom} measured invariant(s) hold")
 
     # ── Term 4: metamorphic relations (veto a would-be PROVEN) ──────────────
     # A special-cased patch passes every invariant yet breaks a relation BETWEEN two
@@ -970,7 +968,7 @@ def judge(
         reason = f"{reason} ({hidden_note})"
 
     return Verdict(verdict, reason, poc_plus=poc_src,
-                   mr_pass_rate=(rate if n else None), mr_n=n,
+                   mr_pass_rate=(rate if denom else None), mr_n=denom,
                    detail=detail)
 
 

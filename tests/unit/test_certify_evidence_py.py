@@ -269,9 +269,14 @@ _POC = "def test_add():\n    assert add(1, 2) == 3\n"
 
 
 class _IncoherentInvariantRunner:
-    """Honest base/delta evidence; every invariant comes back a forged pass."""
+    """Honest base/delta evidence; listed invariants come back as forged passes."""
 
     up = True
+
+    def __init__(self, incoherent: set[int] | None = None) -> None:
+        # Default: every invariant lies. A caller can let some of them pass
+        # coherently to pin the mixed measured/unmeasured accounting.
+        self.incoherent = {1, 2, 3} if incoherent is None else incoherent
 
     def run_test(self, src: str, patch: str = "") -> ExecOutcome:
         passed = _outcome()
@@ -279,11 +284,15 @@ class _IncoherentInvariantRunner:
             status="failed", ran=True, returncode=1, exc="AssertionError",
             output="E   AssertionError: assert 4 == 3",
         )
-        if "test_mr_" in src:
+        hit = re.search(r"def (test_mr_\d+)", src)
+        if hit:
             if not patch:
                 return failed                      # informative on base
-            # Claims a pass while its own bookkeeping says every attempt errored.
-            return _outcome(meta={"final_attempt_status": "error"})
+            index = int(hit.group(1).rsplit("_", 1)[1])
+            if index in self.incoherent:
+                # Claims a pass while its bookkeeping says every attempt errored.
+                return _outcome(meta={"final_attempt_status": "error"})
+            return passed
         return passed if patch else failed
 
 
@@ -304,3 +313,21 @@ def test_metamorphic_loop_withholds_proven_on_incoherent_passes():
     assert v.verdict == "UNVERIFIED"
     assert v.detail["unmeasured"] >= 1
     assert any(rec.get("outcome") == "unmeasured" for rec in v.detail["invariants"])
+    # All-unmeasured evidence scores on an empty denominator, not 0 of 3.
+    assert v.mr_n == v.detail["n_effective"] == 0
+    assert v.mr_pass_rate is None
+
+
+def test_measured_denominator_pairs_mr_pass_rate_with_mr_n():
+    # Two invariants measure cleanly and hold; the third's pass is forged. The
+    # withheld PROVEN must report the pair it actually scored on (2 of 2), not
+    # a rate over the 3 trials one of which measured nothing.
+    v = oracle.judge(
+        _ISSUE, _PATCH, runner=_IncoherentInvariantRunner(incoherent={3}),
+        dispatch=_mr_dispatch, poc=_POC,
+    )
+    assert v.verdict == "UNVERIFIED"
+    assert v.detail["unmeasured"] == 1
+    assert v.detail["invariants"] and v.detail["n_effective"] == 2
+    assert v.mr_n == 2
+    assert v.mr_pass_rate == 1.0
