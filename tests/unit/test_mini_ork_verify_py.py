@@ -93,7 +93,14 @@ def test_vacuous_golden(tmp_path):
     home, db, plan = _scenario(tmp_path, [])   # no verifiers
     sp, rp = _verify(home, db, "art.txt", "--plan", plan)
     assert rp == 0
-    assert _norm(sp) == ("vacuous", 0, 0, [("__gates__", True)])
+    # The `__artifact_contract__` row carries pass=None: this plan declares no
+    # artifact requirement, so nothing was asserted about the artifact. It is a
+    # deferral, not a pass, and it must be visible as its own row — an empty
+    # requirement set and a satisfied one used to look identical here.
+    assert _norm(sp) == (
+        "vacuous", 0, 0,
+        [("__artifact_contract__", None), ("__gates__", True)],
+    )
 
 
 def test_dry_run_golden(tmp_path):

@@ -42,6 +42,7 @@ from typing import Optional
 
 __all__ = [
     "load_contract",
+    "load_contract_ex",
     "validate_artifact",
     "validate",
     "DEFAULT_FAILURE_POLICY",
@@ -136,6 +137,44 @@ def _parse_contract_file(path: str, task_class: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # load_contract (mirror lib/artifact_contract.sh lines 26-91)
 # ─────────────────────────────────────────────────────────────────────────────
+def load_contract_ex(
+    task_class: str,
+    contracts_dir: Optional[str] = None,
+) -> tuple[dict, str]:
+    """Load a contract AND report where it came from.
+
+    Returns ``(contract, source)`` where ``source`` is ``"file"`` when a real
+    contract file was parsed and ``"default"`` when the permissive fallback was
+    substituted because no file exists.
+
+    The distinction is the whole point: the default contract declares
+    ``success_verifiers: []`` and ``expected_artifact: "data"``, so anything
+    validated against it passes as long as *some* file exists. Callers that
+    decide a verdict must see which case they are in, otherwise "no contract
+    was ever written" and "the contract held" produce the same answer.
+    """
+    if contracts_dir is None:
+        home = os.environ.get("MINI_ORK_HOME", ".mini-ork")
+        contracts_dir = os.path.join(home, "config", "artifact_contracts")
+
+    contract_path = os.path.join(contracts_dir, f"{task_class}.yaml")
+
+    if not os.path.isfile(contract_path):
+        sys.stderr.write(
+            f"artifact_contract_load: no contract file at {contract_path}, "
+            f"using default\n"
+        )
+        return _default_contract(task_class), "default"
+
+    try:
+        return _parse_contract_file(contract_path, task_class), "file"
+    except Exception as e:
+        sys.stderr.write(
+            f"artifact_contract_load: error parsing {contract_path}: {e}\n"
+        )
+        sys.exit(1)
+
+
 def load_contract(
     task_class: str,
     contracts_dir: Optional[str] = None,
@@ -149,27 +188,12 @@ def load_contract(
 
     ``contracts_dir`` defaults to ``${MINI_ORK_HOME}/config/artifact_contracts``
     (matches bash's ``_ARTIFACT_CONTRACT_DIR``).
+
+    This keeps the historical dict-only shape. A caller that has to *decide*
+    something from the contract wants :func:`load_contract_ex` instead — the
+    default contract passes almost anything, and silently.
     """
-    if contracts_dir is None:
-        home = os.environ.get("MINI_ORK_HOME", ".mini-ork")
-        contracts_dir = os.path.join(home, "config", "artifact_contracts")
-
-    contract_path = os.path.join(contracts_dir, f"{task_class}.yaml")
-
-    if not os.path.isfile(contract_path):
-        sys.stderr.write(
-            f"artifact_contract_load: no contract file at {contract_path}, "
-            f"using default\n"
-        )
-        return _default_contract(task_class)
-
-    try:
-        return _parse_contract_file(contract_path, task_class)
-    except Exception as e:
-        sys.stderr.write(
-            f"artifact_contract_load: error parsing {contract_path}: {e}\n"
-        )
-        sys.exit(1)
+    return load_contract_ex(task_class, contracts_dir=contracts_dir)[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -345,7 +369,22 @@ def validate(
     Mirrors the bash caller pattern:
       contract_json=$(artifact_contract_load "$tc")
       artifact_contract_validate "$tc" "$artifact"
+
+    A missing contract file yields the verdict ``"defer"`` with
+    ``reason: "contract_missing"`` — not a pass. The default contract has no
+    success verifiers and accepts any of the "data" extensions, so validating
+    against it answers "a file exists", which is not the question the caller
+    asked. ``defer`` says the question was never answered.
     """
-    contract = load_contract(task_class, contracts_dir=contracts_dir)
+    contract, source = load_contract_ex(task_class, contracts_dir=contracts_dir)
+    if source == "default":
+        return "defer", {
+            "verdict": "defer",
+            "reason": "contract_missing",
+            "task_class": task_class,
+            "artifact_path": artifact_path,
+            "contract_source": "default",
+        }
     payload = validate_artifact(contract, artifact_path, mini_ork_root=mini_ork_root)
+    payload.setdefault("contract_source", "file")
     return payload["verdict"], payload

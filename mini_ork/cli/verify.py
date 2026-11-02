@@ -370,6 +370,102 @@ def _run_mutation_campaign(artifact_path, plan_path):
         return None
 
 
+def _write_verification_manifest(
+    *, run_dir: str, task_class: str, artifact_path: str, verdict: str,
+    plan_contract: dict, results: list[str],
+) -> str:
+    """Record which verification instruments could have run, and their status.
+
+    The verdict payload is deliberately byte-stable (a knob-off run emits the
+    same bytes as a knob-on run, so a disabled audit cannot be detected by
+    diffing two payloads — that property is tested and wanted). This manifest
+    is the other half of that trade: a separate, additive record written next
+    to the level-vector stamp that says ``ran`` / ``skipped`` / ``shadow`` /
+    ``not_applicable`` for every instrument the recipe could have used, and the
+    knob that decided it.
+
+    Nothing reads this file to make a decision. It exists so that "we could not
+    measure this" stays distinguishable from "we measured it and it held" after
+    the run is over, which is the property the target repo gets from making its
+    policy text a versioned object (`dsh:src/app/prompts.ts:186`).
+
+    Returns the path written, or "" when there is nothing to write.
+    """
+    if not run_dir or not os.path.isdir(run_dir):
+        return ""
+
+    verifier_text = " ".join(str(v) for v in (plan_contract.get("success_verifiers") or []))
+    codefix_recipe = "code-fix" in verifier_text or task_class in ("code_fix", "codefix")
+
+    instruments: list[dict] = []
+
+    contract_source = (plan_contract.get("contract_source") or "").strip()
+    if contract_source == "missing":
+        instruments.append({
+            "instrument": "artifact_contract",
+            "status": "skipped",
+            "knob": "",
+            "detail": "recipe declares no artifact_contract.yaml; nothing asserted",
+        })
+    else:
+        instruments.append({
+            "instrument": "artifact_contract",
+            "status": "ran",
+            "knob": "",
+            "detail": f"contract_source={contract_source or 'unknown'}",
+        })
+
+    adequacy = os.environ.get("MO_SUITE_ADEQUACY", "1")
+    instruments.append({
+        "instrument": "suite_adequacy",
+        "status": ("ran" if adequacy == "1" else "skipped") if codefix_recipe else "not_applicable",
+        "knob": "" if adequacy == "1" else f"MO_SUITE_ADEQUACY={adequacy}",
+        "detail": "" if codefix_recipe else "not a code-fix recipe",
+    })
+
+    certify = os.environ.get("MO_CODEFIX_CERTIFY", "shadow")
+    instruments.append({
+        "instrument": "certify_terms",
+        "status": {"gate": "ran", "shadow": "shadow", "off": "skipped"}.get(certify, "shadow"),
+        "knob": f"MO_CODEFIX_CERTIFY={certify}",
+        "detail": "" if certify != "shadow" else "computed, never obeyed",
+    })
+
+    # Gates that deferred: named, so an unrun gate never reads as a held one.
+    for raw in results:
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        if row.get("verifier") != "__gates_unmeasured__":
+            continue
+        for gate in str(row.get("detail", "")).split(":", 1)[-1].split(","):
+            gate = gate.strip()
+            if gate:
+                instruments.append({
+                    "instrument": f"gate:{gate}",
+                    "status": "skipped",
+                    "knob": "",
+                    "detail": "gate registry returned defer",
+                })
+
+    payload = {
+        "schema_version": 1,
+        "task_class": task_class,
+        "artifact_path": artifact_path,
+        "verdict": verdict,
+        "instruments": instruments,
+    }
+    path = os.path.join(run_dir, "verification_manifest.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=False)
+            fh.write("\n")
+    except OSError:
+        return ""
+    return path
+
+
 def main(argv: list[str] | None = None, *, db: str | None = None, root: str | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -579,6 +675,9 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     # enforced; relative canonical outputs are publish-targets (exempt). A real,
     # non-empty artifact passes (the 36KB-synthesis false-negative case).
     artifact_fail = False
+    # Hoisted so the verification manifest can report the contract even when the
+    # plan never reached the assertion block below.
+    ac_req: dict = {}
     if dry_run == 0 and plan_path and os.path.isfile(plan_path):
         try:
             ac_req = json.load(open(plan_path, encoding="utf-8")).get("artifact_contract", {})
@@ -609,6 +708,21 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                         results.append(f'{{"verifier":"__artifact__","pass":false,"evidence_path":"{p}"}}')
                         fail_count += 1
                         artifact_fail = True
+            # A recipe with no contract asserts nothing about its artifact. That
+            # is a `defer`, not a pass: an empty requirement set and a satisfied
+            # requirement set currently look identical in the payload, and a
+            # gate that can be skipped by deleting a file is not a gate.
+            declared = (ac_req.get("outputs") or ac_req.get("required_artifacts")
+                        or ac_req.get("success_verifiers"))
+            if not declared:
+                missing = ac_req.get("contract_source") == "missing"
+                results.append(json.dumps({
+                    "verifier": "__artifact_contract__",
+                    "pass": None,
+                    "detail": ("no artifact contract for this recipe"
+                               if missing else "artifact contract declares no requirements"),
+                    "evidence_path": "artifact_contract:defer",
+                }, separators=(",", ":")))
 
     gate_verdict = "pass"
     # Gates are evaluated exclusively through the native registry. Recipe
@@ -685,6 +799,16 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         verdict = "fail"
     else:
         verdict = "partial"
+
+    # A record of instruments that were switched off or never ran. Written before
+    # the payload so it exists even when a later step fails; it never changes the
+    # verdict (the payload's byte-stability invariant is tested separately).
+    if dry_run == 0:
+        _write_verification_manifest(
+            run_dir=run_dir or "", task_class=task_class,
+            artifact_path=artifact_path, verdict=verdict,
+            plan_contract=ac_req, results=results,
+        )
 
     output = (
         "{\n"

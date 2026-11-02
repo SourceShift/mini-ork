@@ -41,8 +41,10 @@ def recipe_fallback_plan(recipe, workflow_path, root, kickoff) -> str | None:
     edges = workflow.get("edges") or []
     contract_path = (recipe_dir(recipe, root, workflow_path) or Path(root) / "recipes" / recipe) / "artifact_contract.yaml"
     contract = {}
+    contract_source = "missing"
     if contract_path.exists():
         contract = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+        contract_source = "file"
     outputs = contract.get("outputs") or workflow.get("outputs") or []
     success_verifiers = contract.get("success_verifiers") or workflow.get("success_verifiers") or []
     plan = {
@@ -63,7 +65,8 @@ def recipe_fallback_plan(recipe, workflow_path, root, kickoff) -> str | None:
             "Fallback plan does not include model-authored verifier shell commands.",
             "Execution still uses the recipe workflow nodes and recipe verifier_ref scripts.",
         ],
-        "artifact_contract": {"outputs": outputs, "success_verifiers": success_verifiers},
+        "artifact_contract": {"outputs": outputs, "success_verifiers": success_verifiers,
+                              "contract_source": contract_source},
         "verifier_contract": {"checks": [
             {"id": "recipe-workflow-dispatch",
              "description": f"Dispatch every node declared in recipes/{recipe}/workflow.yaml."},
