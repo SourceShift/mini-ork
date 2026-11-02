@@ -371,6 +371,58 @@ def test_redaction_hides_a_setup_error_and_spares_the_summary() -> None:
     assert "[held-out probe" in redacted
 
 
+# ── a class-based probe is matched, not silently visible ───────────────────
+
+CLASS_BASED = '''\
+class TestKnob:
+    def test_visible(self):
+        """Kickoff: 'a rejected input fails closed'."""
+        assert False, "visible detail"
+
+    def test_held(self):
+        """Kickoff: 'the fail-closed knob never returns an empty value'.
+
+        Held-out: yes
+        """
+        assert 7 == 42, "secret expectation"
+'''
+
+
+def test_class_based_held_out_probe_is_still_withheld(tmp_path) -> None:
+    """The nodeid keeps the class as `::`, the pytest header uses a dot.
+
+    `test_spec_cls.py::TestKnob::test_held` against `___ TestKnob.test_held ___`
+    — a key that does not collapse the two marks the probe visible and hands
+    the clause back.
+    """
+    run = _run_dir(tmp_path, {"test_spec_cls.py": CLASS_BASED})
+    proc = _invoke(run, _target(tmp_path))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    payload = _payload(run)
+
+    hidden = next(f for f in payload["failures"] if "test_held" in f["test"])
+    assert hidden.get("held_out") is True
+    assert hidden["kickoff"] == ""
+    assert "error" not in hidden
+
+    log = (run / "verifier-spec-tests.log").read_text()
+    assert "visible detail" in log
+    assert "secret expectation" not in log
+    assert "empty value" not in log
+
+
+def test_redaction_cuts_the_reason_from_a_short_summary_line() -> None:
+    """`-rA` can append ` - AssertionError: <expected values>` to the summary."""
+    output = (
+        "___ TestKnob.test_held ___\n"
+        "    assert 7 == 42, 'secret expectation'\n"
+        "=== short test summary info ===\n"
+        "FAILED test_a.py::TestKnob::test_held - AssertionError: secret expectation\n")
+    redacted = VT.redact_held_out(output, {"test_held"})
+    assert "secret expectation" not in redacted
+    assert "FAILED test_a.py::TestKnob::test_held" in redacted
+
+
 # ── parametrized probes inherit the mark ───────────────────────────────────
 
 PARAMETRIZED = '''\

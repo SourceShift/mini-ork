@@ -736,6 +736,14 @@ def redact_held_out(output: str, withheld: set[str]) -> str:
     kept: list[str] = []
     hiding = False
     for line in output.splitlines():
+        summary = _ITEM_LINE_RE.match(line.strip())
+        if summary and _unit_key(summary.group(2)) in withheld:
+            # `-rA` can append the failure reason to the summary line —
+            # `FAILED <nodeid> - AssertionError: 7 == 42` — which is the same
+            # leak in a shorter form. The nodeid stays (it is how a held-out
+            # probe remains in the verdict); the reason is cut.
+            kept.append(f"{summary.group(1)} {summary.group(2)}")
+            continue
         header = _TRACEBACK_HEADER_RE.match(line.strip())
         if header:
             name = header.group(1)
@@ -830,8 +838,16 @@ def failed_items(output: str, selected: list[str]) -> list[str]:
 
 
 def _unit_key(token: str) -> str:
-    """The bare unit name: ``a/b.py::test_x[1-2]`` → ``test_x``."""
-    return _base_nodeid(token).rpartition("::")[2].split("[", 1)[0]
+    """The bare unit name: ``a/b.py::TestK::test_x[1-2]`` → ``test_x``.
+
+    Two renderings have to collapse to the same key or a class-based probe is
+    never matched: a nodeid keeps the class as an ``::`` segment
+    (``test_a.py::TestK::test_x``), while a pytest FAILURES header joins it with
+    a dot (``___ TestK.test_x ___``). The class prefix is dropped from both, and
+    a module-level token (``test_a.py`` — a collection error names no unit) is
+    left alone rather than reduced to ``py``."""
+    unit = _base_nodeid(token).rpartition("::")[2].split("[", 1)[0]
+    return unit if unit.endswith(".py") else unit.rpartition(".")[2]
 
 
 def failure_exceptions(output: str) -> dict[str, str]:
