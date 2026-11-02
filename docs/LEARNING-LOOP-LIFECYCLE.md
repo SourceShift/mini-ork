@@ -80,6 +80,23 @@ positional arg to the trace-payload writer in `_trace_write_node_rich`
 (`:1079`) and persisted as `agent_version_id` (`:1037`, `:1069`). **This is the
 join key** between the write half and the read half.
 
+**Reading the attribution back — `mini-ork why <run> <node>`.** The write half
+above is not the only place a lane decision is recorded, and no one store
+answers "which model produced this artifact, and why":
+
+| Store | Answers |
+|---|---|
+| `<run_dir>/.lane-<node>.json` | which lane the node *asked for* and which one *served* it (written by the dispatcher from `selected_model`) |
+| `execution_traces` | the routing reason: `route_source` (`policy` / `learned` / `pinned` / `fallback` / `trace_governed`), `route_explore`, `route_score`, `route_margin`, `predicted_error` |
+| `llm_calls` | the chain actually walked — every lane tried, its status, tokens, cost and session id |
+| `<run_dir>/learned/<node>.json` | the memory ids injected into this node's prompt (`arm`, `attempt`, `sources`) |
+
+`mini-ork why` joins all four, read-only, and prints `not recorded` for a store
+that has no row for the node rather than leaving the field out. `--json` emits
+the same card for a script. Route `source=pinned` is called out in words,
+because a recipe pin beats the router and no learning signal is attributable to
+it.
+
 ### 3.2 PRM scoring (`lib/process_reward.sh`)
 
 Immediately after the trace lands, `_trace_write_node_rich` calls

@@ -52,7 +52,7 @@ from mini_ork.orchestration import concord_run
 # equality — a name added there is a test edit in the same diff, for no gain.
 _NATIVE_SUBS = {
     "apply", "classify", "plan", "verify", "verifier", "reflect", "garden",
-    "validate", "pm",
+    "validate", "pm", "why",
 }
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this
@@ -189,6 +189,9 @@ Lifecycle:
                                  Write the verification instruments' records
                                    (oracle integrity, verifier mutation); exits 2
                                    rather than record a measurement it could not make
+  why <run> <node>               Provenance for one node's artifact: the lane it
+                                   asked for, the lane that served it, the route
+                                   reason, the chain walked and the memory injected
   recipe-eval                    Static evaluation of recipe definitions
   reviewer-eval [list|add-case|run|status|score]
                                    Score the framework-edit reviewer on incidents + clean changes.
