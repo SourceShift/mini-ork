@@ -3,10 +3,11 @@
 `spec-driven-delivery` is an outer recipe that delivers every feature
 described by a directory of markdown spec files. The spec is the sole source
 of truth. Each spec is compiled into a SpecCard contract
-(`schemas/spec-card.schema.json`). Executable acceptance gates are derived
-before any implementation, on a lane separate from the implementer. Each
-atomic deliverable then goes through its own `recursive-validate-impl` child
-run, and the result is verified against a live surface.
+(`schemas/spec-card.schema.json`). Executable acceptance gates are materialized
+before any implementation from the fences the spec authors wrote, with no LLM
+in the gate-authoring chain. Each atomic deliverable then goes through its own
+`recursive-validate-impl` child run, and the result is verified against a live
+surface.
 
 Use it when the input is a spec directory (`## Spec dir:` in the kickoff)
 and every spec should ship with executable gates. For a single broad
@@ -24,7 +25,7 @@ specdir_ingest       (verifier)                 spec-index.json via `mini-ork sp
   -> contract_compiler   (researcher, lane planner)   spec-cards/<spec_id>.json + ratification/<spec_id>.json
   -> ratification_check  (verifier)             every source requirement covered or acknowledged
   -> spec_lint           (verifier)             authoring-error lint
-  -> test_author         (researcher, lane reviewer)  gates/<spec_id>.json, written before implementation
+  -> gates_materialize   (verifier)             gates/<spec_id>.json, derived from the spec authors' own fences
   -> test_validity       (verifier)             broken-baseline: probes fail on the untouched tree
   -> per_spec_dispatcher (implementer, lane implementer)  one recursive-validate-impl run per deliverable
   -> dispatch_aggregator (verifier)             aggregate-verdict.json recomputed from child runs
@@ -36,13 +37,17 @@ specdir_ingest       (verifier)                 spec-index.json via `mini-ork sp
 reflector -> replanner -> contract_compiler   (recursive; max 6 iterations, $100 total)
 ```
 
-`contract_compiler` and `test_author` are typed `researcher` so their prompts
-run as artifact-producing tasks. A `reviewer` node would be turned into a
+`contract_compiler` is typed `researcher` so its prompt runs as an
+artifact-producing task. There is no `reviewer` node: one would be turned into a
 panel-verdict synthesizer, which would hand an LLM verdict authority.
-Authorship separation is declared in `task_class.yaml`
-(`heterogeneity.authorship_separation`). Contracts and gates come from the
-`planner` and `reviewer` lanes; code comes from `implementer` and the child
-recipe's `worker` lane.
+
+Gates are **deterministic**: `gates_materialize` builds them from the executable
+fences the spec authors already wrote (`docs/decisions/20261004-sdd-gates-deterministic.md`).
+That is why this recipe declares no `probe_author` node, and therefore why the
+authorship-separation gate (`MO_AUTHORSHIP_SEPARATION`, which compares a probe
+author's model family with the implementer's) passes vacuously here. Contracts
+come from the `planner` lane; code from `per_spec_dispatcher` (lane
+`implementer`) and the child recipe's `worker` lane.
 
 Run artifacts in `${MINI_ORK_RUN_DIR}`: `spec-index.json`,
 `spec-cards/<spec_id>.json`, `ratification/<spec_id>.json`,
@@ -68,10 +73,12 @@ Run artifacts in `${MINI_ORK_RUN_DIR}`: `spec-index.json`,
 
 ## Run it
 
-Prerequisites: the `planner`, `reviewer`, `implementer` and `worker` lanes are
-configured (`config/providers.yaml` plus their keys), because
-`contract_compiler`, `test_author`, `per_spec_dispatcher` and the
-`recursive-validate-impl` child runs dispatch to them.
+Prerequisites: the `planner`, `implementer`, `reflector` and `worker` lanes are
+configured — the `roles:` map in `config/agents.yaml` (overridable per user in
+`agents.local.yaml` / `$MINI_ORK_AGENTS`) plus each agent's provider and key in
+`config/providers.yaml` — because `contract_compiler`/`replanner`,
+`per_spec_dispatcher`, `reflector` and the `recursive-validate-impl` child runs
+dispatch to them. No `reviewer` lane is needed — see the DAG note above.
 
 1. Write the kickoff. Put a `## Spec dir:` heading in it, with the spec
    directory as a backticked path on the next non-empty line (or inline after
@@ -127,8 +134,8 @@ It copies `tests/fixtures/sdd_e2e` (a target repo with `add()` and a spec for
 `multiply()`) to a temp dir. Then it runs the real `specs ingest` and
 `specs lint` and every verifier in workflow order: gates fail before
 `multiply()` lands, smoke is red, then green after it lands, and the ledger
-gets one row per gate. The SpecCard, gates and child run that the LLM nodes
-would write are planted from the fixture's golden card.
+gets one row per gate. The SpecCard, the gates and the child run are planted
+from the fixture's golden card, so the dry run needs no LLM lane.
 
 ## Ratifying the compiled contract
 
@@ -183,9 +190,12 @@ dropped pause.
 1. **Spec is the only mutable artifact.** Implementer lanes never edit specs
    or SpecCards. "Spec is wrong or unsatisfiable" routes to a contract
    revision: a structured ASK pauses the deliverable instead of guessing.
-2. **Authorship separation.** The lane that writes contracts and tests is
-   never the lane that implements against them. The verifier payload is the
-   only verdict; rubric scores and self-reports are advisory.
+2. **Authorship separation.** Whatever authors the acceptance gates is never the
+   lane that implements against them. Here contracts come from the `planner`
+   lane and gates from the spec authors' own fences, via a deterministic
+   verifier with no LLM in the chain — so the implementer lane authors neither.
+   The verifier payload is the only verdict; rubric scores and self-reports are
+   advisory.
 3. **Test-first.** Gates exist and pass `test_validity` before the first
    implementer cycle spends budget. Broken baseline: a gate that already
    passes on the untouched tree is vacuous and is rejected.
@@ -202,9 +212,8 @@ dropped pause.
 ## Status
 
 - K2: scaffold (DAG, prompts, artifact contract).
-- K3: all eight `verifiers/*.py` are live deterministic gates, unit-tested in
+- K3: all nine `verifiers/*.py` are live deterministic gates, unit-tested in
   `tests/test_sdd_verifiers.py`.
 - K4: `tests/test_sdd_e2e_dryrun.py` runs the deterministic spine end to end
   on the `tests/fixtures/sdd_e2e` fixture. The LLM nodes (`contract_compiler`,
-  `test_author`, `per_spec_dispatcher`) are not exercised there; their output
-  is planted.
+  `per_spec_dispatcher`) are not exercised there; their output is planted.

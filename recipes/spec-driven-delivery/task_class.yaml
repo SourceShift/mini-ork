@@ -35,14 +35,9 @@ tags:
   - test-first
   - implementation
 
-heterogeneity:
-  authorship_separation:
-    # Lanes that write SpecCards and gates (contract_compiler, test_author).
-    contract_and_test_lanes:
-      - planner
-      - reviewer
-    # Lanes that write code: per_spec_dispatcher here plus the child
-    # recursive-validate-impl implementer node (model_lane: worker).
-    implementer_lanes:
-      - implementer
-      - worker
+# No `heterogeneity.authorship_separation` block: nothing reads one. The gate
+# (`MO_AUTHORSHIP_SEPARATION`, docs/operator/feature-flags.md) derives its
+# probe-author and implementer lanes from `workflow.yaml` node types, and this
+# recipe has no probe-author node at all — gates come from `gates_materialize`,
+# deterministically. A block here used to name a `reviewer` lane that no node
+# in this recipe dispatches to.
