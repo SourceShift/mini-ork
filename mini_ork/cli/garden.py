@@ -362,6 +362,86 @@ def _check_inert_mechanisms(home: str, findings: Findings) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Check 7 — does the shadow certify verdict ever fire?
+#
+# `MO_CODEFIX_CERTIFY=shadow` (the default) computes the two veto terms, writes
+# them to `certify_terms.json`, and then obeys neither: up to 4 lane calls and
+# ~30 single-file pytest runs per green, for a verdict that changes no `pass`
+# and no exit code. That is only a waste if the terms never actually block — and
+# nobody can tell without counting.
+#
+# So count. `would_block: true` in any recent run's certify_terms.json is the
+# observation that justifies flipping the mode to `gate` for the term that
+# fired; a long run of zeroes justifies cutting the budget knobs instead. Either
+# way the answer is one line here rather than a script nobody writes.
+#
+# Severity is ``info`` and never counted: both findings are observations about
+# tuning, not drift, and neither may turn ``--strict`` red.
+# ─────────────────────────────────────────────────────────────────────────────
+SHADOW_CERTIFY_SCAN_LIMIT = 100
+
+
+def _check_shadow_certify(home: str, findings: Findings) -> None:
+    runs_dir = Path(home) / "runs"
+    if not runs_dir.is_dir():
+        return
+    try:
+        reports = sorted(
+            (p for p in runs_dir.glob("*/certify_terms.json") if p.is_file()),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )[:SHADOW_CERTIFY_SCAN_LIMIT]
+    except OSError:
+        return
+    if not reports:
+        return
+
+    import json
+
+    parsed = 0
+    blocked = 0
+    shadow_runs = 0
+    ran = 0
+    for path in reports:
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        parsed += 1
+        if doc.get("status") == "ran":
+            ran += 1
+        if doc.get("would_block") is True:
+            blocked += 1
+            if doc.get("mode") == "shadow":
+                shadow_runs += 1
+
+    if parsed == 0:
+        # Nothing readable — a directory of half-written files is not evidence
+        # about the mechanism either way, so say nothing rather than guess.
+        return
+    if ran == 0:
+        findings.info(
+            f"shadow certify measured nothing across {parsed} run(s)",
+            "check MO_CODEFIX_CERTIFY and that the code-fix verifier reaches "
+            "its certify step",
+        )
+        return
+    if blocked == 0:
+        findings.info(
+            f"shadow certify ran {ran} time(s) and never blocked",
+            "cut the shadow budget (MO_ASSAY_RELATIONS_K, MO_ASSAY_DIFFERENTIAL_N, "
+            "MO_HIDDEN_TRIALS) or promote MO_CODEFIX_CERTIFY=gate once a term fires",
+        )
+        return
+    findings.info(
+        f"shadow certify would have blocked {blocked} of {ran} run(s)"
+        + (f" ({shadow_runs} published anyway)" if shadow_runs else ""),
+        "set MO_CODEFIX_CERTIFY=gate to let the veto terms decide",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # reviewer-eval staleness — the framework-edit reviewer is only as trustworthy
 # as its last measurement, and an edited prompt/lane silently invalidates the
 # score. One uncounted warning (never red under --strict) when the current
@@ -446,6 +526,7 @@ def main(argv: list[str] | None = None) -> int:
     _check_orphan_stashes(target_repo, findings)
     _check_env_docs(root, findings)
     _check_inert_mechanisms(home, findings)  # no bash counterpart; DB-backed
+    _check_shadow_certify(home, findings)    # does the shadow verdict ever fire?
     _check_reviewer_eval(root, home, findings)  # framework-edit reviewer staleness
 
     # ── summary (order mirrors bash) ──

@@ -453,6 +453,13 @@ never obeys them, gate does:
   confirmed correct.
 - **Off** — `MO_CODEFIX_CERTIFY=0` (or `off`/`false`/`no`) skips the terms and
   keeps every payload byte-identical to the pre-feature verifier.
+- **Is shadow earning its cost?** `mini-ork garden` reads the newest 100
+  `<run dir>/certify_terms.json` reports and prints one line: how many runs the
+  terms actually measured, how many they `would_block`, and how many of those
+  were published anyway. Info only — never a warning, never red under
+  `--strict` — because "the veto terms have never fired" is advice about the
+  budget knobs, not a defect in this checkout. A directory with no readable
+  report says nothing at all.
 - **Abstention.** No kickoff, no Python fail-to-pass test, no base worktree, an
   empty candidate diff, or a runner that is not up → `status: "skipped"` (the
   record goes to `certify_terms.json`, but not to the payload). A term that
