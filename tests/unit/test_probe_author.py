@@ -423,6 +423,46 @@ def test_redaction_cuts_the_reason_from_a_short_summary_line() -> None:
     assert "FAILED test_a.py::TestKnob::test_held" in redacted
 
 
+def test_redaction_drops_a_summary_reason_wrapped_onto_its_own_line() -> None:
+    """On CI pytest keeps the reason whole and the writer wraps it.
+
+    `running_on_ci()` in `_pytest.terminal` skips the width trim, so the same
+    suite prints `FAILED <nodeid> - AssertionError: assert 7 == 42` here and,
+    past the terminal width, `FAILED <nodeid> - AssertionError:` / `assert 7 ==
+    42` on a runner. The continuation is not an item line, so a rule that only
+    cuts item lines misses it — and it hands back the values.
+    """
+    output = (
+        "=== short test summary info ===\n"
+        "FAILED spec/test_spec.py::test_held_out_fails - AssertionError:\n"
+        "assert 7 == 42\n"
+        "2 failed in 0.04s\n")
+    redacted = VT.redact_held_out(output, {"test_held_out_fails"})
+    assert "assert 7 == 42" not in redacted
+    assert "FAILED spec/test_spec.py::test_held_out_fails" in redacted
+    assert "2 failed in 0.04s" in redacted
+
+
+def test_evidence_log_withholds_the_ci_summary_rendering(tmp_path, monkeypatch) -> None:
+    """The same log, rendered the way the CI runner renders it.
+
+    The failure this pins reached `main` because the local run could not see
+    it: off CI the reason is trimmed to the terminal width and cut by the
+    item-line rule, while on a runner it arrives whole on a continuation line.
+    Force the CI branch so the local suite exercises what the runner does.
+    """
+    monkeypatch.setenv("CI", "true")
+    run = _run_dir(tmp_path, {"test_spec_split.py": SECRET_ASSERTION})
+    _invoke(run, _target(tmp_path))
+    log = (run / "verifier-spec-tests.log").read_text()
+
+    assert "visible detail" in log
+    assert "test_held_out_fails" in log
+    assert "secret expectation" not in log
+    assert "assert 7 == 42" not in log
+
+
+
 # ── parametrized probes inherit the mark ───────────────────────────────────
 
 PARAMETRIZED = '''\

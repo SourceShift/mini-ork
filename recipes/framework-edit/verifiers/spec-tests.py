@@ -117,6 +117,15 @@ _SPEC_FILE_RE = re.compile(r"^test_.*\.py$")
 # `unselected_executed`). SKIPPED is absent on purpose: `-rA` folds skips into
 # `SKIPPED [n] file.py:line: reason`, which carries no nodeid to check.
 _ITEM_LINE_RE = re.compile(r"^(PASSED|FAILED|ERROR|XFAIL|XPASS)\s+(\S+)")
+# The `-rA` section and its closing count line (`2 failed in 0.04s`). Off CI,
+# pytest TRIMS a summary reason to the terminal width (`- AssertionError: sec…`);
+# on CI it keeps it whole (`running_on_ci()` in `_pytest.terminal`) and the
+# writer WRAPS the line instead, so the reason — `assert 7 == 42` — lands on its
+# own line under the item. Redaction keeps nodeids in this section and nothing
+# else; the failure reason is in the FAILURES block, which is what gets hidden.
+_SUMMARY_BANNER_RE = re.compile(r"^=+ short test summary info =+$")
+_SUMMARY_TOTAL_RE = re.compile(
+    r"^\d+\s+(passed|failed|error|errors|skipped|deselected|xfailed|xpassed)")
 _DESELECTED_RE = re.compile(r"(\d+)\s+deselected")
 # pytest's FAILURES section: a `___ test_name ___` header followed by the
 # traceback, whose exception line carries the `E` marker at column 0.
@@ -729,19 +738,47 @@ def redact_held_out(output: str, withheld: set[str]) -> str:
     Walked the same way `harness_defects` walks the output: a header line opens
     a block, the unit is stripped of the `ERROR at setup of ` prefix (a held-out
     test that dies in a fixture is still that test), and a ``=====`` banner
-    closes it — which is what keeps the ``-rA`` summary, whose ``FAILED
-    <nodeid>`` lines name the probe and nothing else, out of the hiding state."""
+    closes it.
+
+    The ``-rA`` summary is the second leak, and it is not the block: it repeats
+    the assertion on the item line (`FAILED <nodeid> - AssertionError: assert 7
+    == 42`). Inside that section only `STATUS <nodeid>` survives — every item,
+    not just the withheld ones. pytest decides how much of the reason to print
+    from the environment (`running_on_ci()` keeps it whole, everything else
+    trims it to the terminal width and then WRAPS), so a reason can arrive on
+    its own line under the item, where no item-line rule would ever see it.
+    Dropping the whole section's prose makes the redaction independent of that
+    rendering choice; the reasons a visible probe contributes are still in its
+    FAILURES block."""
     if not withheld:
         return output
     kept: list[str] = []
     hiding = False
+    in_summary = False
     for line in output.splitlines():
-        summary = _ITEM_LINE_RE.match(line.strip())
+        stripped = line.strip()
+        if _SUMMARY_BANNER_RE.match(stripped):
+            hiding = False
+            in_summary = True
+            kept.append(line)
+            continue
+        if in_summary:
+            summary = _ITEM_LINE_RE.match(stripped)
+            if summary:
+                kept.append(f"{summary.group(1)} {summary.group(2)}")
+                continue
+            if _SUMMARY_TOTAL_RE.match(stripped) or stripped.startswith("==="):
+                in_summary = False
+                kept.append(line)
+                continue
+            if stripped:
+                # A wrapped remainder of an item line (CI's untrimmed reason,
+                # or a nodeid too long for the width). It carries the values.
+                continue
+            kept.append(line)
+            continue
+        summary = _ITEM_LINE_RE.match(stripped)
         if summary and _unit_key(summary.group(2)) in withheld:
-            # `-rA` can append the failure reason to the summary line —
-            # `FAILED <nodeid> - AssertionError: 7 == 42` — which is the same
-            # leak in a shorter form. The nodeid stays (it is how a held-out
-            # probe remains in the verdict); the reason is cut.
             kept.append(f"{summary.group(1)} {summary.group(2)}")
             continue
         header = _TRACEBACK_HEADER_RE.match(line.strip())
