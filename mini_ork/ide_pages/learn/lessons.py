@@ -337,12 +337,22 @@ def _run_of_trace(home: Path, conn, trace_id: str) -> tuple[str, str]:
 
 
 def _theme_of_gradient(conn, gradient_id: str) -> dict[str, str] | None:
-    if not (conn.has_table("gradient_theme") and conn.has_table("lesson_themes")):
+    if not conn.has_table("gradient_theme"):
         return None
-    row = conn.row(
-        "SELECT t.theme_id, t.representative, t.n_gradients, t.n_runs, t.kind "
-        "FROM gradient_theme gt JOIN lesson_themes t ON t.theme_id = gt.theme_id "
-        "WHERE gt.gradient_id = ? LIMIT 1", (gradient_id,))
+    row = None
+    # Authored rows keep their lesson_themes stats; a cluster that was never
+    # authored now lives only in theme_clusters, so fall back to it (exact
+    # key, uncapped — this is one gradient's theme, not a page of rows).
+    if conn.has_table("lesson_themes"):
+        row = conn.row(
+            "SELECT t.theme_id, t.representative, t.n_gradients, t.n_runs, t.kind "
+            "FROM gradient_theme gt JOIN lesson_themes t ON t.theme_id = gt.theme_id "
+            "WHERE gt.gradient_id = ? LIMIT 1", (gradient_id,))
+    if not row and conn.has_table("theme_clusters"):
+        row = conn.row(
+            "SELECT t.theme_id, t.representative, t.n_gradients, t.n_runs, t.kind "
+            "FROM gradient_theme gt JOIN theme_clusters t ON t.theme_id = gt.theme_id "
+            "WHERE gt.gradient_id = ? LIMIT 1", (gradient_id,))
     if not row:
         return None
     label = "about mini-ork itself" if str(row.get("kind")) == "framework" else "about the task"

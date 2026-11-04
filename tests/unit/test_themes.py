@@ -274,7 +274,7 @@ def test_representative_populated_after_assign(db: str) -> None:
     th.assign_new(db)
     con = sqlite3.connect(db)
     row = con.execute(
-        "SELECT representative FROM lesson_themes"
+        "SELECT representative FROM theme_clusters"
     ).fetchone()
     con.close()
     assert row[0] and len(row[0]) > 0, (
@@ -428,7 +428,7 @@ def test_determinism_two_runs(db: str, tmp_path: Path) -> None:
 
     def _ids(p: str) -> list[str]:
         con = sqlite3.connect(p)
-        out = [r[0] for r in con.execute("SELECT theme_id FROM lesson_themes ORDER BY theme_id")]
+        out = [r[0] for r in con.execute("SELECT theme_id FROM theme_clusters ORDER BY theme_id")]
         con.close()
         return out
 
@@ -452,7 +452,7 @@ def test_n_runs_counts_distinct_runs(db: str) -> None:
         _seed_gradient(db, gid=gid, signal="verifier_output is only {node_type: x}", evidence=ev, run_id=rid, created_at=ts)
     th.assign_new(db)
     con = sqlite3.connect(db)
-    row = con.execute("SELECT n_runs FROM lesson_themes").fetchone()
+    row = con.execute("SELECT n_runs FROM theme_clusters").fetchone()
     con.close()
     assert row[0] == 2
 
@@ -585,10 +585,13 @@ def test_ensure_schema_idempotent_on_fresh_db(tmp_path: Path) -> None:
 
     con = sqlite3.connect(path)
     rows = list(con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('lesson_themes','gradient_theme') ORDER BY name"
+        "SELECT name FROM sqlite_master WHERE type='table'"
+        " AND name IN ('lesson_themes','gradient_theme','theme_clusters')"
+        " ORDER BY name"
     ))
     con.close()
-    assert [r[0] for r in rows] == ["gradient_theme", "lesson_themes"]
+    assert [r[0] for r in rows] == [
+        "gradient_theme", "lesson_themes", "theme_clusters"]
 
 
 def test_assign_new_works_on_db_without_migration(tmp_path: Path) -> None:
@@ -607,7 +610,7 @@ def test_assign_new_works_on_db_without_migration(tmp_path: Path) -> None:
 
 def _seed_theme_members(db: str, theme_id: str, *, task_class: str | None,
                         member_classes: list[str], n_runs: int = 5) -> None:
-    """One ``lesson_themes`` row plus one gradient per member class."""
+    """One ``theme_clusters`` row plus one gradient per member class."""
     th.ensure_schema(db)
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row
@@ -619,10 +622,9 @@ def _seed_theme_members(db: str, theme_id: str, *, task_class: str | None,
         " created_at INTEGER NOT NULL, task_class TEXT)"
     )
     con.execute(
-        "INSERT INTO lesson_themes (theme_id, kind, task_class, representative,"
-        " centroid, n_gradients, n_runs, first_seen, last_seen, lesson_text,"
-        " status) VALUES (?, 'task', ?, 'rep', ?, ?, ?, 1, 1, 'a lesson',"
-        " 'verified')",
+        "INSERT INTO theme_clusters (theme_id, kind, task_class,"
+        " representative, centroid, n_gradients, n_runs, first_seen, last_seen)"
+        " VALUES (?, 'task', ?, 'rep', ?, ?, ?, 1, 1)",
         (theme_id, task_class, th._centroid_to_blob({}), len(member_classes),
          n_runs),
     )
@@ -658,7 +660,7 @@ def _task_class_of(db: str, theme_id: str) -> str | None:
     con = sqlite3.connect(db)
     try:
         row = con.execute(
-            "SELECT task_class FROM lesson_themes WHERE theme_id = ?",
+            "SELECT task_class FROM theme_clusters WHERE theme_id = ?",
             (theme_id,),
         ).fetchone()
     finally:

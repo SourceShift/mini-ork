@@ -51,6 +51,18 @@ status a human set (``wontfix``, ``dupe``, ``resolved``) by deliberately
 omitting ``status`` from the ``ON CONFLICT DO UPDATE`` SET clause — that is
 the only SQLite-portable way to keep a human decision against a re-run.
 
+Clustering store vs lesson store
+================================
+
+``theme_clusters`` holds the cluster statistics (centroid, representative,
+member/run counts, role, task_class, timestamps). ``assign_new``,
+``_refresh_theme``, ``reclassify_themes``, ``stats`` and
+``rollup_framework_bugs`` read and write it. ``lesson_themes`` holds ONLY
+authored rows: ``promote`` copies a qualifying cluster in with a non-blank
+``lesson_text`` and ``status='verified'``. Keeping the unauthorable clusters
+out of ``lesson_themes`` is what lets ``db:L6`` (blank lesson text over all
+rows) close; see migration ``0087_theme_clusters.sql``.
+
 Pure stdlib + ``sqlite3``. No ``numpy`` (the rest of ``mini_ork/learning/``
 does not import it; this module does not either).
 """
@@ -289,6 +301,23 @@ def _ensure_schema_con(con: sqlite3.Connection) -> None:
           bug_report_id INTEGER,
           updated_at    INTEGER
         );
+        CREATE TABLE IF NOT EXISTS theme_clusters (
+          theme_id      TEXT PRIMARY KEY,
+          kind          TEXT NOT NULL CHECK(kind IN ('task','framework')),
+          role          TEXT,
+          task_class    TEXT,
+          representative TEXT NOT NULL,
+          centroid      BLOB NOT NULL,
+          n_gradients   INTEGER NOT NULL DEFAULT 0,
+          n_runs        INTEGER NOT NULL DEFAULT 0,
+          n_at_refresh  INTEGER NOT NULL DEFAULT 0,
+          first_seen    INTEGER,
+          last_seen     INTEGER,
+          bug_report_id INTEGER,
+          updated_at    INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_theme_clusters_kind
+          ON theme_clusters(kind);
         CREATE TABLE IF NOT EXISTS gradient_theme (
           gradient_id   TEXT PRIMARY KEY,
           theme_id      TEXT NOT NULL,
@@ -493,12 +522,12 @@ def _theme_id(kind: str, first_gradient_id: str) -> str:
 
 
 def _members_of(con: sqlite3.Connection, kind: str) -> list[sqlite3.Row]:
-    """Existing themes of one kind, ordered by id for stable iteration."""
+    """Existing clusters of one kind, ordered by id for stable iteration."""
     return list(
         con.execute(
             "SELECT theme_id, centroid, n_gradients, n_at_refresh, first_seen,"
             "       last_seen, role, task_class, representative"
-            "  FROM lesson_themes WHERE kind = ? ORDER BY theme_id",
+            "  FROM theme_clusters WHERE kind = ? ORDER BY theme_id",
             (kind,),
         )
     )
@@ -669,7 +698,7 @@ def _assign_new(con: sqlite3.Connection, sim: float | None = None) -> dict:
     if not unassigned:
         try:
             total = int(
-                con.execute("SELECT COUNT(*) FROM lesson_themes").fetchone()[0]
+                con.execute("SELECT COUNT(*) FROM theme_clusters").fetchone()[0]
             )
         except sqlite3.OperationalError:
             total = 0
@@ -755,7 +784,7 @@ def _assign_new(con: sqlite3.Connection, sim: float | None = None) -> dict:
             new_first = best_theme["first_seen"] or g["created_at"] or now
             new_last = max(best_theme["last_seen"] or 0, g["created_at"] or 0)
             con.execute(
-                "UPDATE lesson_themes SET centroid = ?, n_gradients = ?,"
+                "UPDATE theme_clusters SET centroid = ?, n_gradients = ?,"
                 "  first_seen = ?, last_seen = ?, updated_at = ?"
                 "  WHERE theme_id = ?",
                 (
@@ -799,22 +828,22 @@ def _assign_new(con: sqlite3.Connection, sim: float | None = None) -> dict:
             # A deterministic theme_id can already exist: two runs created in
             # the same second derive the same id from the same first gradient
             # (RB-20). A plain INSERT raised `UNIQUE constraint failed:
-            # lesson_themes.theme_id` and aborted the whole batch. Upsert
+            # theme_clusters.theme_id` and aborted the whole batch. Upsert
             # instead: a second writer joins the theme rather than failing,
             # and a concurrent process that committed between our read and
             # this write is absorbed the same way.
             con.execute(
-                "INSERT INTO lesson_themes ("
+                "INSERT INTO theme_clusters ("
                 "  theme_id, kind, representative, centroid, n_gradients,"
                 "  n_at_refresh, first_seen, last_seen, updated_at"
                 ") VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?)"
                 " ON CONFLICT(theme_id) DO UPDATE SET"
-                "  n_gradients = lesson_themes.n_gradients + 1,"
+                "  n_gradients = theme_clusters.n_gradients + 1,"
                 "  representative = excluded.representative,"
                 "  centroid = excluded.centroid,"
-                "  first_seen = MIN(COALESCE(lesson_themes.first_seen,"
+                "  first_seen = MIN(COALESCE(theme_clusters.first_seen,"
                 "                    excluded.first_seen), excluded.first_seen),"
-                "  last_seen = MAX(COALESCE(lesson_themes.last_seen,"
+                "  last_seen = MAX(COALESCE(theme_clusters.last_seen,"
                 "                   excluded.last_seen), excluded.last_seen),"
                 "  updated_at = excluded.updated_at",
                 (
@@ -851,7 +880,7 @@ def _assign_new(con: sqlite3.Connection, sim: float | None = None) -> dict:
                 # upsert left in the DB so the counts start from the truth.
                 row = con.execute(
                     "SELECT n_gradients, n_at_refresh, first_seen, last_seen"
-                    "  FROM lesson_themes WHERE theme_id = ?",
+                    "  FROM theme_clusters WHERE theme_id = ?",
                     (tid,),
                 ).fetchone()
                 t = {
@@ -966,7 +995,7 @@ def _refresh_theme(
         representative = t["representative"]
 
     con.execute(
-        "UPDATE lesson_themes SET role = ?, task_class = ?, n_runs = ?,"
+        "UPDATE theme_clusters SET role = ?, task_class = ?, n_runs = ?,"
         "  representative = ?, centroid = ?, n_at_refresh = ?, updated_at = ?"
         "  WHERE theme_id = ?",
         (
@@ -979,6 +1008,14 @@ def _refresh_theme(
             now,
             tid,
         ),
+    )
+    # Keep an already-authored lesson row's cached ranking stats fresh. This is
+    # an UPDATE of an existing row only — it never inserts a blank
+    # ``lesson_themes`` row, so the clustering/lesson split stays intact.
+    con.execute(
+        "UPDATE lesson_themes SET task_class = ?, n_runs = ?,"
+        "  last_seen = COALESCE(?, last_seen), updated_at = ? WHERE theme_id = ?",
+        (task_class, n_runs, t["last_seen"], now, tid),
     )
     t["role"] = role
     t["task_class"] = task_class
@@ -1029,31 +1066,36 @@ def reclassify_themes(db: str | os.PathLike[str] | None = None) -> int:
 
 
 def _reclassify_con(con: sqlite3.Connection) -> int:
-    """The connection-scoped core of :func:`reclassify_themes`."""
-    try:
-        rows = list(
-            con.execute(
-                "SELECT theme_id, task_class FROM lesson_themes"
-                " WHERE kind = 'task'"
-                "   AND (task_class IS NULL OR task_class = '*')"
-            )
-        )
-    except sqlite3.OperationalError:
-        # No lesson_themes table (fresh DB, no migration run) — nothing to do.
-        return 0
+    """The connection-scoped core of :func:`reclassify_themes`.
+
+    Repairs both stores: ``theme_clusters`` (where clustering writes task
+    classes) and any legacy ``lesson_themes`` rows left by a pre-split DB.
+    """
     now = int(time.time())
     changed = 0
-    for r in rows:
-        tid = r["theme_id"]
-        new_value = _member_class_value(con, tid)
-        if new_value == r["task_class"]:
+    for table in ("theme_clusters", "lesson_themes"):
+        try:
+            rows = list(
+                con.execute(
+                    f"SELECT theme_id, task_class FROM {table}"  # noqa: S608 — fixed table name
+                    " WHERE kind = 'task'"
+                    "   AND (task_class IS NULL OR task_class = '*')"
+                )
+            )
+        except sqlite3.OperationalError:
+            # Table absent (fresh DB, no migration run) — nothing to do here.
             continue
-        con.execute(
-            "UPDATE lesson_themes SET task_class = ?, updated_at = ?"
-            "  WHERE theme_id = ?",
-            (new_value, now, tid),
-        )
-        changed += 1
+        for r in rows:
+            tid = r["theme_id"]
+            new_value = _member_class_value(con, tid)
+            if new_value == r["task_class"]:
+                continue
+            con.execute(
+                f"UPDATE {table} SET task_class = ?, updated_at = ?"  # noqa: S608
+                "  WHERE theme_id = ?",
+                (new_value, now, tid),
+            )
+            changed += 1
     if changed:
         con.commit()
     return changed
@@ -1163,14 +1205,15 @@ def promote(
     dispatch_fn=None,
     model: str | None = None,
 ) -> dict:
-    """Author + verify ``lesson_text`` for candidate themes.
+    """Author + verify ``lesson_text`` for qualifying task clusters.
 
-    A ``lesson_themes`` row is a cluster statistic until an authored lesson is
-    written. The v1/v2 lesson blocks (``context_assembler``'s
-    ``_verified_theme_lessons`` and ``context_v2.verified_themes``) read only
-    ``status='verified'`` rows with a non-blank ``lesson_text`` — so a table of
-    candidates with no author is a consumer with no producer, and both blocks
-    render nothing. This is that producer.
+    Candidates live in ``theme_clusters``. The v1/v2 lesson blocks
+    (``context_assembler``'s ``_verified_theme_lessons`` and
+    ``context_v2.verified_themes``) read only ``lesson_themes`` rows with
+    ``status='verified'`` and a non-blank ``lesson_text`` — so a cluster store
+    with no author is a consumer with no producer, and both blocks render
+    nothing. This is that producer: it copies a qualifying cluster into
+    ``lesson_themes`` and leaves the cluster itself in place.
 
     A theme's member traces come from ``gradient_theme`` ⋈ ``gradient_records``
     (``evidence`` is the trace a gradient was extracted from). The lesson is
@@ -1207,17 +1250,32 @@ def promote(
             min_members = int(os.environ.get("MO_THEME_PROMOTE_MIN_MEMBERS", "3"))
         except ValueError:
             min_members = 3
+        # Candidates are task clusters at the support bar that do not already
+        # have an authored lesson. Legacy ``lesson_themes`` candidate rows (a
+        # pre-split DB the migration has not touched yet) are still eligible,
+        # so this producer keeps working against an unmigrated home.
         rows = con.execute(
             """
-            SELECT theme_id, representative, task_class, n_runs
+            SELECT theme_id, representative, task_class, n_runs, last_seen
+              FROM theme_clusters c
+             WHERE kind = 'task'
+               AND n_runs >= ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM lesson_themes lt
+                    WHERE lt.theme_id = c.theme_id
+                      AND COALESCE(lt.lesson_text, '') <> ''
+               )
+            UNION ALL
+            SELECT theme_id, representative, task_class, n_runs, last_seen
               FROM lesson_themes
              WHERE kind = 'task' AND status = 'candidate'
                AND COALESCE(lesson_text, '') = ''
                AND n_runs >= ?
-             ORDER BY n_runs DESC, last_seen DESC
-             LIMIT ?
+               AND theme_id NOT IN (SELECT theme_id FROM theme_clusters)
+            ORDER BY n_runs DESC, last_seen DESC
+            LIMIT ?
             """,
-            (max(1, int(min_runs)), max(1, int(limit))),
+            (max(1, int(min_runs)), max(1, int(min_runs)), max(1, int(limit))),
         ).fetchall()
         now = int(time.time())
         for r in rows:
@@ -1268,11 +1326,32 @@ def promote(
                         "reason": lesson_conflict.skip_reason(verdict),
                     })
                     continue
-            con.execute(
-                "UPDATE lesson_themes SET lesson_text = ?, status = 'verified',"
-                " updated_at = ? WHERE theme_id = ?",
-                (text, now, tid),
-            )
+            existing = con.execute(
+                "SELECT 1 FROM lesson_themes WHERE theme_id = ?", (tid,)
+            ).fetchone()
+            if existing is not None:
+                # Legacy candidate already lives in lesson_themes — author it
+                # in place. The cluster row (if any) is left untouched.
+                con.execute(
+                    "UPDATE lesson_themes SET lesson_text = ?,"
+                    " status = 'verified', updated_at = ? WHERE theme_id = ?",
+                    (text, now, tid),
+                )
+            else:
+                # The authored lesson is a copy of the cluster row; the
+                # cluster itself stays in theme_clusters so future gradients
+                # keep joining it.
+                con.execute(
+                    "INSERT INTO lesson_themes ("
+                    "  theme_id, kind, role, task_class, representative,"
+                    "  centroid, n_gradients, n_runs, n_at_refresh, first_seen,"
+                    "  last_seen, lesson_text, status, bug_report_id, updated_at"
+                    ") SELECT theme_id, kind, role, task_class, representative,"
+                    "  centroid, n_gradients, n_runs, n_at_refresh, first_seen,"
+                    "  last_seen, ?, 'verified', bug_report_id, ?"
+                    "  FROM theme_clusters WHERE theme_id = ?",
+                    (text, now, tid),
+                )
             con.commit()
             report["promoted"] += 1
         return report
@@ -1352,7 +1431,7 @@ def _sample_member_pairs(con: sqlite3.Connection, limit: int = 5) -> list:
     """``limit`` member-signal pairs from the largest theme (seeded, so the
     proof block is reproducible)."""
     row = con.execute(
-        "SELECT theme_id FROM lesson_themes"
+        "SELECT theme_id FROM theme_clusters"
         "  ORDER BY n_gradients DESC, theme_id LIMIT 1"
     ).fetchone()
     if not row:
@@ -1395,12 +1474,12 @@ def stats(db_path: str | None = None) -> dict:
 def _stats_con(con: sqlite3.Connection) -> dict:
     per_kind = dict(
         con.execute(
-            "SELECT kind, COUNT(*) FROM lesson_themes GROUP BY kind"
+            "SELECT kind, COUNT(*) FROM theme_clusters GROUP BY kind"
         ).fetchall() or []
     )
     ge3 = list(
         con.execute(
-            "SELECT theme_id, n_gradients FROM lesson_themes"
+            "SELECT theme_id, n_gradients FROM theme_clusters"
             "  WHERE n_gradients >= 3"
         )
     )
@@ -1418,7 +1497,7 @@ def _stats_con(con: sqlite3.Connection) -> dict:
     top10 = list(
         con.execute(
             "SELECT theme_id, kind, n_gradients, representative"
-            "  FROM lesson_themes ORDER BY n_gradients DESC, theme_id LIMIT 10"
+            "  FROM theme_clusters ORDER BY n_gradients DESC, theme_id LIMIT 10"
         )
     )
     return {
@@ -1475,8 +1554,8 @@ def rollup_framework_bugs(
         themes = list(
             con.execute(
                 "SELECT theme_id, representative, n_gradients, first_seen,"
-                "       last_seen, role, bug_report_id"
-                "  FROM lesson_themes"
+                "       last_seen, role, bug_report_id, n_runs"
+                "  FROM theme_clusters"
                 "  WHERE kind = 'framework' AND n_gradients >= ?",
                 (min_members,),
             )
@@ -1515,10 +1594,7 @@ def rollup_framework_bugs(
                 else None
             )
             n = t["n_gradients"]
-            n_runs_row = con.execute(
-                "SELECT n_runs FROM lesson_themes WHERE theme_id = ?", (tid,)
-            ).fetchone()
-            n_runs = int(n_runs_row["n_runs"]) if n_runs_row and n_runs_row["n_runs"] else 0
+            n_runs = int(t["n_runs"] or 0)
             first_seen = t["first_seen"] or now
             description = (
                 f"{n} gradients across {n_runs} runs since "
@@ -1571,7 +1647,7 @@ def rollup_framework_bugs(
                 bug_id = existing["id"]
 
             con.execute(
-                "UPDATE lesson_themes SET bug_report_id = ?, updated_at = ?"
+                "UPDATE theme_clusters SET bug_report_id = ?, updated_at = ?"
                 "  WHERE theme_id = ?",
                 (bug_id, now, tid),
             )
