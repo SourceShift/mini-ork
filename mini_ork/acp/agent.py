@@ -468,6 +468,11 @@ _SLASH_RACE_PREFIX = "/race "
 # times. See ``_offer_lane_repair``.
 _LANE_REPAIR_RETRIES = 3
 _LANE_REPAIR_RETRY_DELAY = 2.0
+# How long ``_bind_orchestrator`` waits for the dispatcher to create the child
+# run's directory before giving up on binding it automatically. A launch that
+# is still queued behind a full scheduler pool can take minutes to be staged.
+_BIND_WAIT_S = float(os.environ.get("MO_ACP_BIND_WAIT_S", "600"))
+_BIND_POLL_S = 0.5
 # A lane that keeps dying must not loop the follower forever: at most this many
 # resumes are started per run in one follower lifetime. The next failure is
 # closed ``failed`` without a further prompt.
@@ -851,6 +856,9 @@ class MiniOrkAcpAgent:
         # session id → follow task for an attached (loaded) run that has not
         # reached a terminal status yet (Z2 live follow).
         self._followers: dict[str, asyncio.Task] = {}
+        # run id → pending orchestrator-binding write for a run whose
+        # ``runs/<id>`` directory the dispatcher has not staged yet.
+        self._binds: dict[str, asyncio.Task] = {}
         # session ids opened via session/load (never launched by prompt).
         self._loaded: set[str] = set()
         # Thread (orchestrator) session ids (Z9c-1). The prompt path
@@ -3900,14 +3908,41 @@ class MiniOrkAcpAgent:
         # and each click leaves a second empty conversation behind. The home is
         # resolved from the *run*, the way every reader of the binding resolves
         # it — a thread may watch a run that lives in another project.
-        orchestrator_thread.write(
-            self._home_for(child_run_id) / "runs" / child_run_id,
-            parent_session_id,
-        )
+        self._bind_orchestrator(parent_session_id, child_run_id)
         await self._open_run_marker(parent_session_id, child_run_id, recipe)
         self._followers[child_run_id] = asyncio.create_task(
             self._follow_child(parent_session_id, child_run_id)
         )
+
+    def _bind_orchestrator(self, thread_id: str, run_id: str) -> None:
+        """Record that ``thread_id`` orchestrates ``run_id``, retrying until the
+        run is staged.
+
+        ``start_run`` returns before the dispatcher creates ``runs/<id>``, so
+        on a fresh launch the write misses and the run stays unbound — the IDE
+        would then offer to mint a second thread for it. The retry is bounded:
+        a run that never materialises leaves no binding, and the first click on
+        its Orchestrator button binds it instead.
+        """
+        run_dir = self._home_for(run_id) / "runs" / run_id
+        if orchestrator_thread.write(run_dir, thread_id):
+            return
+        pending = self._binds.get(run_id)
+        if pending is not None and not pending.done():
+            return
+        self._binds[run_id] = asyncio.create_task(
+            self._bind_when_staged(thread_id, run_dir)
+        )
+
+    async def _bind_when_staged(self, thread_id: str, run_dir: Path) -> None:
+        try:
+            deadline = time.monotonic() + _BIND_WAIT_S
+            while time.monotonic() < deadline:
+                if orchestrator_thread.write(run_dir, thread_id):
+                    return
+                await asyncio.sleep(_BIND_POLL_S)
+        finally:
+            self._binds.pop(run_dir.name, None)
 
     async def _follow_child(self, parent_session_id: str, child_run_id: str) -> None:
         try:

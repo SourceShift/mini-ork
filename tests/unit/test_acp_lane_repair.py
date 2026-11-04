@@ -832,3 +832,39 @@ def test_notify_fails_soft_on_an_unsafe_thread_id(
 
     assert retry_notify.notify(home, "run-lane-1") is not None
     assert not (home / "acp-threads").exists()
+
+
+def test_a_binding_waits_for_the_run_dir_the_dispatcher_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``start_run`` returns before the dispatcher creates ``runs/<id>``.
+
+    A single write at follow time therefore misses on every fresh launch and
+    leaves the run unbound — the IDE would then offer to mint a second thread
+    for it. The write is retried until the directory appears.
+    """
+    agent, project, session = _new_thread_agent(tmp_path, monkeypatch)
+    # ``_start_child_follow`` binds the child's cwd to the thread's project
+    # before writing; the home is resolved from it.
+    agent._sessions["run-late"] = str(project)
+    home = project / ".mini-ork"
+    run_dir = home / "runs" / "run-late"
+    assert not run_dir.exists()
+
+    with monkeypatch.context() as patch:
+        patch.setattr("mini_ork.acp.agent._BIND_POLL_S", 0.01)
+        patch.setattr("mini_ork.acp.agent._BIND_WAIT_S", 5.0)
+
+        async def _drive() -> None:
+            agent._bind_orchestrator(session, "run-late")
+            pending = agent._binds.get("run-late")
+            assert pending is not None
+            await asyncio.sleep(0.05)
+            assert orchestrator_thread.read(run_dir) is None
+            run_dir.mkdir(parents=True)
+            await pending
+
+        asyncio.run(_drive())
+
+    assert orchestrator_thread.read(run_dir) == session
+    assert "run-late" not in agent._binds
