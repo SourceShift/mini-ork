@@ -19,6 +19,8 @@ import pytest
 from mini_ork.rsi.candidates import Candidate
 from mini_ork.rsi.queue import (
     CREDIT_MIN_N,
+    MONITOR_ONLY,
+    REJECT_CODES,
     LedgerView,
     QueueConfig,
     Rejection,
@@ -142,6 +144,34 @@ def test_dedupe_merges_one_gap_seen_twice():
     plan = build_queue([cand, cand], now=NOW)
     assert plan.examined == 1
     assert len(plan.selected) == 1
+
+
+# ── monitor-only gaps ───────────────────────────────────────────────────────
+
+
+def test_a_monitor_only_gap_is_dropped_before_it_takes_a_slot():
+    """A ratio over rows already written cannot be moved by any patch, so the
+    queue must not hand it the top slot — measured: two cycles spent $1.00 and
+    $0.72 quarantining correct patches on G8 ``metric_unchanged``."""
+    dead = replace(_cand("verification", key="null-ratio", severity=99),
+                   evidence={"fixability": MONITOR_ONLY})
+    fixable = _cand("learning", key="real", severity=60)
+    plan = build_queue([dead, fixable], now=NOW)
+
+    assert [i.candidate.candidate_id for i in plan.selected] == [fixable.candidate_id]
+    assert [(r.candidate_id, r.code) for r in plan.rejected] == [
+        (dead.candidate_id, MONITOR_ONLY)]
+    assert MONITOR_ONLY in REJECT_CODES
+
+
+def test_a_monitor_only_gap_is_still_examined():
+    """It is dropped from dispatch, not from the report: the symptom is real
+    and the operator has to be able to see it."""
+    dead = replace(_cand("routing", key="ratio", severity=99),
+                   evidence={"fixability": MONITOR_ONLY})
+    plan = build_queue([dead], now=NOW)
+    assert plan.examined == 1
+    assert plan.selected == ()
 
 
 # ── avoidance ───────────────────────────────────────────────────────────────

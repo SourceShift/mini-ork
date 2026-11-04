@@ -38,7 +38,22 @@ REJECT_CODES: tuple[str, ...] = (
     "low_severity",
     "domain_cap",
     "domain_filtered",
+    "monitor_only",
 )
+
+#: ``evidence["fixability"]`` value for a rule whose success predicate is a
+#: PROPORTION OF ROWS ALREADY WRITTEN. Those rows predate the fix and no diff
+#: rewrites them, so the ratio moves only as new rows arrive — which no single
+#: patch controls. Dispatching one is a guaranteed G8 ``metric_unchanged``
+#: quarantine: measured at $1.00 and $0.72 on cycles rsi-c1793799790 and
+#: rsi-c1793812835, and it is the same shape for every ratio rule.
+#:
+#: Harvest still EMITS these — the symptom is real and an operator should see it
+#: in ``rsi-cycle plan`` — but the queue drops them here instead of paying an
+#: implementer that cannot win. Closing one for real is a data or behaviour
+#: change (author the missing values, or change what produces them), not a code
+#: patch, so it belongs in the operator's hands.
+MONITOR_ONLY: str = "monitor_only"
 
 DEFAULT_MAX_CANDIDATES = 3
 DEFAULT_PER_DOMAIN_MAX = 5
@@ -362,6 +377,15 @@ def build_queue(
         if cand.domain not in allowed:
             rejected.append(Rejection(cand.candidate_id, cand.signature,
                                       "domain_filtered", f"domain {cand.domain} not selected"))
+            continue
+        # Before avoidance: a monitor-only gap must not occupy a slot, or the
+        # seeded order hands the top of the queue to a candidate that can only
+        # be quarantined. See MONITOR_ONLY.
+        if cand.evidence.get("fixability") == MONITOR_ONLY:
+            rejected.append(Rejection(
+                cand.candidate_id, cand.signature, "monitor_only",
+                "the success predicate is a ratio over rows already written; "
+                "no patch can move it — fix the producer or the data instead"))
             continue
         avoid = avoidance(cand, view, cfg, now=now)
         if avoid is not None:

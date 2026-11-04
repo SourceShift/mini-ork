@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from mini_ork.learning.collapse_detector import MIN_STEPS
 from mini_ork.rsi.candidates import Candidate, dedupe
+from mini_ork.rsi.queue import MONITOR_ONLY
 from mini_ork.rsi.probes import SYNTHETIC_PREFIX, Finding, ProbeResult, normalize_path
 
 #: Rule ids are the ``source`` suffix recorded in the ledger (``db:L4``).
@@ -720,7 +721,8 @@ def _l5_promoted_to_never_set(ctx: _Ctx, domain: str, rule_id: str) -> list[Cand
         evidence_key="table:pattern_records:promoted_to:null",
         files=("mini_ork/learning/pattern_induction.py",),
         detail=f"{ratio:.1%} of {total} patterns have no promotion target.",
-        evidence={"table": "pattern_records", "rows": total, "null_ratio": round(ratio, 4)},
+        evidence={"table": "pattern_records", "rows": total, "null_ratio": round(ratio, 4),
+                  "fixability": MONITOR_ONLY},
         reach=total,
         fix_hint="Set promoted_to when a pattern is turned into a directive or lesson.",
         success_metric="promoted_to null ratio falls below 0.9",
@@ -746,7 +748,8 @@ def _l6_lesson_text_missing(ctx: _Ctx, domain: str, rule_id: str) -> list[Candid
         files=("mini_ork/learning/pattern_induction.py",),
         detail=f"{ratio:.1%} of {total} themes have NULL/empty lesson_text, so any "
                "injection built from them injects an identifier, not an instruction.",
-        evidence={"table": "lesson_themes", "rows": total, "missing_ratio": round(ratio, 4)},
+        evidence={"table": "lesson_themes", "rows": total, "missing_ratio": round(ratio, 4),
+                  "fixability": MONITOR_ONLY},
         reach=total,
         fix_hint="Author lesson_text at clustering time; drop themes that cannot get one.",
         success_metric="lesson_text missing ratio falls below 0.8",
@@ -1007,7 +1010,11 @@ def _r3_code_region_null(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate
         files=("mini_ork/steering/decision_service.py",),
         detail=f"{nulls}/{total} traces ({ratio:.1%}) carry no code_region; the AST shows "
                "segment= is passed, so the value is dropped between decide() and the trace.",
-        evidence={"table": "execution_traces", "rows": total, "null_ratio": round(ratio, 4)},
+        # The AST-clean branch is the ratio branch: persisting region from now on
+        # cannot change the traces already written. The AST-dirty branch above is
+        # genuinely fixable and stays dispatchable.
+        evidence={"table": "execution_traces", "rows": total, "null_ratio": round(ratio, 4),
+                  "fixability": MONITOR_ONLY},
         reach=nulls,
         fix_hint="Persist the derived code_region onto the execution trace.",
         success_metric="code_region null ratio falls below 0.5",
@@ -1124,7 +1131,8 @@ def _r7_workflow_candidates_flat(ctx: _Ctx, domain: str, rule_id: str) -> list[C
         files=("mini_ork/orchestration/workflow_lifecycle.py",),
         detail=f"{ratio:.1%} of {total} candidates show zero measured delta — the mutation "
                "search cannot tell a good mutation from a no-op.",
-        evidence={"table": "workflow_candidates", "rows": total, "zero_ratio": round(ratio, 4)},
+        evidence={"table": "workflow_candidates", "rows": total, "zero_ratio": round(ratio, 4),
+                  "fixability": MONITOR_ONLY},
         reach=total,
         fix_hint="Benchmark mutations against a baseline before recording a zero.",
         success_metric="zero-delta ratio falls below 0.9",
@@ -1212,7 +1220,8 @@ def _v1_confidence_never_recorded(ctx: _Ctx, domain: str, rule_id: str) -> list[
         files=("mini_ork/gates/verifier_rubric.py", "mini_ork/cli/execute_handlers.py"),
         detail=f"{ratio:.1%} of {total} results have NULL confidence; escalation has no "
                "uncertainty signal to threshold on.",
-        evidence={"table": "verifier_results", "rows": total, "null_ratio": round(ratio, 4)},
+        evidence={"table": "verifier_results", "rows": total, "null_ratio": round(ratio, 4),
+                  "fixability": MONITOR_ONLY},
         reach=total,
         # The value cannot be *plumbed* into existence: no verifier prints a
         # numeric confidence in its verdict envelope today, so a patch that only
@@ -1365,7 +1374,8 @@ def _v7_promotions_unbenchmarked(ctx: _Ctx, domain: str, rule_id: str) -> list[C
         evidence_key="table:promotion_records:benchmark_run_id:null",
         files=("mini_ork/gates/promotion_gate.py",),
         detail=f"{ratio:.1%} of {total} promotions have no benchmark_run_id.",
-        evidence={"table": "promotion_records", "rows": total, "null_ratio": round(ratio, 4)},
+        evidence={"table": "promotion_records", "rows": total, "null_ratio": round(ratio, 4),
+                  "fixability": MONITOR_ONLY},
         reach=total,
         fix_hint="Require a benchmark run before a promotion record is written.",
         success_metric="benchmark_run_id null ratio falls below 0.9",

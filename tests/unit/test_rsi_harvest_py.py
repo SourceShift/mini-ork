@@ -16,6 +16,7 @@ import pytest
 from mini_ork.rsi import harvest as harvest_mod
 from mini_ork.rsi.harvest import HarvestReport, harvest, parse_ts
 from mini_ork.rsi.probes import Finding, ProbeResult
+from mini_ork.rsi.queue import MONITOR_ONLY
 
 NOW = 1_792_000_000
 DAY = 86400
@@ -582,6 +583,24 @@ def test_r3_gets_its_own_identity_when_the_ast_is_clean(tmp_path, con):
     cand = one(report(tmp_path, con), "db:R3")
     assert cand.evidence_key == "table:execution_traces:code_region:null"
     assert cand.kind == "data_path_dead"
+    # This branch's success metric is a ratio over traces already written, so no
+    # patch can move it. Marked for the queue to drop; still emitted so the
+    # symptom stays visible.
+    assert cand.evidence["fixability"] == MONITOR_ONLY
+
+
+def test_r3_stays_dispatchable_while_the_ast_shows_a_missing_segment(tmp_path, con):
+    """The AST branch is a real code defect: a patch that threads ``segment=``
+    and proves it with a test can close it, so it must keep its queue slot."""
+    write(tmp_path, {"mini_ork/dispatch/routing.py": ROUTING_MISSING_SEGMENT})
+    ddl(con, "CREATE TABLE execution_traces (code_region TEXT, route_source TEXT);")
+    con.executemany("INSERT INTO execution_traces VALUES (NULL, 'policy')", [()] * 8)
+    con.executemany("INSERT INTO execution_traces VALUES ('eu', 'policy')", [()] * 2)
+    con.commit()
+
+    merged = [c for c in report(tmp_path, con).candidates
+              if c.evidence_key == "file:mini_ork/dispatch/routing.py:decide:segment-not-passed"]
+    assert merged and "fixability" not in merged[0].evidence
 
 
 # Mirrors the real call site: annotated assignment, value passed positionally.
