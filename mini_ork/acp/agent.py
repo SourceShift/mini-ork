@@ -3897,9 +3897,11 @@ class MiniOrkAcpAgent:
             runs.append(child_run_id)
         # Which thread watches this run, for every surface that offers "the
         # run's orchestrator": without it the IDE can only mint a new thread,
-        # and each click leaves a second empty conversation behind.
+        # and each click leaves a second empty conversation behind. The home is
+        # resolved from the *run*, the way every reader of the binding resolves
+        # it — a thread may watch a run that lives in another project.
         orchestrator_thread.write(
-            self._home_for(parent_session_id) / "runs" / child_run_id,
+            self._home_for(child_run_id) / "runs" / child_run_id,
             parent_session_id,
         )
         await self._open_run_marker(parent_session_id, child_run_id, recipe)
