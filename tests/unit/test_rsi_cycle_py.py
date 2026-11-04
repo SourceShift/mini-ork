@@ -38,6 +38,7 @@ from mini_ork.rsi.cycle import (  # noqa: E402
     Runtime,
     run_cycle,
 )
+from mini_ork.rsi import gates as gates_mod  # noqa: E402
 from mini_ork.rsi.gates import CriticVerdict, GateEvidence  # noqa: E402
 from mini_ork.rsi.harvest import HarvestReport  # noqa: E402
 from mini_ork.rsi.probes import ProbeResult  # noqa: E402
@@ -1975,3 +1976,108 @@ def test_a_preflight_reason_is_truncated_not_pasted(world, monkeypatch):
     assert "x" * (cycle_mod._PREFLIGHT_REASON_MAX + 50) not in message
     # The prefix plus the run-dir pointer, not the whole provider envelope.
     assert len(message) < cycle_mod._PREFLIGHT_REASON_MAX + 400
+
+
+# ── G6 attribution: a failure that does not reproduce is not a regression ────
+#
+# Measured 2026-11-04 (cycle rsi-c1793801689): two tests failed in an
+# 11-minute, 1929-test run of the scoped suite and passed in 0.4 s when run on
+# their own, in the same worktree with the patch applied. The cycle quarantined
+# a patch that had touched neither file. Re-running the reported failures alone
+# is what separates "this change broke a test" from "this suite, under this
+# shell, on this machine, went red".
+
+_IDS = ("tests/unit/test_x.py::test_a", "tests/unit/test_x.py::test_b")
+
+_SUITE_RED = (
+    1,
+    "F..\n"
+    "=========================== short test summary info ============================\n"
+    "FAILED tests/unit/test_x.py::test_a - AssertionError: assert 1 == 2\n"
+    "FAILED tests/unit/test_x.py::test_b - AssertionError\n"
+    "2 failed, 10 passed in 3.0s\n",
+)
+
+
+def _fake_runs(monkeypatch, replies):
+    """Fake ``_run``: one canned reply per invocation, in order."""
+    calls: list[list[str]] = []
+
+    def _run(argv, *, cwd, timeout_s, env=None):
+        calls.append(list(argv))
+        return replies[min(len(calls), len(replies)) - 1]
+
+    monkeypatch.setattr(cycle_mod, "_run", _run)
+    return calls
+
+
+def _req(world) -> CycleRequest:
+    return CycleRequest(root=world.root, db=world.db, config=world.cfg,
+                        cycle_id="rsi-ctest")
+
+
+def test_a_failure_that_passes_alone_is_not_attributed_to_the_patch(world, monkeypatch):
+    calls = _fake_runs(monkeypatch, [_SUITE_RED, (0, "2 passed in 0.4s")])
+
+    ok, detail = cycle_mod._pytest(world.root, _req(world), _cand(), (FILE,))
+
+    assert ok is True, detail
+    assert "re-run alone" in detail and "not attributable" in detail
+    # It re-ran exactly the ids pytest named — not the whole suite again.
+    assert calls[1][-2:] == list(_IDS)
+
+
+def test_a_failure_that_reproduces_alone_still_fails_the_gate(world, monkeypatch):
+    _fake_runs(monkeypatch, [
+        _SUITE_RED,
+        (1, "FAILED tests/unit/test_x.py::test_a - AssertionError\n1 failed in 0.2s\n"),
+    ])
+
+    ok, detail = cycle_mod._pytest(world.root, _req(world), _cand(), (FILE,))
+
+    assert ok is False
+    assert "still failing when re-run alone" in detail
+    assert "test_a" in detail
+
+
+def test_a_red_run_with_no_summary_stays_red(world, monkeypatch):
+    """A collection crash names no test, so nothing can be re-run or cleared."""
+    calls = _fake_runs(monkeypatch, [(3, "INTERNALERROR> pytest could not collect\n")])
+
+    ok, detail = cycle_mod._pytest(world.root, _req(world), _cand(), (FILE,))
+
+    assert ok is False
+    assert "INTERNALERROR" in detail
+    assert len(calls) == 1            # no re-run was attempted
+
+
+def test_too_many_failures_are_not_re_run(world, monkeypatch):
+    """Twenty-one red tests are a regression, and re-running them is not free."""
+    many = "\n".join(f"FAILED tests/unit/test_x.py::test_{i} - AssertionError"
+                     for i in range(cycle_mod._PYTEST_RERUN_MAX + 1))
+    calls = _fake_runs(monkeypatch, [(1, many)])
+
+    ok, detail = cycle_mod._pytest(world.root, _req(world), _cand(), (FILE,))
+
+    assert ok is False
+    assert "too many" in detail
+    assert len(calls) == 1
+
+
+def test_a_green_scoped_run_does_not_re_run_anything(world, monkeypatch):
+    calls = _fake_runs(monkeypatch, [(0, "1900 passed in 600s")])
+
+    ok, detail = cycle_mod._pytest(world.root, _req(world), _cand(), (FILE,))
+
+    assert ok is True and detail == ""
+    assert len(calls) == 1
+
+
+def test_g6_keeps_the_unattributed_note_on_a_passing_gate():
+    """The gate is green, but the noise it survived must still be readable."""
+    note = "2 test(s) failed in the scoped suite but passed when re-run alone"
+    result = gates_mod._g6(GateEvidence(pytest_ok=True, pytest_detail=note))
+
+    assert result.ok is True
+    assert result.code == ""
+    assert result.detail == note

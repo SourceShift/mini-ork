@@ -2194,16 +2194,78 @@ def _lint(wt: Path, changed: Sequence[str], timeout_s: int) -> tuple[bool, str]:
     return rc == 0, "" if rc == 0 else out[-2000:]
 
 
+# pytest's short-summary lines, which are the only machine-readable statement of
+# *which* test failed: ``FAILED tests/x.py::test_y - AssertionError: ...``,
+# ``ERROR tests/x.py - fixture 'db' not found``, and the file id alone when the
+# file could not be collected. Anything else on the line is prose and dropped.
+_PYTEST_FINDING = re.compile(r"^(?:FAILED|ERROR) (\S+?)(?:\s+-\s+.*)?$", re.M)
+
+# Past this many failures the single re-run stops being cheaper than the verdict
+# it buys, so the gate stays red and names them instead. The scoped set has
+# ~1900 tests; a change that reds twenty of them is a regression, not a flake.
+_PYTEST_RERUN_MAX = 20
+
+# The inherited knobs the scoped suite reads. Same commit, different shell, red
+# in one and green in the other — the gate cannot be reproducible without
+# recording which one it ran under.
+_AMBIENT_KEYS = ("MINI_ORK_ROOT", "MINI_ORK_HOME", "MINI_ORK_DB", "MO_PLACEMENT")
+
+
+def _pytest_findings(out: str) -> list[str]:
+    """The test ids pytest itself named as failing or erroring, deduped."""
+    seen: dict[str, None] = {}
+    for ident in _PYTEST_FINDING.findall(out):
+        seen.setdefault(ident.rstrip(","), None)
+    return list(seen)
+
+
+def _ambient_env_note() -> str:
+    """Which inherited knobs the scoped run saw, for a verdict nobody can replay."""
+    seen = [f"{k}={os.environ[k]}" for k in _AMBIENT_KEYS if os.environ.get(k)]
+    return ", ".join(seen) or "none"
+
+
 def _pytest(wt: Path, req: CycleRequest, cand: Candidate,
             changed: Sequence[str]) -> tuple[bool, str]:
-    """Every test that can pin this change (see ``_scoped_tests``)."""
+    """Every test that can pin this change (see ``_scoped_tests``).
+
+    A red scoped suite is not yet evidence about the patch. The set is large,
+    it shares one process, and it inherits the cycle's shell, so a test can fail
+    for reasons the change did not cause — a leaked global, an ambient
+    ``MINI_ORK_*``, a machine under load. So each reported failure is re-run
+    alone, in the same worktree: only a test that still fails with nothing else
+    running is attributed to the change.
+
+    Measured 2026-11-04 (cycle ``rsi-c1793801689``): two tests failed in an
+    11-minute, 1929-test run and passed in 0.4 s on their own, and the cycle
+    quarantined a patch that had touched neither file. A gate that reports an
+    unattributable failure as a regression burns the whole run's spend.
+    """
     tests = _scoped_tests(req.root, changed, existing=req.config.scoped_tests)
     if not tests:
         return False, ("no scoped tests: set gates.pytest_paths — an unscoped "
                        "pytest run is the whole suite")
     rc, out = _run([sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *tests],
                    cwd=wt, timeout_s=req.config.gates.cmd_timeout_s)
-    return rc == 0, "" if rc == 0 else out[-4000:]
+    if rc == 0:
+        return True, ""
+    failed = _pytest_findings(out)
+    if not failed:
+        # A red run whose own summary names nothing — a collection crash, a
+        # killed process — cannot be attributed in either direction. Stay red.
+        return False, out[-4000:]
+    if len(failed) > _PYTEST_RERUN_MAX:
+        return False, (f"{len(failed)} tests failed in the scoped suite; too many to "
+                       f"re-run alone, treated as a regression\n" + out[-4000:])
+    rc2, out2 = _run([sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *failed],
+                     cwd=wt, timeout_s=req.config.gates.cmd_timeout_s)
+    if rc2 != 0:
+        return False, (f"still failing when re-run alone ({len(failed)} reported): "
+                       f"{', '.join(failed[:5])}\n" + out2[-4000:])
+    shown = ", ".join(failed[:5]) + ("…" if len(failed) > 5 else "")
+    return True, (f"{len(failed)} test(s) failed in the scoped suite but passed when "
+                  f"re-run alone ({shown}) — not attributable to this patch. "
+                  f"Ambient env: {_ambient_env_note()}")
 
 
 def _scoped_tests(root: Path, changed: Sequence[str], *,

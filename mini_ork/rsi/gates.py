@@ -330,7 +330,11 @@ def _g5(ev: GateEvidence) -> GateResult:
 
 def _g6(ev: GateEvidence) -> GateResult:
     if ev.pytest_ok is True:
-        return GateResult("G6", "pytest_scoped", True)
+        # A passing gate can still carry a note. Tests that failed inside the
+        # scoped suite and passed when re-run alone are recorded here rather
+        # than dropped: the verdict is green, but the *noise* is the operator's
+        # only evidence that the suite (or the shell it ran in) needs attention.
+        return GateResult("G6", "pytest_scoped", True, detail=ev.pytest_detail or "")
     detail = ev.pytest_detail or (
         "the scoped test gate did not run" if ev.pytest_ok is None else "pytest failed"
     )
