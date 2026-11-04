@@ -2245,8 +2245,16 @@ def _pytest(wt: Path, req: CycleRequest, cand: Candidate,
     if not tests:
         return False, ("no scoped tests: set gates.pytest_paths — an unscoped "
                        "pytest run is the whole suite")
+    # Point the suite at the tree under test, not at whatever the operator
+    # exported. The cycle runs from the primary checkout with MINI_ORK_ROOT set
+    # to it, and several tests resolve code and migrations through that
+    # variable — so a patch that adds a migration failed seven tests here on
+    # 2026-11-04 purely because the primary tree did not have the file yet.
+    # G7's `_static_findings` already pins this per root; G6 was the odd one
+    # out, which is exactly why it blamed the patch for the harness.
+    env = {**os.environ, "MINI_ORK_ROOT": str(wt)}
     rc, out = _run([sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *tests],
-                   cwd=wt, timeout_s=req.config.gates.cmd_timeout_s)
+                   cwd=wt, timeout_s=req.config.gates.cmd_timeout_s, env=env)
     if rc == 0:
         return True, ""
     failed = _pytest_findings(out)
@@ -2258,7 +2266,7 @@ def _pytest(wt: Path, req: CycleRequest, cand: Candidate,
         return False, (f"{len(failed)} tests failed in the scoped suite; too many to "
                        f"re-run alone, treated as a regression\n" + out[-4000:])
     rc2, out2 = _run([sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *failed],
-                     cwd=wt, timeout_s=req.config.gates.cmd_timeout_s)
+                     cwd=wt, timeout_s=req.config.gates.cmd_timeout_s, env=env)
     if rc2 != 0:
         return False, (f"still failing when re-run alone ({len(failed)} reported): "
                        f"{', '.join(failed[:5])}\n" + out2[-4000:])

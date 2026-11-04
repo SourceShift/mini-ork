@@ -2073,6 +2073,31 @@ def test_a_green_scoped_run_does_not_re_run_anything(world, monkeypatch):
     assert len(calls) == 1
 
 
+def test_the_scoped_suite_runs_with_the_worktree_as_its_root(world, monkeypatch):
+    """The primary checkout's ``MINI_ORK_ROOT`` must not leak into the child's tests.
+
+    Measured 2026-11-04 (cycle ``rsi-c1793808348``): seven tests resolved code
+    and migrations through ``MINI_ORK_ROOT``, which the cycle had pointed at the
+    primary checkout — a tree that does not contain the migration the patch was
+    adding — so the gate blamed the patch for the harness. G7's
+    ``_static_findings`` already pins this per root; G6 was the odd one out.
+    """
+    roots: list[str] = []
+
+    def _run(argv, *, cwd, timeout_s, env=None):
+        roots.append(str((env or {}).get("MINI_ORK_ROOT")))
+        return _SUITE_RED if len(roots) == 1 else (0, "2 passed in 0.4s")
+
+    monkeypatch.setattr(cycle_mod, "_run", _run)
+    monkeypatch.setenv("MINI_ORK_ROOT", "/some/other/checkout")
+
+    ok, _detail = cycle_mod._pytest(world.root, _req(world), _cand(), (FILE,))
+
+    assert ok is True
+    # Both the suite and the alone re-run see the tree under test.
+    assert roots == [str(world.root), str(world.root)]
+
+
 def test_g6_keeps_the_unattributed_note_on_a_passing_gate():
     """The gate is green, but the noise it survived must still be readable."""
     note = "2 test(s) failed in the scoped suite but passed when re-run alone"
