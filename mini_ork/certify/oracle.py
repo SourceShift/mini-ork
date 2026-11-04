@@ -694,8 +694,13 @@ def judge(
     post: ExecOutcome = runner.run_test(poc_src, patch=patch)
     if post.status == "apply_fail":
         return Verdict(REFUTED, "patch does not apply", poc_plus=poc_src)
-    if post.status == "test_defect":
-        return Verdict(UNVERIFIED, f"the probe broke on the patched code ({post.exc}) — cannot judge",
+    # A broken probe measured nothing, so it cannot refute the patch. The flag
+    # matters as much as the status word: a runner whose spec raised during
+    # collection reports ``failed`` plus ``meta['test_defect']``, and without
+    # this check the judge would blame the patch for the harness's own defect.
+    broken = evidence.broken_probe(post)
+    if broken is not None:
+        return Verdict(UNVERIFIED, f"the probe broke on the patched code ({post.exc or broken}) — cannot judge",
                        poc_plus=poc_src)
     if post.status != "passed":
         return Verdict(REFUTED,

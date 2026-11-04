@@ -365,3 +365,68 @@ def test_two_conclusive_failures_still_refute():
     )
     assert v.verdict == "REFUTED"
     assert v.detail["unmeasured"] == 1
+
+
+# ── a broken probe is a harness fact, not a verdict on the patch ────────────
+
+
+def test_broken_probe_reads_the_status_word():
+    assert evidence.broken_probe(_outcome(status="test_defect")) == (
+        "the runner reported a defective test"
+    )
+
+
+def test_broken_probe_reads_the_metadata_flag():
+    # The second producer: a runner whose spec raised during collection says
+    # `failed` (the process really did fail) and flags the defect in meta.
+    assert evidence.broken_probe(
+        _outcome(status="failed", returncode=1, meta={"test_defect": True})
+    ) == "the outcome is flagged meta['test_defect']"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        _outcome(status="failed", returncode=1, exc="AssertionError"),
+        _outcome(status="failed", returncode=1, meta={"test_defect": False}),
+        _outcome(status="apply_fail"),
+        _outcome(),  # a pass is defect()'s question, never this one's
+        _outcome(meta={"test_defect": True}),  # ... even when the flag is set
+    ],
+)
+def test_broken_probe_is_silent_otherwise(outcome):
+    assert evidence.broken_probe(outcome) is None
+
+
+def test_broken_probe_never_raises_on_malformed_evidence():
+    assert evidence.broken_probe(SimpleNamespace(status="failed", meta=None)) is None
+    assert evidence.broken_probe(object()) is None
+
+
+class _FlaggedDeltaRunner:
+    """Base reproduces honestly; the patched run crashes its own test."""
+
+    up = True
+
+    def run_test(self, src: str, patch: str = "") -> ExecOutcome:
+        if not patch:
+            return ExecOutcome(status="failed", ran=True, returncode=1,
+                               exc="AssertionError")
+        return ExecOutcome(status="failed", ran=True, returncode=1,
+                           exc="NameError", meta={"test_defect": True})
+
+
+def test_judge_abstains_when_the_patched_run_flags_a_defective_test():
+    # Without the metadata channel the judge blames the patch for a NameError
+    # the harness raised, i.e. REFUTED. A broken probe measured nothing.
+    v = oracle.judge(_ISSUE, _PATCH, runner=_FlaggedDeltaRunner(),
+                     dispatch=_mr_dispatch, poc=_POC)
+    assert v.verdict == "UNVERIFIED"
+    assert "probe broke" in v.reason
+
+
+def test_the_audit_case_for_a_defective_test_abstains():
+    # The audit scores "not PROVEN" as detected, so it would keep passing even
+    # if the judge went back to blaming the patch. Pin the verdict itself.
+    cases = {c.name: c for c in oracle_integrity.default_cases(oracle.judge)}
+    assert cases["test_defect_as_failure"].run() == "UNVERIFIED"

@@ -30,13 +30,19 @@ patch.
 ``defect(outcome)`` returns a short reason string (or ``None`` when coherent);
 ``is_trustworthy_pass(outcome)`` is the boolean mirror ``defect(outcome) is None``.
 
+The one non-passed case that also belongs here is a *broken probe*.
+``broken_probe(outcome)`` names a failure that measured nothing — the runner
+reported the test itself as defective — so the judge abstains instead of blaming
+the patch. It speaks only about non-passed outcomes; a pass stays ``defect``'s
+question.
+
 Import-time contract: stdlib only, mirroring ``mini_ork.gates.verifier_mutation``.
 """
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-__all__ = ["defect", "is_trustworthy_pass"]
+__all__ = ["broken_probe", "defect", "is_trustworthy_pass"]
 
 #: Exact success words a corroborating field may carry. A near miss ("ok.",
 #: "successful") is NOT a success word: an unknown value cannot support the
@@ -173,6 +179,38 @@ def defect(outcome) -> str | None:
             "different input digest"
         )
 
+    return None
+
+
+def broken_probe(outcome) -> str | None:
+    """Return why a non-``passed`` outcome measured nothing, else ``None``.
+
+    A probe that broke measures neither the base nor the patch, so its failure
+    is a harness fact and must not refute a patch — the right verdict is an
+    abstention. Two producers report that same fact under different status
+    words, and the judge must honour both:
+
+    * ``mini_ork.runtime.engine`` emits ``status="test_defect"`` — the harness
+      itself decided the test is defective;
+    * a runner whose spec raised before it could assert (a ``NameError``, a
+      missing fixture) emits ``status="failed"`` — the process really did fail —
+      and flags ``meta["test_defect"]``, because the status word alone cannot
+      tell "the bug reproduced" from "the test is broken".
+
+    Only the second channel needs the metadata: a plain ``failed`` with no flag
+    is a reproduction and stays the judge's evidence against the patch. A
+    ``passed`` outcome is never inspected here; that is :func:`defect`'s job.
+    """
+    status = _field(outcome, "status")
+    if status == "passed":
+        return None
+    if status == "test_defect":
+        return "the runner reported a defective test"
+    flag = _meta_get(_meta_of(outcome), "test_defect")
+    # ``_MISSING`` is an object, so it is truthy: an absent flag must be tested
+    # for identity, never for truthiness.
+    if flag is not _MISSING and _truthy(flag):
+        return "the outcome is flagged meta['test_defect']"
     return None
 
 
