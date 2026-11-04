@@ -9,18 +9,26 @@ contribute fixes back rather than forking. This file records what we use and why
 
 - **Upstream:** https://github.com/PrimeIntellect-ai/verifiers
 - **License:** MIT
-- **Version:** `>=0.2.0,<0.5` — the `verifiers.v1` namespace, which upstream ships as a
+- **Version:** `>=0.2.0,<0.4.1` — the `verifiers.v1` namespace, which upstream ships as a
   *preview*. We pin deliberately and bump on purpose. The floor is the first release with
   the `v1.runtimes` shape Crucible calls; the ceiling was raised from `<0.3` to `<0.5` by
   dependabot (PR #230, 2026-10-27). Before accepting that, `mini_ork/runtime/engine.py`'s
   entire surface — `make_runtime`, the four `*Config` classes, and the Runtime protocol
-  methods — was checked against **both ends**, `0.2.0` and `0.4.0`, and is unchanged. That
-  check is now a test (`tests/unit/test_crucible_runtime.py::
-  test_the_engine_api_surface_survives_the_pinned_range`) and a CI job (`verifiers-pin`)
-  that installs the floor (`0.2.0`, py3.11) and the newest version the ceiling admits
-  (`>=0.4,<0.5`, py3.12). The test is `skipif`-guarded, so the job also asserts it
+  methods — was checked against **both ends**, `0.2.0` and `0.4.0`, and is unchanged.
+  **`0.4.1` is where that stopped being true:** it ships `verifiers.v1.runtimes` with
+  `make_runtime` and `ModalConfig` removed (provisioning moved to `make_backend` /
+  `provision_runtime`, and `Runtime` lost `start`/`cleanup`), so the ceiling is now the
+  exact version that was measured, `<0.4.1`. The check is a test
+  (`tests/unit/test_crucible_runtime.py::test_the_engine_api_surface_survives_the_pinned_range`)
+  and a CI job (`verifiers-pin`) that installs the floor (`0.2.0`, py3.11) and the ceiling
+  (`0.4.0`, py3.12) — both by exact version, because a range re-resolves: `>=0.4,<0.5`
+  silently became 0.4.1 the day 0.4.1 shipped, while this file recorded the check as
+  having passed against 0.4.0. The test is `skipif`-guarded, so the job also asserts it
   *ran* — a skipped guard would otherwise report success while verifying nothing. The
-  next automated bump is therefore verified rather than merely merged.
+  next automated bump is therefore verified rather than merely merged, and
+  `engine._have_verifiers` asks for `make_runtime` rather than for the import, so a
+  version that drops it again is reported as "runtime not installed" instead of failing
+  from inside the constructor.
 - **Used by:** `mini_ork/runtime/` (Crucible — our verified-execution seam). This is the
   **only** import site; nothing else in mini-ork may import `verifiers`, so an upstream API
   change touches exactly one file.

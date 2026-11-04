@@ -128,15 +128,17 @@ jobs:
         if: matrix.shard == 'rest'
         run: python -m pytest tests/ -q -p no:cacheprovider -n auto --ignore=tests/unit
 
-  # The optional `runtime` extra pins `verifiers>=0.2.0,<0.5`, and that ceiling moves
-  # by dependabot PR (it went <0.3 -> <0.5 on 2026-10-27 with no check on the API).
+  # The optional `runtime` extra pins `verifiers>=0.2.0,<0.4.1`, and that ceiling moves
+  # by dependabot PR (it went <0.3 -> <0.5 on 2026-10-27 with no check on the API, and
+  # 0.4.1 promptly removed `make_runtime` and `ModalConfig`).
   # `mini_ork/runtime/engine.py` is the sole import site, so exercising it at BOTH
   # ends of the declared range is the whole test. Do not widen the range without
   # adding the new end here.
   #
-  # The ceiling entry is a *range*, not `==0.4.0`: the newest 0.4.x is what a user
-  # actually installs under this pin, and it is the version most likely to break
-  # us. Likewise the two ends run on the two interpreters the package supports.
+  # The ceiling entry is an EXACT version, not a range: a range re-resolves on every
+  # run, so `>=0.4,<0.5` silently became 0.4.1 the day 0.4.1 shipped — while
+  # THIRD_PARTY.md recorded the check as having passed against 0.4.0. Pin what was
+  # measured. Likewise the two ends run on the two interpreters the package supports.
   verifiers-pin:
     name: verifiers pin (${{ matrix.req }} / py${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -147,7 +149,7 @@ jobs:
         include:
           - req: "verifiers==0.2.0"      # floor of the declared range
             python: "3.11"
-          - req: "verifiers>=0.4,<0.5"   # ceiling: newest 0.4.x the pin admits
+          - req: "verifiers==0.4.0"      # ceiling: the newest release the pin admits
             python: "3.12"
     steps:
       - uses: actions/checkout@v7

@@ -101,10 +101,20 @@ class ExecOutcome:
 
 
 def _have_verifiers() -> bool:
-    try:
-        from verifiers.v1 import runtimes  # noqa: F401
+    """True iff the installed ``verifiers`` exposes the surface Crucible drives.
 
-        return True
+    Importing the namespace is not enough. 0.4.1 ships ``verifiers.v1.runtimes``
+    with ``make_runtime`` *removed* (provisioning moved to ``make_backend`` /
+    ``provision_runtime``), so a bare-import probe advertised four backends that
+    every one of them failed on, with an ImportError raised from
+    ``_start_verifiers`` rather than the clear "pip install mini-ork[runtime]"
+    the caller deserves. Ask for the entry point we actually call; the pin keeps
+    0.4.1 out, and this keeps the answer honest if a bump lets it back in.
+    """
+    try:
+        from verifiers.v1 import runtimes
+
+        return callable(getattr(runtimes, "make_runtime", None))
     except Exception:
         return False
 

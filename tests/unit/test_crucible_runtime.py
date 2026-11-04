@@ -228,12 +228,15 @@ def test_cloud_backends_are_selectable():
 def test_the_engine_api_surface_survives_the_pinned_range():
     """Every call `engine.py` makes into `verifiers` must exist on any version the pin admits.
 
-    The declared range is `verifiers>=0.2.0,<0.5`, and the ceiling moves on its own —
+    The declared range is `verifiers>=0.2.0,<0.4.1`, and the ceiling moves on its own —
     dependabot raised it `<0.3` -> `<0.5` on 2026-10-27 with nothing checking that the
-    preview API had stayed put. This asserts the *shape* engine.py depends on, not a
-    version, so it runs against whatever is installed; CI's `verifiers-pin` job runs it at
-    both ends of the range, and fails if this test *skips* there — a skipped guard is a
-    green job that verified nothing. Widening a pin is only safe while this test is green.
+    preview API had stayed put, and 0.4.1 then removed `make_runtime` and `ModalConfig`
+    outright (provisioning moved to `make_backend` / `provision_runtime`). That is why
+    the ceiling is now an exact, measured version rather than a range that re-resolves.
+    This asserts the *shape* engine.py depends on, not a version, so it runs against
+    whatever is installed; CI's `verifiers-pin` job runs it at both ends of the range,
+    and fails if this test *skips* there — a skipped guard is a green job that verified
+    nothing. Widening a pin is only safe while this test is green.
     """
     from verifiers.v1 import runtimes as R
 
@@ -299,3 +302,39 @@ def test_end_to_end_base_red_gold_green_garbage_rejected():
         assert c.run_test(TEST).status == "failed"                  # reproduces
         assert c.run_test(TEST, patch=GOLD).status == "passed"      # fixed
         assert c.run_test(TEST, patch=GARBAGE).status == "apply_fail"
+
+
+# ── the availability probe asks for the entry point, not the import ─────────
+
+
+def test_have_verifiers_requires_make_runtime(monkeypatch):
+    """A namespace without `make_runtime` must not be advertised as usable.
+
+    `verifiers` 0.4.1 ships `verifiers.v1.runtimes` with `make_runtime` removed, so
+    an import-only probe reported the docker/prime/modal backends as available and
+    then failed inside `__enter__`. The probe asks for the call it will make.
+    """
+    import sys as _sys
+    import types
+
+    def install(runtimes_module) -> None:
+        root = types.ModuleType("verifiers")
+        root.__path__ = []
+        v1 = types.ModuleType("verifiers.v1")
+        v1.__path__ = []
+        v1.runtimes = runtimes_module
+        root.v1 = v1
+        monkeypatch.setitem(_sys.modules, "verifiers", root)
+        monkeypatch.setitem(_sys.modules, "verifiers.v1", v1)
+        monkeypatch.setitem(_sys.modules, "verifiers.v1.runtimes", runtimes_module)
+
+    without = types.ModuleType("verifiers.v1.runtimes")
+    without.SubprocessConfig = object  # the namespace still exists
+    install(without)
+    assert _have_verifiers() is False
+    assert "modal" not in available_backends()
+
+    with_entry_point = types.ModuleType("verifiers.v1.runtimes")
+    with_entry_point.make_runtime = lambda *a, **k: None
+    install(with_entry_point)
+    assert _have_verifiers() is True
