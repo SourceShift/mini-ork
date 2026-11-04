@@ -514,6 +514,23 @@ def test_inbox_awaiting_review_age_backdates(home: Path) -> None:
     assert "3d ago" in sub, f"backdated row must read '3d ago'; sub={sub!r}"
 
 
+def test_inbox_awaiting_review_merge_row_age(home: Path) -> None:
+    """The merge rows in the operator's screenshot carry the same age fix."""
+    _seed_run(home, status="published")
+    merge_approval.request(RUN, "deadbeef", "deadbeef", branch="wt/demo",
+                           base_branch="main", db_path=str(home / "state.db"))
+
+    page = build_page(home, "inbox", None, {})
+    section = next(s for s in page.get("sections") or []
+                   if str(s.get("title") or "") == "Awaiting review")
+    merge_items = [i for i in section.get("items") or []
+                   if str(i.get("t") or "").startswith("merge")]
+    assert merge_items, f"missing merge row; items={section.get('items')!r}"
+    sub = str(merge_items[0].get("sub") or "")
+    assert sub == "merge · just now", \
+        f"merge row age must be a delta; sub={sub!r}"
+
+
 def test_inbox_without_db_raises_no_exception(tmp_path, monkeypatch) -> None:
     """A home with no ``state.db`` file → no Awaiting review section, no exception.
 
