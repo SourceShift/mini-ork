@@ -321,6 +321,86 @@ def test_l9_closes_when_the_writer_is_called(tmp_path, con):
     assert "L9" in report(tmp_path, con).closed
 
 
+def test_l9_is_not_closed_by_a_same_named_function_in_another_module(tmp_path, con):
+    """A call to *some* ``_tf`` is not a call to this one.
+
+    Measured: ``_tf`` is the trace writer in ``mini_ork/cli/execute.py`` and an
+    unrelated text-vector helper in ``mini_ork/orchestration/watchdog.py``. A
+    bare-name call search reported the writer as called because the other
+    module called its own ``_tf`` — the same false positive as reading SQL out
+    of a docstring, and it silences the detector for every tree that contains
+    the collision.
+    """
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {
+        "mini_ork/cli/execute.py":
+            "def _make_trace_fn():\n"
+            "    def _tf(trace_id):\n"
+            "        db.execute('UPDATE learning_record SET benchmark_delta=?', (0.1,))\n"
+            "    return _tf\n",
+        "mini_ork/orchestration/watchdog.py":
+            "def _tf(v):\n    return sorted(v)\n"
+            "def run():\n    _tf([1, 2])\n",
+    })
+    assert one(report(tmp_path, con), "db:L9").kind == "data_path_dead"
+
+
+def test_l9_closes_when_the_imported_writer_is_called(tmp_path, con):
+    """Same-named functions are resolved by import, not assumed absent."""
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {
+        "mini_ork/learning/ledger.py":
+            "def record_benchmark_delta(db, run_id):\n"
+            "    db.execute('UPDATE learning_record SET benchmark_delta=?', (0.1,))\n",
+        "mini_ork/cli/other.py":
+            "def record_benchmark_delta(db, run_id):\n    return None\n",
+        "mini_ork/cli/self_improve.py":
+            "from mini_ork.learning.ledger import record_benchmark_delta\n"
+            "def _iter_run(db):\n    record_benchmark_delta(db, 1)\n",
+    })
+    assert "L9" in report(tmp_path, con).closed
+
+
+def test_l9_is_not_closed_when_the_import_points_at_the_other_module(tmp_path, con):
+    """Import resolution has to name the module that WRITES, or the rule closes
+    on a call to something that does nothing."""
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {
+        "mini_ork/learning/ledger.py":
+            "def record_benchmark_delta(db, run_id):\n"
+            "    db.execute('UPDATE learning_record SET benchmark_delta=?', (0.1,))\n",
+        "mini_ork/cli/other.py":
+            "def record_benchmark_delta(db, run_id):\n    return None\n",
+        "mini_ork/cli/self_improve.py":
+            "from mini_ork.cli.other import record_benchmark_delta\n"
+            "def _iter_run(db):\n    record_benchmark_delta(db, 1)\n",
+    })
+    assert one(report(tmp_path, con), "db:L9").kind == "data_path_dead"
+
+
+def test_l9_closes_on_a_qualified_call_of_the_writer(tmp_path, con):
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {
+        "mini_ork/learning/ledger.py":
+            "def record_benchmark_delta(db, run_id):\n"
+            "    db.execute('UPDATE learning_record SET benchmark_delta=?', (0.1,))\n",
+        "mini_ork/cli/other.py":
+            "def record_benchmark_delta(db, run_id):\n    return None\n",
+        "mini_ork/cli/self_improve.py":
+            "import mini_ork.learning.ledger as ledger\n"
+            "def _iter_run(db):\n    ledger.record_benchmark_delta(db, 1)\n",
+    })
+    assert "L9" in report(tmp_path, con).closed
+
+
 def test_l9_closes_on_the_sqlite_write_forms_beyond_plain_insert(tmp_path, con):
     """`REPLACE INTO` and `UPDATE OR IGNORE … SET` are writes too.
 

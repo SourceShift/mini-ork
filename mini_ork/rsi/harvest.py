@@ -205,11 +205,29 @@ def _py_files(root: Path) -> Iterable[Path]:
             yield path
 
 
+#: Parsed trees, keyed by path and stamp. A harvest asks several structural
+#: questions per rule and each one used to re-read and re-parse every module;
+#: parsing is the expensive half (measured 4–18 s per question at 612 files).
+_PARSE_CACHE: dict[tuple[str, int, int], ast.AST | None] = {}
+_PARSE_CACHE_MAX = 4096
+
+
 def _parse(path: Path) -> ast.AST | None:
     try:
-        return ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    except (SyntaxError, OSError):
+        stat = path.stat()
+    except OSError:
         return None
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    if key in _PARSE_CACHE:
+        return _PARSE_CACHE[key]
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (SyntaxError, OSError):
+        tree = None
+    if len(_PARSE_CACHE) >= _PARSE_CACHE_MAX:
+        _PARSE_CACHE.clear()
+    _PARSE_CACHE[key] = tree
+    return tree
 
 
 def _call_sites(root: Path, name: str) -> list[tuple[str, int]]:
@@ -316,12 +334,14 @@ def _docstring_constants(tree: ast.AST) -> set[int]:
     return ids
 
 
-def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None]]:
+def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None, str]]:
     """Every SQL statement in ``mini_ork/`` that writes ``table``, and its function.
 
-    Yields ``(statement, enclosing function name)``, with ``None`` for a
-    statement at module level — which executes on import, so it is live by
-    construction.
+    Yields ``(statement, enclosing function name, module path)``, with ``None``
+    for a statement at module level — which executes on import, so it is live by
+    construction. The module path is what lets a caller decide whether a call to
+    that function name can actually reach *this* definition instead of a
+    same-named one in another module.
 
     String CONSTANTS, not file text. A comment or a docstring that quotes SQL
     must not count as a writer: an earlier text-search version of this helper
@@ -347,6 +367,7 @@ def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None]
         tree = _parse(path)
         if tree is None:
             continue
+        rel = normalize_path(str(path.relative_to(root)))
         docstrings = _docstring_constants(tree)
         # constant node id -> enclosing function name (None = module level).
         # Breadth-first walk visits an outer function before a nested one, so a
@@ -368,12 +389,12 @@ def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None]
             # SET clause is bounded by its own statement, not the next one's.
             for stmt in node.value.split(";"):
                 if pat.search(stmt):
-                    yield stmt, owner.get(id(node))
+                    yield stmt, owner.get(id(node)), rel
 
 
 def _sql_write_statements(root: Path, table: str) -> Iterator[str]:
     """``_sql_write_owners`` without the function context."""
-    for stmt, _ in _sql_write_owners(root, table):
+    for stmt, *_ in _sql_write_owners(root, table):
         yield stmt
 
 
@@ -402,6 +423,92 @@ def _statement_writes_column(stmt: str, table: str, column: str) -> bool:
     return bool(insert_cols and re.search(rf"\b{col}\b", insert_cols.group(1)))
 
 
+def _module_name(rel: str) -> str:
+    """``mini_ork/cli/execute.py`` → ``mini_ork.cli.execute``."""
+    stem = rel[:-3] if rel.endswith(".py") else rel
+    parts = stem.split("/")
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _import_bindings(tree: ast.AST) -> dict[str, str]:
+    """Local name → dotted module it was bound to by an ``import``.
+
+    ``from mini_ork.x import fn`` binds ``fn``; ``import mini_ork.x as m`` binds
+    ``m``. Only absolute imports at any nesting level are recorded — they are
+    what tells one module's ``fn`` apart from another's.
+    """
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                bound[alias.asname or alias.name] = node.module
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                bound[local] = alias.name if alias.asname else local
+    return bound
+
+
+def _definitions(root: Path, name: str) -> set[str]:
+    """Modules in ``mini_ork/`` that define a function or method ``name``."""
+    out: set[str] = set()
+    for path in _py_files(root):
+        tree = _parse(path)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                out.add(normalize_path(str(path.relative_to(root))))
+                break
+    return out
+
+
+def _call_reaching(root: Path, name: str, def_rel: str) -> tuple[str, int] | None:
+    """The first call to ``name`` that can reach the definition in ``def_rel``.
+
+    A bare-name search across the tree is not evidence: ``_tf`` is a trace
+    helper in ``mini_ork/cli/execute.py`` AND an unrelated text-vector function
+    in ``mini_ork/orchestration/watchdog.py``, so the first was reported called
+    on the strength of the second. That is the same class of error as counting a
+    docstring as SQL — the detector closes on code that cannot run.
+
+    So a name defined once may be called from anywhere (a call to it cannot mean
+    anything else), while a name defined more than once must be resolved: the
+    call has to sit in the defining module, or in a module that imports the name
+    from it. Method calls (``obj.fn()``) always need the defining module, since
+    a method name collides with every other class's.
+    """
+    unique = len(_definitions(root, name)) == 1
+    module = _module_name(def_rel)
+    for path in _py_files(root):
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = normalize_path(str(path.relative_to(root)))
+        bindings = {} if rel == def_rel else _import_bindings(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id != name:
+                    continue
+                if (rel == def_rel or unique or bindings.get(name) == module):
+                    return rel, int(getattr(node, "lineno", 0))
+            elif isinstance(func, ast.Attribute) and func.attr == name:
+                if rel == def_rel:
+                    return rel, int(getattr(node, "lineno", 0))
+                receiver = func.value
+                if not isinstance(receiver, ast.Name):
+                    continue
+                origin = bindings.get(receiver.id)
+                if origin and origin == module:
+                    return rel, int(getattr(node, "lineno", 0))
+    return None
+
+
 def _live_writer_of(root: Path, table: str, column: str) -> bool:
     """True iff a function that writes ``column`` is itself called.
 
@@ -417,12 +524,18 @@ def _live_writer_of(root: Path, table: str, column: str) -> bool:
     the caller itself runs, so a chain of dead functions would still count; the
     cost of going further is a call graph, and the rule reads "a producer is
     wired", not "a producer has fired".
+
+    The call must RESOLVE to this definition (:func:`_call_reaching`): a
+    same-named function in another module is not a caller. A closure returned
+    under a new name cannot be traced, so it reads as dead — the conservative
+    direction, since a false "dead" keeps the gap visible while a false "live"
+    hides it.
     """
-    for stmt, fn in _sql_write_owners(root, table):
+    for stmt, fn, rel in _sql_write_owners(root, table):
         if not _statement_writes_column(stmt, table, column):
             continue
         # A module-level write executes on import; a function's does not.
-        if fn is None or _call_sites(root, fn):
+        if fn is None or _call_reaching(root, fn, rel) is not None:
             return True
     return False
 
