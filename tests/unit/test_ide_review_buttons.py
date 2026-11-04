@@ -14,6 +14,7 @@ cannot drift from the call site the test exercises.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -462,6 +463,55 @@ def test_inbox_awaiting_review_lists_pending_node(home: Path) -> None:
     blob = json.dumps(items)
     assert "implementer" in blob, f"node id missing from awaiting row: {blob!r}"
     assert "node" in blob.lower(), f"kind missing from row label: {blob!r}"
+
+
+def _awaiting_sub(home: Path) -> str:
+    page = build_page(home, "inbox", None, {})
+    section = next(s for s in page.get("sections") or []
+                   if str(s.get("title") or "") == "Awaiting review")
+    return str((list(section.get("items") or [])[0]).get("sub") or "")
+
+
+def _set_enqueued_at(home: Path, epoch: float) -> None:
+    con = sqlite3.connect(home / "state.db")
+    try:
+        con.execute("UPDATE mo_inbox_gates SET enqueued_at = ?", (epoch,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_inbox_awaiting_review_age_is_a_delta_not_the_epoch(home: Path) -> None:
+    """``enqueued_at`` is an instant; the row must show ``now - enqueued_at``.
+
+    ``mo_inbox_gates.enqueued_at`` is written with ``time.time()``. Passing it
+    straight to ``_age_str`` renders days-since-1970 ("20761d ago") instead of
+    an age — the defect the operator saw on the inbox page.
+    """
+    _seed_run(home, status="executing")
+    _bootstrap_node_tables(str(home / "state.db"))
+    _stage_pending_node_review(home)
+
+    sub = _awaiting_sub(home)
+
+    assert "just now" in sub, f"fresh row must read 'just now'; sub={sub!r}"
+    assert not re.search(r"\d+d ago", sub), \
+        f"epoch leaked into the age cell; sub={sub!r}"
+
+
+def test_inbox_awaiting_review_age_backdates(home: Path) -> None:
+    """A row enqueued three days ago reads ``3d ago`` — not the epoch, not 0."""
+    _seed_run(home, status="executing")
+    _bootstrap_node_tables(str(home / "state.db"))
+    _stage_pending_node_review(home)
+    # 60 s past the boundary: the page floors ``now`` to an int while the
+    # stamp keeps its fraction, so exactly 3*86400 would floor to ``2d``.
+    now = datetime.now(timezone.utc).timestamp()
+    _set_enqueued_at(home, now - 3 * 86400 - 60)
+
+    sub = _awaiting_sub(home)
+
+    assert "3d ago" in sub, f"backdated row must read '3d ago'; sub={sub!r}"
 
 
 def test_inbox_without_db_raises_no_exception(tmp_path, monkeypatch) -> None:

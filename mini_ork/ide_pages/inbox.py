@@ -196,7 +196,7 @@ def _compact_item(row: Any, now: int) -> dict[str, Any]:
 # CLI would print. A missing DB / table / context drops the section silently.
 
 
-def _awaiting_review_rows(home: Path) -> list[dict[str, Any]]:
+def _awaiting_review_rows(home: Path, now: int) -> list[dict[str, Any]]:
     """Decode pending node / merge rows into the shape ``_awaiting_review_section`` draws.
 
     Two families — and ONLY these two — surface here:
@@ -233,8 +233,10 @@ def _awaiting_review_rows(home: Path) -> list[dict[str, Any]]:
             gate_id = str(r.get("gate_id") or "")
             feature = str(r.get("feature") or "")
             ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
-            row_age = _age_seconds(r.get("enqueued_at"))
             enqueued_at = r.get("enqueued_at")
+            enqueued_epoch = _epoch_seconds(enqueued_at)
+            age_text = ("" if enqueued_epoch <= 0
+                        else _age_str(int(max(0.0, now - enqueued_epoch))))
             if gate_id.startswith("node:") and feature == "review.after_node":
                 run_id = str(ctx.get("run_id") or _gate_run_id(gate_id) or "")
                 node_id = str(ctx.get("node_id") or "")
@@ -244,7 +246,7 @@ def _awaiting_review_rows(home: Path) -> list[dict[str, Any]]:
                     "kind": "node", "run": run_id, "node": node_id,
                     "node_type": str(ctx.get("node_type") or ""),
                     "enqueued_at": _to_float(enqueued_at),
-                    "age_text": _age_str(row_age),
+                    "age_text": age_text,
                 })
             elif gate_id.startswith("merge:") and feature == "review.before_merge":
                 run_id = str(ctx.get("run_id") or _gate_run_id(gate_id) or "")
@@ -254,7 +256,7 @@ def _awaiting_review_rows(home: Path) -> list[dict[str, Any]]:
                     "kind": "merge", "run": run_id, "node": "",
                     "node_type": "",
                     "enqueued_at": _to_float(enqueued_at),
-                    "age_text": _age_str(row_age),
+                    "age_text": age_text,
                 })
     except Exception:  # noqa: BLE001 — every failure path omits the section
         return []
@@ -267,11 +269,18 @@ def _gate_run_id(gate_id: str) -> str:
     return parts[1] if len(parts) >= 2 else ""
 
 
-def _age_seconds(value: Any) -> int:
+def _epoch_seconds(value: Any) -> float:
+    """Parse an absolute epoch-seconds stamp; ``0.0`` when absent or unusable.
+
+    ``mo_inbox_gates.enqueued_at`` is written with ``time.time()`` — a point in
+    time, not a duration. The caller subtracts it from ``now`` to get an age,
+    and treats ``0.0`` as "unknown" so a missing stamp cannot render as
+    ``now - 0`` (i.e. an age of ~20,000 days).
+    """
     try:
-        return max(0, int(float(value or 0)))
+        return max(0.0, float(value or 0.0))
     except (TypeError, ValueError):
-        return 0
+        return 0.0
 
 
 def _to_float(value: Any) -> float:
@@ -299,7 +308,7 @@ def _awaiting_review_section(home: Path, now: int) -> list[dict[str, Any]]:
     for every row, Request changes… for node rows. Clicking the row opens
     the run.
     """
-    rows = _awaiting_review_rows(home)
+    rows = _awaiting_review_rows(home, now)
     if not rows:
         return []
     items: list[dict[str, Any]] = []
