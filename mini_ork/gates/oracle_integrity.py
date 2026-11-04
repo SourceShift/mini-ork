@@ -29,9 +29,14 @@ If the real judge cannot be imported, it raises ``RuntimeError`` naming what is
 missing rather than returning a passing result from a stub.
 
 One honest caveat about the predicate: an injection is "detected" iff the decision
-is not ``PROVEN``. That means ``test_defect_as_failure`` counts as detected when the
-judge returns ``REFUTED`` (blaming the patch for a broken test) even though the
-right answer is ``UNVERIFIED``; the literal contract is what this module scores.
+is not ``PROVEN``. ``REFUTED`` and ``UNVERIFIED`` are therefore indistinguishable to
+this module — it scores the literal contract (a broken evidence boundary must not
+prove a patch), not whether the judge picked the *right* non-proof verdict. That
+gap was real once: ``test_defect_as_failure`` used to come back ``REFUTED``, which
+blamed the patch for the harness's own defect and still counted as detected here.
+The judge and its predicate are now pinned by
+``tests/unit/test_certify_evidence_py.py`` (the injected case must decide
+``UNVERIFIED``), because this audit alone cannot see the difference.
 
 Import discipline: stdlib only at module import time (``mini_ork.*`` imports are
 function-local) so the audit stays importable in a stripped runtime.
