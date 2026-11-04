@@ -358,7 +358,8 @@ def test_the_strip_opens_the_thread_that_already_watches_the_run(
         '{"session_id": "orch-9-ff"}\n', encoding="utf-8")
     strip = _strip(_page(home, "intake", capsys))
     assert _button(strip, "Open")["do"] == {
-        "thread_session": "orch-9-ff", "thread": "/orchestrator run-stuck"}
+        "thread_session": "orch-9-ff", "thread": "/orchestrator run-stuck",
+        "send": True}
 
 
 def test_a_finished_runs_signal_is_history_not_attention(

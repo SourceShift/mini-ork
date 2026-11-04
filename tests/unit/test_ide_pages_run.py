@@ -211,7 +211,8 @@ def test_the_orchestrator_action_opens_the_runs_bound_thread(home: Path) -> None
     (run_dir / "orchestrator.json").write_text('{"session_id": "orch-1-ab"}\n')
     btn = next(a for a in build_page(home, "run", None, {"run": RUN})["actions"]
                if a["label"] == "Orchestrator")
-    assert btn["do"] == {"thread_session": "orch-1-ab", "thread": f"/orchestrator {RUN}"}
+    assert btn["do"] == {"thread_session": "orch-1-ab",
+                        "thread": f"/orchestrator {RUN}", "send": True}
 
 
 def test_an_unbound_run_sends_the_command_that_binds_it(home: Path) -> None:
@@ -231,7 +232,8 @@ def test_owner_json_naming_a_thread_is_a_binding(home: Path) -> None:
     (run_dir / "owner.json").write_text(
         json.dumps({"kind": "thread", "id": "orch-2-cd", "label": "thread:orch-2-cd"}) + "\n")
     assert run_page.orchestrator_do(home, RUN) == {
-        "thread_session": "orch-2-cd", "thread": f"/orchestrator {RUN}"}
+        "thread_session": "orch-2-cd", "thread": f"/orchestrator {RUN}",
+        "send": True}
 
 
 def test_agents_learnings_and_artifacts(home: Path) -> None:
