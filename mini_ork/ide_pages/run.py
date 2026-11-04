@@ -772,11 +772,11 @@ def orchestrator_do(home: Path, run_id: str) -> dict[str, Any]:
     — the bug this replaces — so the text is sent rather than prefilled: the
     first click binds, and the next one finds the binding.
     """
+    do: dict[str, Any] = {"thread": f"/orchestrator {run_id}", "send": True}
     session = orchestrator_thread.read(Path(home) / "runs" / run_id)
-    text = f"/orchestrator {run_id}"
     if session:
-        return {"thread_session": session, "thread": text}
-    return {"thread": text, "send": True}
+        do["thread_session"] = session
+    return do
 
 
 def _orchestrator_action(run: Run) -> dict[str, Any]:

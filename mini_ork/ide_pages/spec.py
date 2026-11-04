@@ -64,7 +64,11 @@ Actions (``do``) — what a button, row or chip does in the IDE:
 - ``{"terminal": {"cli", "cwd", "home"}}``  open a real terminal (a TTY), run
   ``mini-ork <cli> --home <home>`` in it; no ``cli`` opens a shell — the only
   action that can host a credential prompt
-- ``{"thread": text}``             new mini-ork thread, ``text`` as its first prompt
+- ``{"thread": text}``             new mini-ork thread, ``text`` as its first prompt;
+  ``"send": true`` sends it instead of leaving it in the composer, and
+  ``"thread_session": s`` opens the thread already bound to ACP session ``s``
+  first — ``text`` is the fallback for an IDE that does not hold that thread
+  (deleted, or opened on another machine)
 - ``{"project": abs}``             switch the IDE window to the project at ``abs``
 - ``{"project_pick": true}``       pick a project folder, then switch to it
 - ``{"pick_files": {"cli": [...], "prompt": p, "home": b}}``  native multi-file
@@ -151,6 +155,9 @@ ACTION_KEYS = frozenset({
 # text, the run/pending/done labels, and the page-link/open-run arguments.
 ACTION_MODIFIERS = frozenset({
     "confirm", "pending", "done", "title", "tab", "args",
+    # On a ``thread`` action: send the text instead of pre-filling it, and
+    # prefer the thread already bound to this ACP session.
+    "send", "thread_session",
 })
 
 
