@@ -323,7 +323,7 @@ def test_without_the_spec_is_todays_page(home: Path, monkeypatch) -> None:
     page = build_page(home, "run", None, {"run": RUN, "view": "dock"})
     assert page["tab"] == "dag"
     assert [t["key"] for t in page["tabs"]] == [
-        "dag", "kickoff", "overview", "orchestrator", "messages", "agents",
+        "dag", "kickoff", "overview", "messages", "agents",
         "learnings", "artifacts"]
 
 

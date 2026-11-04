@@ -39,6 +39,7 @@ from acp.schema import (  # noqa: E402
     ToolCallProgress,
 )
 
+from mini_ork import orchestrator_thread  # noqa: E402
 from mini_ork.acp import commands as acp_commands  # noqa: E402
 from mini_ork.acp.agent import MiniOrkAcpAgent  # noqa: E402
 from mini_ork.recipes_catalog import RecipeInfo  # noqa: E402
@@ -531,6 +532,8 @@ def test_child_follow_survives_a_resume(
     conn = _Conn(outcome_id=["lane:deepseek", "abandon"])
     agent.on_connect(conn)
     recover_calls = _stub_recover(monkeypatch)
+    run_dir = _proj / ".mini-ork" / "runs" / "run-lane-1"
+    run_dir.mkdir(parents=True)
 
     async def _drive() -> None:
         # A live orchestrator turn makes this an active turn (buttons path).
@@ -547,6 +550,9 @@ def test_child_follow_survives_a_resume(
 
     asyncio.run(_drive())
 
+    # The follow records which thread watches the run, so the run's
+    # Orchestrator button reopens this thread rather than minting an empty one.
+    assert orchestrator_thread.read(run_dir) == sid
     assert recover_calls == [(sid, "run-lane-1 --lane codex_lens=deepseek")]
     assert len(conn.calls) == 2
     assert [p.status for p in conn.progress("run-lane-1:parent")] == [

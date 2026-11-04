@@ -19,8 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from mini_ork import orchestrator_thread
 from mini_ork.ide_pages import _cn as _CN
-from mini_ork.ide_pages import orch_tab
 from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import run_messages
 from mini_ork.ide_pages import spec as S
@@ -47,7 +47,7 @@ def _node_session_id(run: "Run", node: Node) -> str | None:
     return _resolve_session_id(run, node)
 
 TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"),
-        ("orchestrator", "Orchestrator"), ("messages", "Messages"), ("agents", "Agents"),
+        ("messages", "Messages"), ("agents", "Agents"),
         ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 
 # The v2 tab bar (``MINI_ORK_IDE_SPEC=2``) follows the Dispatch Console design:
@@ -55,12 +55,15 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"),
 # DAG tab beside the nodes that stopped on them. Old keys still resolve so a
 # stale IDE link lands somewhere sensible.
 V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("checks", "Checks"),
-           ("changes", "Changes"), ("orchestrator", "Orchestrator"),
+           ("changes", "Changes"),
            ("messages", "Messages"), ("kickoff", "Kickoff"), ("agents", "Agents"),
            ("learnings", "Learnings"), ("artifacts", "Artifacts")]
+# ``orch`` was the Orchestrator tab's alias. The orchestrator is a thread now,
+# not a tab, so a stale link lands on the DAG — the run's own shape — instead
+# of a page that no longer exists.
 V2_ALIASES = {"story": "outcome", "graph": "dag", "questions": "dag",
               "overview": "outcome", "verification": "checks",
-              "orch": "orchestrator", "concord": "messages"}
+              "orch": "dag", "concord": "messages"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
 # tab is the place to read the whole task brief. Beyond the cap we append a
@@ -476,6 +479,15 @@ def _running(run: Run) -> bool:
     )
 
 
+def _refresh_seconds(run: Run) -> int | None:
+    """How often the page re-fetches itself: a live run only.
+
+    Five seconds is the watcher's own order of magnitude without turning a
+    finished run's page into a poll loop.
+    """
+    return 5 if _running(run) else None
+
+
 def _state_chip(run: Run) -> dict[str, Any]:
     status = str(run.card.get("status") or "")
     state = (run.card.get("task_state") or {}).get("state") or ""
@@ -746,6 +758,27 @@ def _review_actions(run: Run) -> list[dict[str, Any]]:
     ]
 
 
+def orchestrator_do(home: Path, run_id: str) -> dict[str, Any]:
+    """The action that opens ``run_id``'s orchestrator thread.
+
+    A run is orchestrated by a mini-ork thread, not by a page of this one, so
+    the action names the thread the agent recorded when it adopted the run.
+    The UI opens that thread as it is; the text rides along as the fallback for
+    a thread this IDE no longer has (deleted, or another machine's), where
+    minting a fresh one and sending the command rebinds the run instead of
+    leaving the reader in an empty conversation.
+
+    With no binding yet, every click would otherwise mint a *new* empty thread
+    — the bug this replaces — so the text is sent rather than prefilled: the
+    first click binds, and the next one finds the binding.
+    """
+    session = orchestrator_thread.read(Path(home) / "runs" / run_id)
+    text = f"/orchestrator {run_id}"
+    if session:
+        return {"thread_session": session, "thread": text}
+    return {"thread": text, "send": True}
+
+
 def _orchestrator_action(run: Run) -> dict[str, Any]:
     """Open this run's orchestrator thread — the run's own narrator.
 
@@ -754,7 +787,7 @@ def _orchestrator_action(run: Run) -> dict[str, Any]:
     human-in-the-loop surface: type an instruction and it is applied at the
     next seam (`steer`, `answers`, `resume`), never mid-node.
     """
-    return S.btn("Orchestrator", S.thread(f"/orchestrator {run.id}"), "ghost")
+    return S.btn("Orchestrator", orchestrator_do(run.home, run.id), "ghost")
 
 
 def _actions(run: Run) -> list[dict[str, Any]]:
@@ -1998,21 +2031,6 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
         return S.code("Recent events",
                       recent_lines(run) or [("No events recorded for this run.", "dim")])
 
-    def orchestrator() -> list[dict[str, Any]]:
-        """A pointer to the Orchestrator tab, which owns the whole layer.
-
-        The activity feed, the steering queue and the watcher's state moved to
-        their own tab; Overview keeps one link so the layer stays discoverable
-        from the page a reader arrives on.
-        """
-        return [S.lst("Orchestrator", [S.dot(
-            "The orchestrator has its own tab",
-            "Activity, the steering queue and the watcher's state live there.",
-            mc="sub",
-            acts=[S.btn("Open Orchestrator",
-                        S.page_link("run", "orchestrator", run=run.id), "ghost")])],
-            full=True)]
-
     def files() -> list[dict[str, Any]]:
         # Resolve the per-file session-history once per render. The snapshot
         # path keeps the finished run from re-fetching CN for the line; live
@@ -2072,7 +2090,6 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
             + S.guarded(errors, "Run inputs", inputs)
             + S.guarded(errors, "Why? — evidence",
                         lambda: why_section(run, title="Why? — evidence"))
-            + S.guarded(errors, "Orchestrator", orchestrator)
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
             + S.guarded(errors, "Files changed", files)
             + _run_memory_sections(run))
@@ -4761,11 +4778,11 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
             "Tell the running agent what to change… (Enter to send)",
             ["board", "steer", run.id, "--text"],
             title="Steer this run"))
-    # The Overview tab's tail is not this page's tail. The orchestrator has its
-    # own tab, correlation and recent events are diagnostics, the file list
-    # lives on Artifacts, and the memory sections are already above. What is
-    # genuinely outcome-only is the retry decision and what the run knew going
-    # in; the attempt ledger explains a failure the retry hint is about.
+    # The Overview tab's tail is not this page's tail. Correlation and recent
+    # events are diagnostics, the file list lives on Artifacts, and the memory
+    # sections are already above. What is genuinely outcome-only is the retry
+    # decision and what the run knew going in; the attempt ledger explains a
+    # failure the retry hint is about.
     already = {str(section.get("title") or "") for section in sections}
     keep = {"Retry", "Run inputs"}
     sections.extend(section for section in _overview_tab(run)
@@ -5041,15 +5058,6 @@ def _changes_tab(run: Run, errors: dict[str, str]) -> list[dict[str, Any]]:
     return sections
 
 
-def _orch_args(args: dict[str, Any]) -> dict[str, Any]:
-    """The Orchestrator tab's view state, carried through the page's own args.
-
-    Filters are server-side (``S.set_args`` round-trips them), so the page has
-    to echo the current ones or a refresh would drop the reader back to "all".
-    """
-    return {key: args[key] for key in ("orch_view", "orch_limit") if args.get(key)}
-
-
 def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     """The ``MINI_ORK_IDE_SPEC=2`` page: the run's title, its outcome, its graph.
 
@@ -5131,7 +5139,6 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
         "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
                                 callout_actions=callout_actions),
         "outcome": lambda: _outcome_tab(run, outcome, callout_actions, absorbed),
-        "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
         "messages": lambda: S.guarded(errors, run_messages.RECEIVED_TITLE,
                                       lambda: run_messages.messages_tab(run.id, mailbox)),
         "verification": lambda: _verification_tab(run),
@@ -5186,14 +5193,13 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     page = S.page("run", title if human_title else run.id, sub, chips_=chips,
                   actions=header["actions"] + actions,
                   tabs=_v2_tabs(run, mailbox), tab=resolved,
-                  args={"run": run.id, **({"node": node} if node else {}),
-                        **_orch_args(args)},
+                  args={"run": run.id, **({"node": node} if node else {})},
                   sections=sections, errors=errors,
                   desc=_desc_fold(run, outcome, title),
                   label=header["label"], menu=menu,
                   crumbs=header.get("crumbs") or (),
                   updated_at=header["updated_at"],
-                  refresh=orch_tab.refresh_seconds(run))
+                  refresh=_refresh_seconds(run))
     # The header draws no GOAL / SPEC labels on this page: the sub is the
     # kickoff's own heading, and a label above it would read as a field name.
     page["field_labels"] = False
@@ -5273,7 +5279,6 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         "dag": lambda: _dag_tab(run, args.get("node")),
         "kickoff": lambda: _kickoff_tab(run),
         "overview": lambda: _overview_tab(run),
-        "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
         "messages": lambda: S.guarded({}, run_messages.RECEIVED_TITLE,
                                       lambda: run_messages.messages_tab(run.id)),
         "agents": lambda: _agents_tab(run),
@@ -5282,12 +5287,11 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     }[tab]()
     page = S.page("run", run.id, _sub(run), chips_=chips, actions=_actions(run), tabs=TABS,
                   tab=tab, args={"run": run.id,
-                                 **({"node": args["node"]} if args.get("node") else {}),
-                                 **_orch_args(args)},
+                                 **({"node": args["node"]} if args.get("node") else {})},
                   sections=review_sections + sections
                   + (_graph_patches_section(run) if tab in ("dag", "overview") else []),
                   desc=_desc_fold(run, None, run.id),
-                  refresh=orch_tab.refresh_seconds(run))
+                  refresh=_refresh_seconds(run))
     # Additive at every level: the graph is available to an old IDE too.
     page["graph"] = _graph(run, args.get("node"))
     return page

@@ -125,7 +125,7 @@ def test_dag_layers_the_workflow_and_attributes_cost(home: Path) -> None:
     page = build_page(home, "run", None, {"run": RUN})
     assert page["ok"] is True and page["tab"] == "dag" and page["title"] == RUN
     assert [t["key"] for t in page["tabs"]] == [
-        "dag", "kickoff", "overview", "orchestrator", "messages", "agents", "learnings",
+        "dag", "kickoff", "overview", "messages", "agents", "learnings",
         "artifacts"]
     assert [c["t"] for c in page["chips"]][:2] == ["published · verified", "5/6 nodes"]
     dag = _section(page, "dag")
@@ -195,50 +195,43 @@ def test_overview_reads_verifier_files_with_log_lines_before_the_json(home: Path
     assert events[-1]["t"].split()[2:4] == ["node_end", "publisher"]
 
 
-def test_overview_points_at_the_orchestrator_tab_it_no_longer_carries(
-        home: Path, monkeypatch) -> None:
-    """The orchestrator log moved to its own tab; Overview keeps a pointer so
-    the layer stays discoverable from the page a reader arrives on."""
-    monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)  # default-on
-    _seed(home)
-    page = build_page(home, "run", "overview", {"run": RUN})
-    sec = next(s for s in page["sections"] if s["title"] == "Orchestrator")
-    assert sec["type"] == "list"
-    assert sec["items"][0]["t"] == "The orchestrator has its own tab"
-    assert sec["items"][0]["acts"][0]["do"] == {
-        "page": "run", "tab": "orchestrator", "args": {"run": RUN}}
-
-
-def test_orchestrator_tab_is_armed_and_quiet_on_a_clean_run(
-        home: Path, monkeypatch) -> None:
-    """A clean dependency-graph run leaves the orchestrator silent — it emits a
-    row only when a node needs help/repair/mutate/promote, and green nodes are
-    skipped. The tab must still show the layer, so "armed but quiet" reads as
-    a fact instead of as a missing feature."""
-    monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)  # default-on
-    monkeypatch.setenv("MO_ORCH_WATCH", "1")  # conftest switches the watcher off
+def test_the_run_page_carries_no_orchestrator_tab(home: Path) -> None:
+    """The orchestrator is a thread, not a tab: the tab that rendered its
+    stream panel is gone, and an old ``tab=orchestrator`` link lands on the DAG
+    instead of reopening it."""
     _seed(home)
     page = build_page(home, "run", "orchestrator", {"run": RUN})
-    feed = _section(page, "feed", "Orchestrator activity")
-    assert feed["status"] in ("armed", "stopped")
-    assert "No interventions" in feed["empty"]
+    assert "orchestrator" not in [t["key"] for t in page["tabs"]]
+    assert page["tab"] == "dag"
+    assert all(s.get("title") != "Orchestrator activity" for s in page["sections"])
 
 
-def test_orchestrator_tab_lists_the_interventions(home: Path, monkeypatch) -> None:
-    monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)
+def test_the_orchestrator_action_opens_the_runs_bound_thread(home: Path) -> None:
+    run_dir = _seed(home)
+    (run_dir / "orchestrator.json").write_text('{"session_id": "orch-1-ab"}\n')
+    btn = next(a for a in build_page(home, "run", None, {"run": RUN})["actions"]
+               if a["label"] == "Orchestrator")
+    assert btn["do"] == {"thread_session": "orch-1-ab", "thread": f"/orchestrator {RUN}"}
+
+
+def test_an_unbound_run_sends_the_command_that_binds_it(home: Path) -> None:
+    """No thread watches this run, and none may be invented empty: the command
+    is *sent*, so the click that creates the thread also binds the run and the
+    next click finds that binding."""
     _seed(home)
-    con = sqlite3.connect(home / "state.db")
-    con.execute("INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
-                "VALUES (?,?,?,?,?)",
-                ("ev-orch", RUN, "orchestrator.mutate",
-                 json.dumps({"node_id": "implementer", "reason": "lane exhausted"}), T0 + 60))
-    con.commit()
-    con.close()
-    page = build_page(home, "run", "orchestrator", {"run": RUN})
-    feed = _section(page, "feed", "Orchestrator activity")
-    row = feed["items"][0]
-    assert row["t"] == "mutate"
-    assert row["d"] == "implementer · lane exhausted"
+    btn = next(a for a in build_page(home, "run", None, {"run": RUN})["actions"]
+               if a["label"] == "Orchestrator")
+    assert btn["do"] == {"thread": f"/orchestrator {RUN}", "send": True}
+
+
+def test_owner_json_naming_a_thread_is_a_binding(home: Path) -> None:
+    """A run launched from a thread records it in ``owner.json``; that predates
+    ``orchestrator.json`` and must still open the thread that started it."""
+    run_dir = _seed(home)
+    (run_dir / "owner.json").write_text(
+        json.dumps({"kind": "thread", "id": "orch-2-cd", "label": "thread:orch-2-cd"}) + "\n")
+    assert run_page.orchestrator_do(home, RUN) == {
+        "thread_session": "orch-2-cd", "thread": f"/orchestrator {RUN}"}
 
 
 def test_agents_learnings_and_artifacts(home: Path) -> None:
@@ -390,7 +383,7 @@ def test_level_one_page_is_unchanged_plus_an_additive_graph(
     assert set(page) - {"graph", "desc"} == _LEVEL_ONE_KEYS
     assert page["title"] == RUN  # the run id is still the title
     assert [t["key"] for t in page["tabs"]] == [
-        "dag", "kickoff", "overview", "orchestrator", "messages", "agents", "learnings",
+        "dag", "kickoff", "overview", "messages", "agents", "learnings",
         "artifacts"]
     assert page["tab"] == "dag"
     assert page["sections"][0]["type"] == "dag"

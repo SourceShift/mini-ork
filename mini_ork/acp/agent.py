@@ -89,6 +89,7 @@ from acp.schema import (
     UserMessageChunk,
 )
 
+from mini_ork import orchestrator_thread
 from mini_ork.acp import commands as _commands
 from mini_ork.acp import diffs as _diffs
 from mini_ork.acp.thread_cards import (
@@ -3894,6 +3895,13 @@ class MiniOrkAcpAgent:
         runs = self._thread_runs.setdefault(parent_session_id, [])
         if child_run_id not in runs:
             runs.append(child_run_id)
+        # Which thread watches this run, for every surface that offers "the
+        # run's orchestrator": without it the IDE can only mint a new thread,
+        # and each click leaves a second empty conversation behind.
+        orchestrator_thread.write(
+            self._home_for(parent_session_id) / "runs" / child_run_id,
+            parent_session_id,
+        )
         await self._open_run_marker(parent_session_id, child_run_id, recipe)
         self._followers[child_run_id] = asyncio.create_task(
             self._follow_child(parent_session_id, child_run_id)
