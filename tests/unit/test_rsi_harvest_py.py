@@ -261,6 +261,124 @@ def test_l9_fires_only_when_deltas_are_absent_and_the_table_is_stale(tmp_path, c
     assert "L9" in report(tmp_path, con).closed
 
 
+def test_l9_closes_when_a_code_path_writes_the_column(tmp_path, con):
+    """A producer that UPDATEs the column closes the gap.
+
+    The rows already in the DB are history no patch can backfill, so a
+    data-only predicate stays red for every correct fix — and G8 then
+    quarantines the fix for the gap it just closed (measured: cycle
+    rsi-c1793812835, a verified `record_benchmark_delta` producer).
+    """
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    assert one(report(tmp_path, con), "db:L9").kind == "data_path_dead"
+
+    write(tmp_path, {"mini_ork/cli/self_improve.py":
+                     "con.execute('UPDATE learning_record SET benchmark_delta=?,"
+                     " updated_at=? WHERE run_id=?', (d, t, r))\n"})
+    assert "L9" in report(tmp_path, con).closed
+
+
+def test_l9_closes_on_an_insert_that_names_the_column_last(tmp_path, con):
+    """A column appended to an INSERT list is still a write."""
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {"mini_ork/learning/ledger.py":
+                     "cur.execute('INSERT INTO learning_record (created_at, benchmark_delta)"
+                     " VALUES (?,?)', (t, d))\n"})
+    assert "L9" in report(tmp_path, con).closed
+
+
+def test_l9_is_not_closed_by_a_writer_nothing_calls(tmp_path, con):
+    """Dead code is not a producer.
+
+    `mini_ork/observability/blame_attributor.py` is the measured shape: it
+    INSERTs into its table, nothing calls it, and the table stays empty. Closing
+    on a static match would silence the detector while the gap stood.
+    """
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {"mini_ork/learning/ledger.py":
+                     "def record_benchmark_delta(db, run_id):\n"
+                     "    db.execute('UPDATE learning_record SET benchmark_delta=?', (0.1,))\n"})
+    assert one(report(tmp_path, con), "db:L9").kind == "data_path_dead"
+
+
+def test_l9_closes_when_the_writer_is_called(tmp_path, con):
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {
+        "mini_ork/learning/ledger.py":
+            "def record_benchmark_delta(db, run_id):\n"
+            "    db.execute('UPDATE learning_record SET benchmark_delta=?', (0.1,))\n",
+        "mini_ork/cli/self_improve.py":
+            "def _iter_run(db):\n    record_benchmark_delta(db, 1)\n",
+    })
+    assert "L9" in report(tmp_path, con).closed
+
+
+def test_l9_closes_on_the_sqlite_write_forms_beyond_plain_insert(tmp_path, con):
+    """`REPLACE INTO` and `UPDATE OR IGNORE … SET` are writes too.
+
+    A detector that only recognises the spelling its author happened to use
+    re-opens a closed gap on the next patch that writes it differently.
+    """
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {"mini_ork/learning/ledger.py":
+                     "cur.execute('REPLACE INTO learning_record (benchmark_delta)"
+                     " VALUES (?)', (d,))\n"})
+    assert "L9" in report(tmp_path, con).closed
+
+
+def test_l9_reads_each_statement_of_a_multi_statement_literal_separately(tmp_path, con):
+    """One literal, two statements: the UPDATE that writes a DIFFERENT column
+    must not lend its `SET` to the SELECT of the measured one."""
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {"mini_ork/web/notes.py":
+                     "cur.executescript('UPDATE learning_record SET note=? WHERE run_id=?;'"
+                     " \"SELECT benchmark_delta FROM learning_record\")\n"})
+    assert one(report(tmp_path, con), "db:L9").kind == "data_path_dead"
+
+
+def test_l9_is_not_closed_by_a_docstring_or_a_comment(tmp_path, con):
+    """The defect the pre-push review caught in the first version of the helper.
+
+    It searched raw file text, so the rule matched its own docstring — L9 could
+    then never fire on any tree that contained the rule, which is every tree the
+    queue actually runs against. Prose about SQL is not a producer.
+    """
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {"mini_ork/notes.py":
+                     '"""A fix looks like UPDATE learning_record SET benchmark_delta=?."""\n'
+                     "# UPDATE learning_record SET benchmark_delta=? WHERE run_id=?\n"})
+    assert one(report(tmp_path, con), "db:L9").kind == "data_path_dead"
+
+
+def test_l9_is_not_closed_by_a_reader_of_the_column(tmp_path, con):
+    """Only a write counts. A module that SELECTs the column must not close the
+    gap — that would hide a dead data path behind a reader. Nor does writing the
+    table on a DIFFERENT column: the match is per statement, not per file."""
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {"mini_ork/web/repositories.py":
+                     "cur.execute('SELECT severity, benchmark_delta FROM learning_record')\n",
+                     "mini_ork/web/notes.py":
+                     "cur.execute('UPDATE learning_record SET note=? WHERE run_id=?', (n, r))\n"
+                     "cur.execute('SELECT benchmark_delta FROM learning_record')\n"})
+    assert one(report(tmp_path, con), "db:L9").kind == "data_path_dead"
+
+
 def test_l10_fires_when_conflicts_are_empty_but_themes_exist(tmp_path, con):
     ddl(con, """
         CREATE TABLE lesson_conflicts (id INTEGER);

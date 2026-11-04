@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import ast
 import datetime as _dt
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from mini_ork.learning.collapse_detector import MIN_STEPS
 from mini_ork.rsi.candidates import Candidate, dedupe
@@ -301,11 +302,127 @@ def _code_mentions(
     return out
 
 
-def _inserts_table(root: Path, table: str) -> bool:
-    needle = f"INSERT INTO {table}"
+def _docstring_constants(tree: ast.AST) -> set[int]:
+    """Ids of the ``ast.Constant`` nodes that are docstrings. Never SQL."""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        first = body[0] if body else None
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            ids.add(id(first.value))
+    return ids
+
+
+def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None]]:
+    """Every SQL statement in ``mini_ork/`` that writes ``table``, and its function.
+
+    Yields ``(statement, enclosing function name)``, with ``None`` for a
+    statement at module level — which executes on import, so it is live by
+    construction.
+
+    String CONSTANTS, not file text. A comment or a docstring that quotes SQL
+    must not count as a writer: an earlier text-search version of this helper
+    matched its own docstring and silenced L9 permanently — the rule could only
+    fire on trees that did not yet contain it. That is the worst failure a gap
+    detector has, and the parser is what prevents it.
+
+    Scanning every module (rather than trusting a file name) is what makes a
+    producer found wherever someone puts it. A write assembled at run time from
+    pieces — an f-string, a formatted column list — is not seen; the rules that
+    use this ask "does a producer exist", and a producer that only exists as a
+    runtime-built string is not one yet.
+    """
+    t = re.escape(table)
+    pat = re.compile(
+        # UPDATE [OR <conflict-clause>] t … SET; INSERT [OR …] INTO t; REPLACE INTO t.
+        rf"(?:\bUPDATE\s+(?:OR\s+\w+\s+)?{t}\b.*?\bSET\b"
+        rf"|\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+{t}\b"
+        rf"|\bREPLACE\s+INTO\s+{t}\b)",
+        re.IGNORECASE | re.DOTALL,
+    )
     for path in _py_files(root):
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if needle in text:
+        tree = _parse(path)
+        if tree is None:
+            continue
+        docstrings = _docstring_constants(tree)
+        # constant node id -> enclosing function name (None = module level).
+        # Breadth-first walk visits an outer function before a nested one, so a
+        # plain assignment leaves the INNER function as the owner — which is the
+        # one that has to be called.
+        owner: dict[int, str | None] = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(fn):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        owner[id(sub)] = fn.name
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if id(node) in docstrings:
+                continue
+            # One literal often holds several statements, and a match on the
+            # first must not carry the rest along: yield each separately so a
+            # SET clause is bounded by its own statement, not the next one's.
+            for stmt in node.value.split(";"):
+                if pat.search(stmt):
+                    yield stmt, owner.get(id(node))
+
+
+def _sql_write_statements(root: Path, table: str) -> Iterator[str]:
+    """``_sql_write_owners`` without the function context."""
+    for stmt, _ in _sql_write_owners(root, table):
+        yield stmt
+
+
+def _inserts_table(root: Path, table: str) -> bool:
+    needle = re.compile(
+        rf"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+{re.escape(table)}\b"
+        rf"|\bREPLACE\s+INTO\s+{re.escape(table)}\b",
+        re.IGNORECASE)
+    return any(needle.search(stmt) for stmt in _sql_write_statements(root, table))
+
+
+def _statement_writes_column(stmt: str, table: str, column: str) -> bool:
+    """Does this one statement assign ``column``?
+
+    Matched per STATEMENT, not per file: a module that writes the table on one
+    column and merely SELECTs the measured column elsewhere is a reader here.
+    """
+    col = re.escape(column)
+    set_clause = re.search(r"\bSET\b(.*?)(?:\bWHERE\b|$)", stmt, re.IGNORECASE | re.DOTALL)
+    if set_clause and re.search(rf"\b{col}\b\s*=", set_clause.group(1)):
+        return True
+    insert_cols = re.search(
+        rf"(?:\bINSERT\s+(?:OR\s+\w+\s+)?INTO|\bREPLACE\s+INTO)\s+{re.escape(table)}"
+        rf"\s*\(([^)]*)\)",
+        stmt, re.IGNORECASE)
+    return bool(insert_cols and re.search(rf"\b{col}\b", insert_cols.group(1)))
+
+
+def _live_writer_of(root: Path, table: str, column: str) -> bool:
+    """True iff a function that writes ``column`` is itself called.
+
+    A writer that exists is not yet a producer. ``mini_ork/observability/
+    blame_attributor.py`` is the measured shape: it INSERTs into
+    ``defect_attributions``, nothing calls it, and the table stays empty. A
+    writer half that accepted a static match would close the detector while the
+    gap stood — a silent false negative, which is worse for a gap finder than a
+    false candidate.
+
+    One level of call-site evidence is the cheap proxy, and it is enough to
+    reject dead code: an unreachable function has no callers. It cannot prove
+    the caller itself runs, so a chain of dead functions would still count; the
+    cost of going further is a call graph, and the rule reads "a producer is
+    wired", not "a producer has fired".
+    """
+    for stmt, fn in _sql_write_owners(root, table):
+        if not _statement_writes_column(stmt, table, column):
+            continue
+        # A module-level write executes on import; a function's does not.
+        if fn is None or _call_sites(root, fn):
             return True
     return False
 
@@ -555,6 +672,12 @@ def _l9_benchmark_delta_never_computed(ctx: _Ctx, domain: str, rule_id: str) -> 
     with_delta = _scalar(ctx, "SELECT count(*) FROM learning_record WHERE benchmark_delta IS NOT NULL")
     if with_delta:
         raise _GapClosed(f"{with_delta} records carry a benchmark delta")
+    # The rows in the live DB are history: no code change can backfill them, so a
+    # data-only predicate would stay red for every patch that wires the producer
+    # and G8 would quarantine each one. A writer present means the path exists;
+    # the NULLs are then the past, not the gap. Same shape as L2.
+    if _live_writer_of(ctx.root, "learning_record", "benchmark_delta"):
+        raise _GapClosed("a called code path writes learning_record.benchmark_delta")
     # Parse every timestamp rather than MAX(): the ':fZ' corruption (L4) means
     # the text column cannot be trusted to sort.
     stamps = [ts for ts in (parse_ts(r[0]) for r in _rows(
