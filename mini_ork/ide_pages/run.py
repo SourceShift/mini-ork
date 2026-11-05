@@ -3202,7 +3202,10 @@ def _artifacts_tab(run: Run, *, changes: bool = False) -> list[dict[str, Any]]:
         for a in _artifacts(run.run_dir):
             rows.append({"cells": [S.mono(a["path"]), S.cell(a["group"].lower()),
                                    S.mono(_human(a["size"])), S.muted(_from(a["path"], ids))],
-                         "do": S.open_path(a["abs"])})
+                         "do": S.open_path(a["abs"]),
+                         "acts": [S.btn("Copy path", S.copy(a["abs"], done="Path copied"),
+                                        "ghost"),
+                                  S.btn("Reveal", S.reveal(a["abs"]), "ghost")]})
         if not rows:
             rows = [[S.muted("No artifacts yet"), "", "", ""]]
         return S.table("Artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
