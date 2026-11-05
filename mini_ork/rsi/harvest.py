@@ -511,8 +511,8 @@ def _definitions(root: Path, name: str) -> set[str]:
     return out
 
 
-def _call_reaching(root: Path, name: str, def_rel: str) -> tuple[str, int] | None:
-    """The first call to ``name`` that can reach the definition in ``def_rel``.
+def _call_sites_reaching(root: Path, name: str, def_rel: str) -> list[tuple[str, int]]:
+    """Every call to ``name`` that can reach the definition in ``def_rel``.
 
     A bare-name search across the tree is not evidence: ``_tf`` is a trace
     helper in ``mini_ork/cli/execute.py`` AND an unrelated text-vector function
@@ -525,9 +525,14 @@ def _call_reaching(root: Path, name: str, def_rel: str) -> tuple[str, int] | Non
     call has to sit in the defining module, or in a module that imports the name
     from it. Method calls (``obj.fn()``) always need the defining module, since
     a method name collides with every other class's.
+
+    All sites, not the first one: "is this wired at all?" needs one, but "is it
+    wired *where the decision is made*?" needs them all — the first may be a
+    caller in a different module that takes an entirely different path.
     """
     unique = len(_definitions(root, name)) == 1
     module = _module_name(def_rel)
+    sites: list[tuple[str, int]] = []
     for path in _py_files(root):
         tree = _parse(path)
         if tree is None:
@@ -538,21 +543,25 @@ def _call_reaching(root: Path, name: str, def_rel: str) -> tuple[str, int] | Non
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
+            hit = False
             if isinstance(func, ast.Name):
-                if func.id != name:
-                    continue
-                if (rel == def_rel or unique or bindings.get(name) == module):
-                    return rel, int(getattr(node, "lineno", 0))
+                hit = func.id == name and (rel == def_rel or unique
+                                           or bindings.get(name) == module)
             elif isinstance(func, ast.Attribute) and func.attr == name:
                 if rel == def_rel:
-                    return rel, int(getattr(node, "lineno", 0))
-                receiver = func.value
-                if not isinstance(receiver, ast.Name):
-                    continue
-                origin = bindings.get(receiver.id)
-                if origin and origin == module:
-                    return rel, int(getattr(node, "lineno", 0))
-    return None
+                    hit = True
+                else:
+                    receiver = func.value
+                    hit = isinstance(receiver, ast.Name) and bindings.get(receiver.id) == module
+            if hit:
+                sites.append((rel, int(getattr(node, "lineno", 0))))
+    return sites
+
+
+def _call_reaching(root: Path, name: str, def_rel: str) -> tuple[str, int] | None:
+    """The first call to ``name`` that can reach ``def_rel``'s definition."""
+    sites = _call_sites_reaching(root, name, def_rel)
+    return sites[0] if sites else None
 
 
 def _live_writer_of(root: Path, table: str, column: str) -> bool:
@@ -1090,26 +1099,128 @@ def _r4_screened_out_dropped(ctx: _Ctx, domain: str, rule_id: str) -> list[Candi
     )]
 
 
-def _r5_brain_and_policy_decisions_empty(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
-    """Both decision journals exist and are empty."""
-    present = [t for t in ("brain_decisions", "policy_decisions") if _table_exists(ctx, t)]
-    if len(present) < 2:
-        raise _SkipRule(f"only {present} present")
-    counts = {t: _scalar(ctx, f'SELECT count(*) FROM "{t}"') for t in present}
-    if any(counts.values()):
-        raise _GapClosed(f"decision journals have rows: {counts}")
+#: The module that commits to a lane — the one place a routing decision is made,
+#: and therefore the fix scope for a journal that should record it.
+_ROUTER_MODULE = "mini_ork/dispatch/routing.py"
+_RECORD_DECISION_DEF = "mini_ork/policies/engine.py"
+
+#: The two decision journals, and what a fix for each one actually is. They are
+#: NOT the same gap: ``policy_decisions`` has a working writer that the router
+#: never calls, while ``brain_decisions`` has no writer at all. One ``fix_hint``
+#: for both told the implementer to write a journal entry, which is the wrong
+#: remedy for the journal that already has one — and the resulting patch was
+#: correct and rejected anyway (measured below).
+_DECISION_JOURNALS: dict[str, dict[str, str]] = {
+    "policy_decisions": {
+        "title": "policy_decisions is empty — the router never journals the lane it picks",
+        "detail": "`policies.engine.record_decision()` INSERTs into the journal and is called "
+                  "from intake admission, which these workloads never reach; a lane routing "
+                  "decision is therefore archived nowhere.",
+        "fix_hint": ("Call the existing `policies.engine.record_decision()` from "
+                     "`mini_ork/dispatch/routing.py` where the lane is committed to — not on the "
+                     "`dry_run` preview path, which must journal nothing — and pin it with a "
+                     "test that drives the routing path."),
+        "metric": "the router calls record_decision()",
+    },
+    "brain_decisions": {
+        "title": "brain_decisions is empty — nothing writes it",
+        "detail": "The journal exists and no module INSERTs into it, so the router's own "
+                  "reasoning leaves no record at all.",
+        "fix_hint": ("Write the router's reasoning into `brain_decisions` from "
+                     "`mini_ork/dispatch/routing.py`, call that writer where the lane is "
+                     "committed to, and pin it with a test that drives that path."),
+        "metric": "a brain_decisions writer is called from the routing path",
+    },
+}
+
+
+def _called_writer(root: Path, table: str) -> tuple[str, str] | None:
+    """The first writer of ``table`` that some code actually calls.
+
+    Returns ``(function, module)``. A module-level statement counts as called
+    because it executes on import.
+    """
+    for _, fn, rel in _sql_write_owners(root, table):
+        if fn is None or _call_reaching(root, fn, rel) is not None:
+            return fn or "<module-level>", rel
+    return None
+
+
+def _decision_journal_empty(ctx: _Ctx, domain: str, rule_id: str, table: str) -> list[Candidate]:
+    """One journal, one predicate: is its writer called *from the router*?
+
+    Structural, not data-presence — a ``db:`` predicate cannot be moved by data
+    here. ``tests/conftest.py``'s autouse ``_isolate_process_state`` pops
+    ``MINI_ORK_DB`` before every test on purpose (a verifier's pytest used to
+    inherit a run's live home and write fixtures into the operator's real
+    ``state.db``). ``_exercise_once`` exports the DB copy, and the patch's tests
+    erase it, so no test can add a row to the database G8 re-reads. A rows-based
+    predicate therefore quarantines every correct patch — measured on cycle
+    ``c1793879232-5a3f7534`` ($0.73, ``metric_unchanged``) for a diff that wired
+    the journal exactly as the fix hint asked.
+
+    The two journals need different predicates, because they are different gaps:
+
+    * ``policy_decisions`` — the writer exists and *is* called, from intake
+      admission, which these workloads never reach. A called writer alone would
+      close a live defect, so only a call that resolves inside the router counts:
+      that is the path which commits to a lane and archives nothing.
+    * ``brain_decisions`` — nothing writes it, so any called writer closes it.
+
+    A fixture still cannot close either one: the predicate reads call sites in
+    the tree, and a test that writes rows is a caller in ``tests/``, never in
+    ``mini_ork/dispatch/routing.py``.
+
+    Rows are still *reported* in the evidence — an operator draining the queue
+    wants to know whether the journal is empty — but they do not gate, because
+    nothing that gates a merge can depend on a test writing the measured DB.
+    """
+    if not _table_exists(ctx, table):
+        raise _SkipRule(f"{table} does not exist")
+    spec = _DECISION_JOURNALS[table]
+    rows = _scalar(ctx, f'SELECT count(*) FROM "{table}"')
+    has_writer = _inserts_table(ctx.root, table)
+    if table == "policy_decisions":
+        sites = _call_sites_reaching(ctx.root, "record_decision", _RECORD_DECISION_DEF)
+        wired = [site for site in sites if site[0] == _ROUTER_MODULE]
+    else:
+        writer = _called_writer(ctx.root, table)
+        site = _call_reaching(ctx.root, *writer) if writer else None
+        sites = [site] if site else []
+        wired = sites
+    if wired:
+        raise _GapClosed(f"the router journals {table} at {wired[0][0]}:{wired[0][1]}")
+    detail = spec["detail"]
+    if sites:
+        where = ", ".join(f"{rel}:{line}" for rel, line in sites[:3])
+        detail = (f"The only call(s) to a writer are {where} — outside the router, on a path "
+                  f"these workloads do not take. {detail}")
+    elif has_writer:
+        detail = f"A writer exists and nothing calls it. {detail}"
+    else:
+        detail = f"No module writes it at all, not merely an uncalled one. {detail}"
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
-        title="brain_decisions and policy_decisions are both empty",
-        evidence_key="table:brain_decisions+policy_decisions:empty",
-        files=("mini_ork/dispatch/routing.py",),
-        detail="Both journals are created and neither is written; the router's reasoning "
-               "and policy evaluations leave no record.",
-        evidence={"tables": counts},
-        fix_hint="Write the decision journal entry where the router commits to a lane.",
-        success_metric="either journal gains a row",
+        title=spec["title"],
+        # Count-free and table-scoped, so the identity survives rows coming and going.
+        evidence_key=f"table:{table}:empty",
+        files=(_ROUTER_MODULE,),
+        detail=detail,
+        evidence={"table": table, "rows": rows, "writer_exists": has_writer,
+                  "call_sites": [[rel, line] for rel, line in sites[:5]],
+                  "journalled_from_router": bool(wired)},
+        fix_hint=spec["fix_hint"],
+        success_metric=spec["metric"],
     )]
+
+
+def _r5p_policy_decisions_empty(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
+    return _decision_journal_empty(ctx, domain, rule_id, "policy_decisions")
+
+
+def _r5b_brain_decisions_empty(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
+    return _decision_journal_empty(ctx, domain, rule_id, "brain_decisions")
 
 
 def _r6_stale_routing_signals(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
@@ -1574,7 +1685,10 @@ ROUTING_RULES: tuple[tuple[str, Rule], ...] = (
     ("R2", _r2_learned_route_underused),
     ("R3", _r3_code_region_null),
     ("R4", _r4_screened_out_dropped),
-    ("R5", _r5_brain_and_policy_decisions_empty),
+    # Two rules, not one: they are two gaps with two remedies, and a shared rule
+    # made a correct patch to one of them unmovable (see _decision_journal_empty).
+    ("R5p", _r5p_policy_decisions_empty),
+    ("R5b", _r5b_brain_decisions_empty),
     ("R6", _r6_stale_routing_signals),
     ("R7", _r7_workflow_candidates_flat),
     ("R8", _r8_llm_calls_no_lane),

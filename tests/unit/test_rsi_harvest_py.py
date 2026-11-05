@@ -626,12 +626,149 @@ def test_r4_closes_once_decide_returns_it(tmp_path, con):
     assert "R4" in report(tmp_path, con).closed
 
 
-def test_r5_fires_only_when_both_journals_are_empty(tmp_path, con):
+POLICY_WRITER = """import sqlite3
+
+
+def record_decision(event, response, db):
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO policy_decisions (decision_id) VALUES (?)", ("d1",))
+    con.commit()
+"""
+
+ROUTING_CALLS_IT = """from mini_ork.policies.engine import record_decision
+
+
+def policy_route_lane(node_type, lane):
+    record_decision({}, {}, "db")
+    return lane
+"""
+
+INTAKE_CALLS_IT = """from mini_ork.policies.engine import record_decision
+
+
+def admit(request, response, db):
+    record_decision({}, response, db)
+"""
+
+ROUTING_DEAD_WRITER = """import sqlite3
+
+
+def write_journal(event, db):
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO policy_decisions (decision_id) VALUES (?)", ("d1",))
+"""
+
+BRAIN_WRITER = """import sqlite3
+
+
+def write_brain_decision(reason, db):
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO brain_decisions (reason) VALUES (?)", (reason,))
+    con.commit()
+"""
+
+ROUTING_CALLS_BRAIN = """from mini_ork.brain.journal import write_brain_decision
+
+
+def policy_route_lane(node_type, lane):
+    write_brain_decision("picked " + lane, "db")
+    return lane
+"""
+
+
+def test_r5_is_two_rules_because_it_is_two_gaps(tmp_path, con):
+    """One has a writer nobody calls; the other has no writer at all.
+
+    Separate rules, not two candidates of one rule: a shared rule demands both
+    journals close together, which quarantined a correct patch to one of them.
+    """
     ddl(con, "CREATE TABLE brain_decisions (id INTEGER);"
               "CREATE TABLE policy_decisions (decision_id TEXT);")
-    assert one(report(tmp_path, con), "db:R5").kind == "producer_missing"
-    ddl(con, "INSERT INTO policy_decisions VALUES ('d1');")
-    assert "R5" in report(tmp_path, con).closed
+    rep = report(tmp_path, con)
+    assert one(rep, "db:R5p").evidence["table"] == "policy_decisions"
+    brain = one(rep, "db:R5b")
+    assert brain.evidence["writer_exists"] is False
+    assert "No module writes it at all" in brain.detail
+
+
+def test_r5p_does_not_close_on_a_row_a_fixture_wrote(tmp_path, con):
+    """A row is not a producer, and it is not the metric either.
+
+    ``tests/conftest.py`` pops ``MINI_ORK_DB`` before every test, so no patch's
+    test can add a row to the DB a ``db:`` predicate is re-asked against. Rows
+    are therefore reported as evidence and never gate the rule.
+    """
+    ddl(con, "CREATE TABLE policy_decisions (decision_id TEXT);")
+    ddl(con, "INSERT INTO policy_decisions VALUES ('fixture');")
+    policy = one(report(tmp_path, con), "db:R5p")
+    assert policy.evidence["rows"] == 1
+    assert policy.evidence["journalled_from_router"] is False
+
+
+def test_r5p_closes_when_the_router_journals_it(tmp_path, con):
+    """The movable end state: the source changed, the DB copy did not.
+
+    This is what G8 can observe — ``_exercise_once`` re-asks the rule against a
+    copy of the measured DB, and the patch adds a call, never a row there.
+    """
+    ddl(con, "CREATE TABLE policy_decisions (decision_id TEXT);")
+    write(tmp_path, {
+        "mini_ork/policies/engine.py": POLICY_WRITER,
+        "mini_ork/dispatch/routing.py": ROUTING_CALLS_IT,
+    })
+    assert "R5p" in report(tmp_path, con).closed
+
+
+def test_r5p_still_fires_for_a_call_outside_the_router(tmp_path, con):
+    """The live defect on today's tree: intake journals, the router does not.
+
+    Closing on "a called writer exists" would have hidden it — the journal is
+    empty and the only call sits on a path these workloads never take.
+    """
+    ddl(con, "CREATE TABLE policy_decisions (decision_id TEXT);")
+    write(tmp_path, {
+        "mini_ork/policies/engine.py": POLICY_WRITER,
+        "mini_ork/intake/dispatch.py": INTAKE_CALLS_IT,
+    })
+    policy = one(report(tmp_path, con), "db:R5p")
+    assert policy.evidence["call_sites"] == [["mini_ork/intake/dispatch.py", 5]]
+    assert "outside the router" in policy.detail
+    assert policy.success_metric == "the router calls record_decision()"
+
+
+def test_r5p_still_fires_for_a_writer_nothing_calls(tmp_path, con):
+    ddl(con, "CREATE TABLE policy_decisions (decision_id TEXT);")
+    write(tmp_path, {"mini_ork/policies/engine.py": POLICY_WRITER})
+    policy = one(report(tmp_path, con), "db:R5p")
+    assert policy.evidence["writer_exists"] is True
+    assert policy.evidence["call_sites"] == []
+    assert "nothing calls it" in policy.detail
+
+
+def test_r5b_skips_when_its_table_does_not_exist(tmp_path, con):
+    """Missing table is not a bug — but the sibling rule still fires."""
+    ddl(con, "CREATE TABLE policy_decisions (decision_id TEXT);")
+    rep = report(tmp_path, con)
+    assert of(rep, "db:R5b") == [] and "R5b" in rep.skipped
+
+
+def test_r5b_closes_on_a_writer_that_is_called(tmp_path, con):
+    """Nothing writes it today, so any called writer is a fix."""
+    ddl(con, "CREATE TABLE brain_decisions (reason TEXT);")
+    write(tmp_path, {
+        "mini_ork/brain/journal.py": BRAIN_WRITER,
+        "mini_ork/dispatch/routing.py": ROUTING_CALLS_BRAIN,
+    })
+    assert "R5b" in report(tmp_path, con).closed
+
+
+def test_r5_dead_writer_is_not_a_producer(tmp_path, con):
+    """The writer exists in a module nothing imports it from."""
+    ddl(con, "CREATE TABLE policy_decisions (decision_id TEXT);")
+    write(tmp_path, {"mini_ork/policies/engine.py": ROUTING_DEAD_WRITER})
+    policy = one(report(tmp_path, con), "db:R5p")
+    assert policy.evidence["writer_exists"] is True
+    assert policy.evidence["call_sites"] == []
 
 
 def test_r6_fires_on_a_stale_win_rate_table(tmp_path, con):
