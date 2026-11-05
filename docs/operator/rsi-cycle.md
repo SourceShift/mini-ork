@@ -102,6 +102,21 @@ dotted forms, so the pinning test silently never ran. On the base tree, paths
 that do not exist are skipped rather than named: pytest aborts the entire run
 when one named path is missing, and a test the patch adds cannot exist there.
 
+**Some rules are G8-invisible, and they say so.** G8's "run the tests, then ask
+again" arm only works if a test can write the row the rule reads. It cannot when
+`tests/conftest.py` clears `MINI_ORK_DB`/`MINI_ORK_HOME` for every test (it must
+— that pop exists because a verifier's pytest once wrote fixtures into the
+operator's live `state.db`). For a rule whose evidence is *already-written rows*
+— a count, a ratio, an age — no patch can move the number, so the gate would
+quarantine every correct fix as `metric_unchanged`. Those rules carry
+`fixability: monitor_only` in their evidence: harvest still emits them (they are
+real gaps, and an operator or a data migration may close them), but the queue
+does not dispatch them. Structural rules keep running: a missing table, a
+missing call site, or a module-level write is visible to the AST, and a
+migration-based repair is visible because the gate applies the patch's pending
+migrations to the db copy before re-asking. The list lives in
+`mini_ork/rsi/harvest.py` (`_G8_INVISIBLE`), one line per rule with the reason.
+
 ## Config
 
 `config/rsi-cycle.yaml` (copy from `config/rsi-cycle.example.yaml`) — every key
@@ -211,6 +226,14 @@ mini-ork rsi-cycle quarantine clean <id>       # remove worktree + branch
 `revert <cycle_id>` builds a revert commit from the cycle's `merged_sha` in a
 fresh worktree and merges it through the same gate path. Nothing here ever runs
 `git reset --hard`, and nothing force-pushes.
+
+**A quarantined candidate is retired when the gap stops reproducing.** The next
+harvest that no longer sees the candidate marks it `fixed_externally` — the same
+reconciliation that closes an open candidate someone fixed by hand. That matters
+when a quarantined fix is later landed another way: a human applying it, an
+unrelated change, or the rule itself being rewritten so its signature no longer
+exists. A candidate that *does* still reproduce keeps its `quarantined` status,
+so "we tried this and it failed" is never erased by a later harvest.
 
 ## Scheduling
 
