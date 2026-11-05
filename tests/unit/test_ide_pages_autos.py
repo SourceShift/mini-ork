@@ -94,6 +94,38 @@ def test_automations_table_detail_firings_and_kickoff(home: Path) -> None:
     assert [line["t"] for line in code["lines"]] == ["# Deps", "Bump everything within semver."]
 
 
+def test_the_detail_offers_an_edit_thread(home: Path) -> None:
+    _write_automations(home, [_automation("deps-nightly")])
+    page = autos.build(home, "automations", {})
+    detail = _section(page, "deps-nightly")
+    assert detail["actions"][0]["label"] == "Edit"
+    assert detail["actions"][0]["do"] == {
+        "thread": "Edit automation deps-nightly (recipe, schedule or kickoff): "}
+
+
+def test_a_pending_draft_gets_its_own_review_row(home: Path) -> None:
+    _write_automations(home, [])
+    recipe_dir = home / "recipes" / "dep-check"
+    recipe_dir.mkdir(parents=True)
+    (recipe_dir / "workflow.yaml").write_text(
+        "name: dep-check\nnodes:\n  - id: n1\n    type: verifier\n", encoding="utf-8")
+    (recipe_dir / "task_class.yaml").write_text("id: dep-check\n", encoding="utf-8")
+    assert automations.propose(
+        home, id="later", name="Later build", recipe="dep-check",
+        kickoff="# later", schedule="0 5 * * *")["ok"] is True
+    page = autos.build(home, "automations", {})
+    table = _section(page, "Drafts awaiting you")
+    assert table["type"] == "table"
+    assert [c["t"] for c in table["rows"][0]["cells"]][:2] == ["later", "Later build"]
+    assert table["rows"][0]["do"] == {"thread": "/automation later"}
+
+
+def test_no_drafts_means_no_empty_section(home: Path) -> None:
+    _write_automations(home, [_automation("deps-nightly")])
+    page = autos.build(home, "automations", {})
+    assert not any(s["title"] == "Drafts awaiting you" for s in page["sections"])
+
+
 def test_selecting_a_paused_automation(home: Path) -> None:
     _write_automations(home, [_automation("deps-nightly"),
                               _automation("obs-hourly", enabled=False, kickoff="probe every surface")])

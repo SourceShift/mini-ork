@@ -71,14 +71,16 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
         return [S.lst("Automations", [S.bad("Could not read automations", f"{type(exc).__name__}: {exc}")],
                       full=True)]
     if not rows:
-        return _with_automations_board(rows, [S.table(
+        out = [S.table(
             "Automations",
             [S.col(fr=1, min=120), S.col(fr=1, min=120), S.col(80), S.col(110)],
             ["automation", "when", "next", "last"],
             [[S.muted("No automations yet"), "", "", ""]],
             full=True,
             note="Ask a mini-ork thread to run a recipe on a schedule, "
-                 "or use mini-ork automations add.")], errors)
+                 "or use mini-ork automations add.")]
+        out += S.guarded(errors, "Drafts", lambda: _drafts(home))
+        return _with_automations_board(rows, out, errors)
     selected = next((r for r in rows if r["id"] == args.get("auto")), rows[0])
     table = S.table(
         "Automations",
@@ -90,6 +92,7 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
           "do": S.set_args(auto=r["id"]), "sel": r["id"] == selected["id"]} for r in rows],
         full=True)
     out = [table]
+    out += S.guarded(errors, "Drafts", lambda: _drafts(home))
     out += S.guarded(errors, selected["id"], lambda: _detail(selected))
     out += S.guarded(errors, "Next three firings", lambda: _firings(selected))
     out += S.guarded(errors, "Kickoff each run receives", lambda: _kickoff(home, selected["id"]))
@@ -153,10 +156,38 @@ def _with_automations_board(rows: list[dict[str, Any]], sections: list[dict[str,
     return S.guarded(errors, "Automations", lambda: _automations_board(rows)) + sections
 
 
+def _drafts(home: Path) -> list[dict[str, Any]]:
+    """Drafts an agent wrote but nobody committed — review happens in its thread."""
+    from mini_ork import automations
+
+    drafts = automations.list_proposals(home)
+    if not drafts:
+        return []
+    rows = []
+    for draft in drafts:
+        aid = str(draft.get("id") or "")
+        schedule = str(draft.get("schedule") or "")
+        rows.append({
+            "cells": [S.mono(aid), str(draft.get("name") or ""),
+                      automations.describe(schedule) if schedule else "",
+                      S.muted("in place" if draft.get("workspace") == "in-place"
+                              else "in a worktree")],
+            "do": S.thread(f"/automation {aid}"),
+        })
+    return [S.table(
+        "Drafts awaiting you",
+        [S.col(fr=1, min=120), S.col(fr=1, min=120), S.col(110), S.col(90)],
+        ["draft", "name", "when", "runs"],
+        rows,
+        full=True,
+        note="An agent drafted these. Open one to Commit or Discard it in its thread.")]
+
+
 def _detail(row: dict[str, Any]) -> dict[str, Any]:
     aid = row["id"]
     enabled = bool(row.get("enabled"))
     actions = [
+        S.btn("Edit", S.thread(f"Edit automation {aid} (recipe, schedule or kickoff): "), "ghost"),
         S.btn("Run now", S.cli("automations", "run", aid,
                                confirm=f"Start a run of {row.get('recipe') or 'this automation'} now?"),
               "primary"),

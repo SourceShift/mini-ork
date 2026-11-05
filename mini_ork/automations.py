@@ -656,6 +656,31 @@ def get_proposal(home: Path | str, automation_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def list_proposals(home: Path | str) -> list[dict[str, Any]]:
+    """Every pending draft, newest first; malformed files are skipped.
+
+    The drafts directory is shared with the agent's ``propose`` calls, so a
+    half-written or hand-edited file must not blank the page that lists them.
+    """
+    try:
+        paths = sorted(
+            _drafts_dir(Path(home)).glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
 def propose(
     home: Path | str,
     *,
@@ -909,6 +934,34 @@ def run_statuses(home: Path | str) -> dict[str, str]:
     except Exception:  # noqa: BLE001 — a status column must not break `list`
         return {}
     return {str(r["run_id"]): str(r.get("status") or "") for r in rows if r.get("run_id")}
+
+
+def recent_runs(home: Path | str, *, limit: int = 20) -> list[dict[str, Any]]:
+    """The newest ``limit`` entries of ``automations.log``, newest first.
+
+    ``fire`` appends one JSON line per attempt (``ts``, ``id``, ``run_id``,
+    ``ok``, ``error``); a malformed line is skipped so a truncated write never
+    hides the rest of the history.
+    """
+    try:
+        lines = (Path(home) / _LOG_FILENAME).read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+            if len(entries) >= limit:
+                break
+    return entries
 
 
 def last_run_status(home: Path | str, automation: dict[str, Any], *,

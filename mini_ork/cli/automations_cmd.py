@@ -5,6 +5,9 @@ Surface (kickoff §CLI):
   list [--json]                          table or JSON of every automation
   add --id --name --recipe --schedule    validate and store a new automation
         --kickoff-file <path> [--in-place]
+  edit <id> [--name --schedule --recipe --kickoff-file --in-place --worktree
+        --enable --disable]              change the fields that were passed
+  runs [<id>] [--limit N] [--json]       recent firings, newest first
   remove <id>                            drop an automation
   pause <id>                             enabled = false
   resume <id>                            enabled = true
@@ -28,12 +31,14 @@ from mini_ork import automations as _auto
 
 
 _USAGE = (
-    "Usage: mini-ork automations <list|add|remove|pause|resume|run|tick|"
+    "Usage: mini-ork automations <list|add|edit|runs|remove|pause|resume|run|tick|"
     "scheduler> [--home <dir>] [--json]\n\n"
     "Manage scheduled recipe runs for a mini-ork project.\n"
     "Subcommands:\n"
     "  list                 show every automation (--json for JSON)\n"
     "  add                  register a new automation\n"
+    "  edit <id>            change the fields that are passed\n"
+    "  runs [<id>]          recent firings, newest first\n"
     "  remove <id>          drop an automation\n"
     "  pause <id>           disable an automation\n"
     "  resume <id>          re-enable an automation\n"
@@ -124,6 +129,72 @@ def _cmd_add(args: argparse.Namespace) -> int:
         sys.stderr.write(f"mini-ork automations add: {result.get('error', 'unknown error')}\n")
         return 1
     sys.stdout.write(json.dumps(result, indent=2) + "\n")
+    return 0
+
+
+def _cmd_edit(args: argparse.Namespace) -> int:
+    fields: dict[str, object] = {}
+    if args.name is not None:
+        fields["name"] = args.name
+    if args.schedule is not None:
+        fields["schedule"] = args.schedule
+    if args.recipe is not None:
+        fields["recipe"] = args.recipe
+    if args.kickoff_file is not None:
+        try:
+            fields["kickoff"] = Path(args.kickoff_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(
+                f"mini-ork automations edit: could not read kickoff file: {exc}\n")
+            return 1
+    if args.workspace is not None:
+        fields["workspace"] = args.workspace
+    if args.enable:
+        fields["enabled"] = True
+    if args.disable:
+        fields["enabled"] = False
+    if not fields:
+        sys.stderr.write(
+            "mini-ork automations edit: nothing to change (pass --name, --schedule, "
+            "--recipe, --kickoff-file, --in-place/--worktree, or --enable/--disable)\n")
+        return 2
+    result = _auto.update(args.home, args.automation_id, **fields)
+    if not result.get("ok"):
+        sys.stderr.write(
+            f"mini-ork automations edit: {result.get('error', 'unknown error')}\n")
+        return 1
+    sys.stdout.write(json.dumps(result, indent=2) + "\n")
+    return 0
+
+
+def _cmd_runs(args: argparse.Namespace) -> int:
+    home = Path(args.home)
+    entries = _auto.recent_runs(home, limit=max(1, args.limit))
+    if args.automation_id:
+        entries = [e for e in entries if str(e.get("id") or "") == args.automation_id]
+    if args.json:
+        sys.stdout.write(json.dumps({"runs": entries}, indent=2) + "\n")
+        return 0
+    if not entries:
+        sys.stdout.write("(no firings yet)\n")
+        return 0
+    statuses = _auto.run_statuses(home)
+    rows = []
+    for e in entries:
+        rid = str(e.get("run_id") or "")
+        if e.get("ok") and rid:
+            status = statuses.get(rid) or "starting"
+        elif e.get("ok"):
+            status = "started"
+        else:
+            status = f"not started: {e.get('error') or 'unknown error'}"
+        rows.append({
+            "fired": str(e.get("ts") or ""),
+            "automation": str(e.get("id") or ""),
+            "run": rid or "—",
+            "status": status,
+        })
+    _emit_table(rows)
     return 0
 
 
@@ -242,6 +313,30 @@ def _build_parser() -> argparse.ArgumentParser:
     add_p.add_argument("--in-place", action="store_true",
                        help="run in-place instead of minting a worktree")
 
+    edit_p = sub.add_parser("edit", parents=[common], add_help=False)
+    edit_p.add_argument("automation_id")
+    edit_p.add_argument("--name")
+    edit_p.add_argument("--schedule", help="5-field cron expression")
+    edit_p.add_argument("--recipe")
+    edit_p.add_argument("--kickoff-file")
+    edit_workspace = edit_p.add_mutually_exclusive_group()
+    edit_workspace.add_argument("--in-place", dest="workspace", action="store_const",
+                                const="in-place",
+                                help="run in-place instead of minting a worktree")
+    edit_workspace.add_argument("--worktree", dest="workspace", action="store_const",
+                                const="worktree",
+                                help="run in a fresh worktree (the default)")
+    edit_state = edit_p.add_mutually_exclusive_group()
+    edit_state.add_argument("--enable", action="store_true", help="re-enable the automation")
+    edit_state.add_argument("--disable", action="store_true", help="pause the automation")
+
+    runs_p = sub.add_parser("runs", parents=[common], add_help=False)
+    runs_p.add_argument("automation_id", nargs="?")
+    runs_p.add_argument("--limit", type=int, default=20,
+                        help="how many firings to show (default: 20)")
+    runs_p.add_argument("--json", action="store_true",
+                        help="emit JSON instead of a table")
+
     remove_p = sub.add_parser("remove", parents=[common], add_help=False)
     remove_p.add_argument("automation_id")
 
@@ -282,7 +377,8 @@ def main(rest: list[str], root: str) -> int:
         sys.stderr.write(_USAGE)
         return 0
 
-    known = {"list", "add", "remove", "pause", "resume", "run", "tick", "scheduler"}
+    known = {"list", "add", "edit", "runs", "remove", "pause", "resume", "run",
+             "tick", "scheduler"}
     words = [w for i, w in enumerate(rest)
              if not w.startswith("-") and (i == 0 or rest[i - 1] != "--home")]
     if not words or words[0] not in known:
@@ -312,6 +408,10 @@ def main(rest: list[str], root: str) -> int:
         return _cmd_list(args)
     if sub == "add":
         return _cmd_add(args)
+    if sub == "edit":
+        return _cmd_edit(args)
+    if sub == "runs":
+        return _cmd_runs(args)
     if sub == "remove":
         return _cmd_remove(args)
     if sub == "pause":

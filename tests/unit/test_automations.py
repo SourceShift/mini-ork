@@ -1262,6 +1262,85 @@ class TestCLI:
         assert rc == 1
         assert "unknown automation" in capsys.readouterr().err.lower()
 
+    def test_edit_changes_only_the_fields_passed(self, tmp_path: Path, capsys) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        from mini_ork.cli import automations_cmd
+        automations_cmd._auto.add(
+            home, id="nightly", name="Nightly", recipe="code-fix",
+            kickoff="# k", schedule="0 3 * * *", workspace="in-place",
+        )
+        rc = automations_cmd.main(
+            ["edit", "nightly", "--name", "Renamed", "--schedule", "0 4 * * *",
+             "--home", str(home)], "/tmp/root")
+        assert rc == 0
+        record = automations_cmd._auto.load(home)[0]
+        assert record["name"] == "Renamed"
+        assert record["schedule"] == "0 4 * * *"
+        assert record["recipe"] == "code-fix"
+        assert record["kickoff"] == "# k"
+
+    def test_edit_can_pause_and_switch_the_workspace(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        from mini_ork.cli import automations_cmd
+        automations_cmd._auto.add(
+            home, id="nightly", name="Nightly", recipe="code-fix",
+            kickoff="# k", schedule="0 3 * * *", workspace="worktree",
+        )
+        rc = automations_cmd.main(
+            ["edit", "nightly", "--disable", "--in-place", "--home", str(home)],
+            "/tmp/root")
+        assert rc == 0
+        record = automations_cmd._auto.load(home)[0]
+        assert record["enabled"] is False
+        assert record["workspace"] == "in-place"
+
+    def test_edit_with_nothing_to_change_is_a_usage_error(
+            self, tmp_path: Path, capsys) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        from mini_ork.cli import automations_cmd
+        rc = automations_cmd.main(["edit", "nightly", "--home", str(home)], "/tmp/root")
+        assert rc == 2
+        assert "nothing to change" in capsys.readouterr().err.lower()
+
+    def test_edit_surfaces_the_store_error(self, tmp_path: Path, capsys) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        from mini_ork.cli import automations_cmd
+        rc = automations_cmd.main(
+            ["edit", "whichever", "--name", "n", "--home", str(home)], "/tmp/root")
+        assert rc == 1
+        assert "unknown automation" in capsys.readouterr().err.lower()
+
+    def test_runs_reads_the_log_newest_first(self, tmp_path: Path, capsys) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "automations.log").write_text(
+            '{"ts": "2026-11-04T03:00:00", "id": "a", "run_id": "r1", "ok": true, "error": ""}\n'
+            '{"ts": "2026-11-05T03:00:00", "id": "a", "run_id": "r2", "ok": true, "error": ""}\n',
+            encoding="utf-8")
+        from mini_ork.cli import automations_cmd
+        rc = automations_cmd.main(["runs", "--json", "--home", str(home)], "/tmp/root")
+        assert rc == 0
+        entries = json.loads(capsys.readouterr().out)["runs"]
+        assert [e["run_id"] for e in entries] == ["r2", "r1"]
+
+    def test_runs_filters_and_shows_a_failed_launch(self, tmp_path: Path, capsys) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "automations.log").write_text(
+            '{"ts": "t1", "id": "a", "run_id": null, "ok": false, "error": "no worktree"}\n'
+            '{"ts": "t2", "id": "b", "run_id": "r9", "ok": true, "error": ""}\n',
+            encoding="utf-8")
+        from mini_ork.cli import automations_cmd
+        rc = automations_cmd.main(["runs", "a", "--home", str(home)], "/tmp/root")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no worktree" in out
+        assert "r9" not in out
+
 
 # ── native dispatch exact-set guard ──────────────────────────────────────────
 
@@ -1316,6 +1395,15 @@ class TestNextFires:
 
 class TestProposals:
     """``propose`` / ``get_proposal`` / ``commit_proposal`` / ``discard_proposal``."""
+
+    def test_list_proposals_skips_a_malformed_draft(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        (home / "automation-drafts").mkdir(parents=True)
+        (home / "automation-drafts" / "good.json").write_text(
+            json.dumps({"id": "good", "name": "Good"}), encoding="utf-8")
+        (home / "automation-drafts" / "broken.json").write_text("{", encoding="utf-8")
+        drafts = auto.list_proposals(home)
+        assert [d["id"] for d in drafts] == ["good"]
 
     def test_propose_writes_a_draft(self, tmp_path: Path) -> None:
         home = tmp_path / "home"
