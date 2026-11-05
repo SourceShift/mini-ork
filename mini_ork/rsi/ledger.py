@@ -328,12 +328,22 @@ def set_candidate_status(
 
 def reconcile(con: sqlite3.Connection, observed: Iterable[str], *,
               now: int, blind_sources: Iterable[str] = ()) -> int:
-    """Mark open candidates the harvest did not reproduce as ``fixed_externally``.
+    """Mark open or quarantined candidates the harvest did not reproduce as
+    ``fixed_externally``.
 
     Returns the number of rows closed. A candidate can disappear because the gap
     was fixed by a cycle elsewhere, by a human, or because the probe that
     produced it changed shape — all three mean "stop queueing it and say so",
     which is why the reason names the harvest rather than a cause it cannot see.
+
+    ``quarantined`` is in scope on purpose. A cycle that quarantined a candidate
+    leaves the row saying so, and if the gap is then closed some other way — a
+    human, an unrelated fix, or (measured 2026-11-05) the rule itself being
+    rewritten so its signature no longer exists — nothing ever retires that row:
+    the queue keeps treating the signature as failed for the whole TTL and the
+    operator keeps seeing a stuck quarantine whose worktree is long gone. A row
+    that *does* still reproduce is untouched here: ``_upsert`` sees it first and
+    keeps ``quarantined``, so only a gap that is genuinely gone is retired.
 
     ``blind_sources`` names the producers that could **not** look this time
     (``db:V8`` for a rule whose table is absent, ``probe:tests`` for one that
@@ -344,7 +354,7 @@ def reconcile(con: sqlite3.Connection, observed: Iterable[str], *,
     """
     ids = sorted({str(i) for i in observed})
     blind = sorted({str(s) for s in blind_sources})
-    where = ["status = 'open'"]
+    where = ["status IN ('open', 'quarantined')"]
     params: list[Any] = [int(now)]
     if ids:
         where.append(f"candidate_id NOT IN ({','.join('?' for _ in ids)})")

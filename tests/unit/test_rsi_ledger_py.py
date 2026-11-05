@@ -204,6 +204,32 @@ def test_reconcile_closes_unreproduced_open_candidates_only(db):
     assert L.get_candidate(db, merged.candidate_id)["status"] == "merged"
 
 
+def test_reconcile_retires_a_quarantined_candidate_the_gap_is_gone_from(db):
+    """A quarantine is not a life sentence.
+
+    Measured 2026-11-05: a cycle quarantined ``db:R5`` on ``metric_unchanged``,
+    the gap was then closed by rewriting the rule itself (its signature stopped
+    existing), and the row still said ``quarantined`` — while the queue kept
+    treating that signature as failed and the operator kept seeing a stuck
+    quarantine whose worktree had long been cleaned. Nothing but a harvest can
+    notice, because only the harvest knows the gap stopped reproducing.
+    """
+    gone = _cand(evidence_key="table:r5:empty", source="db:R5")
+    still = _cand(evidence_key="table:r6:empty", source="db:R6")
+    for cand in (gone, still):
+        L.upsert_candidate(db, cand, now=NOW)
+    L.set_candidate_status(db, gone.candidate_id, "quarantined", now=NOW)
+    L.set_candidate_status(db, still.candidate_id, "quarantined", now=NOW)
+
+    closed = L.reconcile(db, [still.candidate_id], now=NOW + 60)
+
+    assert closed == 1
+    assert L.get_candidate(db, gone.candidate_id)["status"] == "fixed_externally"
+    # The one that still reproduces keeps its quarantine: this is what stops a
+    # shared rule from clearing a real "we tried and it failed" record.
+    assert L.get_candidate(db, still.candidate_id)["status"] == "quarantined"
+
+
 def test_reconcile_leaves_blind_sources_open(db):
     """A producer that could not look cannot testify that its gap is gone."""
     seen = _cand(evidence_key="table:a:empty", source="db:V1")
