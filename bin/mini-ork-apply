@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Compatibility launcher for mini-ork apply."""
 
-from _mini_ork_subcommand import main
+import os
+import sys
+
+# mini-ork exports PYTHONSAFEPATH for its own `-m` children; that flag drops a
+# script's directory from sys.path, so the shim beside this file needs it back.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _mini_ork_subcommand import main  # noqa: E402
 
 if __name__ == "__main__":
     raise SystemExit(main("apply"))
