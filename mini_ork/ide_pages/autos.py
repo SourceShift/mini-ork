@@ -80,6 +80,7 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
             note="Ask a mini-ork thread to run a recipe on a schedule, "
                  "or use mini-ork automations add.")]
         out += S.guarded(errors, "Drafts", lambda: _drafts(home, args))
+        out += S.guarded(errors, "Recent firings", lambda: _recent_firings(home))
         return _with_automations_board(rows, out, errors)
     selected = next((r for r in rows if r["id"] == args.get("auto")), rows[0])
     table = S.table(
@@ -96,6 +97,7 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
     out += S.guarded(errors, selected["id"], lambda: _detail(selected))
     out += S.guarded(errors, "Next three firings", lambda: _firings(selected))
     out += S.guarded(errors, "Kickoff each run receives", lambda: _kickoff(home, selected["id"]))
+    out += S.guarded(errors, "Recent firings", lambda: _recent_firings(home))
     return _with_automations_board(rows, out, errors)
 
 
@@ -154,6 +156,42 @@ def _with_automations_board(rows: list[dict[str, Any]], sections: list[dict[str,
         if section.get("title") == "Automations":
             section["title"] = "All · Automations"
     return S.guarded(errors, "Automations", lambda: _automations_board(rows)) + sections
+
+
+def _recent_firings(home: Path) -> list[dict[str, Any]]:
+    """The last ten attempts, newest first — including ones that never started."""
+    from mini_ork import automations
+
+    entries = automations.recent_runs(home, limit=10)
+    if not entries:
+        return [S.lst("Recent firings", [
+            S.dot("No firings yet", "Automations fire on their schedule, or with Run now.")])]
+    statuses = automations.run_statuses(home)
+    rows = []
+    for entry in entries:
+        rid = str(entry.get("run_id") or "")
+        if entry.get("ok") and rid:
+            status = statuses.get(rid) or "starting"
+        elif entry.get("ok"):
+            status = "started"
+        else:
+            status = f"not started: {entry.get('error') or 'unknown error'}"
+        aid = str(entry.get("id") or "")
+        row: dict[str, Any] = {
+            "cells": [S.muted(str(entry.get("ts") or "")), S.mono(aid),
+                      S.mono(rid) if rid else S.muted("—"),
+                      S.cell(status, "red" if not entry.get("ok") else "sub")],
+        }
+        if rid:
+            row["do"] = S.open_run(rid, aid)
+        rows.append(row)
+    return [S.table(
+        "Recent firings",
+        [S.col(140), S.col(fr=1, min=110), S.col(140), S.col(fr=1, min=110)],
+        ["fired", "automation", "run", "status"],
+        rows, full=True,
+        note="One line per attempt, from .mini-ork/automations.log. "
+             "Open a run to see what it did.")]
 
 
 def _drafts(home: Path, args: dict[str, str]) -> list[dict[str, Any]]:
