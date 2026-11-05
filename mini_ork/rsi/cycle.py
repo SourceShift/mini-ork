@@ -1121,9 +1121,7 @@ def _scoped_runner(req: CycleRequest):
 
     def run(argv, *, timeout_s: int, cwd: str):
         return subprocess_runner(argv, timeout_s=timeout_s, cwd=cwd,
-                                 env={**os.environ,
-                                      "MINI_ORK_DB": str(req.db),
-                                      "MINI_ORK_ROOT": str(req.root)})
+                                 env=_gate_env(req.root, MINI_ORK_DB=str(req.db)))
 
     return run
 
@@ -2216,22 +2214,27 @@ _AMBIENT_KEYS = ("MINI_ORK_ROOT", "MINI_ORK_HOME", "MINI_ORK_DB", "MO_PLACEMENT"
 # ``mini_ork/cli/main.py::_module_env`` runs every ``python -m mini_ork.cli.*``
 # child with ``PYTHONSAFEPATH=1`` so a ``mini_ork/`` tree in the child's cwd
 # cannot shadow the engine. A cycle launched as ``mini-ork rsi-cycle`` inherits
-# that flag, and both gate arms copy ``os.environ`` — so it reached the tree
-# under test, where it means something else: it drops the *script's own*
-# directory from ``sys.path``, so ``bin/mini-ork-resume`` could not import the
-# shim beside it. Measured 2026-11-05 (cycle ``rsi-c1793834730``):
-# ``test_resume_cost_pause_unchanged`` failed with ``ModuleNotFoundError: No
-# module named '_mini_ork_subcommand'`` and passed in 0.27 s in the same
-# worktree re-run from a plain shell. Cycles ``rsi-c1793801689`` and
-# ``rsi-c1793827696`` quarantined on the same test for the same reason.
+# that flag, and every arm that runs code from the tree inherited the whole
+# ``os.environ`` — so it reached the tree under test, where it means something
+# else: it drops the *script's own* directory from ``sys.path``, so
+# ``bin/mini-ork-resume`` could not import the shim beside it. Measured
+# 2026-11-05 (cycle ``rsi-c1793834730``): ``test_resume_cost_pause_unchanged``
+# failed with ``ModuleNotFoundError: No module named '_mini_ork_subcommand'``
+# and passed in 0.27 s in the same worktree re-run from a plain shell. Cycles
+# ``rsi-c1793801689`` and ``rsi-c1793827696`` quarantined on the same test for
+# the same reason.
 #
 # ``MINI_ORK_ENGINE_ROOT`` is the same mistake with a worse consequence:
 # ``bin/mini-ork`` resolves the engine from it *ahead of* ``MINI_ORK_ROOT``, so
-# left at the primary checkout a launcher-spawning test exercises the primary
-# tree and the gate judges code the patch never changed. ``MINI_ORK_TARGET_REPO``
-# comes from the same launcher bootstrap and pins lanes to the cycle's cwd.
+# left at the primary checkout ``<worktree>/bin/mini-ork garden`` runs the
+# PRIMARY engine. G7 and G9 then compare findings produced by code the patch
+# never touched — the exact blind spot a loop that edits ``mini_ork/`` cannot
+# afford. ``MINI_ORK_TARGET_REPO`` comes from the same launcher bootstrap and
+# pins lanes to the cycle's cwd.
 #
-# CI runs plain pytest with none of these set. The gate models CI.
+# CI runs plain pytest with none of these set. The gate models CI, so every arm
+# that spawns a process from the tree builds its env here, not from the ambient
+# environment (``test_no_gate_arm_copies_the_raw_environment`` pins that).
 _GATE_ENV_DROPPED = ("PYTHONSAFEPATH", "MINI_ORK_ENGINE_ROOT", "MINI_ORK_TARGET_REPO")
 
 
@@ -2413,7 +2416,7 @@ def _static_findings(req: CycleRequest, root: Path) -> tuple:
     from .probes import parse_garden, parse_validate
 
     bin_path = str(Path(root) / "bin" / "mini-ork")
-    env = {**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(req.db)}
+    env = _gate_env(root, MINI_ORK_DB=str(req.db))
     findings: list = []
     rc, out = _run([bin_path, "garden"], cwd=root,
                    timeout_s=req.config.gates.cmd_timeout_s, env=env)
@@ -2748,7 +2751,7 @@ def _gap_at(req: CycleRequest, cand: Candidate, root: Path, *,
         timeout_s=req.config.probes.timeout_s, db=db)}.get(command)
     if spec is None:
         return None
-    env = {**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(db)}
+    env = _gate_env(root, MINI_ORK_DB=str(db))
     try:
         result = probe_mod.run_probe(spec, root=root,
                                      runner=lambda a, timeout_s, cwd: probe_mod.subprocess_runner(
@@ -2787,7 +2790,7 @@ def _probe_failures(req: CycleRequest, root: Path, *,
         specs, root=root,
         runner=lambda a, timeout_s, cwd: probe_mod.subprocess_runner(
             a, timeout_s=timeout_s, cwd=cwd,
-            env={**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(db)}))
+            env=_gate_env(root, MINI_ORK_DB=str(db))))
     return tuple(r.probe_id for r in results if r.failed)
 
 

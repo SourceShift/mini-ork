@@ -2157,6 +2157,46 @@ def test_the_exercise_arm_shares_the_cleaned_env_with_its_own_overrides(world, m
     assert "PYTHONSAFEPATH" not in env
 
 
+def test_the_static_differential_runs_the_engine_of_the_tree_under_test(world, monkeypatch):
+    """G7 must not inherit the primary checkout's engine root.
+
+    ``bin/mini-ork`` resolves its engine from ``MINI_ORK_ENGINE_ROOT`` *ahead
+    of* ``MINI_ORK_ROOT``. The cycle runs from the primary checkout with that
+    variable set, so ``<worktree>/bin/mini-ork garden`` ran the PRIMARY engine:
+    both ends of the differential were produced by unpatched code, and a patch
+    to a validation rule could never show up as a removed finding. Measured
+    2026-11-05 alongside the G6 defect (cycle ``rsi-c1793834730``).
+    """
+    seen: list[dict] = []
+
+    def _run(argv, *, cwd, timeout_s, env=None):
+        seen.append(dict(env or {}))
+        return (0, "")
+
+    monkeypatch.setattr(cycle_mod, "_run", _run)
+    monkeypatch.setenv("MINI_ORK_ENGINE_ROOT", "/some/other/checkout")
+
+    cycle_mod._static_findings(_req(world), world.root)
+
+    assert len(seen) == 2                       # garden + validate --strict
+    assert all("MINI_ORK_ENGINE_ROOT" not in env for env in seen)
+    assert all(env["MINI_ORK_ROOT"] == str(world.root) for env in seen)
+
+
+def test_no_gate_arm_copies_the_raw_environment():
+    """Every arm that spawns code from the tree must go through ``_gate_env``.
+
+    Six arms did not — G6, G8's exercise, G8's real-probe branch, G7, G9 and the
+    harvest probe runner — and each one re-opened the same hole. A structural
+    assertion is the only guard that covers an arm added later.
+    """
+    source = Path(cycle_mod.__file__).read_text(encoding="utf-8")
+    assert "{**os.environ" not in source, (
+        "a gate arm copies the ambient environment; build it with _gate_env "
+        "instead, or it inherits the dispatcher's PYTHONSAFEPATH/"
+        "MINI_ORK_ENGINE_ROOT")
+
+
 def test_g6_keeps_the_unattributed_note_on_a_passing_gate():
     """The gate is green, but the noise it survived must still be readable."""
     note = "2 test(s) failed in the scoped suite but passed when re-run alone"
