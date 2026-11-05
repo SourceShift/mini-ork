@@ -588,8 +588,26 @@ def _settle_cn_outcomes(run_dir: str, verdict: str) -> dict:
     return report
 
 
+def _stamp_verdict_execution(verdict_path, execution):
+    """Record which execution wrote ``verdict_path`` (sidecar, bytes untouched).
+
+    ``verdict.json``'s four-key shape is byte-stable (tests 8 / 11 pin it), so the
+    token that makes the write-once rule per-execution lives beside it. Failure to
+    write it is not a reason to lose the verdict: the next execution then treats
+    the record as its own predecessor's and overwrites it, which is the older,
+    noisier behaviour — never a lost result.
+    """
+    if not execution:
+        return
+    try:
+        with open(verdict_path + ".execution", "w", encoding="utf-8") as handle:
+            handle.write(execution + "\n")
+    except OSError:
+        pass
+
+
 def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_class="",
-                      recovery=False):
+                      recovery=False, execution=""):
     # A rehearsal must not occupy the run's own record. A nested lifecycle that
     # inherits MINI_ORK_RUN_ID shares the run dir; when the rehearsal wrote
     # verdict.json first, this guard skipped the live run and the run dir kept a
@@ -621,11 +639,29 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
             existing = {}
         own_record = (isinstance(existing, dict)
                       and existing.get("source") == "execute@run-level")
-        # The run-level record is write-once for a normal execution: a nested
-        # lifecycle that inherited this run dir must not replace the live run's
-        # outcome. A recovery execution IS that run continuing, so it refreshes
-        # the same record instead of keeping the dead attempt's `fail` (RB-16).
-        if own_record and not recovery:
+        # The run-level record is write-once PER EXECUTION, not per run dir: a
+        # nested lifecycle that inherited this run dir must not replace the live
+        # run's outcome, but the SAME run executing again must be able to correct
+        # it. Both are one file on disk, so a sidecar names the execution that
+        # wrote the record; only that execution leaves it alone.
+        #
+        # Keying on "some execution already wrote here" instead outlived every
+        # pass after the first: cycle `rsi-c1793838883` executed twice, the second
+        # pass failed two nodes, and `verdict.json` stayed `pass/0` from 10
+        # minutes earlier while `execute.log` said "2 node(s) failed" — so the run
+        # was `error` with no artifact that named the failing node.
+        #
+        # A recovery execution IS that run continuing, so it refreshes the same
+        # record instead of keeping the dead attempt's `fail` (RB-16).
+        previous_execution = ""
+        try:
+            with open(verdict_path + ".execution", encoding="utf-8") as handle:
+                previous_execution = handle.read().strip()
+        except OSError:
+            pass
+        # No token (a rehearsal path, an embedder): behave exactly as before —
+        # write-once per run dir.
+        if own_record and not recovery and (not execution or execution == previous_execution):
             return
         if isinstance(existing, dict) and existing.get("pass") is False and not dry_run:
             # RB-02 layer 4: a recipe's own verdict.json says the run failed.
@@ -663,6 +699,7 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
                 json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n")
         except OSError:
             return
+        _stamp_verdict_execution(verdict_path, execution)
         print(f"  [verdict] run-level {os.path.basename(verdict_path)}: {verdict} "
               f"(failed_nodes={fail_count}) levels_ok={str(report['levels_ok']).lower()}")
         # Settle CN outcomes after the verdict bytes are on disk. A parked /
@@ -686,6 +723,7 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
         open(verdict_path, "w").write(line)
     except OSError:
         return
+    _stamp_verdict_execution(verdict_path, execution)
     print(f"  [verdict] run-level {os.path.basename(verdict_path)}: {verdict} "
           f"(failed_nodes={fail_count})")
     # Settle CN outcomes after the verdict bytes are on disk (byte-stable
@@ -2250,7 +2288,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             )
             return REVIEW_PAUSE_RC
         _emit_run_verdict(live_run_dir, fail_count, len(fields_list), task_class=task_class,
-                          recovery=args.recovery_active)
+                          recovery=args.recovery_active, execution=uuid.uuid4().hex)
         _record_plan_artifact(db, run_id, live_run_dir)
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
         if fail_count > 0:
