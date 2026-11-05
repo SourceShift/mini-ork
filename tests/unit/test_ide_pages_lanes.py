@@ -166,7 +166,18 @@ def test_header_offers_the_lifetime_reports(home: Path) -> None:
     assert [b["do"] for b in page["actions"]] == [
         {"cli": ["lifetime", "summary"], "home": False},
         {"cli": ["lifetime", "conductor-history"], "home": False},
+        {"cli": ["providers", "status"], "home": False},
     ]
+
+
+def test_a_missing_key_opens_the_hidden_prompt_in_a_terminal(home: Path) -> None:
+    page = lanes.build(home, "lanes", {})
+    creds = _section(page, "Credentials")
+    missing = next(i for i in creds["items"] if i["t"].startswith("TEST_MINIMAX_KEY missing"))
+    configure = missing["acts"][0]
+    assert configure["label"] == "Configure"
+    assert configure["do"] == {
+        "terminal": {"cli": ["providers", "configure", "minimax"], "home": False}}
 
 
 def test_entrypoint_every_tab(ledger: Path) -> None:

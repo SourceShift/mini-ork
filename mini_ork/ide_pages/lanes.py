@@ -57,7 +57,10 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     # The lifetime reports read MINI_ORK_HOME / MINI_ORK_DB themselves and reject
     # ``--home``, so they are ``home=False`` actions rather than appended flags.
     actions = [S.btn("Lifetime summary", S.cli("lifetime", "summary", home=False), "ghost"),
-               S.btn("Conductor history", S.cli("lifetime", "conductor-history", home=False), "ghost")]
+               S.btn("Conductor history", S.cli("lifetime", "conductor-history", home=False), "ghost"),
+               # ``providers status`` reports presence and source only — the
+               # same question the Credentials section answers in full.
+               S.btn("Provider status", S.cli("providers", "status", home=False), "ghost")]
     return S.page("lanes", TITLE, SUB, chips_=chips, actions=actions, tabs=TABS, tab=tab, args=args,
                   sections=sections, errors=errors)
 
@@ -336,9 +339,13 @@ def _credentials(home: Path) -> dict[str, Any]:
         items.append(S.ok(", ".join(present), "secrets.local.sh or the environment · values never shown"))
     for key in sorted(k for k in declared if k not in names):
         lanes = ", ".join(sorted(declared[key]))
+        # A credential is typed, never passed as an argv or a page payload:
+        # the button opens a terminal running the hidden prompt. ``home=False``
+        # because the providers parser reads MINI_ORK_HOME, not ``--home``.
+        configure = S.terminal(["providers", "configure", declared[key][0]], home=False)
         items.append(S.bad(f"{key} missing", f"lane {lanes} disabled · "
                                              f"run mini-ork providers configure {declared[key][0]} in a terminal",
-                           [S.btn("Configure", None, "primary")]))
+                           [S.btn("Configure", configure, "primary")]))
     if store_error:
         items.append(S.warn("Secret store unreadable", store_error))
     if not items:
