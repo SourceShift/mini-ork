@@ -599,6 +599,47 @@ def _live_writer_of(root: Path, table: str, column: str) -> bool:
 # Candidate constructor
 # --------------------------------------------------------------------------
 
+#: Rules whose closure a diff cannot move on the database G8 measures.
+#:
+#: ``_exercise_once`` copies the measured db, exports ``MINI_ORK_DB`` to the copy,
+#: runs the patch's scoped tests, then re-asks the rule against it. The tests
+#: cannot fill that copy: ``tests/conftest.py``'s autouse
+#: ``_isolate_process_state`` pops ``MINI_ORK_DB`` before every test — on purpose,
+#: because a verifier's pytest used to inherit a run's live home and write its
+#: fixtures into the operator's real ``state.db`` (measured 2026-10-13). Every
+#: rule below closes on a ROW that copy can never receive, or on an AGE no patch
+#: rewrites, so a correct patch re-asks red and is quarantined as
+#: ``metric_unchanged``. Measured on R5 ($0.73) before its predicate was made
+#: structural — see :func:`_decision_journal_empty`.
+#:
+#: These are G8-invisible, not unfixable, and the distinction is load-bearing:
+#: harvest still EMITS them, so ``rsi-cycle plan`` keeps showing an operator a
+#: real symptom. Only the queue drops them (``MONITOR_ONLY``), instead of paying
+#: an implementer whose patch the gate is guaranteed to refuse.
+#:
+#: A rule belongs here only when NO source predicate can stand in for its data
+#: condition. R5 was here in spirit and did not belong: "the router journals the
+#: lane" is a call site. Prefer moving a rule to structure over demoting it.
+_G8_INVISIBLE: Mapping[str, str] = {
+    # a row only a real run can write
+    "L3": "held-out injections are recorded at selection time; a db copy gains none",
+    "L7": "the count grows only as the loop iterates; no diff adds four rows",
+    "L10": "conflicts are computed from promotion and injection history",
+    "V2": "rubrics are authored rows; a copy of the db has none",
+    "V3": "calibration needs fp/fn measured by real verification runs",
+    "V4": "the writer is already called — only a real failure adds the row",
+    "V5": "gauntlet and safety evidence comes from live runs",
+    "V12": "verdicts are history; a patch cannot rewrite rows it did not create",
+    # a proportion or an age over rows already written
+    "L11": "the window slides over history; no patch relabels existing rows",
+    "L12": "a pass-rate regression is measured across past runs",
+    "R2": "the learned share is a ratio over traces already recorded",
+    "R6": "freshness needs new writes at runtime, not a source change",
+    "V6": "the backlog clears when a human acts on it, not when code changes",
+    "V9": "the age of the newest apply moves with the clock, not with a diff",
+}
+
+
 def _cand(
     ctx: _Ctx,
     domain: str,
@@ -617,6 +658,8 @@ def _cand(
     source: str | None = None,
     success_command: str | None = None,
 ) -> Candidate:
+    if kind != "probe_broken" and rule_id in _G8_INVISIBLE:
+        evidence = {**dict(evidence or {}), "fixability": MONITOR_ONLY}
     return Candidate.build(
         domain=domain,
         source=source or f"{SYNTHETIC_PREFIX}{rule_id}",

@@ -1146,3 +1146,42 @@ def test_the_rules_own_package_is_never_its_own_evidence(tmp_path):
                      "    return 'INSERT INTO learning_record (benchmark_delta) VALUES (?)'\n"})
 
     assert list(harvest_mod._sql_write_owners(tmp_path, "learning_record")) == []
+
+
+# --------------------------------------------------------------------------
+# G8 visibility: which rules a patch's diff can actually move
+# --------------------------------------------------------------------------
+
+def test_every_g8_invisible_rule_is_a_registered_rule():
+    """The table names rules that exist — a typo would silently demote nothing."""
+    registered = {rid for _domain, rules in harvest_mod.ALL_RULES for rid, _fn in rules}
+    unknown = sorted(set(harvest_mod._G8_INVISIBLE) - registered)
+    assert unknown == [], unknown
+
+
+def test_a_g8_invisible_rule_emits_monitor_only(tmp_path, con):
+    """The queue must be able to drop it without every rule repeating the flag."""
+    ctx = harvest_mod._Ctx(root=tmp_path, con=con, now=NOW, cfg={})
+    cand = harvest_mod._cand(ctx, "learning", "L3", kind="data_path_dead",
+                             title="t", evidence_key="k", evidence={"rows": 0})
+    assert cand.evidence["fixability"] == MONITOR_ONLY
+
+
+def test_a_broken_rule_is_still_dispatchable(tmp_path, con):
+    """Schema drift is a real bug a patch fixes; it must not inherit the flag."""
+    ctx = harvest_mod._Ctx(root=tmp_path, con=con, now=NOW, cfg={})
+    cand = harvest_mod._broken(ctx, "L3", "learning", "column held_out is missing")
+    assert cand.kind == "probe_broken"
+    assert "fixability" not in cand.evidence
+
+
+def test_r5_is_structural_rather_than_g8_invisible():
+    """R5 was the measured cost of guessing wrong: make it stay moved.
+
+    Its predicate is now a call site, so the rule can close on a diff alone. If
+    someone later finds it easier to demote it, this test asks them to explain
+    why a source predicate stopped working.
+    """
+    assert "R5p" not in harvest_mod._G8_INVISIBLE
+    assert "R5b" not in harvest_mod._G8_INVISIBLE
+    assert "R5" not in harvest_mod._G8_INVISIBLE
