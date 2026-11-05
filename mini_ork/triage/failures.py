@@ -21,6 +21,7 @@ from pathlib import Path
 
 from mini_ork.context import scoped_environ
 from mini_ork.observability import bug_report
+from mini_ork.observability.blame_attributor import attribute
 from mini_ork.triage import blame as _blame
 from mini_ork.triage.blame import Evidence, NodeFailure
 
@@ -32,6 +33,10 @@ _LOG_TAIL_LINES = 120
 _LOG_TAIL_BYTES = 16384
 
 _ERROR_LINE_RE = re.compile(r"^.*(?:Error|Exception|error:|Traceback)\b.*$", re.MULTILINE)
+
+# Path *and* line from a traceback frame — ``blame._FRAME_RE`` drops the line
+# number, and ``defect_attributions`` needs ``ranges=[[line, line]]``.
+_FRAME_LINE_RE = re.compile(r'File "([^"]+)", line (\d+)')
 
 
 @dataclass
@@ -227,6 +232,79 @@ def _run_recipe(db_path: str, run_id: str) -> str:
         con.close()
 
 
+def _run_task_class(db_path: str, run_id: str) -> str:
+    """The run's real ``task_runs.task_class`` — ``""`` when the row is absent.
+
+    ``blame_attributor.attribute`` defaults an empty value to ``"unknown"``, so
+    returning ``""`` is the honest "not known" marker.
+    """
+    if not os.path.isfile(db_path):
+        return ""
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        row = con.execute("SELECT task_class FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        return (row[0] or "") if row else ""
+    except sqlite3.Error:
+        return ""
+    finally:
+        con.close()
+
+
+def _repo_relative(frame_path: str, root: str) -> str | None:
+    """``frame_path`` as a repo-relative file under *root*, or ``None``.
+
+    A failed run often executes from a linked worktree or a vendored copy, so
+    the frame's absolute path is not necessarily under the triager's root —
+    ``_blame._is_framework_path`` recognises those by path shape for exactly
+    that reason. Mirror it here: try the path as-is under *root*, and failing
+    that slice from its ``mini_ork``/``recipes`` segment; either way the result
+    must resolve inside *root* and be an existing file, or nothing is
+    attributed. Attributing a nearby path would poison the lane-penalty
+    consumer downstream, so this fails closed.
+    """
+    if not frame_path or not root:
+        return None
+    real_root = os.path.realpath(root)
+    raw = frame_path.strip()
+    candidates: list[str] = []
+    if not os.path.isabs(raw):
+        candidates.append(raw)
+    else:
+        real_frame = os.path.realpath(raw)
+        try:
+            if os.path.commonpath([real_frame, real_root]) == real_root:
+                candidates.append(os.path.relpath(real_frame, real_root))
+        except ValueError:
+            pass
+        parts = [p for p in raw.split(os.sep) if p and p != os.pardir]
+        for marker in ("mini_ork", "recipes"):
+            if marker in parts:
+                candidates.append(os.path.join(*parts[parts.index(marker):]))
+                break
+    for cand in candidates:
+        rel = os.path.normpath(cand)
+        if os.path.isabs(rel) or rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            continue
+        full = os.path.realpath(os.path.join(real_root, rel))
+        try:
+            if os.path.commonpath([full, real_root]) != real_root:
+                continue
+        except ValueError:
+            continue
+        if os.path.isfile(full):
+            return rel
+    return None
+
+
+def _first_attributable_frame(log_excerpt: str, root: str) -> tuple[str, int] | None:
+    """The first traceback frame in *log_excerpt* that names an existing repo file."""
+    for frame_path, line in _FRAME_LINE_RE.findall(log_excerpt or ""):
+        rel = _repo_relative(frame_path, root)
+        if rel is not None:
+            return rel, int(line)
+    return None
+
+
 def latest_failed_run(db_path: str) -> str | None:
     if not os.path.isfile(db_path):
         return None
@@ -306,6 +384,36 @@ def triage_run(
     if _triage_kill_switch(home_s):
         res.reason += "; kill switch set (.triage-kill) — not filing a bug"
         return res
+
+    # This funnel is the production writer of ``defect_attributions``: the
+    # attributor landed with tests but no caller, so a real blamed failure
+    # never recorded a row (lane routing reads them as a decayed penalty).
+    # Sits after both guards above — a dry run and the kill switch suppress
+    # attribution exactly as they suppress the bug write. When no frame in the
+    # primary failure's log resolves to an existing file under ``root_s`` (or
+    # blame fails), record nothing rather than attribute a nearby path.
+    try:
+        frame = _first_attributable_frame(primary.log_excerpt, root_s)
+        if frame is None:
+            res.reason += "; defect attribution: no framework frame resolves under root"
+        else:
+            rel, line = frame
+            run_dir = os.path.join(home_s, "runs", run_id)
+            os.makedirs(run_dir, exist_ok=True)
+            path = os.path.join(run_dir, "defect-attribution.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "file": rel,
+                        "ranges": [[line, line]],
+                        "task_class": _run_task_class(db_s, run_id),
+                    },
+                    fh,
+                )
+            rows = attribute(path, db=db_s, found_run_id=run_id, repo_root=root_s)
+            res.reason += f"; defect attribution: {len(rows)} row(s)"
+    except Exception as exc:  # noqa: BLE001 — triage must never raise into a run
+        res.reason += f"; defect attribution failed: {exc}"
 
     # Record the bug. Only on first sighting: ``bug_report_sweep`` re-counts
     # every line still present in the sink, so re-emitting the same signature

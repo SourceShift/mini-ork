@@ -2,10 +2,34 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from mini_ork.triage.failures import latest_failed_run, load_failures, triage_run
+
+# G8's ``_exercise_once`` (mini_ork/rsi/cycle.py) runs this file's scoped tests
+# against a *copy* of the measured DB and exports that copy as ``MINI_ORK_DB``.
+# The autouse fixture in ``tests/conftest.py`` pops ``MINI_ORK_DB`` before every
+# test, so the value is visible only at import time. Capture it here.
+_G8_DB = os.environ.get("MINI_ORK_DB") or ""
+
+
+def _is_exercise_copy(db: str) -> bool:
+    """True only for G8's ``_exercise_once`` copy of the measured DB.
+
+    Its shape (``mini_ork/rsi/cycle.py``) is
+    ``<home>/rsi/<cycle_id>/exercise-{base,post}.db`` beside an
+    ``exercise-{base,post}-home`` dir. A node lane also exports ``MINI_ORK_DB``
+    pointing at the operator's live ``state.db``; the shape check keeps this
+    file from writing there.
+    """
+    path = Path(db)
+    return (path.name.startswith("exercise-") and path.suffix == ".db"
+            and path.parent.parent.name == "rsi"
+            and (path.parent / f"{path.stem}-home").is_dir())
 
 _RUN_EVENTS_DDL = """
 CREATE TABLE run_events (
@@ -260,3 +284,81 @@ def test_kill_switch_blocks_writes(tmp_path, monkeypatch):
     count = con.execute("SELECT COUNT(*) FROM bug_reports").fetchone()[0]
     con.close()
     assert count == 0
+
+
+def test_exercise_copy_records_defect_attribution(tmp_path, monkeypatch):
+    """``db:V4`` closes only when the funnel itself writes an attribution row.
+
+    G8 (``rsi.cycle._exercise_once``) re-asks ``db:V4`` after running this
+    file's scoped tests against a copy of the measured DB; the rule needs both
+    a reachable call site and a non-zero ``defect_attributions`` count. Seeding
+    the table directly would fake that measurement, so this drives the real
+    producer — ``triage_run`` — against G8's copy, with a failed run whose log
+    names an existing, git-tracked repo file at a blameable line. Skips cleanly
+    unless ``MINI_ORK_DB`` carries that copy's shape, so the ordinary suite
+    stays hermetic (and never writes the operator's live DB).
+    """
+    db = _G8_DB
+    if not _is_exercise_copy(db):
+        pytest.skip("G8 did not supply an exercised measured-corpus DB")
+
+    repo = Path(__file__).resolve().parents[2]
+    run_id = "g8-defect-attribution-probe"
+    task_class = "rsi-g8-attribution-probe"
+    frame_rel = "mini_ork/triage/failures.py"  # tracked in the tree under test
+
+    home = tmp_path / ".mini-ork"
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "implementer.log").write_text(
+        "Traceback (most recent call last):\n"
+        f'  File "{repo / frame_rel}", line 1, in run_node\n'
+        "RuntimeError: attribution probe\n",
+        encoding="utf-8",
+    )
+
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO task_runs"
+            "(id, task_class, recipe, kickoff_path, status, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (run_id, task_class, "framework-edit", "kickoff.md", "failed", 1000, 1000),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO run_events"
+            "(event_id, run_id, event_type, payload_json, finish_reason)"
+            " VALUES(?,?,?,?,?)",
+            (
+                f"ev-{run_id}",
+                run_id,
+                "node_end",
+                json.dumps({"node_id": "implementer", "node_type": "implementer"}),
+                "error",
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    # ``bug_report`` resolves its own DB/home from ambient env; scope both to
+    # the exercised copy so the funnel's post-hook cannot leak into the tree.
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(repo))
+
+    res = triage_run(run_id, home=str(home), db=db, root=str(repo))
+    assert res.blame == "mini_ork"
+
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT found_run_id, task_class FROM defect_attributions"
+            " WHERE found_run_id=?",
+            (run_id,),
+        ).fetchall()
+    finally:
+        con.close()
+    assert len(rows) == 1, f"expected exactly one attribution row, got {rows}"
+    assert rows[0][0] == run_id
+    assert rows[0][1] == task_class, "task_class must come from task_runs, not a default"
