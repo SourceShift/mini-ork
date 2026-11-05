@@ -240,14 +240,18 @@ def test_the_engine_api_surface_survives_the_pinned_range():
     """
     from verifiers.v1 import runtimes as R
 
-    # engine.py:105 probes the namespace; :200 builds these four configs; :216 starts one.
+    # `engine._have_verifiers` probes the namespace; `_runtime_config` builds these
+    # four configs; `__enter__` starts one. Anchored on symbol names, not line
+    # numbers: every `:NNN` in this file had drifted by the time the change that
+    # added them was reviewed, and a stale anchor reads as checked code.
     for name in ("SubprocessConfig", "DockerConfig", "PrimeConfig", "ModalConfig"):
         assert hasattr(R, name), name
     assert callable(R.make_runtime)
-    # The protocol methods `engine.py` actually calls: `start` (:220), `run` (:342),
-    # `cleanup` (:176, the one sync method), and `stop`/`teardown` (:180, driven through
-    # `getattr` inside a `try/except Exception: pass`). The last two matter *because* they
-    # are guarded: a version that dropped either would skip teardown silently and leak the
+    # The protocol methods `engine.py` actually calls: `start` (`_start_verifiers`),
+    # `run` (`_exec`), and `cleanup` plus `stop`/`teardown` (`__exit__` — the sync
+    # cleanup, then the pair driven through `getattr` inside a
+    # `try/except Exception: pass`). The last two matter *because* they are
+    # guarded: a version that dropped either would skip teardown silently and leak the
     # runtime, so the guard would report success while the container stayed up. Measured
     # present on 0.2.0, 0.3.0 and 0.4.0, so asserting them reds nothing the pin admits.
     # `read` is genuinely untouched and stays out.
