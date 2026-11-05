@@ -41,6 +41,7 @@ PolicyEventType = Literal[
     "cost_threshold",     # cumulative cost crossed a threshold
     "verifier_result",    # a verifier emitted pass/fail
     "intake_admission",   # a ticket is about to become a run
+    "lane_routing",       # the router committed to a lane for a node
 ]
 
 

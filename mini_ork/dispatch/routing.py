@@ -40,6 +40,25 @@ def last_route_provenance() -> dict:
     return dict(_ROUTE_PROVENANCE.get())
 
 
+def _journal_db() -> str:
+    """The state db this router may journal into, or ``""`` when none is configured.
+
+    Only an explicit ``MINI_ORK_DB`` or ``MINI_ORK_HOME`` counts. There is
+    deliberately no ``./.mini-ork/state.db`` arm: that CWD-relative fallback is
+    exactly what ``MINI_ORK_NO_CWD_DB`` (RBF-27/RB-27) exists to close, because
+    a pytest or a node running from the operator's checkout resolved the live
+    db and wrote its fixtures into it. Journaling is an audit side effect, so a
+    missing explicit db is a silent skip — never a guess at someone's home.
+    """
+    db = os.environ.get("MINI_ORK_DB")
+    if db:
+        return db
+    home = os.environ.get("MINI_ORK_HOME")
+    if home:
+        return os.path.join(home, "state.db")
+    return ""
+
+
 REGION_NODE_TYPES = ("implementer",)
 
 
@@ -406,10 +425,16 @@ def policy_route_lane(
     root=None,
     task_class: str | None = None,
     run_dir: str | None = None,
+    journal: bool = True,
 ) -> str:
     """Port of bash `_mo_policy_route_lane`. Applied to every live node BEFORE dispatch
     so the routed lane (not the raw node_type/workflow lane) reaches --node-type. Dry-run
-    preserves the recipe's explicit lane (workflow-shape preview, not a policy preview)."""
+    preserves the recipe's explicit lane (workflow-shape preview, not a policy preview).
+
+    ``journal=False`` skips the ``policy_decisions`` row: a caller that only
+    *predicts* a lane (``cli/lane_preflight.py``) has not committed the router to
+    anything, and recording its guess would both fill the journal with decisions
+    never dispatched and double-count the node when the real dispatch routes it."""
     # Cleared up front: a stale record from the previous node must never be
     # attributed to this one's lane — and a dry-run must leave no record at all.
     _ROUTE_PROVENANCE.set({})
@@ -438,51 +463,52 @@ def policy_route_lane(
     # which whole classes of runs never reach: the ordinary ``mini-ork run``,
     # rsi-cycle, and CLI dispatch paths evaluated a policy and persisted its
     # provenance only to ``execution_traces``, leaving the decision journal
-    # empty. The db is resolved by RunContext (MINI_ORK_DB first) — NOT
-    # ``policy_store.db_path()``, whose MO_STORE_DB preference can point at a
-    # different file than the one the cycle counts.
+    # empty. The db is resolved by ``_journal_db`` (explicit MINI_ORK_DB /
+    # MINI_ORK_HOME only) — NOT ``context.db_or_default()``, whose CWD arm
+    # writes into the operator's live db, and not ``policy_store.db_path()``,
+    # whose MO_STORE_DB preference can point at a different file than the one
+    # the cycle counts.
     provenance = _ROUTE_PROVENANCE.get()
     route_source = provenance.get("route_source") or ""
-    # Function-local: routing is imported while the executor boots, and the
-    # journaling dependencies must not enlarge that import surface.
-    from mini_ork.context import RunContext
-    from mini_ork.policies.engine import record_decision
+    db = _journal_db() if journal else ""
+    if db:
+        # Function-local: routing is imported while the executor boots, and the
+        # journaling dependencies must not enlarge that import surface.
+        from mini_ork.context import RunContext
+        from mini_ork.policies.engine import record_decision
+        from mini_ork.policies.schema import PolicyEvent, PolicyResponse
 
-    context = RunContext.from_env()
-    decision_event = {
-        "type": "lane_routing",
-        "run_id": context.run_id or "",
-        "data": {
-            "node_type": node_type,
-            "from_lane": current_lane,
-            "to_lane": lane,
-            "task_class": task_class,
-            "route_source": provenance.get("route_source"),
-            "route_explore": provenance.get("route_explore"),
-            "route_score": provenance.get("route_score"),
-            "route_margin": provenance.get("route_margin"),
-            "predicted_error": provenance.get("predicted_error"),
-        },
-        "timestamp": int(time.time()),
-    }
-    decision_response = {
-        "result": "ALLOW",
-        "policy_name": policy,
-        "reason": f"{current_lane}->{lane} via {route_source}",
-    }
-    try:
-        record_decision(
-            decision_event,
-            decision_response,
-            context.db_or_default(),
+        context = RunContext.from_env()
+        decision_event = PolicyEvent(
+            type="lane_routing",
+            run_id=context.run_id or "",
+            data={
+                "node_type": node_type,
+                "from_lane": current_lane,
+                "to_lane": lane,
+                "task_class": task_class,
+                "route_source": provenance.get("route_source"),
+                "route_explore": provenance.get("route_explore"),
+                "route_score": provenance.get("route_score"),
+                "route_margin": provenance.get("route_margin"),
+                "predicted_error": provenance.get("predicted_error"),
+            },
+            timestamp=int(time.time()),
         )
-    except (FileNotFoundError, sqlite3.Error, OSError) as exc:
-        # Same contract as intake/dispatch.py::_admit: an uninitialised or
-        # unwritable state db must never crash routing or change the lane.
-        sys.stderr.write(
-            f"  [route] policy decision for node={node_type} was not archived "
-            f"({exc}); the lane is still {lane}\n"
+        decision_response = PolicyResponse(
+            result="ALLOW",
+            policy_name=policy,
+            reason=f"{current_lane}->{lane} via {route_source}",
         )
+        try:
+            record_decision(decision_event, decision_response, db)
+        except (FileNotFoundError, sqlite3.Error, OSError) as exc:
+            # Same contract as intake/dispatch.py::_admit: an uninitialised or
+            # unwritable state db must never crash routing or change the lane.
+            sys.stderr.write(
+                f"  [route] policy decision for node={node_type} was not archived "
+                f"({exc}); the lane is still {lane}\n"
+            )
     return lane
 
 

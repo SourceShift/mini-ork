@@ -93,7 +93,10 @@ def _no_inherited_workflow_env(monkeypatch):
 
 
 def _identity_route(node_type, workflow_lane, dry_run=False, root=None,
-                    task_class=""):
+                    task_class="", **_kwargs):
+    """Stand-in for the router. ``**_kwargs`` keeps it shape-compatible with the
+    real signature, which also takes ``journal=`` (preflight passes
+    ``journal=False`` so its predictions are never journalled)."""
     return workflow_lane
 
 

@@ -262,8 +262,13 @@ def resolve_dispatch_lanes(
             continue
         node_type = str(t[1] or "")
         workflow_lane = str(t[6] or node_type)
+        # ``journal=False``: this call only predicts which lane each node will
+        # take, for the preflight message. The router has committed to nothing,
+        # so a ``policy_decisions`` row here would record a decision that never
+        # happened — and duplicate the node once the real dispatch routes it.
         routed = routing.policy_route_lane(
             node_type, workflow_lane, dry_run=False, root=root, task_class=task_class,
+            journal=False,
         )
         model = llm_dispatch.resolve_lane_family(
             routed, str(root) if root else "", str(home) if home else "",
