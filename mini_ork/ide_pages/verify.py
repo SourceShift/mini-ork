@@ -114,6 +114,12 @@ def _certify_sections(home: Path, args: dict[str, str], errors: dict[str, str]) 
 
     def form() -> dict[str, Any]:
         prompt = f"/certify {claim}" if claim else "/certify "
+        # A claim that arrived with the page is the whole command, so the
+        # button submits it. Without one the command is incomplete — it only
+        # opens the composer, where the claim is typed before Enter.
+        do = S.thread(prompt)
+        if claim:
+            do["send"] = True
         return S.kv("Certify", [
             ("Base", "HEAD~1", "text", "commit before the change"),
             ("Head", "HEAD", "text", "commit with the change"),
@@ -122,7 +128,7 @@ def _certify_sections(home: Path, args: dict[str, str], errors: dict[str, str]) 
             note="Proves a change fixes a bug: a probe that fails on base and passes on head, plus "
                  "adversarial invariants. Exit codes: 0 PROVEN · 1 REFUTED · 2 UNVERIFIED — CI can "
                  "gate on it. Any range: mini-ork certify --base B --head H --issue TEXT.",
-            actions=[S.btn("Run certify", S.thread(prompt), "primary")])
+            actions=[S.btn("Run certify", do, "primary")])
 
     def latest() -> list[dict[str, Any]]:
         certs.extend(_certificates(home))

@@ -61,10 +61,19 @@ def test_unknown_tab_falls_back_to_certify(home: Path) -> None:
     assert build_page(home, "verify", "nope", {})["tab"] == "certify"
 
 
+def test_certify_without_a_claim_waits_in_the_composer(home: Path) -> None:
+    form = _section(build_page(home, "verify", "certify", {}), "Certify")
+    assert form["actions"][0]["do"] == {"thread": "/certify "}
+
+
 def test_certify_reads_the_certificates_folder(home: Path) -> None:
     empty = build_page(home, "verify", "certify", {"claim": "dark mode is lost on reload"})
     form = _section(empty, "Certify")
-    assert form["actions"][0]["do"] == {"thread": "/certify dark mode is lost on reload"}
+    # A claim from the page completes the command, so the button submits it.
+    assert form["actions"][0]["do"] == {
+        "thread": "/certify dark mode is lost on reload",
+        "send": True,
+    }
     recent = _section(empty, "Recent certificates")
     assert "No certificates yet" in recent["rows"][0]["cells"][0]["t"]
 
