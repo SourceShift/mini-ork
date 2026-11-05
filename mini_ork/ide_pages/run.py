@@ -773,7 +773,7 @@ def orchestrator_do(home: Path, run_id: str) -> dict[str, Any]:
     first click binds, and the next one finds the binding.
     """
     do: dict[str, Any] = {"thread": f"/orchestrator {run_id}", "send": True}
-    session = orchestrator_thread.read(Path(home) / "runs" / run_id)
+    session = orchestrator_thread.read_run(home, run_id)
     if session:
         do["thread_session"] = session
     return do

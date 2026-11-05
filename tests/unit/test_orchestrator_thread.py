@@ -57,3 +57,35 @@ def test_a_corrupt_record_reads_as_unbound(tmp_path: Path) -> None:
     run_dir.mkdir(parents=True)
     (run_dir / "orchestrator.json").write_text("{not json", encoding="utf-8")
     assert orchestrator_thread.read(run_dir) is None
+
+
+def test_run_dir_is_the_direct_run_directory(tmp_path: Path) -> None:
+    direct = tmp_path / "runs" / "run-1"
+    direct.mkdir(parents=True)
+    assert orchestrator_thread.run_dir(tmp_path, "run-1") == direct
+
+
+def test_run_dir_finds_an_rsi_child_run(tmp_path: Path) -> None:
+    """An rsi cycle stages its child runs in their own nested home while the
+    IDE lists them from the parent ``state.db``."""
+    nested = tmp_path / "rsi" / "cand-1" / "rsi-cycle" / "home" / "runs" / "run-9"
+    nested.mkdir(parents=True)
+    assert orchestrator_thread.run_dir(tmp_path, "run-9") == nested
+    assert orchestrator_thread.write(nested, "orch-9-xy") is True
+    assert orchestrator_thread.read_run(tmp_path, "run-9") == "orch-9-xy"
+
+
+def test_run_dir_finds_a_child_home_run(tmp_path: Path) -> None:
+    nested = tmp_path / "rsi" / "cand-1" / "child-home" / "runs" / "run-8"
+    nested.mkdir(parents=True)
+    assert orchestrator_thread.run_dir(tmp_path, "run-8") == nested
+
+
+def test_run_dir_falls_back_to_the_direct_path(tmp_path: Path) -> None:
+    """A run that is not staged yet keeps the path a later retry re-resolves."""
+    assert orchestrator_thread.run_dir(tmp_path, "run-late") == tmp_path / "runs" / "run-late"
+    assert orchestrator_thread.read_run(tmp_path, "run-late") is None
+
+
+def test_run_dir_does_not_glob_outside_the_tree(tmp_path: Path) -> None:
+    assert orchestrator_thread.run_dir(tmp_path, "../escape") == tmp_path / "runs" / "../escape"

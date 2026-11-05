@@ -23,6 +23,36 @@ FILENAME = "orchestrator.json"
 OWNER_FILENAME = "owner.json"
 
 
+def run_dir(home: str | Path, run_id: str) -> Path:
+    """Where ``run_id``'s artifacts live under ``home``.
+
+    A user-launched run sits at ``<home>/runs/<id>``. An rsi cycle gives each
+    child run its own home, one directory deeper — ``<home>/rsi/<candidate>/
+    <step>/home/runs/<id>``, or ``…/child-home/runs/<id>`` when the cycle
+    stages the exercise base that way — while the row the IDE lists still
+    comes from the parent ``state.db``. Both shapes resolve here so a page
+    and the agent that binds it agree on the one directory they read.
+
+    A missing directory returns the direct path unchanged: callers already
+    treat "no run dir" as "nothing to read", and a run id that could escape
+    the tree never reaches the glob.
+    """
+    home = Path(home)
+    direct = home / "runs" / run_id
+    if direct.is_dir() or not run_id or "/" in run_id or "\\" in run_id or ".." in run_id:
+        return direct
+    for pattern in (f"rsi/*/*/home/runs/{run_id}", f"rsi/*/child-home/runs/{run_id}"):
+        for candidate in sorted(home.glob(pattern)):
+            if candidate.is_dir():
+                return candidate
+    return direct
+
+
+def read_run(home: str | Path, run_id: str) -> str | None:
+    """The orchestrator bound to ``run_id`` under ``home`` (any run layout)."""
+    return read(run_dir(home, run_id))
+
+
 def read(run_dir: str | Path) -> str | None:
     """The session id of the thread watching ``run_dir``, or ``None``.
 

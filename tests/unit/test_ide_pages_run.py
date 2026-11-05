@@ -215,6 +215,20 @@ def test_the_orchestrator_action_opens_the_runs_bound_thread(home: Path) -> None
                         "thread": f"/orchestrator {RUN}", "send": True}
 
 
+def test_an_rsi_child_run_finds_its_nested_binding(home: Path) -> None:
+    """An rsi cycle stages its child run in a home of its own while the IDE
+    still lists the row from the parent ``state.db``; the page must read the
+    binding where it was written, or every click mints a new thread."""
+    run_dir = _seed(home)
+    nested = home / "rsi" / "cand-1" / "rsi-cycle" / "home" / "runs" / RUN
+    nested.parent.mkdir(parents=True)
+    run_dir.rename(nested)
+    (nested / "orchestrator.json").write_text('{"session_id": "orch-9-xy"}\n')
+    assert run_page.orchestrator_do(home, RUN) == {
+        "thread_session": "orch-9-xy", "thread": f"/orchestrator {RUN}",
+        "send": True}
+
+
 def test_an_unbound_run_sends_the_command_that_binds_it(home: Path) -> None:
     """No thread watches this run, and none may be invented empty: the command
     is *sent*, so the click that creates the thread also binds the run and the

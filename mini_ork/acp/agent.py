@@ -3924,25 +3924,33 @@ class MiniOrkAcpAgent:
         a run that never materialises leaves no binding, and the first click on
         its Orchestrator button binds it instead.
         """
-        run_dir = self._home_for(run_id) / "runs" / run_id
-        if orchestrator_thread.write(run_dir, thread_id):
+        home = self._home_for(run_id)
+        if orchestrator_thread.write(orchestrator_thread.run_dir(home, run_id), thread_id):
             return
         pending = self._binds.get(run_id)
         if pending is not None and not pending.done():
             return
         self._binds[run_id] = asyncio.create_task(
-            self._bind_when_staged(thread_id, run_dir)
+            self._bind_when_staged(thread_id, home, run_id)
         )
 
-    async def _bind_when_staged(self, thread_id: str, run_dir: Path) -> None:
+    async def _bind_when_staged(self, thread_id: str, home: Path, run_id: str) -> None:
+        """Retry until the run directory exists, re-resolving it each poll.
+
+        Re-resolving matters for an rsi child run: it is staged into a nested
+        home (``rsi/<candidate>/<step>/home/runs/<id>``), so a path resolved
+        before staging would keep missing forever.
+        """
         try:
             deadline = time.monotonic() + _BIND_WAIT_S
             while time.monotonic() < deadline:
-                if orchestrator_thread.write(run_dir, thread_id):
+                if orchestrator_thread.write(
+                    orchestrator_thread.run_dir(home, run_id), thread_id
+                ):
                     return
                 await asyncio.sleep(_BIND_POLL_S)
         finally:
-            self._binds.pop(run_dir.name, None)
+            self._binds.pop(run_id, None)
 
     async def _follow_child(self, parent_session_id: str, child_run_id: str) -> None:
         try:
