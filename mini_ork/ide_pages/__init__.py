@@ -28,6 +28,7 @@ PAGES: dict[str, str] = {
     "autos": "Automations",
     "lanes": "Lanes & cost",
     "learn": "Learning & memory",
+    "skills": "Skills",
     "context": "Context",
     "nodes": "Nodes",
     "dags": "DAGs",
