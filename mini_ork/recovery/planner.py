@@ -1658,6 +1658,43 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
                 _repair_markers)
         if not _problem:
             _overrides.update(placement_env_map(_placement, _node_env))
+    # ── verifier calibration ground truth: link the failures this repair
+    # answered (db:V3) ──. Only an auto-repair-spawned recover served this
+    # run's failures, so only the captured repair marker arms the write; a
+    # human (marker-less) recover links nothing. Placed after every pre-spawn
+    # refusal above — ``main``'s early return and the RB-08/RB-06 guards — so
+    # a refused revival, which dispatched no repair, writes nothing either.
+    # The value is measured, never derived: the row is linked to the run the
+    # recover genuinely resumed (``handoff['run_id']``), never to the marker's
+    # per-attempt child id. ``verifier_chain_repair`` is the existing writer
+    # and sets exactly ``repair_run_id``; the ``IS NULL`` filter keeps re-runs
+    # idempotent and leaves pass/indeterminate/vacuous rows and operator
+    # FP/FN annotations untouched. Fail-soft: a missing table, a locked or
+    # missing DB can never fail the repair it describes, and stderr is used
+    # because stdout is this path's operator contract.
+    if _repair_markers.get("MO_AUTO_REPAIR_RUN_ID"):
+        try:
+            import sqlite3 as _sqlite3  # noqa: PLC0415 — scoped to cli_main
+
+            from mini_ork.gates.verifier_rubric import (  # noqa: PLC0415
+                verifier_chain_repair,
+            )
+
+            _db = handoff["db_path"]
+            _con = _sqlite3.connect(f"file:{_db}?mode=ro", uri=True)
+            try:
+                _result_ids = [row[0] for row in _con.execute(
+                    "SELECT result_id FROM verifier_results"
+                    " WHERE run_id=? AND verdict='fail'"
+                    " AND repair_run_id IS NULL",
+                    (handoff["run_id"],))]
+            finally:
+                _con.close()
+            for _rid in _result_ids:
+                verifier_chain_repair(_db, _rid, handoff["run_id"])
+        except Exception as _exc:  # noqa: BLE001 — never fail the repair it describes
+            sys.stderr.write(
+                f"[mini-ork-recover] verifier repair link skipped: {_exc}\n")
     apply_env_overrides(_overrides)
     # ── Recover revival fix 1 (kickoff recover-revival-fixes §1): close the
     # dead attempt before dispatching. The original process died mid-node and
