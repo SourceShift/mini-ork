@@ -424,6 +424,63 @@ def list_atom_prs(module_id: str, status: str = "pending") -> str:
     return "".join("\t".join(_row_val(v) for v in r) + "\n" for r in rows)
 
 
+# ─── Reflection queue ─────────────────────────────────────────────────
+
+
+#: The eight ``item_table`` values the reflection_log CHECK accepts
+#: (db/migrations/0008_reflection_basins.sql). One source of truth: the
+#: pipeline imports this rather than re-typing the list.
+REFLECTION_LOG_ITEM_TABLES = frozenset({
+    "arch_specs", "module_plans", "atom_prs", "adrs",
+    "node_annotations", "communities", "validations", "fixes",
+})
+
+#: The four triggers the reflection_log CHECK accepts.
+REFLECTION_LOG_TRIGGERS = frozenset({"commit", "cron", "read", "manual"})
+
+
+def enqueue_reflection_log(item_table: str, item_id: str, trigger: str,
+                           drift_summary_json: str, *,
+                           db_path: str | None = None) -> None:
+    """Queue one reflection_log row for the reflection sweeper to drain.
+
+    Guards the two CHECK-constrained columns client-side so a caller gets a
+    clear ``ValueError`` instead of a bare ``IntegrityError``. ``processed_at``
+    and ``outcome`` are left out of the column list: nothing has drained the
+    row yet, so they stay NULL.
+
+    Unlike the D3 writers this one raises on failure — a silently dropped queue
+    row is exactly the defect this producer exists to prevent.
+    """
+    if item_table not in REFLECTION_LOG_ITEM_TABLES:
+        raise ValueError(
+            f"enqueue_reflection_log: item_table {item_table!r} is not one of "
+            f"{sorted(REFLECTION_LOG_ITEM_TABLES)}"
+        )
+    if trigger not in REFLECTION_LOG_TRIGGERS:
+        raise ValueError(
+            f"enqueue_reflection_log: trigger {trigger!r} is not one of "
+            f"{sorted(REFLECTION_LOG_TRIGGERS)}"
+        )
+
+    db = db_path if db_path is not None else _db_path()
+    trigger_sha = _git_head() if trigger == "commit" else None
+    con = sqlite3.connect(db)
+    try:
+        con.execute("""
+          INSERT INTO reflection_log (
+            item_table, item_id, trigger, trigger_sha, enqueued_at,
+            drift_summary_json
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            item_table, item_id, trigger, trigger_sha, _now(),
+            drift_summary_json,
+        ))
+        con.commit()
+    finally:
+        con.close()
+
+
 # ─── ADRs ──────────────────────────────────────────────────────────────
 
 

@@ -464,6 +464,63 @@ def _detect_stale_select(db_path: str, tbl: str, days: int) -> dict:
     return {"table": tbl, "stale_ids": stale, "stale_before_epoch": cutoff}
 
 
+def _enqueue_reflection_drift(db_path: str | None = None) -> None:
+    """Queue a reflection_log row per stale id in every representable table.
+
+    Probes the eight tables the migration's ``item_table`` CHECK accepts, but
+    only those that exist AND carry a timestamp column
+    ``_detect_stale_select`` recognises — ``communities`` has none, and letting
+    the query warn about it would change the pass's stderr. ``gradient_records``
+    is deliberately absent: the CHECK cannot represent it, so a row queued for
+    it would always be refused.
+
+    Silent by contract (stdout *and* stderr are bash-parity surfaces for
+    ``reflection_run``); the caller wraps it so one bad table cannot abort the
+    pass, while the store writer itself still raises for direct callers.
+    """
+    from mini_ork.memory.store import (
+        REFLECTION_LOG_ITEM_TABLES,
+        enqueue_reflection_log,
+    )
+
+    db = _resolve_db(db_path)
+    stale_days = int(os.environ.get("MINI_ORK_STALE_DAYS", 14))
+    # MO_REFLECT_POST_RUN=1 is set only by the detached post-run child; every
+    # other caller (cron, manual CLI) leaves it unset or "0".
+    trigger = "commit" if os.environ.get("MO_REFLECT_POST_RUN") == "1" else "manual"
+
+    ts_columns = {"updated_at", "created_at", "reflection_last_check", "last_seen"}
+    eligible: list[str] = []
+    con = _connect(db)
+    try:
+        present = {
+            r[0]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        for tbl in sorted(REFLECTION_LOG_ITEM_TABLES & present):
+            cols = {r[1] for r in con.execute(f"PRAGMA table_info({tbl})").fetchall()}
+            if cols & ts_columns:
+                eligible.append(tbl)
+    finally:
+        con.close()
+
+    for tbl in eligible:
+        result = _detect_stale_select(db, tbl, stale_days)
+        summary = json.dumps(result)
+        for item_id in result["stale_ids"]:
+            # A NULL/empty cell is not a "real stale id": ``arch_specs`` carries
+            # a nullable ``adr_id``, which the stale query's pk preference picks
+            # ahead of the first column. Skipping keeps it silent instead of
+            # raising the item_id NOT NULL constraint on every such row.
+            if item_id is None or item_id == "":
+                continue
+            enqueue_reflection_log(
+                tbl, item_id, trigger, summary, db_path=db,
+            )
+
+
 def _summarize_patterns_query(db_path: str, cluster_id: str | None) -> dict:
     """Mirror bash summarize_patterns heredoc.
 
@@ -1383,6 +1440,12 @@ def reflection_run(since_ts: int | None = None, *,
     print("  [4/6] detect_stale(gradient_records)", file=sys.stderr)
     try:
         reflection_detect_stale("gradient_records")
+    except Exception:
+        pass
+    # Queue real drift for the reflection sweeper. Separate guard from the
+    # gradient probe above so a failing queue write cannot skip detection.
+    try:
+        _enqueue_reflection_drift(db_path)
     except Exception:
         pass
 
