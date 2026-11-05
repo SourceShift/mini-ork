@@ -2205,3 +2205,53 @@ def test_g6_keeps_the_unattributed_note_on_a_passing_gate():
     assert result.ok is True
     assert result.code == ""
     assert result.detail == note
+
+
+def _run_dir(tmp_path: Path, *, verify: dict | None = None, verdict: dict | None = None) -> Path:
+    run = tmp_path / "runs" / "r1"
+    run.mkdir(parents=True)
+    if verify is not None:
+        (run / "verify-result.json").write_text(json.dumps(verify))
+    if verdict is not None:
+        (run / "verdict.json").write_text(json.dumps(verdict))
+    return tmp_path
+
+
+def test_a_node_failure_is_not_reported_as_a_failed_contract_verify(tmp_path):
+    """Cycle `rsi-c1793838883` failed two nodes and the operator was told the
+    contract verify failed with `verdict='pass'` — a contradiction, not a
+    diagnosis. A run that exits non-zero with no failing verifier failed at a
+    node, and the run-level record counts those."""
+    home = _run_dir(
+        tmp_path,
+        verify={"verdict": "pass", "results": []},
+        verdict={"verdict": "fail", "failed_nodes": 2, "dispatched": 9,
+                 "source": "execute@run-level"},
+    )
+
+    assert cycle_mod._verify_failure(home, "r1") == (
+        "2 node(s) failed before the contract verify ran")
+
+
+def test_a_failing_verifier_entry_still_wins_over_the_node_count(tmp_path):
+    home = _run_dir(
+        tmp_path,
+        verify={"verdict": "fail", "results": [
+            {"verifier": "panel", "pass": False, "detail": "two distinct families"}]},
+        verdict={"verdict": "fail", "failed_nodes": 1, "dispatched": 9,
+                 "source": "execute@run-level"},
+    )
+
+    assert cycle_mod._verify_failure(home, "r1") == "two distinct families"
+
+
+def test_the_node_count_survives_a_recipe_owned_verdict_json(tmp_path):
+    """A recipe that owns verdict.json as a deliverable leaves execute's count
+    in run-verdict.json beside it."""
+    home = _run_dir(tmp_path, verify={"verdict": "pass", "results": [
+        {"verifier": "proposal", "pass": True}]})
+    (home / "runs" / "r1" / "run-verdict.json").write_text(
+        json.dumps({"verdict": "fail", "failed_nodes": 3, "dispatched": 9,
+                    "source": "execute@run-level"}))
+
+    assert cycle_mod._failed_node_count(home, "r1") == 3

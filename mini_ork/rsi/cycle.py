@@ -1482,8 +1482,38 @@ def _verify_failure(home: Path, run_id: str) -> str:
         for entry in (results or [])
         if isinstance(entry, Mapping) and entry.get("pass") is False
     ]
-    return "; ".join(detail for detail in details if detail) or (
-        f"verdict={payload.get('verdict')!r}")
+    if details:
+        return "; ".join(detail for detail in details if detail)
+    # No verifier entry failed, so the contract verify has nothing to say and
+    # `verdict='pass'` is the last thing an operator should be shown: it reads
+    # like a contradiction, not a diagnosis. A run that exits non-zero with no
+    # failing verifier failed at a NODE, and the run-level record counts those.
+    failed_nodes = _failed_node_count(home, run_id)
+    if failed_nodes:
+        return f"{failed_nodes} node(s) failed before the contract verify ran"
+    return f"verdict={payload.get('verdict')!r}"
+
+
+def _failed_node_count(home: Path, run_id: str) -> int:
+    """``failed_nodes`` from the run-level verdict, or 0 when it is absent.
+
+    ``verdict.json`` is execute's own record; a recipe that owns that file as a
+    deliverable leaves its count in ``run-verdict.json`` beside it.
+    """
+    for filename in ("verdict.json", "run-verdict.json"):
+        path = _run_artifact(home, run_id, filename)
+        if path is None:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        count = payload.get("failed_nodes")
+        if isinstance(count, int) and count > 0:
+            return count
+    return 0
 
 
 def _blocked_reason(home: Path, run_id: str) -> str:
