@@ -56,10 +56,13 @@ OPEN_GAP = (
 
 #: The DB rules. L8, V10 and V11 are probe-derived (verifier audit, the tests
 #: probe, garden/validate findings) and have no ``db:`` success state, so they
-#: are correctly absent here.
+#: are correctly absent here. R5 is pinned as its two halves: ``R5b`` (brain
+#: decisions empty) and ``R5p`` (policy decisions empty) were split from one
+#: row-count rule so each predicate could become structural on its own.
 EXPECTED_RULES = (
     *(f"L{i}" for i in (1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12)),
-    *(f"R{i}" for i in range(1, 9)),
+    *(f"R{i}" for i in (1, 2, 3, 4, 6, 7, 8)),
+    "R5b", "R5p",
     *(f"V{i}" for i in (1, 2, 3, 4, 5, 6, 7, 8, 9, 12)),
 )
 
