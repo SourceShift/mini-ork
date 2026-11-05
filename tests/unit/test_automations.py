@@ -1327,6 +1327,64 @@ class TestCLI:
         entries = json.loads(capsys.readouterr().out)["runs"]
         assert [e["run_id"] for e in entries] == ["r2", "r1"]
 
+    def test_runs_filter_does_not_let_another_automation_use_the_limit(
+            self, tmp_path: Path, capsys) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        lines = [
+            '{"ts": "t%d", "id": "b", "run_id": "rb%d", "ok": true, "error": ""}' % (i, i)
+            for i in range(3)
+        ]
+        lines.append('{"ts": "t9", "id": "a", "run_id": "ra9", "ok": true, "error": ""}')
+        (home / "automations.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        from mini_ork.cli import automations_cmd
+        rc = automations_cmd.main(
+            ["runs", "a", "--limit", "1", "--json", "--home", str(home)], "/tmp/root")
+        assert rc == 0
+        entries = json.loads(capsys.readouterr().out)["runs"]
+        assert [e["run_id"] for e in entries] == ["ra9"]
+
+    def test_draft_commit_and_discard(self, tmp_path: Path, capsys) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        from mini_ork.cli import automations_cmd
+        recipe_dir = home / "recipes" / "code-fix"
+        recipe_dir.mkdir(parents=True)
+        (recipe_dir / "workflow.yaml").write_text("name: code-fix\n", encoding="utf-8")
+        (recipe_dir / "task_class.yaml").write_text("id: code-fix\n", encoding="utf-8")
+        assert automations_cmd._auto.propose(
+            home, id="later", name="Later", recipe="code-fix",
+            kickoff="# k", schedule="0 5 * * *")["ok"] is True
+        rc = automations_cmd.main(
+            ["draft", "commit", "later", "--home", str(home)], "/tmp/root")
+        assert rc == 0
+        assert [a["id"] for a in automations_cmd._auto.load(home)] == ["later"]
+        assert not (home / "automation-drafts" / "later.json").exists()
+
+        assert automations_cmd._auto.propose(
+            home, id="other", name="Other", recipe="code-fix",
+            kickoff="# k2", schedule="0 6 * * *")["ok"] is True
+        rc = automations_cmd.main(
+            ["draft", "discard", "other", "--home", str(home)], "/tmp/root")
+        assert rc == 0
+        assert not (home / "automation-drafts" / "other.json").exists()
+
+    def test_edit_reads_the_kickoff_file(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        kickoff = tmp_path / "new-kickoff.md"
+        kickoff.write_text("# rewritten\n", encoding="utf-8")
+        from mini_ork.cli import automations_cmd
+        automations_cmd._auto.add(
+            home, id="nightly", name="Nightly", recipe="code-fix",
+            kickoff="# old", schedule="0 3 * * *", workspace="in-place",
+        )
+        rc = automations_cmd.main(
+            ["edit", "nightly", "--kickoff-file", str(kickoff), "--home", str(home)],
+            "/tmp/root")
+        assert rc == 0
+        assert automations_cmd._auto.load(home)[0]["kickoff"] == "# rewritten\n"
+
     def test_runs_filters_and_shows_a_failed_launch(self, tmp_path: Path, capsys) -> None:
         home = tmp_path / "home"
         home.mkdir()

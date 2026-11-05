@@ -79,7 +79,7 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
             full=True,
             note="Ask a mini-ork thread to run a recipe on a schedule, "
                  "or use mini-ork automations add.")]
-        out += S.guarded(errors, "Drafts", lambda: _drafts(home))
+        out += S.guarded(errors, "Drafts", lambda: _drafts(home, args))
         return _with_automations_board(rows, out, errors)
     selected = next((r for r in rows if r["id"] == args.get("auto")), rows[0])
     table = S.table(
@@ -92,7 +92,7 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
           "do": S.set_args(auto=r["id"]), "sel": r["id"] == selected["id"]} for r in rows],
         full=True)
     out = [table]
-    out += S.guarded(errors, "Drafts", lambda: _drafts(home))
+    out += S.guarded(errors, "Drafts", lambda: _drafts(home, args))
     out += S.guarded(errors, selected["id"], lambda: _detail(selected))
     out += S.guarded(errors, "Next three firings", lambda: _firings(selected))
     out += S.guarded(errors, "Kickoff each run receives", lambda: _kickoff(home, selected["id"]))
@@ -156,13 +156,19 @@ def _with_automations_board(rows: list[dict[str, Any]], sections: list[dict[str,
     return S.guarded(errors, "Automations", lambda: _automations_board(rows)) + sections
 
 
-def _drafts(home: Path) -> list[dict[str, Any]]:
-    """Drafts an agent wrote but nobody committed — review happens in its thread."""
+def _drafts(home: Path, args: dict[str, str]) -> list[dict[str, Any]]:
+    """Drafts an agent wrote but nobody committed, and the one being reviewed.
+
+    A draft id is not yet an automation, so ``/automation <id>`` cannot open
+    its card; commit and discard ride the CLI verbs instead.
+    """
     from mini_ork import automations
 
     drafts = automations.list_proposals(home)
     if not drafts:
         return []
+    selected = next((d for d in drafts
+                     if str(d.get("id") or "") == args.get("draft")), drafts[0])
     rows = []
     for draft in drafts:
         aid = str(draft.get("id") or "")
@@ -172,15 +178,40 @@ def _drafts(home: Path) -> list[dict[str, Any]]:
                       automations.describe(schedule) if schedule else "",
                       S.muted("in place" if draft.get("workspace") == "in-place"
                               else "in a worktree")],
-            "do": S.thread(f"/automation {aid}"),
+            "do": S.set_args(draft=aid),
+            "sel": draft is selected,
         })
-    return [S.table(
+    aid = str(selected.get("id") or "")
+    out: list[dict[str, Any]] = [S.table(
         "Drafts awaiting you",
         [S.col(fr=1, min=120), S.col(fr=1, min=120), S.col(110), S.col(90)],
         ["draft", "name", "when", "runs"],
         rows,
         full=True,
-        note="An agent drafted these. Open one to Commit or Discard it in its thread.")]
+        note="An agent drafted these. Create one to make it an automation, "
+             "or discard it.")]
+    out.append(S.kv(
+        f"Draft {aid}",
+        [("Name", str(selected.get("name") or "—")),
+         ("Recipe", str(selected.get("recipe") or "—")),
+         ("When", automations.describe(str(selected.get("schedule") or "")) or "—"),
+         ("Saved", str(selected.get("created_at") or "—"))],
+        actions=[
+            S.btn("Create automation",
+                  S.cli("automations", "draft", "commit", aid,
+                        confirm=f"Create automation {aid} from this draft?"),
+                  "primary"),
+            S.btn("Discard", S.cli("automations", "draft", "discard", aid,
+                                   confirm=f"Discard the draft {aid}?"), "danger"),
+            S.btn("Ask for changes", S.thread(f"Change the draft automation {aid}: "),
+                  "ghost"),
+        ]))
+    kickoff = str(selected.get("kickoff") or "")
+    lines = kickoff.splitlines() or ["(empty kickoff)"]
+    if len(lines) > _KICKOFF_LINES:
+        lines = lines[:_KICKOFF_LINES] + [f"… {len(lines) - _KICKOFF_LINES} more lines"]
+    out.append(S.code(f"Draft {aid} kickoff", [(ln, "body") for ln in lines], full=True))
+    return out
 
 
 def _detail(row: dict[str, Any]) -> dict[str, Any]:

@@ -8,6 +8,8 @@ Surface (kickoff §CLI):
   edit <id> [--name --schedule --recipe --kickoff-file --in-place --worktree
         --enable --disable]              change the fields that were passed
   runs [<id>] [--limit N] [--json]       recent firings, newest first
+  draft commit <id>                      turn a staged draft into an automation
+  draft discard <id>                     drop a staged draft
   remove <id>                            drop an automation
   pause <id>                             enabled = false
   resume <id>                            enabled = true
@@ -39,6 +41,8 @@ _USAGE = (
     "  add                  register a new automation\n"
     "  edit <id>            change the fields that are passed\n"
     "  runs [<id>]          recent firings, newest first\n"
+    "  draft commit <id>    turn a staged draft into an automation\n"
+    "  draft discard <id>   drop a staged draft\n"
     "  remove <id>          drop an automation\n"
     "  pause <id>           disable an automation\n"
     "  resume <id>          re-enable an automation\n"
@@ -169,9 +173,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 def _cmd_runs(args: argparse.Namespace) -> int:
     home = Path(args.home)
-    entries = _auto.recent_runs(home, limit=max(1, args.limit))
-    if args.automation_id:
-        entries = [e for e in entries if str(e.get("id") or "") == args.automation_id]
+    entries = _auto.recent_runs(
+        home, limit=max(1, args.limit), automation_id=args.automation_id)
     if args.json:
         sys.stdout.write(json.dumps({"runs": entries}, indent=2) + "\n")
         return 0
@@ -195,6 +198,20 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             "status": status,
         })
     _emit_table(rows)
+    return 0
+
+
+def _cmd_draft(args: argparse.Namespace) -> int:
+    if args.draft_subcommand == "commit":
+        result = _auto.commit_proposal(args.home, args.proposal_id)
+    else:
+        result = _auto.discard_proposal(args.home, args.proposal_id)
+    if not result.get("ok"):
+        sys.stderr.write(
+            f"mini-ork automations draft {args.draft_subcommand}: "
+            f"{result.get('error', 'unknown error')}\n")
+        return 1
+    sys.stdout.write(json.dumps(result, indent=2) + "\n")
     return 0
 
 
@@ -337,6 +354,12 @@ def _build_parser() -> argparse.ArgumentParser:
     runs_p.add_argument("--json", action="store_true",
                         help="emit JSON instead of a table")
 
+    draft_p = sub.add_parser("draft", parents=[common], add_help=False)
+    draft_sub = draft_p.add_subparsers(dest="draft_subcommand")
+    for verb in ("commit", "discard"):
+        verb_p = draft_sub.add_parser(verb, parents=[common], add_help=False)
+        verb_p.add_argument("proposal_id")
+
     remove_p = sub.add_parser("remove", parents=[common], add_help=False)
     remove_p.add_argument("automation_id")
 
@@ -377,8 +400,8 @@ def main(rest: list[str], root: str) -> int:
         sys.stderr.write(_USAGE)
         return 0
 
-    known = {"list", "add", "edit", "runs", "remove", "pause", "resume", "run",
-             "tick", "scheduler"}
+    known = {"list", "add", "edit", "runs", "draft", "remove", "pause", "resume",
+             "run", "tick", "scheduler"}
     words = [w for i, w in enumerate(rest)
              if not w.startswith("-") and (i == 0 or rest[i - 1] != "--home")]
     if not words or words[0] not in known:
@@ -412,6 +435,11 @@ def main(rest: list[str], root: str) -> int:
         return _cmd_edit(args)
     if sub == "runs":
         return _cmd_runs(args)
+    if sub == "draft":
+        if args.draft_subcommand not in ("commit", "discard"):
+            sys.stderr.write(_USAGE)
+            return 2
+        return _cmd_draft(args)
     if sub == "remove":
         return _cmd_remove(args)
     if sub == "pause":

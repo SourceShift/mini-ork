@@ -662,14 +662,13 @@ def list_proposals(home: Path | str) -> list[dict[str, Any]]:
     The drafts directory is shared with the agent's ``propose`` calls, so a
     half-written or hand-edited file must not blank the page that lists them.
     """
-    try:
-        paths = sorted(
-            _drafts_dir(Path(home)).glob("*.json"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
-        return []
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    paths = sorted(_drafts_dir(Path(home)).glob("*.json"), key=_mtime, reverse=True)
     out: list[dict[str, Any]] = []
     for path in paths:
         try:
@@ -936,12 +935,14 @@ def run_statuses(home: Path | str) -> dict[str, str]:
     return {str(r["run_id"]): str(r.get("status") or "") for r in rows if r.get("run_id")}
 
 
-def recent_runs(home: Path | str, *, limit: int = 20) -> list[dict[str, Any]]:
+def recent_runs(home: Path | str, *, limit: int = 20,
+                automation_id: str | None = None) -> list[dict[str, Any]]:
     """The newest ``limit`` entries of ``automations.log``, newest first.
 
     ``fire`` appends one JSON line per attempt (``ts``, ``id``, ``run_id``,
     ``ok``, ``error``); a malformed line is skipped so a truncated write never
-    hides the rest of the history.
+    hides the rest of the history. ``automation_id`` filters while scanning, so
+    one automation's older firings are not crowded out by another's newer ones.
     """
     try:
         lines = (Path(home) / _LOG_FILENAME).read_text(
@@ -957,10 +958,13 @@ def recent_runs(home: Path | str, *, limit: int = 20) -> list[dict[str, Any]]:
             entry = json.loads(line)
         except ValueError:
             continue
-        if isinstance(entry, dict):
-            entries.append(entry)
-            if len(entries) >= limit:
-                break
+        if not isinstance(entry, dict):
+            continue
+        if automation_id is not None and str(entry.get("id") or "") != automation_id:
+            continue
+        entries.append(entry)
+        if len(entries) >= limit:
+            break
     return entries
 
 

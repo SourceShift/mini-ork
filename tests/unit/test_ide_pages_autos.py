@@ -117,7 +117,16 @@ def test_a_pending_draft_gets_its_own_review_row(home: Path) -> None:
     table = _section(page, "Drafts awaiting you")
     assert table["type"] == "table"
     assert [c["t"] for c in table["rows"][0]["cells"]][:2] == ["later", "Later build"]
-    assert table["rows"][0]["do"] == {"thread": "/automation later"}
+    assert table["rows"][0]["do"] == {"set": {"draft": "later"}}
+    assert table["rows"][0]["sel"] is True
+
+    detail = _section(page, "Draft later")
+    labels = {a["label"]: a["do"] for a in detail["actions"]}
+    assert labels["Create automation"]["cli"] == ["automations", "draft", "commit", "later"]
+    assert labels["Discard"]["cli"] == ["automations", "draft", "discard", "later"]
+    assert labels["Create automation"]["confirm"]
+    kickoff = _section(page, "Draft later kickoff")
+    assert [line["t"] for line in kickoff["lines"]] == ["# later"]
 
 
 def test_no_drafts_means_no_empty_section(home: Path) -> None:
