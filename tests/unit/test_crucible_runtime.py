@@ -244,10 +244,14 @@ def test_the_engine_api_surface_survives_the_pinned_range():
     for name in ("SubprocessConfig", "DockerConfig", "PrimeConfig", "ModalConfig"):
         assert hasattr(R, name), name
     assert callable(R.make_runtime)
-    # Only the protocol methods engine.py actually calls: `start` (:220), `run` (:342) and
-    # `cleanup` (:176, the one sync method). Asserting `read`/`stop`/`teardown` would red
-    # this job on surface we never touch, which is not what a broken call site looks like.
-    for method in ("start", "run", "cleanup"):
+    # The protocol methods `engine.py` actually calls: `start` (:220), `run` (:342),
+    # `cleanup` (:176, the one sync method), and `stop`/`teardown` (:180, driven through
+    # `getattr` inside a `try/except Exception: pass`). The last two matter *because* they
+    # are guarded: a version that dropped either would skip teardown silently and leak the
+    # runtime, so the guard would report success while the container stayed up. Measured
+    # present on 0.2.0, 0.3.0 and 0.4.0, so asserting them reds nothing the pin admits.
+    # `read` is genuinely untouched and stays out.
+    for method in ("start", "run", "cleanup", "stop", "teardown"):
         assert hasattr(R.Runtime, method), method
 
     # Mirror `_runtime_config`, including the optional cpu/memory passthrough.
@@ -317,24 +321,28 @@ def test_have_verifiers_requires_make_runtime(monkeypatch):
     import sys as _sys
     import types
 
+    # `setattr` rather than attribute assignment: a bare `ModuleType` has no declared
+    # members, so `mod.attr = x` is a static-analysis error even though it is legal Python.
     def install(runtimes_module) -> None:
         root = types.ModuleType("verifiers")
         root.__path__ = []
         v1 = types.ModuleType("verifiers.v1")
         v1.__path__ = []
-        v1.runtimes = runtimes_module
-        root.v1 = v1
+        setattr(v1, "runtimes", runtimes_module)
+        setattr(root, "v1", v1)
         monkeypatch.setitem(_sys.modules, "verifiers", root)
         monkeypatch.setitem(_sys.modules, "verifiers.v1", v1)
         monkeypatch.setitem(_sys.modules, "verifiers.v1.runtimes", runtimes_module)
 
     without = types.ModuleType("verifiers.v1.runtimes")
-    without.SubprocessConfig = object  # the namespace still exists
+    setattr(without, "SubprocessConfig", object)  # the namespace still exists
     install(without)
     assert _have_verifiers() is False
     assert "modal" not in available_backends()
 
     with_entry_point = types.ModuleType("verifiers.v1.runtimes")
-    with_entry_point.make_runtime = lambda *a, **k: None
+    # The probe only ever checks `callable`; taking no arguments keeps it honest about
+    # that and keeps the module stub free of unused-parameter noise.
+    setattr(with_entry_point, "make_runtime", lambda: None)
     install(with_entry_point)
     assert _have_verifiers() is True

@@ -25,10 +25,12 @@ contribute fixes back rather than forking. This file records what we use and why
   silently became 0.4.1 the day 0.4.1 shipped, while this file recorded the check as
   having passed against 0.4.0. The test is `skipif`-guarded, so the job also asserts it
   *ran* — a skipped guard would otherwise report success while verifying nothing. The
-  next automated bump is therefore verified rather than merely merged, and
-  `engine._have_verifiers` asks for `make_runtime` rather than for the import, so a
-  version that drops it again is reported as "runtime not installed" instead of failing
-  from inside the constructor.
+  next automated bump is therefore verified rather than merely merged. The runtime
+  guard `engine._have_verifiers` is narrower than the pin: it asks for `make_runtime`
+  rather than for the import, so a version that drops *that entry point* is reported as
+  "runtime not installed" instead of raising from inside `_start_verifiers`. It does not
+  check the `*Config` classes or the protocol methods — those are the pin test's job, and
+  because 0.4.1 dropped them together they are checked together.
 - **Used by:** `mini_ork/runtime/` (Crucible — our verified-execution seam). This is the
   **only** import site; nothing else in mini-ork may import `verifiers`, so an upstream API
   change touches exactly one file.
