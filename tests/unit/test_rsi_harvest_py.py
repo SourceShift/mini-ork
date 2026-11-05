@@ -919,3 +919,93 @@ def test_v4_is_not_fooled_by_a_same_named_helper_in_another_module(tmp_path, con
 
     assert cand.evidence["call_site"] == ""
     assert "nothing calls it" in cand.detail
+
+
+def test_v4_does_not_close_on_rows_a_smoke_fixture_wrote(tmp_path, con):
+    """Rows are not a producer.
+
+    ``mini_ork/observability/usage_report.py:build_smoke_db`` INSERTs into
+    ``defect_attributions`` for a smoke fixture. A non-zero count therefore
+    proves *something* wrote the table, not that a real failure ever will — and
+    closing on the count left the gap invisible while the attributor stayed
+    unreachable.
+    """
+    ddl(con, "CREATE TABLE defect_attributions (lane TEXT, penalty REAL);"
+              "INSERT INTO defect_attributions VALUES ('claude', 0.5);")
+    write(tmp_path, {
+        "mini_ork/observability/blame_attributor.py":
+            "def attribute(defect_json_path, *, db, found_run_id, repo_root):\n"
+            "    return []\n",
+        "mini_ork/observability/usage_report.py":
+            "def build_smoke_db(db):\n"
+            "    db.execute('INSERT INTO defect_attributions (lane, penalty) VALUES (?,?)',\n"
+            "               ('claude', 0.0))\n",
+    })
+
+    cand = one(report(tmp_path, con), "db:V4")
+
+    assert cand.evidence["rows"] == 1
+    assert "does not run in production" in cand.detail
+    assert "fixture, not a producer" in cand.fix_hint
+
+
+def test_v4_closes_when_rows_exist_and_a_call_reaches_the_writer(tmp_path, con):
+    ddl(con, "CREATE TABLE defect_attributions (lane TEXT, penalty REAL);"
+              "INSERT INTO defect_attributions VALUES ('claude', 0.5);")
+    write(tmp_path, {
+        "mini_ork/observability/blame_attributor.py":
+            "def attribute(defect_json_path, *, db, found_run_id, repo_root):\n"
+            "    return []\n",
+        "mini_ork/cli/execute_handlers.py":
+            "from mini_ork.observability.blame_attributor import attribute\n"
+            "\n"
+            "def _after_failure(db, run_id):\n"
+            "    attribute('defect.json', db=db, found_run_id=run_id, repo_root='.')\n",
+    })
+
+    assert "V4" in report(tmp_path, con).closed
+
+
+def test_a_constant_that_quotes_the_sql_is_not_a_writer(tmp_path):
+    """The AST alone is not enough: docstrings are excluded, other constants were not.
+
+    A fix hint, a prompt, or a worked example is a string constant too, so a
+    rule that quotes the SQL it hunts for closed itself. The prose below carries
+    the write on the far side of a ``;`` — the case semicolon splitting alone
+    gets wrong in the permissive direction.
+    """
+    write(tmp_path, {"mini_ork/learning/hints.py":
+                     "HINT = ('Call the producer; it must UPDATE learning_record SET "
+                     "benchmark_delta=? once the benchmark has run.')\n"})
+
+    assert list(harvest_mod._sql_write_owners(tmp_path, "learning_record")) == []
+    assert harvest_mod._live_writer_of(tmp_path, "learning_record", "benchmark_delta") is False
+
+
+def test_a_real_sql_script_is_still_a_writer(tmp_path):
+    """Tightening must not hide a producer: comments and multi-statement scripts count."""
+    write(tmp_path, {"mini_ork/learning/ledger.py":
+                     "SCHEMA = '''\n"
+                     "-- created by the ledger\n"
+                     "CREATE TABLE IF NOT EXISTS learning_record (benchmark_delta REAL);\n"
+                     "INSERT INTO learning_record (benchmark_delta) VALUES (?)\n"
+                     "'''\n"})
+
+    statements = list(harvest_mod._sql_write_owners(tmp_path, "learning_record"))
+
+    assert len(statements) == 1
+    assert "INSERT INTO learning_record" in statements[0][0]
+
+
+def test_the_rules_own_package_is_never_its_own_evidence(tmp_path):
+    """A rule module that mentions the write must not close the rule.
+
+    The detector scans every module, ``mini_ork/rsi/`` included, so its own text
+    is parsed as a candidate producer. Skipping the package is the structural
+    fix; the prose filter is the second line of defence.
+    """
+    write(tmp_path, {"mini_ork/rsi/harvest.py":
+                     "def hint():\n"
+                     "    return 'INSERT INTO learning_record (benchmark_delta) VALUES (?)'\n"})
+
+    assert list(harvest_mod._sql_write_owners(tmp_path, "learning_record")) == []

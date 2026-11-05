@@ -335,6 +335,40 @@ def _docstring_constants(tree: ast.AST) -> set[int]:
     return ids
 
 
+#: The package these rules live in. It is scanned like every other module, so
+#: the rules' own prose can silence the rules; see ``_sql_write_owners``.
+_RULES_PACKAGE = "mini_ork/rsi/"
+
+#: Whitespace and comments carried in front of a statement.
+_SQL_PROLOGUE = re.compile(r"\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)*", re.DOTALL)
+
+#: Every SQLite statement a driver accepts begins with one of these. A fragment
+#: that begins with anything else is prose that happens to contain SQL.
+_SQL_HEAD = re.compile(
+    r"(?:SELECT|INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|PRAGMA|WITH|"
+    r"BEGIN|COMMIT|ROLLBACK|VACUUM|ANALYZE|ATTACH|DETACH|SAVEPOINT|RELEASE)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_sql_script(text: str) -> bool:
+    """True when ``text`` reads as SQL throughout, not as prose quoting SQL.
+
+    Every ``;``-separated fragment has to begin with a SQL verb, so a hint that
+    says "…; UPDATE learning_record SET benchmark_delta=? after the benchmark
+    runs" is prose (its second fragment starts with "after"), while a real
+    multi-statement script ("CREATE TABLE …; INSERT INTO …") is SQL. Semicolon
+    splitting alone cannot tell those apart, and getting it wrong in the
+    permissive direction silently closes the gap the text describes.
+    """
+    fragments = []
+    for fragment in text.split(";"):
+        body = _SQL_PROLOGUE.sub("", fragment)
+        if body.strip():
+            fragments.append(body)
+    return bool(fragments) and all(_SQL_HEAD.match(body) for body in fragments)
+
+
 def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None, str]]:
     """Every SQL statement in ``mini_ork/`` that writes ``table``, and its function.
 
@@ -349,6 +383,13 @@ def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None,
     matched its own docstring and silenced L9 permanently — the rule could only
     fire on trees that did not yet contain it. That is the worst failure a gap
     detector has, and the parser is what prevents it.
+
+    Excluding docstrings is not enough on its own. Any OTHER string constant
+    that quotes the SQL — a fix hint, a prompt, a worked example — is parsed as
+    a constant too, so "it is AST, not text" only gets half the protection.
+    Two further filters close that hole: this package is skipped entirely (the
+    detector cannot be its own evidence), and a statement has to BEGIN with its
+    write verb, which prose does not.
 
     Scanning every module (rather than trusting a file name) is what makes a
     producer found wherever someone puts it. A write assembled at run time from
@@ -369,6 +410,10 @@ def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None,
         if tree is None:
             continue
         rel = normalize_path(str(path.relative_to(root)))
+        if rel.startswith(_RULES_PACKAGE):
+            # The rules' own module is never a producer for the tables it
+            # scans; reading it would let a rule's text close the rule.
+            continue
         docstrings = _docstring_constants(tree)
         # constant node id -> enclosing function name (None = module level).
         # Breadth-first walk visits an outer function before a nested one, so a
@@ -383,7 +428,7 @@ def _sql_write_owners(root: Path, table: str) -> Iterator[tuple[str, str | None,
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
                 continue
-            if id(node) in docstrings:
+            if id(node) in docstrings or not _is_sql_script(node.value):
                 continue
             # One literal often holds several statements, and a match on the
             # first must not carry the rest along: yield each separately so a
@@ -1306,33 +1351,47 @@ def _v4_defect_attribution_absent(ctx: _Ctx, domain: str, rule_id: str) -> list[
     file; the candidate has to say which one it is or the lens writes the wrong
     patch. `files` points at the producer: the old anchor named
     ``advantage_store.py``, the *reader*, and every lens followed it there.
+
+    Rows alone are not a closed gap either. ``usage_report.build_smoke_db``
+    writes this table for a smoke fixture, so a non-zero count can come from a
+    path that never runs in production while the real attributor is still dead.
+    The rule therefore closes on rows ONLY when a call can reach the writer;
+    rows without one are a candidate that says so.
     """
     _require_table(ctx, "defect_attributions")
     rows = _scalar(ctx, "SELECT count(*) FROM defect_attributions")
-    if rows:
-        raise _GapClosed(f"{rows} attributions recorded")
     # Reachability must RESOLVE to this definition: `attribute(` appears in
     # triage/recovery/harness-contrast as an unrelated blame helper, and a
     # bare-name search would report the attributor "wired" on their strength —
     # the same trap L9 documents.
     caller = _call_reaching(ctx.root, "attribute", _BLAME_PRODUCER)
-    if caller is not None:
-        site = f"{caller[0]}:{caller[1]}"
+    site = f"{caller[0]}:{caller[1]}" if caller is not None else ""
+    if rows and site:
+        raise _GapClosed(f"{rows} attributions recorded; the call at {site} reaches the writer")
+    if site:
         detail = (f"`attribute()` is reachable from {site} and has recorded nothing: the "
                   "call never fires on a real failure.")
         fix_hint = ("Make the existing `blame_attributor.attribute()` call reach a real failed "
                     "verification; do not add a second attributor.")
-        evidence = {"table": "defect_attributions", "rows": 0, "call_site": site}
+    elif rows:
+        detail = (f"{rows} rows exist, but `blame_attributor.attribute()` has no reachable call "
+                  "site: they were written by a path that does not run in production (a smoke "
+                  "fixture), so a real failure still attributes nothing.")
+        fix_hint = ("Call `blame_attributor.attribute()` from the failure path; the existing rows "
+                    "are a fixture, not a producer.")
     else:
         detail = ("`blame_attributor.attribute()` exists and nothing calls it, so the table "
                   "can never fill: credit assignment across lanes has no input.")
         fix_hint = ("Call `blame_attributor.attribute()` from the failure path when a run fails "
                     "a verification it previously passed.")
-        evidence = {"table": "defect_attributions", "rows": 0, "call_site": ""}
+    evidence = {"table": "defect_attributions", "rows": rows, "call_site": site}
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
-        title="defect_attributions is never written — blame never reaches a lane",
+        title="defect_attributions gets no attribution from a real failure",
+        # Deliberately unchanged from the empty-table era: the identity of the
+        # gap is "no production producer", and a new key would orphan its ledger
+        # history the first time a smoke fixture wrote a row.
         evidence_key="table:defect_attributions:empty",
         files=(_BLAME_PRODUCER,),
         detail=detail,
