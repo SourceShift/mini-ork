@@ -3,6 +3,12 @@
 Same contract as ``recipes/rsi-cycle/verifiers/_common.py``: read artifacts from
 ``$MINI_ORK_NODE_INPUT_DIR/<input-name>/``, write declared outputs under
 ``$MINI_ORK_RUN_DIR``, fail by exiting non-zero with one line on stderr.
+
+A filename is NOT a reliable way to find the current input: staging never
+overwrites a differing artifact, so a re-dispatched node finds this pass's copy
+beside the previous one as ``2-<file>``, ``3-<file>``, … The engine records which
+one is current in ``$MINI_ORK_NODE_INPUT_MANIFEST``, and that is what these
+helpers read.
 """
 import glob
 import json
@@ -12,6 +18,7 @@ from typing import NoReturn
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 INPUT_DIR = os.environ.get("MINI_ORK_NODE_INPUT_DIR", "")
+INPUT_MANIFEST = os.environ.get("MINI_ORK_NODE_INPUT_MANIFEST", "")
 
 
 def brief_path() -> str:
@@ -22,14 +29,48 @@ def brief_path() -> str:
     return path
 
 
+def _declared_inputs(name: str) -> list[str]:
+    """The paths this dispatch's manifest declares for ``name``, in order.
+
+    Empty when the node has no manifest (an older engine, or a verifier run by
+    hand), so every caller falls back to the literal path it asked for. A
+    manifest that declares ``name`` is authoritative: the paths may not exist, but
+    the answer is still "this dispatch's input", never a previous pass's copy.
+    """
+    if not INPUT_MANIFEST or not os.path.isfile(INPUT_MANIFEST):
+        return []
+    try:
+        with open(INPUT_MANIFEST, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    records = payload.get("inputs") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return []
+    declared = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("name") != name:
+            continue
+        relative = record.get("path")
+        if isinstance(relative, str) and relative:
+            declared.append(os.path.join(INPUT_DIR, relative))
+    return declared
+
+
 def input_file(name: str, filename: str) -> str:
-    path = os.path.join(INPUT_DIR, name, filename)
+    declared = _declared_inputs(name)
+    # Last binding wins, matching the staging order the manifest records.
+    path = declared[-1] if declared else os.path.join(INPUT_DIR, name, filename)
     if not os.path.isfile(path):
         fail(name, f"missing input artifact {path}")
     return path
 
 
 def input_many(name: str, suffix: str) -> list[str]:
+    declared = _declared_inputs(name)
+    if declared:
+        # Both passes' artifacts live in the folder; only this pass's are inputs.
+        return sorted(p for p in declared if p.endswith(suffix) and os.path.isfile(p))
     folder = os.path.join(INPUT_DIR, name)
     if not os.path.isdir(folder):
         return []
