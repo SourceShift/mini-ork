@@ -159,7 +159,14 @@ def _with_automations_board(rows: list[dict[str, Any]], sections: list[dict[str,
 
 
 def _recent_firings(home: Path) -> list[dict[str, Any]]:
-    """The last ten attempts, newest first — including ones that never started."""
+    """The last ten attempts, newest first — including ones that never started.
+
+    Level 2 only. Level 1 is the byte-identical section list an older IDE reads,
+    so a section it has never seen would break the one promise that level makes;
+    the same gate lives in ``lanes.py`` and ``recipes.py`` for their new boards.
+    """
+    if S.ide_level() < 2:
+        return []
     from mini_ork import automations
 
     entries = automations.recent_runs(home, limit=10)

@@ -129,7 +129,8 @@ def test_a_pending_draft_gets_its_own_review_row(home: Path) -> None:
     assert [line["t"] for line in kickoff["lines"]] == ["# later"]
 
 
-def test_recent_firings_open_their_run(home: Path) -> None:
+def test_recent_firings_open_their_run(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")   # level 1 keeps the old section list
     _write_automations(home, [_automation("deps-nightly")])
     (home / "automations.log").write_text(
         '{"ts": "2026-11-03T02:00:00", "id": "deps-nightly", "run_id": null, "ok": false,'
@@ -144,12 +145,21 @@ def test_recent_firings_open_their_run(home: Path) -> None:
     assert table["rows"][1]["do"] is None
 
 
-def test_no_firings_is_an_honest_empty_state(home: Path) -> None:
+def test_no_firings_is_an_honest_empty_state(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     _write_automations(home, [_automation("deps-nightly")])
     page = autos.build(home, "automations", {})
     section = _section(page, "Recent firings")
     assert section["type"] == "list"
     assert section["items"][0]["t"] == "No firings yet"
+
+
+def test_level1_does_not_carry_the_firings_section(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An older IDE reads the old section list; a new section is a level-2 add."""
+    monkeypatch.delenv("MINI_ORK_IDE_SPEC", raising=False)
+    _write_automations(home, [_automation("deps-nightly")])
+    page = autos.build(home, "automations", {})
+    assert not any(s["title"] == "Recent firings" for s in page["sections"])
 
 
 def test_no_drafts_means_no_empty_section(home: Path) -> None:
