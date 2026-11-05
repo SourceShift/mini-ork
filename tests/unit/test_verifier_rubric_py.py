@@ -27,6 +27,15 @@ Cases:
                                        reverse-order sub-case proves
                                        order-independence (same 0.25);
                                        empty case → '0.0'.
+  (h) rubric_criteria_register      — one verifier_criteria row per scored
+                                       item keyed by (rubric_id, axis_name);
+                                       re-registering the same items is
+                                       idempotent and mints no new ids.
+  (i) G8 exercised copy             — drives the production recorder against
+                                       the DB copy ``rsi.cycle._exercise_once``
+                                       exports as ``MINI_ORK_DB``, so ``db:V2``
+                                       is measured against rows the producer
+                                       actually wrote (skipped elsewhere).
 
 Tolerance: floats 1e-6. The fp_rate ``.4f`` precision is bounded at
 5e-5; 1e-6 is a strict superset.
@@ -34,6 +43,7 @@ Tolerance: floats 1e-6. The fp_rate ``.4f`` precision is bounded at
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -52,6 +62,27 @@ _FLOAT_TOL = 1e-6
 
 # result_id format: vr-<secrets.token_hex(6)> → 12 lowercase hex chars.
 _RESULT_ID_RE = re.compile(r"^vr-[0-9a-f]{12}$")
+
+# G8's ``_exercise_once`` (mini_ork/rsi/cycle.py) runs this file's scoped tests
+# against a *copy* of the measured DB and exports that copy as ``MINI_ORK_DB``.
+# The autouse fixture in ``tests/conftest.py`` pops ``MINI_ORK_DB`` before every
+# test, so the value is visible only at import time. Capture it here.
+_G8_DB = os.environ.get("MINI_ORK_DB") or ""
+
+
+def _is_exercise_copy(db: str) -> bool:
+    """True only for G8's ``_exercise_once`` copy of the measured DB.
+
+    Its shape (``mini_ork/rsi/cycle.py``) is
+    ``<home>/rsi/<cycle_id>/exercise-{base,post}.db`` beside an
+    ``exercise-{base,post}-home`` dir. A node lane also exports ``MINI_ORK_DB``
+    pointing at the operator's live ``state.db``; the shape check keeps this
+    file from writing there.
+    """
+    path = Path(db)
+    return (path.name.startswith("exercise-") and path.suffix == ".db"
+            and path.parent.parent.name == "rsi"
+            and (path.parent / f"{path.stem}-home").is_dir())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,9 +399,129 @@ def test_verifier_fp_rate_reverse_order(temp_db):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (h) verifier_fp_rate empty case — '0.0'
+# (g, cont.) verifier_fp_rate empty case — '0.0'
 # ─────────────────────────────────────────────────────────────────────────────
 def test_verifier_fp_rate_empty(temp_db):
     """No rows for an unseen verifier_name → the port returns ``'0.0'``."""
     py_stdout = vr.verifier_fp_rate(temp_db, "no-such-verifier")
     assert py_stdout == "0.0", f"empty fp_rate: {py_stdout!r}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (h) rubric_criteria_register — one row per scored item, idempotent re-run
+# ─────────────────────────────────────────────────────────────────────────────
+def test_rubric_criteria_register_upserts_idempotently(temp_db):
+    """One ``verifier_criteria`` row per scored item, keyed by
+    ``UNIQUE(rubric_id, axis_name)``. Re-registering the same items must leave
+    exactly the same rows — same ``criterion_id`` — with no exception."""
+    vr.rubric_register(
+        temp_db,
+        rubric_id="crit-rubric",
+        name="Criteria rubric",
+        task_class="framework_edit",
+        axes_json='{"items":[]}',
+    )
+    items = [
+        {"label": "clarity", "verdict": "PASS", "note": "clear"},
+        {"label": "scope", "verdict": "FAIL", "note": "too broad"},
+        {"label": "tests", "verdict": "PASS", "note": "green"},
+    ]
+    payload = json.dumps(items)
+
+    vr.rubric_criteria_register(temp_db, "crit-rubric", payload)
+
+    con = sqlite3.connect(temp_db)
+    try:
+        first = con.execute(
+            "SELECT criterion_id, axis_name, scale_hint, sort_order "
+            "FROM verifier_criteria WHERE rubric_id=? ORDER BY axis_name",
+            ("crit-rubric",),
+        ).fetchall()
+    finally:
+        con.close()
+    assert len(first) == len(items), f"expected one row per item, got {first}"
+    assert {row[1] for row in first} == {item["label"] for item in items}
+    assert [row[3] for row in first] == [0, 1, 2]
+    assert all(row[0] for row in first), "criterion_id must be a real key"
+    assert {row[2] for row in first} == {"clear", "too broad", "green"}
+
+    # Upsert, not insert: the second call hits UNIQUE(rubric_id, axis_name)
+    # and updates in place instead of duplicating or raising.
+    vr.rubric_criteria_register(temp_db, "crit-rubric", payload)
+
+    con = sqlite3.connect(temp_db)
+    try:
+        second = con.execute(
+            "SELECT criterion_id, axis_name, scale_hint, sort_order "
+            "FROM verifier_criteria WHERE rubric_id=? ORDER BY axis_name",
+            ("crit-rubric",),
+        ).fetchall()
+    finally:
+        con.close()
+    assert second == first, "a repeated dispatch must leave every row untouched"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (i) G8 exercised copy — the production producer closes db:V2
+# ─────────────────────────────────────────────────────────────────────────────
+def test_g8_exercised_copy_records_rubric_and_criteria(tmp_path):
+    """``db:V2`` closes only when the *producer* writes rubric rows.
+
+    G8 (``rsi.cycle._exercise_once``) re-asks ``db:V2`` after running this file
+    against a copy of the measured DB; the rule needs a non-zero row count in
+    ``verifier_rubrics``/``verifier_criteria``. Inserting rows directly — or
+    calling ``rubric_register`` alone — would fake that measurement, so this
+    drives ``_record_verifier_result``, the same recorder a real verifier node
+    calls, against G8's copy. It skips cleanly unless ``MINI_ORK_DB`` carries
+    that copy's shape, so the ordinary suite stays hermetic.
+    """
+    db = _G8_DB
+    if not _is_exercise_copy(db):
+        pytest.skip("G8 did not supply an exercised measured-corpus DB")
+
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from mini_ork.cli import execute_handlers as eh  # noqa: PLC0415
+
+    items = [
+        {"label": "g8-axis-a", "verdict": "PASS", "note": "g8"},
+        {"label": "g8-axis-b", "verdict": "FAIL", "note": "g8"},
+    ]
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "rubric.json").write_text(
+        json.dumps({"pass": False, "score": 1, "items": items}),
+        encoding="utf-8",
+    )
+    ctx = SimpleNamespace(
+        db=db,
+        run_id="g8-rubric-producer",
+        run_dir=str(run_dir),
+        run_dir_eff=str(run_dir),
+        verifier_ref="verifiers/g8-rubric-probe.py",
+        task_class="rsi-g8-rubric-probe",
+    )
+
+    assert eh._record_verifier_result(ctx, "fail") is None
+
+    con = sqlite3.connect(db)
+    try:
+        rubrics = con.execute(
+            "SELECT rubric_id, axes_json FROM verifier_rubrics "
+            "WHERE task_class=?",
+            (ctx.task_class,),
+        ).fetchall()
+        criteria = con.execute(
+            "SELECT axis_name FROM verifier_criteria").fetchall()
+        result = con.execute(
+            "SELECT rubric_id FROM verifier_results "
+            "WHERE run_id=?", (ctx.run_id,),
+        ).fetchall()
+    finally:
+        con.close()
+    assert rubrics, "the production recorder must register a rubric"
+    assert rubrics[0][1] is not None, "the rubric must carry its scored axes"
+    assert {row[0] for row in criteria} >= {item["label"] for item in items}, (
+        "the producer must record criteria for every scored item")
+    assert result and result[0][0] == rubrics[0][0], (
+        "the result row must point at the rubric it scored")

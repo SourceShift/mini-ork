@@ -2644,6 +2644,21 @@ def _verifier_result_name(ctx: NodeDispatch) -> str:
     return "verifier@v1"
 
 
+def _verifier_rubric_id(ctx: NodeDispatch) -> str:
+    """The deterministic ``rubric_id`` a verifier's scored axes persist under.
+
+    Derived from ``ctx.task_class`` plus the verifier's identity
+    (``_verifier_result_name``) — no run id, clock or random suffix — so every
+    dispatch of the same verifier under the same task class converges on one
+    rubric (and its criteria) instead of minting a new one per run.
+    """
+    task_class = (getattr(ctx, "task_class", "") or "").strip() or "unknown"
+    digest = hashlib.sha256(
+        f"{task_class}\x1f{_verifier_result_name(ctx)}".encode("utf-8")
+    ).hexdigest()
+    return "rub-" + digest[:16]
+
+
 def _rubric_items(run_dir: str) -> list | None:
     """The parsed ``rubric.json`` items for this run, else None.
 
@@ -2740,22 +2755,61 @@ def _record_verifier_result(ctx: NodeDispatch, verdict: str) -> None:
     rows store NULL rather than a back-filled number, so the column stays a
     trustworthy uncertainty signal.
 
+    When the same ``items`` hold scored axes, the rubric and its criteria are
+    registered first and the resulting ``rubric_id`` is linked from the result
+    row — the migrated ``verifier_rubrics``/``verifier_criteria`` tables stay
+    populated instead of dead schema. The id is derived from ``task_class`` plus
+    the verifier name (see ``_verifier_rubric_id``), so repeated dispatches
+    converge on one rubric. With no scored items nothing rubric-shaped is
+    written and the row keeps ``rubric_id`` NULL: no axis is invented.
+
     Best-effort: a recording failure must never fail a verifier node, so every
     exception is swallowed (mirrors ``_write_evidence_ledger_row``). A
     transient ``database is locked`` no longer reaches this except — the
     writer retries and (on exhaustion) spools the row under the run dir — so
-    only a genuinely unrecorded row gets the warning below.
+    only a genuinely unrecorded row gets the warning below. The rubric pair has
+    its own inner guard: a broken rubric table must not cost the calibration
+    row, so the result write proceeds with ``rubric_id=None`` instead.
     """
     if not ctx.db or not ctx.run_id:
         return
     try:
-        from mini_ork.gates.verifier_rubric import verifier_result_record  # noqa: PLC0415
+        from mini_ork.gates.verifier_rubric import (  # noqa: PLC0415
+            rubric_criteria_register,
+            rubric_register,
+            verifier_result_record,
+        )
 
         run_dir = ctx.run_dir_eff or ctx.run_dir
+        # One read: the confidence, the persisted axes and the rubric criteria
+        # are all measured from the same items (no TOCTOU re-read).
+        items = _rubric_items(run_dir)
+        scored_axes_json = json.dumps(items) if items is not None else None
+
+        rubric_id = None
+        if items is not None:
+            task_class = (getattr(ctx, "task_class", "") or "").strip()
+            try:
+                rubric_id = _verifier_rubric_id(ctx)
+                rubric_register(
+                    ctx.db, rubric_id,
+                    f"{task_class or 'unknown'}/{_verifier_result_name(ctx)}",
+                    task_class or None,
+                    scored_axes_json,
+                )
+                rubric_criteria_register(ctx.db, rubric_id, scored_axes_json)
+            except Exception as exc:  # noqa: BLE001 — enrichment must never fail the node
+                rubric_id = None
+                print(
+                    f"  [warn] verifier rubric/criteria write lost: {exc}",
+                    file=sys.stderr,
+                )
+
         verifier_result_record(
             ctx.db, ctx.run_id, _verifier_result_name(ctx), verdict,
-            confidence=_confidence_from_axes(_rubric_items(run_dir), verdict),
-            scored_axes_json=_rubric_axes_json(run_dir),
+            rubric_id=rubric_id,
+            confidence=_confidence_from_axes(items, verdict),
+            scored_axes_json=scored_axes_json,
         )
     except Exception as exc:  # noqa: BLE001 — enrichment must never fail the node
         print(f"  [warn] verifier_results write lost: {exc}", file=sys.stderr)

@@ -26,6 +26,8 @@ Pipeline map (bash → Python; bash line ranges from
 Public surface (mirrors the bash signatures exactly):
     rubric_register(db_path, rubric_id, name, task_class, axes_json) -> None
     rubric_get(db_path, rubric_id) -> str
+    rubric_criteria_register(db_path, rubric_id, criteria_json) -> None
+        (no bash counterpart — the bash port never wrote ``verifier_criteria``)
     verifier_result_record(db_path, run_id, verifier_name, verdict,
                            rubric_id=None, confidence=None,
                            scored_axes_json=None) -> str
@@ -54,6 +56,7 @@ Notes on parity:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -66,6 +69,7 @@ from mini_ork.stores import audit_chain
 
 __all__ = [
     "rubric_register",
+    "rubric_criteria_register",
     "rubric_get",
     "verifier_result_record",
     "verifier_result_annotate",
@@ -282,6 +286,79 @@ def rubric_register(
                 now,
             ),
         )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _criterion_id(rubric_id: str, axis_name: str) -> str:
+    """A deterministic ``verifier_criteria.criterion_id`` for one axis.
+
+    ``sha256(rubric_id, axis_name)`` — never a clock or a random source — so a
+    re-dispatch of the same rubric leaves every id byte-identical, including
+    on a different database.
+    """
+    digest = hashlib.sha256(
+        f"{rubric_id}\x1f{axis_name}".encode("utf-8")
+    ).hexdigest()
+    return "vc-" + digest[:16]
+
+
+def rubric_criteria_register(
+    db_path: str,
+    rubric_id: str,
+    criteria_json: str,
+) -> None:
+    """Upsert one ``verifier_criteria`` row per scored rubric item.
+
+    No bash counterpart: ``lib/verifier_rubric.sh`` never wrote this table, so
+    the ``verifier_criteria`` half of migration 0025 stayed dead schema until
+    this function. ``criteria_json`` is the verifier's scored ``rubric.json``
+    item list (``label``/``verdict``/``note``); each item becomes an axis named
+    by its ``label``, with the item's ``note`` as its ``scale_hint``.
+
+    The upsert targets the DDL's ``UNIQUE(rubric_id, axis_name)`` — a
+    deterministic ``criterion_id`` alone is not enough, because a repeated
+    dispatch collides on that constraint before the primary key. Items with no
+    dict shape or no usable ``label`` describe no axis and are skipped: an
+    invented axis would be worse than a missing one.
+
+    JSON and DDL errors propagate unchanged — the caller owns the best-effort
+    boundary, and swallowing here would hide a real schema defect.
+    """
+    if not criteria_json:
+        return
+    items = json.loads(criteria_json)
+    if not isinstance(items, list):
+        return
+    con = _open(db_path)
+    try:
+        for sort_order, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            axis = item.get("label")
+            if not isinstance(axis, str) or not axis.strip():
+                continue
+            note = item.get("note")
+            con.execute(
+                """
+                INSERT INTO verifier_criteria
+                    (criterion_id, rubric_id, axis_name, scale_hint,
+                     sort_order)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(rubric_id, axis_name) DO UPDATE SET
+                    criterion_id=excluded.criterion_id,
+                    scale_hint=excluded.scale_hint,
+                    sort_order=excluded.sort_order
+                """,
+                (
+                    _criterion_id(rubric_id, axis),
+                    rubric_id,
+                    axis,
+                    str(note) if note is not None else None,
+                    sort_order,
+                ),
+            )
         con.commit()
     finally:
         con.close()
