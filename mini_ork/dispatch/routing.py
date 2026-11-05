@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import contextvars
 import os
+import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -431,6 +433,56 @@ def policy_route_lane(
         f"  [route] policy={policy} node={node_type} "
         f"lane={current_lane}->{lane} "
         f"source={_ROUTE_PROVENANCE.get().get('route_source', '')}\n")
+    # The router has now committed to a lane, so journal the decision. Until
+    # this call the only writer of ``policy_decisions`` was intake admission,
+    # which whole classes of runs never reach: the ordinary ``mini-ork run``,
+    # rsi-cycle, and CLI dispatch paths evaluated a policy and persisted its
+    # provenance only to ``execution_traces``, leaving the decision journal
+    # empty. The db is resolved by RunContext (MINI_ORK_DB first) — NOT
+    # ``policy_store.db_path()``, whose MO_STORE_DB preference can point at a
+    # different file than the one the cycle counts.
+    provenance = _ROUTE_PROVENANCE.get()
+    route_source = provenance.get("route_source") or ""
+    # Function-local: routing is imported while the executor boots, and the
+    # journaling dependencies must not enlarge that import surface.
+    from mini_ork.context import RunContext
+    from mini_ork.policies.engine import record_decision
+
+    context = RunContext.from_env()
+    decision_event = {
+        "type": "lane_routing",
+        "run_id": context.run_id or "",
+        "data": {
+            "node_type": node_type,
+            "from_lane": current_lane,
+            "to_lane": lane,
+            "task_class": task_class,
+            "route_source": provenance.get("route_source"),
+            "route_explore": provenance.get("route_explore"),
+            "route_score": provenance.get("route_score"),
+            "route_margin": provenance.get("route_margin"),
+            "predicted_error": provenance.get("predicted_error"),
+        },
+        "timestamp": int(time.time()),
+    }
+    decision_response = {
+        "result": "ALLOW",
+        "policy_name": policy,
+        "reason": f"{current_lane}->{lane} via {route_source}",
+    }
+    try:
+        record_decision(
+            decision_event,
+            decision_response,
+            context.db_or_default(),
+        )
+    except (FileNotFoundError, sqlite3.Error, OSError) as exc:
+        # Same contract as intake/dispatch.py::_admit: an uninitialised or
+        # unwritable state db must never crash routing or change the lane.
+        sys.stderr.write(
+            f"  [route] policy decision for node={node_type} was not archived "
+            f"({exc}); the lane is still {lane}\n"
+        )
     return lane
 
 
