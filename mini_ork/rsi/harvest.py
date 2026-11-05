@@ -1292,20 +1292,52 @@ def _v3_calibration_never_recorded(ctx: _Ctx, domain: str, rule_id: str) -> list
     )]
 
 
+_BLAME_PRODUCER = "mini_ork/observability/blame_attributor.py"
+
+
 def _v4_defect_attribution_absent(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
+    """``defect_attributions`` is empty — and *why* decides which fix is honest.
+
+    The table being empty says nothing about the writer. Measured 2026-11-05:
+    ``blame_attributor.attribute()`` exists, is tested, and has no call site
+    outside its own module — so the fix is to reach it from the failure path,
+    not to write a second attributor. If a call site DOES exist the table is
+    starved by a call that never fires, which is a different bug in a different
+    file; the candidate has to say which one it is or the lens writes the wrong
+    patch. `files` points at the producer: the old anchor named
+    ``advantage_store.py``, the *reader*, and every lens followed it there.
+    """
     _require_table(ctx, "defect_attributions")
     rows = _scalar(ctx, "SELECT count(*) FROM defect_attributions")
     if rows:
         raise _GapClosed(f"{rows} attributions recorded")
+    # Reachability must RESOLVE to this definition: `attribute(` appears in
+    # triage/recovery/harness-contrast as an unrelated blame helper, and a
+    # bare-name search would report the attributor "wired" on their strength —
+    # the same trap L9 documents.
+    caller = _call_reaching(ctx.root, "attribute", _BLAME_PRODUCER)
+    if caller is not None:
+        site = f"{caller[0]}:{caller[1]}"
+        detail = (f"`attribute()` is reachable from {site} and has recorded nothing: the "
+                  "call never fires on a real failure.")
+        fix_hint = ("Make the existing `blame_attributor.attribute()` call reach a real failed "
+                    "verification; do not add a second attributor.")
+        evidence = {"table": "defect_attributions", "rows": 0, "call_site": site}
+    else:
+        detail = ("`blame_attributor.attribute()` exists and nothing calls it, so the table "
+                  "can never fill: credit assignment across lanes has no input.")
+        fix_hint = ("Call `blame_attributor.attribute()` from the failure path when a run fails "
+                    "a verification it previously passed.")
+        evidence = {"table": "defect_attributions", "rows": 0, "call_site": ""}
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
         title="defect_attributions is never written — blame never reaches a lane",
         evidence_key="table:defect_attributions:empty",
-        files=("mini_ork/learning/advantage_store.py",),
-        detail="The table is created and empty; credit assignment across lanes has no input.",
-        evidence={"table": "defect_attributions", "rows": 0},
-        fix_hint="Attribute a defect when a run fails a verification it previously passed.",
+        files=(_BLAME_PRODUCER,),
+        detail=detail,
+        evidence=evidence,
+        fix_hint=fix_hint,
         success_metric="defect_attributions gains a row after a blamed failure",
     )]
 

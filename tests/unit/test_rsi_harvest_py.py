@@ -844,3 +844,78 @@ def test_a_closed_rule_and_a_skipped_rule_are_reported_apart(tmp_path, con):
     rep = report(tmp_path, con)
     assert "L1" in rep.closed and "L1" not in rep.skipped
     assert "L3" in rep.skipped and "L3" not in rep.closed
+
+
+def test_v4_anchors_the_unreachable_producer_not_its_reader(tmp_path, con):
+    """The gap is that nothing CALLS the attributor.
+
+    The candidate used to name ``advantage_store.py`` — the module that reads
+    ``defect_attributions`` — so every lens followed the anchor to a file where
+    the only possible change is nothing. A fix has to reach the producer.
+    """
+    ddl(con, "CREATE TABLE defect_attributions (lane TEXT, penalty REAL);")
+    write(tmp_path, {"mini_ork/observability/blame_attributor.py":
+                     "def attribute(defect_json_path, *, db, found_run_id, repo_root):\n"
+                     "    return []\n"})
+
+    cand = one(report(tmp_path, con), "db:V4")
+
+    assert cand.kind == "producer_missing"
+    assert cand.files == ("mini_ork/observability/blame_attributor.py",)
+    assert cand.evidence["call_site"] == ""
+    assert "nothing calls it" in cand.detail
+    assert "Call `blame_attributor.attribute()`" in cand.fix_hint
+
+
+def test_v4_says_so_when_a_call_site_exists_but_never_fires(tmp_path, con):
+    """An empty table with a live call is a different bug in a different file.
+
+    A lens that is told "nothing calls it" while a caller exists writes a second
+    attributor; naming the call site is what keeps the fix on the real path.
+    """
+    ddl(con, "CREATE TABLE defect_attributions (lane TEXT, penalty REAL);")
+    write(tmp_path, {
+        "mini_ork/observability/blame_attributor.py":
+            "def attribute(defect_json_path, *, db, found_run_id, repo_root):\n"
+            "    return []\n",
+        "mini_ork/cli/execute_handlers.py":
+            "from mini_ork.observability.blame_attributor import attribute\n"
+            "\n"
+            "def _after_failure(db, run_id):\n"
+            "    attribute('defect.json', db=db, found_run_id=run_id, repo_root='.')\n",
+    })
+
+    cand = one(report(tmp_path, con), "db:V4")
+
+    assert cand.evidence["call_site"] == "mini_ork/cli/execute_handlers.py:4"
+    assert "do not add a second attributor" in cand.fix_hint
+    # The call site is a hint, not the scope: the deliverable still edits a
+    # module that exists and is where the attributor lives.
+    assert cand.files == ("mini_ork/observability/blame_attributor.py",)
+
+
+def test_v4_is_not_fooled_by_a_same_named_helper_in_another_module(tmp_path, con):
+    """`attribute(` is a common name — six other modules define one.
+
+    Measured 2026-11-05: ``triage/failures.py``, ``recovery/diagnose.py`` and
+    ``learning/harness_operator.py`` all call an unrelated ``attribute``. A
+    bare-name search reports the attributor wired on their strength and closes
+    the gap while the producer stays unreachable.
+    """
+    ddl(con, "CREATE TABLE defect_attributions (lane TEXT, penalty REAL);")
+    write(tmp_path, {
+        "mini_ork/observability/blame_attributor.py":
+            "def attribute(defect_json_path, *, db, found_run_id, repo_root):\n"
+            "    return []\n",
+        "mini_ork/triage/failures.py":
+            "def attribute(failure):\n"
+            "    return 'blamed'\n"
+            "\n"
+            "def _score(f):\n"
+            "    return attribute(f)\n",
+    })
+
+    cand = one(report(tmp_path, con), "db:V4")
+
+    assert cand.evidence["call_site"] == ""
+    assert "nothing calls it" in cand.detail
