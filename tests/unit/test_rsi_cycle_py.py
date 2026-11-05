@@ -2098,6 +2098,65 @@ def test_the_scoped_suite_runs_with_the_worktree_as_its_root(world, monkeypatch)
     assert roots == [str(world.root), str(world.root)]
 
 
+def test_the_scoped_suite_does_not_inherit_the_engines_own_child_env(world, monkeypatch):
+    """A cycle launched through ``bin/mini-ork`` must not judge the tree with a
+    dispatcher's ``-m`` child env.
+
+    ``mini_ork/cli/main.py::_module_env`` gives every ``python -m mini_ork.cli.*``
+    child ``PYTHONSAFEPATH=1``, and the launcher bootstrap exports
+    ``MINI_ORK_ENGINE_ROOT``/``MINI_ORK_TARGET_REPO``. Copied verbatim into the
+    gate those do real damage: SAFEPATH drops the *script's own* directory from
+    ``sys.path``, so ``bin/mini-ork-resume`` cannot import the shim beside it,
+    and ``MINI_ORK_ENGINE_ROOT`` wins over ``MINI_ORK_ROOT`` inside
+    ``bin/mini-ork``, so a launcher-spawning test runs the PRIMARY tree's engine
+    — the gate then judges code the patch never changed.
+
+    Measured 2026-11-05 (cycle ``rsi-c1793834730``):
+    ``test_resume_cost_pause_unchanged`` failed with ``ModuleNotFoundError: No
+    module named '_mini_ork_subcommand'`` and passed in 0.27 s in the same
+    worktree re-run from a plain shell.
+    """
+    seen: list[dict] = []
+
+    def _run(argv, *, cwd, timeout_s, env=None):
+        seen.append(dict(env or {}))
+        return (0, "1900 passed in 600s")
+
+    monkeypatch.setattr(cycle_mod, "_run", _run)
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    monkeypatch.setenv("MINI_ORK_ENGINE_ROOT", "/some/other/checkout")
+    monkeypatch.setenv("MINI_ORK_TARGET_REPO", "/some/other/checkout")
+
+    ok, _detail = cycle_mod._pytest(world.root, _req(world), _cand(), (FILE,))
+
+    assert ok is True and len(seen) == 1
+    assert "PYTHONSAFEPATH" not in seen[0]
+    assert "MINI_ORK_ENGINE_ROOT" not in seen[0]
+    assert "MINI_ORK_TARGET_REPO" not in seen[0]
+    assert seen[0]["MINI_ORK_ROOT"] == str(world.root)
+
+
+def test_the_exercise_arm_shares_the_cleaned_env_with_its_own_overrides(world, monkeypatch):
+    """G8's arm and G6's must agree on what a clean env is.
+
+    The exercise arm adds ``MINI_ORK_DB``/``MINI_ORK_HOME`` (it asks the rule
+    against a DB copy under its own home). If it built its env separately the
+    two arms would drift and one of them would start inheriting the engine's
+    knobs again.
+    """
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    monkeypatch.setenv("MO_PLACEMENT", "local")
+
+    env = cycle_mod._gate_env(world.root, MINI_ORK_DB="/tmp/exercise.db",
+                              MINI_ORK_HOME="/tmp/exercise-home")
+
+    assert env["MINI_ORK_DB"] == "/tmp/exercise.db"
+    assert env["MINI_ORK_HOME"] == "/tmp/exercise-home"
+    assert env["MINI_ORK_ROOT"] == str(world.root)
+    assert env["MO_PLACEMENT"] == "local"      # the operator's own knobs stay
+    assert "PYTHONSAFEPATH" not in env
+
+
 def test_g6_keeps_the_unattributed_note_on_a_passing_gate():
     """The gate is green, but the noise it survived must still be readable."""
     note = "2 test(s) failed in the scoped suite but passed when re-run alone"

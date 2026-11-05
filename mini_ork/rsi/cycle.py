@@ -2208,7 +2208,44 @@ _PYTEST_RERUN_MAX = 20
 # The inherited knobs the scoped suite reads. Same commit, different shell, red
 # in one and green in the other — the gate cannot be reproducible without
 # recording which one it ran under.
-_AMBIENT_KEYS = ("MINI_ORK_ROOT", "MINI_ORK_HOME", "MINI_ORK_DB", "MO_PLACEMENT")
+_AMBIENT_KEYS = ("MINI_ORK_ROOT", "MINI_ORK_HOME", "MINI_ORK_DB", "MO_PLACEMENT",
+                 "MINI_ORK_ENGINE_ROOT", "PYTHONSAFEPATH")
+
+# Env the ENGINE exports for its own children, which must not reach a gate.
+#
+# ``mini_ork/cli/main.py::_module_env`` runs every ``python -m mini_ork.cli.*``
+# child with ``PYTHONSAFEPATH=1`` so a ``mini_ork/`` tree in the child's cwd
+# cannot shadow the engine. A cycle launched as ``mini-ork rsi-cycle`` inherits
+# that flag, and both gate arms copy ``os.environ`` — so it reached the tree
+# under test, where it means something else: it drops the *script's own*
+# directory from ``sys.path``, so ``bin/mini-ork-resume`` could not import the
+# shim beside it. Measured 2026-11-05 (cycle ``rsi-c1793834730``):
+# ``test_resume_cost_pause_unchanged`` failed with ``ModuleNotFoundError: No
+# module named '_mini_ork_subcommand'`` and passed in 0.27 s in the same
+# worktree re-run from a plain shell. Cycles ``rsi-c1793801689`` and
+# ``rsi-c1793827696`` quarantined on the same test for the same reason.
+#
+# ``MINI_ORK_ENGINE_ROOT`` is the same mistake with a worse consequence:
+# ``bin/mini-ork`` resolves the engine from it *ahead of* ``MINI_ORK_ROOT``, so
+# left at the primary checkout a launcher-spawning test exercises the primary
+# tree and the gate judges code the patch never changed. ``MINI_ORK_TARGET_REPO``
+# comes from the same launcher bootstrap and pins lanes to the cycle's cwd.
+#
+# CI runs plain pytest with none of these set. The gate models CI.
+_GATE_ENV_DROPPED = ("PYTHONSAFEPATH", "MINI_ORK_ENGINE_ROOT", "MINI_ORK_TARGET_REPO")
+
+
+def _gate_env(root: Path, **overrides: str) -> dict[str, str]:
+    """The scoped suite's env: the operator's shell, minus the engine's knobs.
+
+    ``MINI_ORK_ROOT`` always names the tree under test — that is the one
+    inherited value the suite legitimately reads (migrations, engine paths), and
+    the cycle's own value points at the primary checkout.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _GATE_ENV_DROPPED}
+    env["MINI_ORK_ROOT"] = str(root)
+    env.update(overrides)
+    return env
 
 
 def _pytest_findings(out: str) -> list[str]:
@@ -2252,7 +2289,7 @@ def _pytest(wt: Path, req: CycleRequest, cand: Candidate,
     # 2026-11-04 purely because the primary tree did not have the file yet.
     # G7's `_static_findings` already pins this per root; G6 was the odd one
     # out, which is exactly why it blamed the patch for the harness.
-    env = {**os.environ, "MINI_ORK_ROOT": str(wt)}
+    env = _gate_env(wt)
     rc, out = _run([sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *tests],
                    cwd=wt, timeout_s=req.config.gates.cmd_timeout_s, env=env)
     if rc == 0:
@@ -2628,8 +2665,7 @@ def _exercise_once(req: CycleRequest, cand: Candidate, root: Path, *,
     _copy_db(src, db)
     home = workdir / f"exercise-{side}-home"
     home.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "MINI_ORK_DB": str(db), "MINI_ORK_ROOT": str(root),
-           "MINI_ORK_HOME": str(home)}
+    env = _gate_env(root, MINI_ORK_DB=str(db), MINI_ORK_HOME=str(home))
     # A red test run is not a verdict here: the rule is asked afterwards, and a
     # patch that writes the row but breaks an unrelated assertion fails G6.
     _run([sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *tests],
