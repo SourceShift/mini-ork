@@ -333,6 +333,16 @@ def _awaiting_review_section(home: Path, now: int) -> list[dict[str, Any]]:
                 "Request changes…",
                 S.thread(f"/request-changes {run_id} {row['node']} "),
                 "default"))
+        elif run_id.startswith("wt:"):
+            # A merge-risk gate is bound to the branch's patch id, and the CLI
+            # refuses to decide one on a non-TTY stdin — which is all a ``cli``
+            # action has, so the button looked inert. Approval stays a person
+            # typing the patch id: hand the command to a terminal, where it
+            # prints the changed paths and the risk first.
+            actions.append(S.btn(
+                "Approve",
+                S.terminal(["approvals", "approve", run_id], home=False),
+                "primary"))
         else:
             actions.append(S.btn(
                 "Approve",

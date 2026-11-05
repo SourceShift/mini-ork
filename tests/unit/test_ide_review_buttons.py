@@ -600,3 +600,29 @@ def test_existing_pages_still_build(home: Path, monkeypatch) -> None:
     for tab in ("story", "graph", "kickoff", "agents", "learnings", "artifacts"):
         build_page(home, "run", tab, {"run": RUN})
     build_page(home, "inbox", None, {})
+
+
+def test_a_worktree_merge_approval_is_handed_to_a_terminal(home: Path) -> None:
+    """A ``wt:`` merge-risk gate cannot be approved by a ``cli`` action.
+
+    ``approvals approve wt:<slug>`` refuses on a non-TTY stdin — "must be typed
+    by a person at a terminal" — so the button confirmed and then did nothing.
+    The decision stays hand-typed: the button opens a terminal running it.
+    """
+    _seed_run(home, status="published")
+    merge_approval.request("wt:demo", "deadbeef", "deadbeef", branch="wt/demo",
+                           base_branch="main", db_path=str(home / "state.db"))
+
+    page = build_page(home, "inbox", None, {})
+    section = next(s for s in page.get("sections") or []
+                   if str(s.get("title") or "") == "Awaiting review")
+    item = next(i for i in section.get("items") or []
+                if str(i.get("t") or "").startswith("merge"))
+    approve = next(a for a in item.get("acts") or []
+                   if str(a.get("label") or "") == "Approve")
+
+    do = approve.get("do") or {}
+    assert do.get("terminal") == {
+        "home": False, "cli": ["approvals", "approve", "wt:demo"],
+    }, f"merge-risk Approve must run in a terminal; do={do!r}"
+    assert "cli" not in do, "a cli action has no TTY and is refused"
