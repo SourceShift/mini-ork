@@ -602,16 +602,20 @@ def test_existing_pages_still_build(home: Path, monkeypatch) -> None:
     build_page(home, "inbox", None, {})
 
 
-def test_a_worktree_merge_approval_is_handed_to_a_terminal(home: Path) -> None:
-    """A ``wt:`` merge-risk gate cannot be approved by a ``cli`` action.
+def test_a_worktree_merge_approval_names_its_patch_in_one_click(home: Path) -> None:
+    """A ``wt:`` Approve click is the decision — no terminal opens.
 
-    ``approvals approve wt:<slug>`` refuses on a non-TTY stdin — "must be typed
-    by a person at a terminal" — so the button confirmed and then did nothing.
-    The decision stays hand-typed: the button opens a terminal running it.
+    ``approvals approve wt:<slug>`` needs to know *which* diff the person
+    decided about. The row carries the patch id it was requested for, so the
+    button sends it as ``--head``: the CLI recomputes the live patch id and
+    approves only a match, which keeps a stale row from approving a moved
+    branch without asking anyone to open a terminal.
     """
     _seed_run(home, status="published")
-    merge_approval.request("wt:demo", "deadbeef", "deadbeef", branch="wt/demo",
-                           base_branch="main", db_path=str(home / "state.db"))
+    merge_approval.request(
+        "wt:demo", "deadbeef", "deadbeef", branch="wt/demo",
+        base_branch="main", reasons=["danger/x.txt is high risk"],
+        db_path=str(home / "state.db"))
 
     page = build_page(home, "inbox", None, {})
     section = next(s for s in page.get("sections") or []
@@ -622,7 +626,16 @@ def test_a_worktree_merge_approval_is_handed_to_a_terminal(home: Path) -> None:
                    if str(a.get("label") or "") == "Approve")
 
     do = approve.get("do") or {}
-    assert do.get("terminal") == {
-        "home": False, "cli": ["approvals", "approve", "wt:demo"],
-    }, f"merge-risk Approve must run in a terminal; do={do!r}"
-    assert "cli" not in do, "a cli action has no TTY and is refused"
+    assert do.get("cli") == [
+        "approvals", "approve", "wt:demo", "--head", "deadbeef",
+        "--db", str(home / "state.db"),
+    ], f"merge-risk Approve must send the row's patch id; do={do!r}"
+    assert do.get("home") is False, "``approvals`` rejects --home"
+    assert "terminal" not in do, "the click is the decision; no terminal"
+    confirm = str(do.get("confirm") or "")
+    assert "patch deadbeef" in confirm, (
+        "the confirm must name the patch the person is approving"
+    )
+    assert "danger/x.txt is high risk" in confirm, (
+        "the confirm must show why the diff needs the decision, as a terminal did"
+    )

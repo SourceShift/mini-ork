@@ -36,7 +36,7 @@ import json
 import os
 import sqlite3
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from mini_ork.gates import oversight_inbox
 from mini_ork.gates.review_policy import ReviewPolicy, load_policy
@@ -219,6 +219,8 @@ def request(
     *,
     branch: str = "",
     base_branch: str = "",
+    reasons: Sequence[str] | None = None,
+    files: Sequence[str] | None = None,
     db_path: str | os.PathLike[str] | None = None,
 ) -> int:
     """Enqueue a merge-approval request, idempotent on ``(run_id, head_sha)``.
@@ -227,6 +229,10 @@ def request(
     SHA returns the same id; a different head SHA marks the previous pending
     row ``rejected`` with note ``"superseded: diff changed"`` and enqueues a
     new one.
+
+    ``reasons`` and ``files`` are the risk classifier's findings, carried on
+    the row so the approver can be shown *why* the diff needs a decision and
+    what it touches before deciding — the same lines the terminal prints.
     """
     gate = _gate_id(run_id)
     pending = _pending_for_run(run_id, db_path)
@@ -254,6 +260,8 @@ def request(
             "head_sha": head_sha,
             "branch": branch,
             "base_branch": base_branch,
+            "reasons": [str(reason) for reason in reasons or ()],
+            "files": [str(path) for path in files or ()],
             "approver": "",
             "signature": "",
             "requested_at": time.time(),

@@ -8,6 +8,12 @@ is the only place a human acts. The verbs mirror the policy/ledger split:
   ``approve <run_id> [--head SHA | --node NODE_ID] [--note TEXT]
                               [--no-resume]``
                               resolve the pending row ``approved``
+
+A merge-risk approval (``wt:<slug>``) names the exact patch: ``--head``
+supplies the patch id the caller decided about (the IDE's Approve button
+sends the one its row was drawn from) and needs no terminal; without it the
+CLI requires a TTY and a typed patch id. Either way the live patch id is
+recomputed and must match, so a stale decision cannot approve a moved diff.
   ``reject <run_id> (--node NODE_ID)? --note TEXT``
                               resolve the pending row ``rejected`` (or the
                               ``request-changes`` alias verb)
@@ -71,6 +77,11 @@ Verbs:
   approve          resolve a pending row 'approved'
   reject           resolve a pending row 'rejected' (alias: request-changes)
   policy           print the resolved ReviewPolicy
+
+``approve wt:<slug> --head <patch-id>`` approves the specific diff the caller
+decided about (the IDE's Approve button sends the id its row was drawn from);
+without ``--head`` the same verb demands a terminal and a typed patch id.
+The live patch id is recomputed in both cases and a mismatch is refused.
 
 On a node ``approve`` / ``reject`` whose run was parked for review
 (.review-pause sentinel exists), the LAST pending row's resolution spawns
@@ -470,18 +481,37 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 
 def _approve_worktree_merge(args: argparse.Namespace, db: str) -> int:
-    """Approve a ``wt:<slug>`` merge-risk gate — by hand, at a terminal.
+    """Approve a ``wt:<slug>`` merge-risk gate.
 
     The approval is bound to the branch's ``git patch-id`` (not a commit sha),
     so it survives a clean rebase and stops counting the moment the branch's
-    own patch changes. The operator sees the changed paths and the risk
-    reasons, then types the first eight characters of the patch id. A missing
-    TTY refuses before touching the ledger: an agent must never mint one.
+    own patch changes.
+
+    Two ways in, and both name the exact diff being approved:
+
+    * ``--head <patch-id>`` — the caller decided about a known patch. The
+      IDE's Approve button sends the patch id its row was drawn from, so a
+      person's click is the decision and no terminal is involved. The live
+      patch id is recomputed and must match, and the gate's request must
+      still be pending for that same patch, so a click can neither approve a
+      diff that moved after the row was rendered nor mint an approval for a
+      diff the risk classifier never asked about.
+    * no ``--head`` — a person at a terminal reads the changed paths and the
+      risk reasons and types the patch id. A missing TTY refuses: a caller
+      that names no patch must prove a person is present.
     """
-    if not sys.stdin.isatty():
+    explicit_head = (args.head or "").strip()
+    if args.head is not None and not explicit_head:
+        sys.stderr.write(
+            "approvals approve: --head is empty (empty patch id); name the "
+            "patch to approve or omit the flag\n"
+        )
+        return 1
+    if not explicit_head and not sys.stdin.isatty():
         sys.stderr.write(
             "approvals approve: a merge-risk approval (wt:…) must be typed "
-            "by a person at a terminal\n"
+            "by a person at a terminal, or named with --head <patch-id> "
+            "(what the IDE's Approve button sends)\n"
         )
         return 1
 
@@ -498,21 +528,41 @@ def _approve_worktree_merge(args: argparse.Namespace, db: str) -> int:
         )
         return 1
 
-    # ``None`` means the flag was absent; an explicit ``--head ""`` is an empty
-    # head and is refused below rather than silently defaulted.
-    head = args.head
-    if head is None:
-        try:
-            head = merge_risk.branch_patch_id(str(wt_dir))
-        except Exception as exc:  # noqa: BLE001 — surface, never approve blindly
-            sys.stderr.write(f"approvals approve: cannot read {wt_dir}: {exc}\n")
-            return 1
+    # The live patch id is always the one recorded: ``is_approved`` compares
+    # the merge's own patch id against the ledger, so approving anything else
+    # would resolve the row while leaving the merge blocked.
+    try:
+        head = merge_risk.branch_patch_id(str(wt_dir))
+    except Exception as exc:  # noqa: BLE001 — surface, never approve blindly
+        sys.stderr.write(f"approvals approve: cannot read {wt_dir}: {exc}\n")
+        return 1
     if not head:
         sys.stderr.write(
             f"approvals approve: {args.run_id} has an empty head (empty patch "
             "id); nothing to approve\n"
         )
         return 1
+    if explicit_head and explicit_head != head:
+        sys.stderr.write(
+            f"approvals approve: {args.run_id} changed since it was requested "
+            f"(requested patch {explicit_head[:12]}, live patch {head[:12]}); "
+            "re-request approval for the new diff\n"
+        )
+        return 1
+    if explicit_head:
+        # The patch id is public (the driver prints it), so it cannot be the
+        # whole decision: the row the risk classifier enqueued must still be
+        # pending for this same patch. That refuses minting an approval for a
+        # diff nobody requested, and keeps a click bound to one open question.
+        row = status(args.run_id, db_path=db)
+        if row["state"] != "pending" or row["head_sha"] != head:
+            sys.stderr.write(
+                f"approvals approve: no pending request for {args.run_id} at "
+                f"patch {head[:12]} (ledger: {row['state'] or 'none'}, patch "
+                f"{(row['head_sha'] or '')[:12] or 'none'}); the merge-risk "
+                "gate must request approval for this diff first\n"
+            )
+            return 1
 
     try:
         verdict = merge_risk.classify(
@@ -535,14 +585,21 @@ def _approve_worktree_merge(args: argparse.Namespace, db: str) -> int:
         for reason in verdict.reasons:
             sys.stdout.write(f"  {reason}\n")
 
-    try:
-        answer = input(f"type {head[:8]} to approve: ")
-    except (EOFError, KeyboardInterrupt):
-        sys.stderr.write("approvals approve: not approved\n")
-        return 1
-    if answer.strip() != head[:8]:
-        sys.stderr.write("approvals approve: not approved\n")
-        return 1
+    if not explicit_head:
+        try:
+            answer = input(f"type {head[:8]} to approve: ")
+        except (EOFError, KeyboardInterrupt):
+            sys.stderr.write("approvals approve: not approved\n")
+            return 1
+        if answer.strip() != head[:8]:
+            sys.stderr.write("approvals approve: not approved\n")
+            return 1
+
+    # A head-bound decision left its own trace: which patch the caller named,
+    # so the ledger distinguishes a click from a typed challenge.
+    note = args.note or ""
+    if explicit_head and not note:
+        note = f"head-bound approval of patch {head[:8]}"
 
     try:
         inbox_id = approve(
@@ -550,7 +607,7 @@ def _approve_worktree_merge(args: argparse.Namespace, db: str) -> int:
             head,
             approver=_approver(),
             base_sha=args.base or "",
-            note=args.note or "",
+            note=note,
             db_path=db,
             env=os.environ,
         )

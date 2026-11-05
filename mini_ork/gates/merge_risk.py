@@ -405,6 +405,8 @@ def check_merge(
             verdict.patch_id,
             branch=f"wt/{slug}",
             base_branch="main",
+            reasons=verdict.reasons,
+            files=verdict.files,
             db_path=db,
         )
         return False, "\n".join(lines)

@@ -255,6 +255,18 @@ def _awaiting_review_rows(home: Path, now: int) -> list[dict[str, Any]]:
                 out.append({
                     "kind": "merge", "run": run_id, "node": "",
                     "node_type": "",
+                    # The patch id this row was requested for. The Approve
+                    # button hands it to the CLI as the decision itself, so
+                    # the click approves exactly this diff and no other.
+                    "head": str(ctx.get("head_sha") or ""),
+                    # What the risk classifier found, and what the diff
+                    # touches — the same lines the CLI used to print at a
+                    # terminal before asking for the patch id. The confirm
+                    # shows them so the click is informed.
+                    "reasons": [str(x) for x in ctx.get("reasons") or ()
+                                if str(x).strip()],
+                    "files": [str(x) for x in ctx.get("files") or ()
+                              if str(x).strip()],
                     "enqueued_at": _to_float(enqueued_at),
                     "age_text": age_text,
                 })
@@ -312,6 +324,10 @@ def _awaiting_review_section(home: Path, now: int) -> list[dict[str, Any]]:
     if not rows:
         return []
     items: list[dict[str, Any]] = []
+    # Pin the ledger path: ``approvals`` prefers $MINI_ORK_DB over the home it
+    # was handed, so an IDE whose environment carries that variable would
+    # otherwise resolve this approval against a different state.db.
+    db_args = ["--db", str(Path(home) / "state.db")]
     for row in rows:
         kind_label = "merge" if row["kind"] == "merge" else "node"
         run_id = row["run"]
@@ -326,6 +342,7 @@ def _awaiting_review_section(home: Path, now: int) -> list[dict[str, Any]]:
             actions.append(S.btn(
                 "Approve",
                 S.cli("approvals", "approve", run_id, "--node", row["node"],
+                      *db_args,
                       confirm=(f"Approve {row['node']}'s output and resume the run?"),
                       home=False),
                 "primary"))
@@ -334,19 +351,36 @@ def _awaiting_review_section(home: Path, now: int) -> list[dict[str, Any]]:
                 S.thread(f"/request-changes {run_id} {row['node']} "),
                 "default"))
         elif run_id.startswith("wt:"):
-            # A merge-risk gate is bound to the branch's patch id, and the CLI
-            # refuses to decide one on a non-TTY stdin — which is all a ``cli``
-            # action has, so the button looked inert. Approval stays a person
-            # typing the patch id: hand the command to a terminal, where it
-            # prints the changed paths and the risk first.
+            # A merge-risk gate is bound to the branch's patch id. The click
+            # IS the decision, so the command names the patch the row was
+            # drawn from (``--head``); the CLI recomputes the live patch id
+            # and refuses if the branch moved, so this cannot approve a diff
+            # the person never saw. A row without a patch id (written by an
+            # older engine) has nothing to bind to; the CLI then prints the
+            # explicit "needs --head or a terminal" refusal.
+            head = row.get("head") or ""
+            patch_args = ["--head", head] if head else []
+            reasons = row.get("reasons") or []
+            question = (f"Approve merging {run_id} (patch {head[:8]}) "
+                        "into the base branch?" if head else
+                        f"Approve merging {run_id} into the base branch?")
+            if reasons:
+                question += "\n\nWhy it needs you:\n" + "\n".join(
+                    f"· {reason}" for reason in reasons[:4])
+            files = row.get("files") or []
+            if files:
+                shown = ", ".join(files[:6])
+                more = f" (+{len(files) - 6} more)" if len(files) > 6 else ""
+                question += f"\n\nTouches {len(files)} file(s): {shown}{more}"
             actions.append(S.btn(
                 "Approve",
-                S.terminal(["approvals", "approve", run_id], home=False),
+                S.cli("approvals", "approve", run_id, *patch_args, *db_args,
+                      confirm=question, home=False),
                 "primary"))
         else:
             actions.append(S.btn(
                 "Approve",
-                S.cli("approvals", "approve", run_id,
+                S.cli("approvals", "approve", run_id, *db_args,
                       confirm=f"Approve merging {run_id} into the base branch?",
                       home=False),
                 "primary"))

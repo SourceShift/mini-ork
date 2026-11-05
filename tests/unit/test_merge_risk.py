@@ -539,6 +539,105 @@ def test_approve_wt_refuses_an_explicit_empty_head(h, monkeypatch, capsys) -> No
         f"wt:{slug}", pid, db_path=str(h.db), env={})
 
 
+def test_approve_wt_with_head_needs_no_terminal(h, monkeypatch, capsys) -> None:
+    """``--head <patch-id>`` is the decision itself: no TTY, no typed answer.
+
+    This is the path the IDE's Approve button takes when a person clicks it.
+    """
+    slug = "risk-clicked"
+    wt = h.create(slug)
+    h.commit(wt, {"danger/x.txt": "risky\n"}, "risky")
+    pid = merge_risk.branch_patch_id(str(wt))
+    assert pid
+    # The gate enqueues its request before anyone can click; the head-bound
+    # path requires that row to still be pending.
+    merge_approval.request(
+        f"wt:{slug}", "", pid, branch=f"wt/{slug}", base_branch="main",
+        reasons=["danger/x.txt is high risk"], db_path=str(h.db),
+    )
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(h.home))
+    monkeypatch.setenv("MINI_ORK_WORKTREES_DIR", str(h.wts))
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    saved = sys.stdin
+    sys.stdin = io.StringIO("")  # a non-TTY: the old gate refused here
+    try:
+        rc = approvals_cmd.main(
+            ["approve", f"wt:{slug}", "--head", pid, "--db", str(h.db)])
+    finally:
+        sys.stdin = saved
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.out + captured.err
+    assert merge_approval.is_approved(
+        f"wt:{slug}", pid, db_path=str(h.db), env={})
+
+
+def test_approve_wt_refuses_a_head_that_moved(h, monkeypatch, capsys) -> None:
+    """A row drawn against an older patch must not approve the current one."""
+    slug = "risk-moved"
+    wt = h.create(slug)
+    h.commit(wt, {"danger/x.txt": "risky\n"}, "risky")
+    pid = merge_risk.branch_patch_id(str(wt))
+    assert pid
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(h.home))
+    monkeypatch.setenv("MINI_ORK_WORKTREES_DIR", str(h.wts))
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    stale = "0" * 40
+    assert stale != pid
+    saved = sys.stdin
+    sys.stdin = io.StringIO("")
+    try:
+        rc = approvals_cmd.main(
+            ["approve", f"wt:{slug}", "--head", stale, "--db", str(h.db)])
+    finally:
+        sys.stdin = saved
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "changed since it was requested" in (captured.out + captured.err)
+    assert not merge_approval.is_approved(
+        f"wt:{slug}", pid, db_path=str(h.db), env={})
+
+
+def test_approve_wt_with_head_needs_a_pending_request(h, monkeypatch, capsys) -> None:
+    """A matching patch id is public: it approves only an open request.
+
+    Without this, any caller who read the driver's output could mint an
+    approval for a diff the risk gate never enqueued.
+    """
+    slug = "risk-no-request"
+    wt = h.create(slug)
+    h.commit(wt, {"danger/x.txt": "risky\n"}, "risky")
+    pid = merge_risk.branch_patch_id(str(wt))
+    assert pid
+    assert merge_approval.status(f"wt:{slug}", db_path=str(h.db))["state"] == "none"
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(h.home))
+    monkeypatch.setenv("MINI_ORK_WORKTREES_DIR", str(h.wts))
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    saved = sys.stdin
+    sys.stdin = io.StringIO("")  # non-TTY: --head must not need one
+    try:
+        rc = approvals_cmd.main(
+            ["approve", f"wt:{slug}", "--head", pid, "--db", str(h.db)])
+    finally:
+        sys.stdin = saved
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "no pending request" in (captured.out + captured.err)
+    assert not merge_approval.is_approved(
+        f"wt:{slug}", pid, db_path=str(h.db), env={})
+
+
 @pytest.mark.parametrize(
     ("pattern", "path", "expected"),
     [
