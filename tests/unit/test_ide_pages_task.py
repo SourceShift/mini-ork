@@ -370,6 +370,24 @@ def test_ticket_page_carries_its_facts_links_and_actions(home: Path) -> None:
     assert "Dispatch now" not in labels         # a ticket is not an epic
 
 
+def test_an_open_ticket_offers_to_start_a_run_by_hand(home: Path) -> None:
+    """Row 40: the item itself can start work, without waiting for a trigger."""
+    _seed_ticket(home, "acme:ENG-1")
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+    labels = _actions(page)
+    assert labels["Start a run"]["do"] == {"cli": ["intake", "dispatch", "acme:ENG-1"],
+                                           "confirm": "Start a run for ENG-1?"}
+    assert labels["Start a run"]["kind"] == "primary"
+    assert labels["Open in acme"]["kind"] == "ghost"
+
+
+def test_a_closed_ticket_offers_no_start(home: Path) -> None:
+    """`intake dispatch` refuses a closed ticket, so the button would only fail."""
+    _seed_ticket(home, "acme:ENG-1", state="done")
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+    assert "Start a run" not in _actions(page)
+
+
 def test_ticket_page_degrades_when_the_source_was_never_registered(home: Path) -> None:
     """No adapter, no cached body: a callout that says so, not a traceback.
 

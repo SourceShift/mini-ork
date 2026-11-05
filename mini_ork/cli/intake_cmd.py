@@ -8,6 +8,7 @@ buys reach with none.
 
   intake once   [--source S] [--max-runs N] [--dry-run]   one pass now
   intake poll   [--interval SECS] [--passes N] ...        a pass every interval
+  intake dispatch UID [--source S] [--recipe R] [--dry-run]  start one ticket by hand
   intake report [--dry-run]                               report finished runs back
   intake status                                          what is set up, and why not
 
@@ -52,6 +53,7 @@ Usage:
 Verbs:
   once     sync the sources and dispatch what their triggers select, then exit
   poll     the same pass, every --interval seconds, until interrupted
+  dispatch start one ticket now, whatever the triggers say
   report   report finished linked runs back to their tickets, once each
   status   every source this build knows, its trigger, and its last sync
 
@@ -117,6 +119,17 @@ def _report_parser(prog: str = "mini-ork intake report") -> argparse.ArgumentPar
     return parser
 
 
+def _dispatch_parser(prog: str = "mini-ork intake dispatch") -> argparse.ArgumentParser:
+    """One ticket, by hand. No ``--source`` needed when the uid carries one."""
+    parser = argparse.ArgumentParser(prog=prog, add_help=False, usage=argparse.SUPPRESS)
+    parser.add_argument("uid")
+    parser.add_argument("--source", default=None)
+    parser.add_argument("--recipe", default=None)
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true")
+    _common(parser)
+    return parser
+
+
 def _status_parser(prog: str = "mini-ork intake status") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog, add_help=False, usage=argparse.SUPPRESS)
     _common(parser)
@@ -144,6 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     poll.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
     poll.add_argument("--passes", type=int, default=None)
+    subs.add_parser(
+        "dispatch", parents=[_dispatch_parser()], usage=argparse.SUPPRESS
+    )
     subs.add_parser(
         "report", parents=[_report_parser()], usage=argparse.SUPPRESS
     )
@@ -177,6 +193,8 @@ def main(argv=None, *, root=None) -> int:  # noqa: ARG001 - root is the dispatch
             return _cmd_run(rest, loop=False)
         if verb == "poll":
             return _cmd_run(rest, loop=True)
+        if verb == "dispatch":
+            return _cmd_dispatch(rest)
         if verb == "report":
             return _cmd_report(rest)
         if verb == "status":
@@ -268,6 +286,65 @@ def _announce(report: intake_poll.PollReport, as_json: bool) -> None:
     if report.deferred:
         parts.append(f"{report.deferred} over --max-runs")
     sys.stdout.write(f"intake {report.source}: " + ", ".join(parts) + "\n")
+
+
+def _cmd_dispatch(argv: list[str]) -> int:
+    """Start one ticket now, at a person's request rather than a rule's.
+
+    The trigger is deliberately *not* consulted: a hand dispatch is its own
+    authority, and the admission policies still run inside
+    :func:`~mini_ork.intake.dispatch.dispatch_issue`, so this cannot start a
+    ticket a policy would have refused. What it does not do is bypass the
+    open-state check — a ticket the source reports as done is refused here
+    rather than starting a run to close something already closed.
+    """
+    from mini_ork.intake.dispatch import dispatch_issue
+
+    args = _dispatch_parser().parse_args(argv)
+    source = args.source or (args.uid.split(":", 1)[0] if ":" in args.uid else "")
+    if not source:
+        sys.stderr.write(
+            "intake dispatch: pass `--source S` or a `source:key` uid "
+            "(the Board's ticket ids already carry it)\n"
+        )
+        return 2
+
+    home, db = _targets(args)
+    adapter = intake_poll._adapter(source, db)
+    issue = intake_poll._read(adapter, args.uid)
+    if isinstance(issue, str):
+        sys.stderr.write(f"intake dispatch: {issue}\n")
+        return 1
+    if not issue.is_open:
+        sys.stderr.write(
+            f"intake dispatch: the source reports {issue.uid} as {issue.state}; "
+            "open it there before starting a run\n"
+        )
+        return 1
+    if args.dry_run:
+        if args.json:
+            sys.stdout.write(json.dumps({
+                "issue_uid": issue.uid, "action": "would-start",
+                "recipe": args.recipe, "dry_run": True,
+            }, indent=2) + "\n")
+        else:
+            recipe = args.recipe or "the source's default recipe"
+            sys.stdout.write(f"intake dispatch: would start {issue.uid} with {recipe}\n")
+        return 0
+
+    dispatch = dispatch_issue(
+        home, adapter, issue, recipe=args.recipe, source="intake-cli", db=db
+    )
+    if args.json:
+        sys.stdout.write(json.dumps(dispatch.to_dict(), indent=2) + "\n")
+    else:
+        where = f" → {dispatch.thread_id}" if dispatch.thread_id else ""
+        run = f" [run {dispatch.run_id}]" if dispatch.run_id else ""
+        detail = f" — {dispatch.detail}" if dispatch.detail else ""
+        sys.stdout.write(f"  {dispatch.action:<12} {dispatch.issue_uid}{where}{run}{detail}\n")
+    # A refusal is a real answer, and a caller that scripts this must be able to
+    # tell it from a start: the admission policies said no, and nothing ran.
+    return 1 if dispatch.action == "refused" else 0
 
 
 def _cmd_report(argv: list[str]) -> int:

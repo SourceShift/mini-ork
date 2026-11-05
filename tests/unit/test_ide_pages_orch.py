@@ -287,3 +287,43 @@ def test_coordination_with_contextnest(home: Path, monkeypatch) -> None:
     assert titles[:3] == ["Principals · concord", "Claims on hot files", "Scope violations (--owns)"]
     assert [c["t"] for c in page["sections"][0]["rows"][0]["cells"]] == ["run:abc", "42", "active", "1"]
     assert page["sections"][2]["items"][0]["m"] == "✗"  # the broken source costs one section
+
+
+def test_the_dispatch_tab_pins_a_lane_per_alias_into_the_start(
+        home: Path, tmp_path: Path, monkeypatch) -> None:
+    """Row 61 at the page: one axis per workflow alias, carried as ``--lane``."""
+    registry = tmp_path / "providers.yaml"
+    registry.write_text(
+        "providers:\n"
+        "  glm:\n    kind: anthropic-compat\n    model: GLM-5.3\n"
+        "    base_url: https://example.invalid/anthropic\n"
+        "  minimax:\n    kind: anthropic-compat\n    model: MiniMax-M3\n"
+        "    base_url: https://example.invalid/anthropic\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(registry))
+    monkeypatch.delenv("MO_ACP_RECIPE", raising=False)
+    monkeypatch.delenv("MO_WORKSPACE_MODE", raising=False)
+    folder = home / "kickoffs"
+    folder.mkdir()
+    (folder / "deps.md").write_text("---\nrecipe: code-fix\n---\n# Deps\n", encoding="utf-8")
+
+    page = orch.build(home, "dispatch", {})
+    sections = {s["title"]: s for s in page["sections"]}
+    # The recipe's nodes declare planner/worker/reviewer/judge; each gets an axis.
+    assert {"Lane · worker", "Lane · reviewer"} <= set(sections)
+    choices = [i["t"] for i in sections["Lane · worker"]["items"]]
+    assert choices[0] == "default" and "glm" in choices
+    assert sections["Lane · worker"]["items"][0]["on"] is True
+
+    page = orch.build(home, "dispatch", {"lane_worker": "glm"})
+    sections = {s["title"]: s for s in page["sections"]}
+    chosen = [i for i in sections["Lane · worker"]["items"] if i["on"]]
+    assert [i["t"] for i in chosen] == ["glm"]
+    start = next(i for i in sections["Start a run · .mini-ork/kickoffs/"]["items"]
+                 if i["t"] == "deps.md")
+    button = next(a for a in start["acts"] if a["label"] == "Start run")
+    cli = button["do"]["cli"]
+    assert cli[:4] == ["board", "start", "--kickoff", str(folder / "deps.md")]
+    assert "--lane" in cli and "worker=glm" in cli
+    assert "worker=glm" in sections["Start a run · .mini-ork/kickoffs/"]["note"]

@@ -438,7 +438,9 @@ def _dispatch(home: Path, args: dict[str, str]) -> list[dict[str, Any]]:
                   f"{_WORKSPACE_LABELS.get(workspace, workspace)}. Page-scoped, like the recipe above."),
         ),
     ]
-    sections.append(_dispatch_list(home, recipe, workspace, args.get("kickoff", "")))
+    lanes = _lane_overrides(home, recipe, args)
+    sections.extend(_lane_pickers(home, recipe, lanes))
+    sections.append(_dispatch_list(home, recipe, workspace, args.get("kickoff", ""), lanes))
     sections.append(S.composer(
         "One sentence describing the work…", ["kickoff", "new"],
         title="New kickoff",
@@ -451,7 +453,88 @@ def _dispatch(home: Path, args: dict[str, str]) -> list[dict[str, Any]]:
     return sections
 
 
-def _dispatch_list(home: Path, recipe: str, workspace: str, selected: str) -> dict[str, Any]:
+def _lane_aliases(home: Path, recipe: str) -> list[str]:
+    """The ``model_lane`` aliases the recipe's workflow declares, deduped.
+
+    The alias set ``board start --lane <alias>=<lane>`` validates against, so a
+    picker built here can only ever offer axes that will be accepted. A recipe
+    that cannot be resolved yields ``[]`` — the tab still works, it just offers
+    no lane pin, which is what a missing recipe can honestly support.
+    """
+    try:
+        import yaml
+
+        from mini_ork.recipes_catalog import find_recipe
+
+        info = find_recipe(recipe, home)
+        if info is None:
+            return []
+        doc = yaml.safe_load((Path(info.path) / "workflow.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 — an unreadable recipe offers no axes
+        return []
+    aliases: list[str] = []
+    for node in doc.get("nodes") or []:
+        lane = node.get("model_lane") if isinstance(node, dict) else None
+        if isinstance(lane, str) and lane and lane not in aliases:
+            aliases.append(lane)
+    return aliases
+
+
+def _available_lanes(home: Path) -> list[str]:
+    """The lane names the project's provider registry declares, sorted.
+
+    Same source ``board start --lane`` validates a lane against (the effective
+    providers registry), so the picker cannot offer a lane the launch refuses.
+    """
+    try:
+        from mini_ork.dispatch.providers import _load_providers_registry
+
+        return sorted(str(name) for name in _load_providers_registry())
+    except Exception:  # noqa: BLE001 — no registry, no lanes to offer
+        return []
+
+
+def _lane_overrides(home: Path, recipe: str, args: dict[str, str]) -> dict[str, str]:
+    """The lane pins this page currently holds, one per workflow alias."""
+    pins: dict[str, str] = {}
+    for alias in _lane_aliases(home, recipe):
+        lane = (args.get(f"lane_{alias}") or "").strip()
+        if lane:
+            pins[alias] = lane
+    return pins
+
+
+def _lane_pickers(home: Path, recipe: str, pins: dict[str, str]) -> list[dict[str, Any]]:
+    """One chips axis per alias, plus the "no pin" option.
+
+    Page-scoped exactly like the recipe and workspace pickers: a chip writes an
+    ``--arg``, and the Start buttons below carry every pinned alias as
+    ``--lane <alias>=<lane>``. The run freezes them into its own config
+    snapshot, so the pin reaches every node of THIS run and nothing else.
+    """
+    aliases = _lane_aliases(home, recipe)
+    if not aliases:
+        return []
+    lanes = _available_lanes(home)
+    sections: list[dict[str, Any]] = []
+    for alias in aliases:
+        current = pins.get(alias, "")
+        items = [{"t": "default", "on": current == "", "do": S.set_args(**{f"lane_{alias}": ""})}]
+        items += [{"t": lane, "on": lane == current, "do": S.set_args(**{f"lane_{alias}": lane})}
+                  for lane in lanes]
+        sections.append(_picker(
+            f"Lane · {alias}", items, f"lane_{alias}", "page override",
+            note=(f"{alias} runs on {current or 'the config default'} for runs started here. "
+                  "Page-scoped, and frozen into the run at launch."),
+        ))
+    return sections
+
+
+def _dispatch_list(home: Path, recipe: str, workspace: str, selected: str,
+                   lanes: dict[str, str] | None = None) -> dict[str, Any]:
+    lane_flags: list[str] = []
+    for alias, lane in (lanes or {}).items():
+        lane_flags += ["--lane", f"{alias}={lane}"]
     rows = _scan_kickoffs(home)
     items = []
     for row in rows[:_KICKOFF_LIMIT]:
@@ -471,15 +554,18 @@ def _dispatch_list(home: Path, recipe: str, workspace: str, selected: str) -> di
                 acts.append(S.btn("Log", S.open_path(log), "ghost"))
         acts.append(S.btn("Start run", S.cli(
             "board", "start", "--kickoff", str(path),
-            "--recipe", recipe, "--workspace", workspace), "primary"))
+            "--recipe", recipe, "--workspace", workspace, *lane_flags), "primary"))
         items.append(S.item(path.name, " · ".join(_kickoff_parts(row)),
                             m="▦" if on else "▤", mc=mc, acts=acts))
     if not items:
         items = [S.dot("No kickoffs yet",
                        "Draft one in the box below — it lands in .mini-ork/kickoffs/ and appears here.")]
+    pinned = ", ".join(f"{a}={l}" for a, l in (lanes or {}).items())
     note = ("Start launches the run detached with the recipe and workspace picked above — no "
             "confirmation, because starting a run is what this tab is for. A red row is a lint "
             "error: advice, not a gate, so its Start button stays live.")
+    if pinned:
+        note += f" Lanes pinned for this start: {pinned} (frozen into the run's own config)."
     if len(rows) > _KICKOFF_LIMIT:
         note += f" Showing the {_KICKOFF_LIMIT} newest of {len(rows)}."
     return S.lst("Start a run · .mini-ork/kickoffs/", items, full=True, note=note)

@@ -520,3 +520,59 @@ def test_the_cli_poll_bounds_itself_with_passes(home, configured, registered, ca
 def test_the_cli_refuses_an_unknown_verb(home, capsys):
     assert intake_cmd.main(["nonsense", "--home", str(home)]) == 2
     assert "unknown verb" in capsys.readouterr().err
+
+
+# ── dispatch by hand ──────────────────────────────────────────────────────
+
+
+def test_the_cli_dispatch_starts_one_ticket_with_no_trigger_configured(
+    home, launches, registered, capsys
+):
+    """A hand dispatch is its own authority: the ticket starts even though no
+    rule selects it, which is the whole point of the verb."""
+    registered(_Source(_issue(1)))
+    rc = intake_cmd.main(["dispatch", "acme:ENG-1", "--home", str(home)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert len(launches) == 1
+    assert "launched" in out and "acme:ENG-1" in out
+
+
+def test_the_cli_dispatch_dry_run_starts_nothing(home, launches, registered, capsys):
+    registered(_Source(_issue(1)))
+    rc = intake_cmd.main(["dispatch", "acme:ENG-1", "--home", str(home), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert launches == []
+    assert "would start acme:ENG-1" in out
+
+
+def test_the_cli_dispatch_refuses_a_ticket_the_source_closed(
+    home, launches, registered, capsys
+):
+    registered(_Source(_issue(1, state=IssueState.DONE)))
+    rc = intake_cmd.main(["dispatch", "acme:ENG-1", "--home", str(home)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert launches == []
+    assert "reports acme:ENG-1 as done" in err
+
+
+def test_the_cli_dispatch_needs_a_source_when_the_uid_has_none(
+    home, launches, capsys
+):
+    rc = intake_cmd.main(["dispatch", "ENG-1", "--home", str(home)])
+    assert rc == 2
+    assert "source" in capsys.readouterr().err
+    assert launches == []
+
+
+def test_the_cli_dispatch_has_a_json_form(home, launches, registered, capsys):
+    import json
+
+    registered(_Source(_issue(1)))
+    rc = intake_cmd.main(["dispatch", "acme:ENG-1", "--home", str(home), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["issue_uid"] == "acme:ENG-1"
+    assert payload["action"] == "launched" and payload["started"] is True

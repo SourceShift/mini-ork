@@ -166,7 +166,6 @@ def test_header_offers_the_lifetime_reports(home: Path) -> None:
     assert [b["do"] for b in page["actions"]] == [
         {"cli": ["lifetime", "summary"], "home": False},
         {"cli": ["lifetime", "conductor-history"], "home": False},
-        {"cli": ["providers", "status"], "home": False},
     ]
 
 

@@ -94,4 +94,62 @@ def snapshot_run_config(run_dir: str | None = None) -> bool:
     except (OSError, IOError):
         return True  # mirror bash's `2>/dev/null || return 0` semantic
 
+    _apply_lane_overrides(dest)
     return True
+
+
+#: ``<alias>=<lane>,…`` — a launch-time lane assignment for THIS run
+#: (``board start --lane implementer=glm``). Read here rather than in the
+#: launcher because the snapshot below is the one place every dispatch-time
+#: resolver already agrees on, so an override written here is honoured by
+#: every node without a second precedence rule.
+LANE_OVERRIDES_ENV = "MO_LANE_OVERRIDES"
+
+
+def lane_overrides(raw: str | None = None) -> dict[str, str]:
+    """Parse :data:`LANE_OVERRIDES_ENV` into ``{alias: lane}``.
+
+    Empty and malformed pairs are dropped rather than raised: the snapshot is
+    best-effort by contract, and a bad pair reaching here has already been
+    refused by the CLI that set it. ``board start`` validates before launching,
+    so this path must not be able to fail a run that is already dispatched.
+    """
+    text = (raw if raw is not None else os.environ.get(LANE_OVERRIDES_ENV, "")).strip()
+    out: dict[str, str] = {}
+    for pair in text.split(","):
+        alias, sep, lane = pair.partition("=")
+        if sep and alias.strip() and lane.strip():
+            out[alias.strip()] = lane.strip()
+    return out
+
+
+def _apply_lane_overrides(dest: str) -> None:
+    """Merge the launch-time assignment into the just-copied snapshot.
+
+    Only after a fresh copy — an existing snapshot is the frozen policy of an
+    earlier launch and is never rewritten (the function above returns before
+    this is reached). A YAML that cannot be read or re-written is left as the
+    effective file copied there: the run keeps working with the merged policy,
+    which is what it had before this feature existed.
+    """
+    overrides = lane_overrides()
+    if not overrides:
+        return
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover — config_resolve is used with yaml installed
+        return
+    try:
+        with open(dest, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+    except (OSError, ValueError, yaml.YAMLError):
+        return
+    if not isinstance(doc, dict):
+        return
+    lanes = doc.get("lanes")
+    doc["lanes"] = {**(lanes if isinstance(lanes, dict) else {}), **overrides}
+    try:
+        with open(dest, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(doc, fh, sort_keys=True)
+    except (OSError, ValueError, yaml.YAMLError):
+        return

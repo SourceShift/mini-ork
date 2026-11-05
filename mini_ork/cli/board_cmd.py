@@ -1371,6 +1371,47 @@ def _start_env(args) -> tuple[dict[str, str], str, str]:
     return extra_env, "", "default"
 
 
+def _start_lanes(args, home: Path, recipe: str,
+                 extra_env: dict[str, str]) -> dict[str, str] | str:
+    """Validate ``board start --lane`` and queue it for the run's snapshot.
+
+    Returns the assignment (empty when none was asked for) or the refusal text.
+    The assignment rides :data:`config_resolve.LANE_OVERRIDES_ENV` into the
+    child, where ``snapshot_run_config`` merges it into the run's own
+    ``config/agents.yaml`` — the file every dispatch-time resolver reads first,
+    so the pin applies to the whole run and to nothing outside it.
+
+    Validation is the recovery planner's, against the recipe's own workflow:
+    an alias no node declares would silently pin nothing, and a lane absent
+    from the providers registry would fall through ``resolve_lane_model``'s
+    default instead of failing.
+    """
+    raw = list(getattr(args, "lane", None) or [])
+    if not raw:
+        return {}
+    from mini_ork.dispatch.config_resolve import LANE_OVERRIDES_ENV
+    from mini_ork.recovery.planner import _parse_lane_overrides, _validate_lane_overrides
+
+    try:
+        overrides = _parse_lane_overrides(raw)
+    except ValueError as exc:
+        return str(exc)
+    if LANE_OVERRIDES_ENV in extra_env:
+        return ("--lane and --set MO_LANE_OVERRIDES are two sources for one "
+                "assignment; pass only one")
+    from mini_ork.recipes_catalog import find_recipe
+
+    info = find_recipe(recipe, home)
+    workflow = str(Path(getattr(info, "path", "") or "") / "workflow.yaml") if info is not None else ""
+    if not workflow or not Path(workflow).is_file():
+        return f"cannot validate --lane for recipe {recipe!r}: no workflow on disk"
+    errors = _validate_lane_overrides(overrides, workflow)
+    if errors:
+        return "; ".join(errors)
+    extra_env[LANE_OVERRIDES_ENV] = ",".join(f"{a}={l}" for a, l in overrides.items())
+    return overrides
+
+
 def _act_start(home: Path, args) -> dict[str, Any]:
     """Start a run from a kickoff file, detached.
 
@@ -1420,6 +1461,10 @@ def _act_start(home: Path, args) -> dict[str, Any]:
     except ValueError as exc:
         return refuse(str(exc))
 
+    lanes = _start_lanes(args, home, recipe, extra_env)
+    if isinstance(lanes, str):
+        return refuse(lanes)
+
     run_id = (args.start_run_id or "").strip() or f"run-{int(time.time())}-{secrets.token_hex(3)}"
     if args.dry_run:
         return {
@@ -1428,6 +1473,7 @@ def _act_start(home: Path, args) -> dict[str, Any]:
             "recipe": recipe, "recipe_source": recipe_source,
             "workspace": workspace,
             "workspace_source": workspace_source,
+            "lanes": lanes,
             "kickoff": str(kickoff),
             "kickoff_path": str(home / "runs-inbox" / f"{run_id}.md"),
             "extra_env": sorted(extra_env),
@@ -1721,9 +1767,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "never deletes a run. not-needed: restore the status "
                              "the run had before it was closed.")
     parser.add_argument("--lane", action="append", default=[],
-                        help="retry: pin a lane for the spawned recover "
-                             "(repeatable, <alias>=<lane>). Does not imply "
-                             "--ack-change/--force.")
+                        help="retry: pin a lane for the spawned recover. start: pin "
+                             "a lane for THIS run, frozen into its config snapshot "
+                             "(repeatable, <alias>=<lane>). On retry this does not "
+                             "imply --ack-change/--force.")
     parser.add_argument("--kickoff", default=None,
                         help="start: the kickoff markdown to launch")
     parser.add_argument("--recipe", default=None,

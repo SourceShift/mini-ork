@@ -328,3 +328,80 @@ def test_a_run_id_the_launcher_cannot_use_is_the_launchers_to_refuse(
                                 "--home", str(home)], capsys)
     assert rc == 1
     assert payload["stage"] == "launch"
+
+
+# ── lane assignment for the launched run (row 61) ──────────────────────────
+
+
+@pytest.fixture()
+def lanes_registry(tmp_path: Path, monkeypatch) -> Path:
+    """A providers registry the lane validator can see, with two real lanes."""
+    path = tmp_path / "providers.yaml"
+    path.write_text(
+        "providers:\n"
+        "  glm:\n    kind: anthropic-compat\n    model: GLM-5.3\n"
+        "    base_url: https://example.invalid/anthropic\n"
+        "  minimax:\n    kind: anthropic-compat\n    model: MiniMax-M3\n"
+        "    base_url: https://example.invalid/anthropic\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(path))
+    return path
+
+
+def test_lane_pins_ride_the_environment_into_the_launched_run(
+        home: Path, launcher: _Launcher, tmp_path: Path, lanes_registry, capsys) -> None:
+    kickoff = _kickoff(tmp_path / "draft.md")
+    rc, _payload, err = _board(["start", "--kickoff", str(kickoff),
+                                "--lane", "worker=glm", "--lane", "reviewer=minimax",
+                                "--home", str(home)], capsys)
+    assert rc == 0, err
+    assert launcher.calls[0]["extra_env"]["MO_LANE_OVERRIDES"] == \
+        "worker=glm,reviewer=minimax"
+
+
+def test_the_dry_run_reports_the_assignment(
+        home: Path, launcher: _Launcher, tmp_path: Path, lanes_registry, capsys) -> None:
+    kickoff = _kickoff(tmp_path / "draft.md")
+    rc, payload, err = _board(["start", "--kickoff", str(kickoff), "--lane", "worker=glm",
+                               "--dry-run", "--home", str(home)], capsys)
+    assert rc == 0, err
+    assert payload["lanes"] == {"worker": "glm"}
+    assert launcher.calls == []
+
+
+def test_an_alias_no_node_declares_is_a_usage_error(
+        home: Path, launcher: _Launcher, tmp_path: Path, lanes_registry, capsys) -> None:
+    kickoff = _kickoff(tmp_path / "draft.md")
+    rc, _payload, err = _board(["start", "--kickoff", str(kickoff), "--lane", "nope=glm",
+                                "--home", str(home)], capsys)
+    assert rc == 2
+    assert "unknown alias" in err and launcher.calls == []
+
+
+def test_a_lane_the_registry_does_not_know_is_a_usage_error(
+        home: Path, launcher: _Launcher, tmp_path: Path, lanes_registry, capsys) -> None:
+    kickoff = _kickoff(tmp_path / "draft.md")
+    rc, _payload, err = _board(["start", "--kickoff", str(kickoff), "--lane", "worker=gpt-9",
+                                "--home", str(home)], capsys)
+    assert rc == 2
+    assert "unknown lane" in err and launcher.calls == []
+
+
+def test_a_malformed_lane_is_a_usage_error(
+        home: Path, launcher: _Launcher, tmp_path: Path, lanes_registry, capsys) -> None:
+    kickoff = _kickoff(tmp_path / "draft.md")
+    rc, _payload, err = _board(["start", "--kickoff", str(kickoff), "--lane", "worker",
+                                "--home", str(home)], capsys)
+    assert rc == 2
+    assert "--lane <alias>=<lane>" in err and launcher.calls == []
+
+
+def test_lane_and_set_mo_lane_overrides_together_are_refused(
+        home: Path, launcher: _Launcher, tmp_path: Path, lanes_registry, capsys) -> None:
+    kickoff = _kickoff(tmp_path / "draft.md")
+    rc, _payload, err = _board(["start", "--kickoff", str(kickoff), "--lane", "worker=glm",
+                                "--set", "MO_LANE_OVERRIDES=worker=minimax",
+                                "--home", str(home)], capsys)
+    assert rc == 2
+    assert "two sources" in err and launcher.calls == []

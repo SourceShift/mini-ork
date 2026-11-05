@@ -450,6 +450,18 @@ def _ticket(home: Path, uid: str, errors: dict[str, str]) -> Any:
         return None
 
 
+def _can_start(row: Any) -> bool:
+    """Whether a hand dispatch of this ticket could start a run.
+
+    The state words come from :data:`mini_ork.pm.model.OPEN_STATES` rather than a
+    copy: the vocabulary the Board sorts by and the one this button gates on
+    drifting apart is how a ticket shows as open and refuses to start.
+    """
+    from mini_ork.pm.model import OPEN_STATES
+
+    return str(getattr(row, "state", "") or "") in {str(state) for state in OPEN_STATES}
+
+
 @dataclass(frozen=True, slots=True)
 class _Live:
     """What one live read of a ticket produced — or why it produced nothing."""
@@ -478,8 +490,20 @@ def _ticket_page(home: Path, uid: str, row: Any, args: dict[str, str],
     sections.extend(S.guarded(errors, "Ticket", lambda: _ticket_facts(row, live, now)))
     sections.extend(S.guarded(errors, "Links", lambda: _ticket_links(home, uid)))
     actions = [S.btn("Board", S.page_link("kanban"), "ghost")]
+    # The one way a mirrored ticket starts work without waiting for its source's
+    # trigger to select it. Offered only while the ticket is open: `intake
+    # dispatch` refuses a closed one anyway, and a button that can only fail is
+    # worse than no button.
+    if _can_start(row):
+        actions.insert(0, S.btn(
+            "Start a run",
+            S.cli("intake", "dispatch", uid,
+                  confirm=f"Start a run for {native_key or uid}?"),
+            "primary",
+        ))
     if url:
-        actions.insert(0, S.btn(f"Open in {provider or 'the source'}", S.url(url), "primary"))
+        actions.insert(0, S.btn(f"Open in {provider or 'the source'}", S.url(url),
+                                "ghost" if _can_start(row) else "primary"))
     return _page(uid, title, f"Ticket · {source}" if source else "Ticket",
                  sections, actions, errors, args, label=title)
 
