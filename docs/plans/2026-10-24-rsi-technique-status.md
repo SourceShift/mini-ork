@@ -209,9 +209,13 @@ Follow-ups found while landing Tier 0 (corrected 2026-10-27):
 - ~~`mini-ork epics show` lists no outgoing dependencies.~~ **Not a bug.** The
   output had been piped through `head -12`, which cut the section off.
 - **R8's cap counts `in progress` epics**, and R8 spawned the scheduler in the
-  engine checkout. Both are addressed by `kickoffs/auto/rsi-t0f-r8-hardening.md`:
-  it requires a `target_root` distinct from the engine checkout, and it
-  reclaims stale epics with the scheduler's own rules.
+  engine checkout. Both are **fixed on main**: `recovery/supervisor.py:1296`
+  refuses a `target_root` that is the engine checkout (returning the refusal
+  action instead of a dispatch), and `recovery/supervisor.py:1359` calls
+  `scheduler.reclaim_stale(db)` before counting the cap. The kickoff that asked
+  for this, `kickoffs/auto/rsi-t0f-r8-hardening.md`, was later lost with its
+  worktree — its run stayed `failed`, but the deliverable landed another way (see
+  `docs/audits/2026-11-06-revive-batch.md`).
 
 ### Changes on main since this audit (2026-10-25 / 10-26, other sessions)
 
