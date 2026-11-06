@@ -55,6 +55,14 @@ jobs:
           TOTAL=$(grep -cE '^\s*[0-9]+' ruff-advisory.log || echo 0)
           echo "::notice::ruff advisory findings: $TOTAL (non-blocking — see ratchet note in pyproject.toml)"
 
+      # `features check-skill` calls itself what makes registry→skill sync "a
+      # guarantee rather than a habit" (mini_ork/cli/features.py), and until now
+      # nothing ran it: register a feature, forget `render-skill`, and the wizard
+      # silently omits a knob the CLI exposes. It imports only the stdlib, so it
+      # runs here without the package install the test jobs pay for.
+      - name: "Feature registry ↔ skill sync (check-skill)"
+        run: python -m mini_ork.cli.features check-skill
+
   python-tests:
     name: python tests (${{ matrix.python-version }} / ${{ matrix.shard }})
     runs-on: ubuntu-latest
@@ -98,7 +106,11 @@ jobs:
           # tests/unit/test_acp_agent_py.py imports at module scope; without
           # the extra the whole shard dies at collection, not on an assertion.
           pip install -e ".[yaml,acp]"
-          pip install pytest "pytest-xdist>=3.5" fastapi uvicorn httpx2
+          # pytest-timeout: a per-test ceiling so one hung subprocess names the
+          # test instead of consuming the job's 30-minute limit with "job timed
+          # out". Belongs in the `[dev]` extra; installed here until that file
+          # is free (another worktree holds pyproject.toml).
+          pip install pytest "pytest-xdist>=3.5" pytest-timeout fastapi uvicorn httpx2
 
       # The web smoke suite points the FastAPI route handlers at a real
       # state.db; init bootstraps the full schema so those tests run
@@ -113,7 +125,10 @@ jobs:
           # with no input would run bare pytest -- the whole suite -- green.
           files=$(find tests/unit \( -name 'test_*.py' -o -name '*_test.py' \) | sort | awk 'NR % 2 == 1')
           test -n "$files" || { echo "::error::unit shard A selected no test files"; exit 1; }
-          python -m pytest -q -p no:cacheprovider -n auto $files
+          # --timeout is a hang ceiling, not a performance budget: the slowest
+          # unit file is ~4% of the shard, so 300 s is generous by an order of
+          # magnitude. A timeout is a failure, never a skip.
+          python -m pytest -q -p no:cacheprovider -n auto --timeout=300 $files
 
       - name: Run pytest (unit shard B)
         if: matrix.shard == 'unit-b'
@@ -122,7 +137,7 @@ jobs:
           # with no input would run bare pytest -- the whole suite -- green.
           files=$(find tests/unit \( -name 'test_*.py' -o -name '*_test.py' \) | sort | awk 'NR % 2 == 0')
           test -n "$files" || { echo "::error::unit shard B selected no test files"; exit 1; }
-          python -m pytest -q -p no:cacheprovider -n auto $files
+          python -m pytest -q -p no:cacheprovider -n auto --timeout=300 $files
 
       - name: Run pytest (root + non-unit layers)
         if: matrix.shard == 'rest'
@@ -216,3 +231,42 @@ jobs:
 
       - name: Run observability web smoke suite
         run: make web-test
+
+  # The single check branch protection can require. Without it a renamed job,
+  # a new job nobody added to the required list, or a job skipped by a typo'd
+  # `if:` all leave the workflow green and unnoticed — five jobs with no
+  # aggregate have no place to say "and the others passed too".
+  ci-result:
+    name: ci result
+    runs-on: ubuntu-latest
+    needs: [readme-claim-check, python-lint, python-tests, verifiers-pin, web-smoke]
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Every required job must have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python - "$NEEDS" <<'PY'
+          import json
+          import sys
+
+          needs = json.loads(sys.argv[1])
+          expected = {"readme-claim-check", "python-lint", "python-tests",
+                      "verifiers-pin", "web-smoke"}
+          bad = []
+          for name in sorted(expected):
+              result = (needs.get(name) or {}).get("result")
+              print(f"{name}: {result}")
+              # `skipped` is NOT accepted: a job that did not run verified
+              # nothing, and a typo'd `if:` is exactly the failure this gate
+              # exists for. Add a name here explicitly if a skip is intended.
+              if result != "success":
+                  bad.append(f"{name}={result}")
+          missing = expected - set(needs)
+          if missing:
+              bad.append(f"not a dependency: {sorted(missing)}")
+          if bad:
+              sys.exit("::error::CI incomplete: " + ", ".join(bad))
+          print("ok: every required job succeeded")
+          PY
