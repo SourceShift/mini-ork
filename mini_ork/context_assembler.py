@@ -40,6 +40,21 @@ FRAMEWORK_INTERNAL_PREFIXES = (
 # ``MO_SIMILAR_LESSONS_FLOOR`` overrides for experiments.
 _SIMILAR_LESSONS_FLOOR_DEFAULT = 0.35
 
+def _log_context_failure(source: str, exc: Exception) -> None:
+    """Record that an optional context source could not be read.
+
+    Every source in this module is best-effort: a missing lessons table or an
+    unreadable preferences file must not fail prompt assembly, so the handler
+    still continues with an empty block. But the failure is *stated* — with
+    ``MO_CONTEXT_DEBUG=1`` it names the block that went missing, which is the
+    difference between a designed fallback and an invisible one. Verified by
+    ``mini-ork fallbacks``: a bare ``except Exception: pass`` here would mean
+    the layer that injects the "no silent fallback" rule breaks it itself.
+    """
+    if os.environ.get("MO_CONTEXT_DEBUG") == "1":
+        sys.stderr.write(
+            f"[context] {source} unavailable: {type(exc).__name__}: {exc}\n")
+
 
 def _similar_lessons_floor() -> float:
     """Resolved similar_lessons score floor (env-overridable, fail-safe)."""
@@ -219,8 +234,8 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                 "outcome": outcome,
                 "artifact_ref": artifact_ref,
                 "created_at": r["last_at"]})
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_context_failure("prior_runs", exc)
 
     failure_modes = []
     try:
@@ -238,8 +253,8 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                 "suggested_change": r["suggested_change"],
                 "confidence": r["confidence"],
                 "scope": "cross_class" if r["is_cross_class"] else task_class})
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_context_failure("gradient_records", exc)
 
     # Verified emergent patterns (judge-gate approved) — read-back of the
     # reflection judge-gate. ONLY status='approved' rows (those that cleared the
@@ -272,8 +287,8 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                     "suggested_change": (r["lesson_text"] or r["suggested_meta_adr"] or ""),
                     "strength_score": r["strength_score"],
                     "scope": "emergent"})
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_context_failure("emergent_patterns", exc)
 
     similar_lessons = []
     try:
@@ -308,8 +323,8 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                     "suggested_fix": (r["suggested_fix"] if "suggested_fix" in r.keys()
                                       else r["suggested_change"]
                                       if "suggested_change" in r.keys() else "") or ""})
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_context_failure("similar_lessons", exc)
 
     user_prefs = {}
     try:
@@ -317,8 +332,8 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                                 "config", "user_preferences.json")
         user_prefs = json.load(open(cfg_path, encoding="utf-8"))
         user_prefs["cite"] = cfg_path
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_context_failure("user_preferences", exc)
 
     constraints, forbidden_fallbacks = [], []
     try:
@@ -327,8 +342,8 @@ def context_assemble(task_brief_path: str, workflow_node: str,
         cfg = json.load(open(cfg_path, encoding="utf-8"))
         constraints = cfg.get("constraints", [])
         forbidden_fallbacks = cfg.get("forbidden_fallbacks", [])
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_context_failure("constraints", exc)
     con.close()
 
     # graph_context — failure-linked evidence for the same three sources the
@@ -354,8 +369,8 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                  "code_region": r[1], "task_class": r[2], "severity": r[3],
                  "penalty": r[4], "decay_halflife_days": r[5], "ts": r[6]}
                 for r in gc_blame]
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_context_failure("graph_context", exc)
 
     pack = {
         "task_brief": {"content": brief, "cite": "task_brief_path"},
@@ -1288,7 +1303,9 @@ def contextnest_atoms_md(
     persist = getattr(client, "persist_prefetch", None) or cn_client.persist_prefetch
     try:
         persist(text, "context")
-    except Exception:  # noqa: BLE001 — persistence must never break context assembly
+    except Exception:  # noqa: BLE001
+        # fallback-guard: allow: the atom cache is an optimisation; a failed
+        # write must never break context assembly.
         pass
     return text
 

@@ -1,6 +1,6 @@
 version: "0.1.0"
 task_class: code_fix
-description: "Single-patch code fix with typecheck, test, and reviewer gates"
+description: "Single-patch code fix with typecheck, fallback-guard, test, and reviewer gates"
 
 nodes:
   # Reference capability profiles — enforced hermetically by
@@ -31,6 +31,17 @@ nodes:
     type: verifier
     prompt_ref: null
     verifier_ref: verifiers/typecheck.py
+    dispatch_mode: serial
+
+  # Deterministic "no silent fallback" gate over the run's touched files. The
+  # implementer prompt has always forbidden `except: pass` and `return None` on
+  # error; until now only the reviewer lane looked for it, and an approval is
+  # indistinguishable from an oversight. Cheap (an AST walk), so it runs beside
+  # typecheck rather than only on demand.
+  - name: fallbacks
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/fallback_guard.py
     dispatch_mode: serial
 
   - name: test
@@ -76,18 +87,22 @@ nodes:
 edges:
   - { from: planner,     to: implementer, edge_type: depends_on   }
   - { from: implementer, to: typecheck,   edge_type: depends_on      }
+  - { from: implementer, to: fallbacks,   edge_type: depends_on      }
   - { from: implementer, to: test,        edge_type: depends_on      }
   - { from: typecheck,   to: reviewer,    edge_type: depends_on    }
+  - { from: fallbacks,   to: reviewer,    edge_type: depends_on    }
   - { from: test,        to: reviewer,    edge_type: depends_on    }
   - { from: reviewer,    to: eval,        edge_type: depends_on    }
   - { from: eval,        to: publisher,   edge_type: depends_on    }
   - { from: typecheck,   to: rollback,    edge_type: escalates_to  }
+  - { from: fallbacks,   to: rollback,    edge_type: escalates_to  }
   - { from: test,        to: rollback,    edge_type: escalates_to  }
   - { from: reviewer,    to: rollback,    edge_type: escalates_to  }
   # Revise loop: a failed gate sends its findings back to the implementer for a
   # bounded number of rounds BEFORE the escalates_to rollback edges fire (they
   # run only after the rounds are exhausted).
   - { from: typecheck,   to: implementer, edge_type: retries, max_rounds: 2 }
+  - { from: fallbacks,   to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: test,        to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: reviewer,    to: implementer, edge_type: retries, max_rounds: 2 }
 

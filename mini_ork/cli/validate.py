@@ -107,6 +107,56 @@ def _infer_recipe(kickoff: str, root: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Check 1 — kickoff checks (recognizable Goal/Done-When heading + size cap).
 # ─────────────────────────────────────────────────────────────────────────────
+# Any `Done When` / `Definition of Done` / `Acceptance` heading, at any level.
+_DONE_WHEN_RE = re.compile(
+    r"^(#{1,6})\s*(Done[- ]When|Definition of Done|Acceptance)", re.IGNORECASE)
+# `1. …`, `2) …`, `  3. …` — a numbered criterion, the only shape a verifier
+# node can bind to.
+_NUMBERED_RE = re.compile(r"^\s*\d+[.)]\s+\S")
+_ANY_HEADING_RE = re.compile(r"^(#{1,6})\s+\S")
+
+
+def _numbered_criteria(text: str) -> tuple[int, int]:
+    """``(done-when sections, numbered criteria across them)``.
+
+    A section runs from its heading to the next heading of the same or a
+    higher level, so a nested subsection's items still count.
+    """
+    lines = text.splitlines()
+    sections = 0
+    items = 0
+    i = 0
+    while i < len(lines):
+        m = _DONE_WHEN_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        sections += 1
+        level = len(m.group(1))
+        i += 1
+        while i < len(lines):
+            nxt = _ANY_HEADING_RE.match(lines[i])
+            if nxt and len(nxt.group(1)) <= level:
+                break
+            if _NUMBERED_RE.match(lines[i]):
+                items += 1
+            i += 1
+    return sections, items
+
+
+def _invariants_mode() -> str:
+    """``MO_KICKOFF_INVARIANTS`` — off | warn (default) | error.
+
+    Warn first by design: ``recipes/*/example-kickoff.md`` and in-flight
+    kickoffs predate the rule, and turning a convention into a hard error on
+    the day it is introduced blocks work that is no worse than yesterday's.
+    Promote to ``error`` once the shipped examples are migrated (the same
+    ratchet ruff uses in ``pyproject.toml``).
+    """
+    mode = os.environ.get("MO_KICKOFF_INVARIANTS", "warn").strip().lower()
+    return mode if mode in ("off", "warn", "error") else "warn"
+
+
 def _check_kickoff(kickoff: str, findings: Findings) -> None:
     if not kickoff or not os.path.isfile(kickoff):
         return
@@ -116,6 +166,15 @@ def _check_kickoff(kickoff: str, findings: Findings) -> None:
         findings.warn(
             f"kickoff {kickoff} has no recognizable Goal/Done-When heading",
             f"add a '## Goal' and '## Done When' section to {kickoff}",
+        )
+    sections, items = _numbered_criteria(text)
+    if sections and items == 0 and _invariants_mode() != "off":
+        emit = findings.error if _invariants_mode() == "error" else findings.warn
+        emit(
+            f"kickoff {kickoff} has a Done-When section with no numbered criteria",
+            "list each acceptance criterion as an observable, numbered item "
+            "('1. `mini-ork validate <kickoff>` exits 0'); the planner binds "
+            "them and the verifier node can gate each one",
         )
     size_bytes = os.path.getsize(kickoff)
     max_bytes = int(os.environ.get("MO_MAX_KICKOFF_BYTES", "1048576"))

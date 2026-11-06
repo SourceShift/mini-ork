@@ -90,11 +90,25 @@ def test_kickoff_recognized_headings(env, tmp_path, capsys, heading):
     root, _home = env
     _recipe(root, "demo")
     kickoff = tmp_path / "k.md"
-    kickoff.write_text(f"{heading}\n- thing\n", encoding="utf-8")
+    # A numbered criterion: the heading check and the invariants check are
+    # independent, and only a numbered list satisfies both.
+    kickoff.write_text(f"{heading}\n1. thing\n", encoding="utf-8")
     assert validate.main([str(kickoff), "--recipe", "demo"]) == 0
     captured = capsys.readouterr()
     assert captured.out == "validate: OK\n"
     assert captured.err == ""
+
+
+def test_bullet_list_under_done_when_warns_unnumbered(env, tmp_path, capsys):
+    """A bullet is not a criterion a verifier can bind to, so it warns."""
+    root, _home = env
+    _recipe(root, "demo")
+    kickoff = tmp_path / "k.md"
+    kickoff.write_text("## Done When\n\n- thing\n- other thing\n", encoding="utf-8")
+    assert validate.main([str(kickoff), "--recipe", "demo"]) == 0
+    captured = capsys.readouterr()
+    assert "no numbered criteria" in captured.err
+    assert captured.err.endswith("validate: 0 error(s), 1 warning(s)\n")
 
 
 def test_kickoff_size_cap(env, tmp_path, capsys, monkeypatch):

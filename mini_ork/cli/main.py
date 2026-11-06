@@ -52,6 +52,10 @@ from mini_ork.orchestration import concord_run
 _NATIVE_SUBS = {
     "apply", "classify", "plan", "verify", "verifier", "reflect", "garden",
     "validate", "pm", "why",
+    # Deterministic no-silent-fallback check over changed .py files. Added
+    # here (not `_NATIVE_MODULE_SUBS`) because that table is pinned as a
+    # mirror of the retired runtime-select.sh mapping.
+    "fallbacks",
 }
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this

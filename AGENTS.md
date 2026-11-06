@@ -84,7 +84,8 @@ push itself runs in a bounded retry (`MO_MERGE_PUSH_ATTEMPTS`, default 5).
 ```bash
 make test                    # existing test suite
 make lint                    # ruff blocking tier (F + E9; advisory: make lint-advisory)
-mini-ork validate            # pre-run static checks
+mini-ork validate            # pre-run static checks (kickoff needs numbered Done-When criteria)
+mini-ork fallbacks           # no `except: pass` / `return None` on error in changed .py files
 mini-ork garden              # drift detection
 ```
 

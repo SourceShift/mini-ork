@@ -3,6 +3,8 @@ expected_artifact: patch
 
 success_verifiers:
   - verifiers/typecheck.py
+  # Deterministic no-silent-fallback gate over the touched files (AST walk).
+  - verifiers/fallback_guard.py
   - verifiers/test.py
   # Layer 2, gold-free: fires whenever a metamorphic spec exists (MO_METAMORPHIC_SPEC,
   # MO_METAMORPHIC_SPEC_JSON, or ${MINI_ORK_RUN_DIR}/metamorphic-spec.json). With no
