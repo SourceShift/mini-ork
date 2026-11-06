@@ -1,0 +1,41 @@
+version: "0.1.0"
+task_class: repo_practices_benchmark
+description: >
+  Benchmark a reference repository's engineering practices against this
+  one. Four lenses each own a distinct surface of the reference repo and
+  report evidence as EXISTING path:line citations; one synthesizer emits a
+  ranked improvement list for our repo, each item naming both the reference
+  evidence and the current state here.
+
+# Each lens is pinned to a DISTINCT model family so the four readings are
+# decorrelated (a single family agreeing with itself is not a signal). The
+# lane aliases are the heterogeneous-panel ones from config/agents.yaml; a
+# run-scoped MINI_ORK_AGENTS overlay pins them when the home overlay has
+# repointed them.
+nodes:
+  - { name: planner,           type: planner,   model_lane: planner,       prompt_ref: prompts/planner.md,            dispatch_mode: serial }
+  - { name: conventions_lens,  type: researcher, model_lane: glm_lens,     prompt_ref: prompts/lens-conventions.md,   dispatch_mode: parallel }
+  - { name: pipeline_lens,     type: researcher, model_lane: deepseek_lens, prompt_ref: prompts/lens-pipeline.md,     dispatch_mode: parallel }
+  - { name: architecture_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/lens-architecture.md,  dispatch_mode: parallel }
+  - { name: agent_ux_lens,     type: researcher, model_lane: opus_lens,    prompt_ref: prompts/lens-agent-ux.md,      dispatch_mode: parallel }
+  - { name: synthesizer,       type: reviewer,  model_lane: reviewer,      prompt_ref: prompts/synthesis.md,          dispatch_mode: serial }
+  - { name: evidence_density,  type: verifier,  verifier_ref: verifiers/evidence-citations.py, dispatch_mode: serial }
+  - { name: publisher,         type: publisher, prompt_ref: null, dispatch_mode: serial }
+  - { name: rollback,          type: rollback,  prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: planner, to: conventions_lens,  edge_type: depends_on }
+  - { from: planner, to: pipeline_lens,     edge_type: depends_on }
+  - { from: planner, to: architecture_lens, edge_type: depends_on }
+  - { from: planner, to: agent_ux_lens,     edge_type: depends_on }
+  - { from: conventions_lens,  to: synthesizer, edge_type: depends_on }
+  - { from: pipeline_lens,     to: synthesizer, edge_type: depends_on }
+  - { from: architecture_lens, to: synthesizer, edge_type: depends_on }
+  - { from: agent_ux_lens,     to: synthesizer, edge_type: depends_on }
+  - { from: synthesizer,      to: evidence_density, edge_type: depends_on }
+  - { from: evidence_density, to: publisher,        edge_type: depends_on }
+  - { from: synthesizer,      to: rollback, edge_type: escalates_to }
+  - { from: evidence_density, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_synthesis
+max_self_correction_iterations: 2

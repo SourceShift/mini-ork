@@ -1,0 +1,39 @@
+name: repo_practices_benchmark
+version: "0.1.0"
+description: >
+  Benchmark one open-source repository's engineering practices against our
+  own, and emit a ranked, evidence-cited improvement list. Four researcher
+  lenses each own a different surface of the reference repo (conventions,
+  quality pipeline, architecture/testing, agent affordances); one
+  synthesizer turns them into improvements for THIS repo.
+
+matches:
+  keywords:
+    - best practices
+    - benchmark against
+    - compare with
+    - how does X do it
+    - repo practices
+    - engineering practices
+    - adopt from
+    - learn from repository
+    - competitive analysis
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+  - scope_gate
+
+risk_class: low   # read-only analysis; the run writes one markdown document.
+
+cost_model:
+  min_usd: 2
+  max_usd: 25
+  per_lens_usd: 3
+
+runtime_model:
+  min_minutes: 8
+  max_minutes: 45

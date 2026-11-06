@@ -1,0 +1,18 @@
+task_class: repo_practices_benchmark
+expected_artifact: composite   # 4 lens reports + 1 synthesis markdown
+
+success_verifiers:
+  - verifiers/evidence-citations.py
+
+failure_policy: request_changes
+rollback_policy: >
+  Keep the 4 lens reports under runs/<id>/lens-*.md — each is individually
+  useful as a survey of one surface of the reference repo. Discard a
+  synthesis that fails the citation gate rather than shipping claims whose
+  evidence does not resolve.
+
+# Publisher path. Override per kickoff where the caller wants a different
+# home for the document.
+source_artifact: synthesis.md
+outputs:
+  - docs/research/repo-practices-latest.md
