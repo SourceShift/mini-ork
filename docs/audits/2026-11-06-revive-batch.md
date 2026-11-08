@@ -60,9 +60,11 @@ Always run both directions.
 | 1 | `rsi-t1-kernel-hole-3-freeze-policy-inputs-20261027` | `retryable` refused by a stale retry-hint; the cited success command was re-run instead | **Merged** as `bcc98e10` — *feat(kernel): freeze the self-driving policy's inputs* |
 | 3 | `run-1792400538-82050` | `resume` from `implementer`, 4 checkpoints reused | **Superseded** — see below; the resume died on a remote node-agent 502 |
 | 4 | `rsi-t0f-r8-hardening-20261027-085038` | `resume` from `code_impact_lens`, 1 checkpoint reused | **Already landed** — see below |
+| 5 | `rsi-c1793808348-e4c9d816` (child of `rsi-c1793808348`) | not a `recover` plan — the unmerged commit was found in its worktree | **Merged** as `8e4aeddb` — *split the clustering store out of the lesson store* (RSI rule L6) |
+| 6 | `rsi-c1793086961-7396275d` (child of `rsi-c1793086961`) | the killed child's patch applied cleanly to today's `main` | **Merged** as `b812c86f` — *hold out a deterministic slice of every lesson block* (RSI rule L3) |
 
-Two of the three dispatches resolved without a merge, and neither because the
-work was bad: both because `main` had moved 495 and 10 days respectively, and
+Two of the first three dispatches resolved without a merge, and neither because
+the work was bad: both because `main` had moved 495 and 10 days respectively, and
 the deliverable was already there.
 
 Revive 1 is the instructive one. `recover` refused it with `rc=1` —
@@ -72,6 +74,36 @@ of what happened then, not of what the branch does now. Running the kickoff's
 own success command in the worktree gave **54 passed**, and the frozen-path
 consumers gave **219 passed**, so the branch was merged rather than re-run.
 `--force` was never used: the hint was audited, not overridden.
+
+### Revives 5 and 6 — found in worktrees, not in the run table
+
+Both were `rsi-cycle` children: an `rsi-cycle` run dispatches a `framework-edit`
+child in a worktree of its own, and when the driver is killed the child leaves a
+published-looking row, a worktree, and an unmerged commit behind. `recover`
+never sees this shape — the child's own row can read `published` while its
+branch was never pushed — so the landed-ness oracle has to be applied to the
+*worktree*, not to the run dir. A sweep of every `rsi-c*` worktree found these
+two commits ahead of `main` with real, unlanded work in them.
+
+Revive 5 (`theme_clusters`) also proves the oracle's third case. The patch had
+been rebased away from the code it was written against (it was 66 commits
+behind), and the live DB already carried its table — created ad hoc months
+earlier, with no migration file on `main` and no code referencing it. So the
+gap was real (6364 of 6497 `lesson_themes` rows had no lesson text, exactly what
+rule L6 measures), the table's presence was not evidence that the work landed,
+and a `git apply --check` against `main` was the only thing that settled it.
+
+The pre-push panel blocked the first merge attempt with a defect worth keeping:
+copying only the *blank* rows into `theme_clusters` drops the authored themes
+from the clustering space, because pre-split **every** `lesson_themes` row was a
+cluster candidate. The rest of the patch was sound; the migration and the read
+path were fixed in the same worktree (`8e4aeddb`) and merged on the second pass.
+That is the panel earning its cost on a patch that had already been read by a
+human.
+
+Live outcome after the migration: `theme_clusters` 6513 rows, `lesson_themes`
+133 (authored) with **0** blank — `mini-ork rsi-cycle plan` no longer emits L6,
+while 7 other gaps from the same harvest still do.
 
 ## Tier 2 — deferred, cause first
 
