@@ -76,6 +76,9 @@ FAILED_AT_PREFIX = "Failed at "
 # reaper's own probe detail (``pid N gone (.pid written <iso>)``) so the row
 # names the pid the operator can grep for; the tail names the two ways out.
 STALLED_PREFIX = "Failed: the dispatcher is gone — "
+#: Detail for a ``superseded`` row (rule 5.6): the work landed through another
+#: run, so there is nothing here to review — and nothing to restart.
+SUPERSEDED_DETAIL = "Superseded — another run delivered this work"
 STALLED_SUFFIX = "; /recover restarts it, /stop closes it"
 FAILED_AT_SUFFIX_OPEN = " ("
 FAILED_AT_SUFFIX_CLOSE = ")"
@@ -504,7 +507,7 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
     call site; the ``Path`` cast in this function accepts both.
 
     Rule 6 is the only branch that reads the run's ``.pid``: a live status
-    with a dead owner is not working (see ``_dispatcher_is_gone``), and
+    with a dead owner is not working (see ``_dispatcher_gone_detail``), and
     reporting it as working left a killed classification showing "Working:
     Starting" with a growing wall clock (``classified-state-working``).
     """
@@ -763,6 +766,21 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
             removed=0,
         )
 
+    # Rule 5.6 (superseded): this run's work was delivered by another run, so
+    # like ``not_needed`` it is the fifth state — not a defect, and not this
+    # run's win either. It is terminal, so the answer must not depend on a
+    # ``.pid``: a superseded row that fell through to rule 6 read "Working:"
+    # (and, once rule 6 probed the pid, "the dispatcher is gone") for work
+    # nobody is waiting on.
+    if status == "superseded":
+        return TaskState(
+            state="not_needed",
+            detail=SUPERSEDED_DETAIL,
+            step=_current_step(events),
+            added=0,
+            removed=0,
+        )
+
     # Rule 6: anything else (None, classified, planned, executing, ...)
     # is working — unless the process that owns the run is gone. A live
     # status is a claim by the dispatcher about itself; when the .pid
@@ -858,8 +876,9 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
     whose publisher withheld (``verdict.json`` says ``abstain``, no level
     refuted, no failing node) is "needs you"; a terminal run with an open
     workspace record whose branch still changes also flips to ✋ (S5);
-    published → done; failed / rolled_back → failed; ``not_needed`` → ⊘;
-    a live status whose ``.pid`` names only dead processes → failed (rule 6);
+    published → done; failed / rolled_back → failed; ``not_needed`` and
+    ``superseded`` → ⊘; a live status whose ``.pid`` names only dead processes
+    → failed (rule 6);
     anything else → working. The mark is the prefix Zed's thread list shows next
     to the run's title, so it must agree with ``task_state`` — both re-read the
     same helpers.
@@ -925,9 +944,10 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
         return MARKS["done"]
     if status in ("failed", "rolled_back"):
         return MARKS["failed"]
-    # Terminal, but neither a delivery nor a defect: the operator closed it.
-    # Checked before the fallthrough so a closed run is not counted as ●.
-    if status == "not_needed":
+    # Terminal, but neither a delivery nor a defect: the operator closed it, or
+    # another run delivered the work. Checked before the fallthrough so neither
+    # is counted as ● (or, once rule 6 probes the pid, as ✗).
+    if status in ("not_needed", "superseded"):
         return MARKS["not_needed"]
     # Mirrors ``task_state`` rule 6: a live status whose dispatcher is gone
     # projects as failed, so the cheap tile count cannot call a dead run ●

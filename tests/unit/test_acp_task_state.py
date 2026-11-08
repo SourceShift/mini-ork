@@ -31,6 +31,7 @@ from mini_ork.acp.task_state import (  # noqa: E402
     STALLED_PREFIX,
     STALLED_SUFFIX,
     STARTING_DETAIL,
+    SUPERSEDED_DETAIL,
     TaskState,
     run_mark,
     task_state,
@@ -296,6 +297,28 @@ def test_run_mark_keeps_working_for_a_live_or_absent_pid(tmp_path):
     absent = tmp_path / "absent"
     absent.mkdir()
     assert run_mark("classified", absent) == MARKS["working"]
+
+
+# ── rule 5.6: a superseded row is terminal, not working ─────────────────────
+
+
+def test_a_superseded_row_is_not_needed_not_working(tmp_path):
+    """Another run delivered the work: nothing to review, nothing to restart."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ts = task_state(run_dir, _snapshot(status="superseded"))
+    assert ts.state == "not_needed"
+    assert ts.detail == SUPERSEDED_DETAIL
+
+
+def test_a_superseded_row_does_not_read_as_failed_through_a_dead_pid(tmp_path):
+    """It is terminal, so rule 6's pid probe must not reach it."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / ".pid").write_text(f"{_dead_pid()}\n", encoding="utf-8")
+    ts = task_state(run_dir, _snapshot(status="superseded"))
+    assert ts.state == "not_needed"
+    assert run_mark("superseded", run_dir) == MARKS["not_needed"]
 
 
 # ── diff count edge cases ───────────────────────────────────────────────────
