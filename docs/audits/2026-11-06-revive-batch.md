@@ -105,6 +105,47 @@ Live outcome after the migration: `theme_clusters` 6513 rows, `lesson_themes`
 133 (authored) with **0** blank — `mini-ork rsi-cycle plan` no longer emits L6,
 while 7 other gaps from the same harvest still do.
 
+### Revive 7 — `rsi-c1792978180`: `llm_calls` records no lane (R8)
+
+Merged as `a19f1448`. Additive `lane` column (nullable, no default, no backfill),
+filled by both writers from the model that actually served the call, guarded
+ALTER, renumbered from the patch's `0085` because `0085_review_findings.sql`
+already occupies that number. Applied to the live DB: `pragma_table_info('llm_calls')`
+has `lane`, `schema_migrations` has the row.
+
+**A trap worth recording, caught while applying it:** the guarded ALTER is
+`.read "|sh -c …${MINI_ORK_DB}…"`. Running the file with the `sqlite3` CLI
+instead of through `migrate_apply` leaves `MINI_ORK_DB` unset, so the shell
+guard emits no ALTER — and the file's own trailing INSERT still records the
+migration. The result is a recorded no-op. Repair: delete the
+`schema_migrations` row, re-run `migrate_apply` (it exports `MINI_ORK_DB`), then
+assert the column exists. Never hand-apply a guarded migration.
+
+### Declined — `rsi-c1793812835`: `learning_record.benchmark_delta` (L9)
+
+The patch applies cleanly to today's `main` and would compose
+`AVG(utility_score - baseline_utility_score)` from `benchmark_results` rows
+joined on `benchmark_results.candidate_id = learning_record.run_id`. On the
+live DB that join matches **nothing**: `benchmark_results` holds 2 rows, its
+`candidate_id` values are non-numeric slugs, and no `learning_record.run_id`
+equals one. The patch would add a producer that writes nothing and leaves the
+rule firing, while reading as fixed. The real blocker is the missing
+candidate↔run link (`project_l9_benchmark_delta_has_no_link`), so this stays
+declined until the link exists.
+
+## Left in place, deliberately
+
+Twelve `rsi-c*` worktrees still hold a branch that is one commit ahead of
+`main`. The landed-ness oracle was re-run **against `main`** (not inside each
+worktree, where a delta built off its own merge base trivially re-applies) and
+none of them reverse-applies, so none is provably landed and **no worktree was
+cleaned** — cleaning deletes the branch. Of the eleven with a non-empty delta,
+five apply forward cleanly — revive 7 was one; `benchmark_delta` (L9) is
+declined below; three remain (`lesson_conflicts` L10, `execution_traces.
+code_region` R1/R3, verifier calibration ground truth V3). The other six are
+base-drifted and need a hand-port. They keep their claims until someone lands
+or declines each one.
+
 ## Tier 2 — deferred, cause first
 
 | Gate | Runs | What blocks a revive |
