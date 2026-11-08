@@ -31,6 +31,11 @@ mini-ork rsi-cycle                   # one cycle (one config file: mode: once)
 `plan` and `doctor` are always safe: no ledger writes, no worktrees, no model
 calls. Start with them.
 
+`config/rsi-cycle.yaml` is git-ignored on purpose: it holds this machine's
+budget caps, lanes, probe paths and lease key, and the example beside it is
+what ships. Without the file the loader uses the documented defaults — nothing
+silently changes shape, it just gets less specific.
+
 ## Verbs
 
 | Command | What it does | Cost |

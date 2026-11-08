@@ -30,6 +30,13 @@ node_modules/
 # Local provider registry may name private endpoints/models — never commit.
 # (It SHADOWS config/providers.yaml entirely: first-hit resolution, no merge.)
 .mini-ork/config/providers.yaml
+# Local RSI cycle instance config. `cp config/rsi-cycle.example.yaml
+# config/rsi-cycle.yaml` is the documented setup (docs/operator/rsi-cycle.md),
+# and what it holds — budget caps, lanes, probe paths, the lease key of THIS
+# install — is per-machine truth. Committing it would make one machine's caps
+# the default for everyone, and leaving it untracked puts it one `git add -A`
+# away from being committed by accident.
+/config/rsi-cycle.yaml
 
 # Per-developer Claude Code workspace — never ship to OSS.
 # Covers session memory, handoffs, scheduled task state, settings overrides.
