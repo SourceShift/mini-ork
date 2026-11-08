@@ -36,6 +36,8 @@ class LearningRepository:
     # ── task_runs ────────────────────────────────────────────────────────────
 
     def fetch_task_run(self, task_run_id: str) -> dict[str, Any] | None:
+        if not self._db.has_table("task_runs"):
+            return None
         return self._db.row(
             """
             SELECT id, task_class, recipe, status, trace_id, created_at, ended_at
@@ -252,10 +254,14 @@ class RunDetailRepository:
 
     def fetch_task_run_row(self, task_run_id: str) -> dict[str, Any] | None:
         """The full task_runs row (the detail endpoint returns it wholesale)."""
+        if not self._db.has_table("task_runs"):
+            return None
         return self._db.row("SELECT * FROM task_runs WHERE id = ?", (task_run_id,))
 
     def fetch_input_paths(self, task_run_id: str) -> dict[str, Any] | None:
         """kickoff/plan/recipe columns the inputs endpoint resolves to files."""
+        if not self._db.has_table("task_runs"):
+            return None
         return self._db.row(
             "SELECT kickoff_path, plan_path, recipe FROM task_runs WHERE id = ?",
             (task_run_id,),
@@ -263,6 +269,8 @@ class RunDetailRepository:
 
     def fetch_correlation_row(self, task_run_id: str) -> dict[str, Any] | None:
         """Columns the correlation diagnostic reports on."""
+        if not self._db.has_table("task_runs"):
+            return None
         return self._db.row(
             "SELECT id, trace_id, created_at, ended_at, kickoff_path FROM task_runs WHERE id = ?",
             (task_run_id,),
@@ -270,6 +278,8 @@ class RunDetailRepository:
 
     def fetch_trace_window(self, task_run_id: str) -> dict[str, Any] | None:
         """trace_id + [created_at, ended_at] — the events/llm-calls bridge input."""
+        if not self._db.has_table("task_runs"):
+            return None
         return self._db.row(
             "SELECT trace_id, created_at, ended_at FROM task_runs WHERE id = ?",
             (task_run_id,),
@@ -277,6 +287,8 @@ class RunDetailRepository:
 
     def fetch_run_recipe(self, task_run_id: str) -> dict[str, Any] | None:
         """Just the recipe name, for the DAG endpoint's fingerprint lookup."""
+        if not self._db.has_table("task_runs"):
+            return None
         return self._db.row(
             "SELECT recipe FROM task_runs WHERE id = ?", (task_run_id,)
         )
@@ -339,7 +351,14 @@ class RunDetailRepository:
         NULL ``recipe`` values (per-run column nullable; see
         ``tests/unit/test_run_detail_repo_py.py:177``) are dropped — the
         caller treats their run as "recipe not found" via the empty mapping.
+
+        A home whose ``state.db`` exists but was never migrated has no
+        ``task_runs`` table at all, and an unguarded SELECT raises
+        ``sqlite3.OperationalError`` — a 500 on the ``dags`` page instead of an
+        empty board. Guarded like every other reader in this class.
         """
+        if not self._db.has_table("task_runs"):
+            return {}
         if task_run_ids is None:
             rows = self._db.rows(
                 "SELECT id, recipe FROM task_runs "
@@ -376,7 +395,7 @@ class RunDetailRepository:
         caller has already established which ids those are by their absence
         from :meth:`fetch_run_recipes`.
         """
-        if not task_run_ids:
+        if not task_run_ids or not self._db.has_table("task_runs"):
             return {}
         placeholders = ",".join("?" * len(task_run_ids))
         rows = self._db.rows(

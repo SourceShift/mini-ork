@@ -258,6 +258,31 @@ def test_empty_db_returns_empty_not_error(empty: RunDetailRepository) -> None:
     assert empty.fetch_llm_calls_in_window(0, 100) == []
 
 
+def test_no_task_runs_table_returns_empty_not_error(tmp_path: Path) -> None:
+    """``task_runs`` itself absent — the case the ``empty`` fixture cannot cover.
+
+    A home whose ``state.db`` exists but was never migrated (or a foreign home
+    read by ``mini-ork ide-page dags``, which that page supports from a CLI for
+    any home) has no ``task_runs`` at all. Every reader that SELECTed from it
+    raised ``sqlite3.OperationalError`` and turned the page into a 500; the
+    guards make it an empty board, exactly as a missing ``run_events`` already
+    does. ``fetch_run_recipes`` is the batched path the page calls first, so it
+    is the one that must not raise.
+    """
+    db_path = tmp_path / "state.db"
+    sqlite3.connect(db_path).close()  # an existing but unmigrated state.db
+    repo = RunDetailRepository(StateDB(db_path))
+    assert not repo.has_table("task_runs")
+    assert repo.fetch_task_run_row("run-1") is None
+    assert repo.fetch_input_paths("run-1") is None
+    assert repo.fetch_correlation_row("run-1") is None
+    assert repo.fetch_trace_window("run-1") is None
+    assert repo.fetch_run_recipe("run-1") is None
+    assert repo.fetch_run_recipes() == {}
+    assert repo.fetch_run_recipes(["run-1"]) == {}
+    assert repo.fetch_run_classifications(["run-1"]) == {}
+
+
 # ── handler-level shape pins ──────────────────────────────────────────────
 
 

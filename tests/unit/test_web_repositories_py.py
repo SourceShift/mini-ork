@@ -131,8 +131,9 @@ def seeded(tmp_path: Path) -> LearningRepository:
 @pytest.fixture
 def empty(tmp_path: Path) -> LearningRepository:
     """A db with ONLY task_runs — the learning tables are absent, exercising the
-    has_table guards. (task_runs itself is queried unguarded, as the handler
-    always did: the web app only runs where state.db has task_runs.)"""
+    has_table guards. ``task_runs`` itself is kept here because this fixture is
+    about the *other* tables; the unmigrated-home case (no ``task_runs`` at all)
+    is ``test_no_task_runs_table_returns_none_not_error``."""
     db_path = tmp_path / "state.db"
     con = sqlite3.connect(db_path)
     con.execute("CREATE TABLE task_runs (id TEXT PRIMARY KEY, task_class TEXT, recipe TEXT,"
@@ -215,6 +216,20 @@ def test_empty_db_returns_empty_not_error(empty: LearningRepository) -> None:
     assert empty.fetch_prior_similar_runs("code-fix", [""], "run-1") == []
     assert empty.fetch_trace_summaries(["tr-1"]) == {}
     assert empty.gradient_count() == 0
+
+
+def test_no_task_runs_table_returns_none_not_error(tmp_path: Path) -> None:
+    """``task_runs`` absent — the ``empty`` fixture keeps it, so it cannot.
+
+    ``fetch_task_run`` was the one reader in this class without a ``has_table``
+    guard: on a ``state.db`` that exists but was never migrated it raised
+    ``sqlite3.OperationalError`` instead of reporting the run as not found.
+    """
+    db_path = tmp_path / "state.db"
+    sqlite3.connect(db_path).close()  # an existing but unmigrated state.db
+    repo = LearningRepository(StateDB(db_path))
+    assert not repo.has_table("task_runs")
+    assert repo.fetch_task_run("run-1") is None
 
 
 def test_get_learning_handler_shape_preserved(tmp_path: Path, monkeypatch) -> None:
