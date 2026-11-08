@@ -27,7 +27,7 @@ from _lib import (  # noqa: E402
     check_psql_credentials_set,
     emit_verifier_json,
 )
-from mini_ork.verify.pm import exec_argv, run_argv  # noqa: E402
+from mini_ork.verify.pm import classify_spawn, exec_argv, run_argv, run_logged  # noqa: E402
 
 NAME = "researcher"
 
@@ -38,6 +38,40 @@ REPO = os.environ.get("MINI_ORK_EPIC_TARGET_REPO") or os.path.expanduser("~/ps/r
 CHANGED_FILE_LIST = os.path.join(RUN_DIR, f"verifier-{NAME}.changed-files")
 TYPECHECK_FILE_LIST = os.path.join(RUN_DIR, f"verifier-{NAME}.typecheck-files")
 JEST_INPUT_LIST = os.path.join(RUN_DIR, f"verifier-{NAME}.jest-inputs")
+
+# Spawn bookkeeping for the toolchain abstention at the bottom. A check that
+# fails because pnpm/jest/psql never LAUNCHED has not judged the child run; one
+# that fails because the tool ran and rejected has. `_cur_check` attributes each
+# spawn to the check that issued it.
+_cur_check = None
+_spawn_toolchain = {}     # cid -> a spawn during this check failed to launch
+_spawn_real_fail = set()  # cids where a spawn ran and genuinely rejected
+
+
+def _note_spawn(argv, rc, tail):
+    if rc == 0 or _cur_check is None:
+        return
+    if classify_spawn(argv, rc, tail):
+        _spawn_toolchain[_cur_check] = True
+    else:
+        _spawn_real_fail.add(_cur_check)
+
+
+def _spawn(argv, cwd=None, env=None):
+    """Run into the evidence log, keeping the output that decides abstention."""
+    rc, tail = run_logged(argv, log.evidence, cwd=cwd, env=env, stream=log._ev)
+    _note_spawn(argv, rc, tail)
+    return rc == 0
+
+
+def _record(cid, desc, fn):
+    """``log.record_check`` that also attributes the check's spawns."""
+    global _cur_check
+    _cur_check = cid
+    try:
+        log.record_check(cid, desc, fn)
+    finally:
+        _cur_check = None
 
 
 def _normalize_changed_files():
@@ -82,7 +116,7 @@ def _typecheck_touched():
     # manager, and npm refuses to start against a pnpm-only devEngines repo.
     argv = run_argv(REPO, "type-check:touched", *files)
     log.write(f"$ {' '.join(argv)}\n")
-    return subprocess.run(argv, cwd=REPO, stdout=log._ev, stderr=subprocess.STDOUT).returncode == 0
+    return _spawn(argv, cwd=REPO)
 
 
 def _test_candidates_for_changed_file(path):
@@ -131,8 +165,7 @@ def _jest_related_tests():
         "--config", os.path.join(REPO, "server", "jest.config.js"),
         "--findRelatedTests", *inputs, "--runInBand", "--forceExit")
     log.write(f"$ {' '.join(argv)}\n")
-    return subprocess.run(argv, cwd=REPO,
-                          stdout=log._ev, stderr=subprocess.STDOUT).returncode == 0
+    return _spawn(argv, cwd=REPO)
 
 
 def _sql_probe():
@@ -144,10 +177,10 @@ def _sql_probe():
         log.write("missing one or more PostgreSQL env vars: PGPASSWORD, PGHOST, PGPORT, PGUSER, PGDATABASE\n")
         return False
     env = {**os.environ, "PGPASSWORD": os.environ["PGPASSWORD"]}
-    return subprocess.run(
+    return _spawn(
         ["psql", "-h", os.environ["PGHOST"], "-p", os.environ["PGPORT"],
          "-U", os.environ["PGUSER"], "-d", os.environ["PGDATABASE"], "-c", probe],
-        env=env, stdout=log._ev, stderr=subprocess.STDOUT).returncode == 0
+        env=env)
 
 
 def _no_uncommitted_debt_files():
@@ -171,20 +204,31 @@ log.write(f"changed_files={CHANGED_FILE_LIST}\n")
 log.write(f"typecheck_files={TYPECHECK_FILE_LIST}\n")
 log.write(f"jest_inputs={JEST_INPUT_LIST}\n")
 
-log.record_check("typecheck-passed",
-                 "type-check:touched passes for changed TypeScript files, or is skipped when none changed",
-                 _typecheck_touched)
-log.record_check("jest-passed",
-                 "jest related tests pass when changed or adjacent tests exist, or are skipped when none apply",
-                 _jest_related_tests)
-log.record_check("sql-probe-passed",
-                 "optional EPIC_SQL_PROBE passes with operator-supplied PostgreSQL credentials, or is skipped when unset",
-                 _sql_probe)
-log.record_check("no-uncommitted-debt-files",
-                 "target repo has no leftover debt artifacts such as .orig, .rej, backups, or coverage directories",
-                 _no_uncommitted_debt_files)
+_record("typecheck-passed",
+        "type-check:touched passes for changed TypeScript files, or is skipped when none changed",
+        _typecheck_touched)
+_record("jest-passed",
+        "jest related tests pass when changed or adjacent tests exist, or are skipped when none apply",
+        _jest_related_tests)
+_record("sql-probe-passed",
+        "optional EPIC_SQL_PROBE passes with operator-supplied PostgreSQL credentials, or is skipped when unset",
+        _sql_probe)
+_record("no-uncommitted-debt-files",
+        "target repo has no leftover debt artifacts such as .orig, .rej, backups, or coverage directories",
+        _no_uncommitted_debt_files)
 
-emit_verifier_json(log, NAME, f"{REPO} {CHANGED_FILE_LIST}")
+# Abstain only when EVERY failed check owes its failure to a spawn that never
+# launched (pnpm, psql, or jest absent — not the child run's fault). A check that
+# failed with no spawn at all, like a missing jest config or unset PostgreSQL
+# credentials, keeps this a refutation.
+_failed = [line.split("\t", 1)[0] for line in _read_lines(log.checks_tsv)
+           if line.rsplit("\t", 1)[-1] != "true"]
+_failure_kind = ("toolchain"
+                 if _failed and all(cid in _spawn_toolchain and cid not in _spawn_real_fail
+                                    for cid in _failed)
+                 else None)
+
+emit_verifier_json(log, NAME, f"{REPO} {CHANGED_FILE_LIST}", failure_kind=_failure_kind)
 log.close()
 
 sys.exit(0)

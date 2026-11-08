@@ -1160,6 +1160,11 @@ def evaluate(run_dir: str, log) -> dict:
     result["rc"] = rc
     result["timed_out"] = timed_out
     result["deselected_reported"] = deselected_count(output)
+    # `_run_pytest` returns rc=None only when pytest could not be started, and a
+    # timeout is cancelled. A suite that never launched judged nothing, so it is
+    # a toolchain abstention, not a refutation (mini_ork/verify/pm.py).
+    if rc is None and not timed_out:
+        result["failure_kind"] = "toolchain"
 
     if timed_out:
         result["error"] = f"spec suite timed out after {timeout}s"
@@ -1394,6 +1399,8 @@ def _normal(run_dir: str) -> int:
         payload["note"] = result["note"]
     if result["error"]:
         payload["error"] = result["error"]
+    if result.get("failure_kind"):
+        payload["failure_kind"] = result["failure_kind"]
     if result.get("harness_defect_report"):
         payload["harness_defect_report"] = result["harness_defect_report"]
     # The executor copies its captured stdout over verifier_spec-tests.json

@@ -10,8 +10,17 @@
 
 import json
 import os
-import subprocess
 import sys
+
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.realpath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
+from mini_ork.verify.pm import classify_spawn, run_logged  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 REPO_ROOT = os.environ.get("MO_TARGET_CWD") or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -23,6 +32,12 @@ STATE = os.path.join(RUN_DIR, "pre-retirement-parity.json")
 
 passed = True
 reasons = []
+# Every failure below comes from a spawn. Record which spawn produced it so a
+# binary that never ran (rc 127, signal kill) can be told apart from a real
+# parity break, which is a refutation.
+failed_argv = []
+failed_rc = None
+failed_tail = ""
 
 
 def _state_is_passing():
@@ -47,18 +62,21 @@ if FORK and os.path.isfile(FORK_TEST):
     env = {k: v for k, v in os.environ.items()
            if k not in ("MINI_ORK_RUN_DIR", "MINI_ORK_RECIPE", "MINI_ORK_RUN_ID",
                         "MINI_ORK_PLAN_PATH", "MINI_ORK_TASK_CLASS")}
+    pytest_argv = [sys.executable, "-m", "pytest", FORK_TEST, "-q",
+                   "-p", "no:cacheprovider"]
     with open(EVIDENCE, "wb") as f:
-        rc = subprocess.run([sys.executable, "-m", "pytest", FORK_TEST, "-q",
-                             "-p", "no:cacheprovider"], cwd=REPO_ROOT, env=env,
-                            stdout=f, stderr=subprocess.STDOUT).returncode
+        rc, tail = run_logged(pytest_argv, EVIDENCE, cwd=REPO_ROOT, env=env, stream=f)
     if rc != 0:
         passed = False
+        failed_argv, failed_rc, failed_tail = pytest_argv, rc, tail
         reasons.append(f"pre-retirement fork parity failed: {FORK_TEST}")
 elif os.path.isfile(HARNESS):
+    harness_argv = ["bash", HARNESS]
     with open(EVIDENCE, "wb") as f:
-        rc = subprocess.run(["bash", HARNESS], stdout=f, stderr=subprocess.STDOUT).returncode
+        rc, tail = run_logged(harness_argv, EVIDENCE, stream=f)
     if rc != 0:
         passed = False
+        failed_argv, failed_rc, failed_tail = harness_argv, rc, tail
         reasons.append("pre-retirement runtime parity harness failed")
 else:
     passed = False
@@ -71,6 +89,13 @@ result = {
     "evidence": EVIDENCE,
     "reasons": reasons,
 }
+# A parity oracle that could not launch (missing pytest, missing bash, signal
+# kill) proved nothing about parity. Declared so the engine abstains instead of
+# refuting the migration (see mini_ork/verify/pm.py).
+if not passed and failed_argv:
+    _kind = classify_spawn(failed_argv, failed_rc, failed_tail)
+    if _kind:
+        result["failure_kind"] = _kind
 with open(STATE, "w", encoding="utf-8") as handle:
     json.dump(result, handle)
     handle.write("\n")

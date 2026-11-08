@@ -9,7 +9,6 @@
 import json
 import os
 import shlex
-import subprocess
 import sys
 
 # mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
@@ -20,7 +19,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import exec_argv  # noqa: E402
+from mini_ork.verify.pm import classify_spawn, exec_argv, run_logged  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -61,6 +60,8 @@ passed = True
 # (kimi's hard-rule finding on run-1791821930-72687, 2026-10-12.)
 property_rc = None
 mutation_rc = None
+mutation_argv = []  # set only on the branch that runs stryker
+mutation_tail = ""
 checks_ran = []
 checks_skipped = []
 
@@ -82,8 +83,7 @@ if os.path.isfile("stryker.conf.json") or os.path.isfile("stryker.conf.js"):
     mutation_argv = exec_argv(".", "stryker", "run")
     ev.write(f"$ {shlex.join(mutation_argv)}\n")
     ev.flush()
-    mutation_rc = subprocess.run(mutation_argv,
-                                 stdout=ev, stderr=subprocess.STDOUT).returncode
+    mutation_rc, mutation_tail = run_logged(mutation_argv, EVIDENCE, stream=ev)
     checks_ran.append("mutation")
     if mutation_rc != 0:
         passed = False
@@ -93,7 +93,7 @@ else:
     checks_skipped.append("mutation: no stryker.conf.json/.js")
 
 ev.close()
-print(json.dumps({
+payload = {
     "verifier": "tier3-property-mutation",
     "pass": passed,
     "evidence_path": EVIDENCE,
@@ -102,5 +102,12 @@ print(json.dumps({
     "checks_ran": checks_ran,
     "checks_skipped": checks_skipped,
     "vacuous": not checks_ran,
-}))
+}
+# Stryker not installed (rc 127) or killed before it scored anything is not a
+# verdict on the code — abstain rather than refute (mini_ork/verify/pm.py).
+if not passed and mutation_rc is not None:
+    _kind = classify_spawn(mutation_argv, mutation_rc, mutation_tail)
+    if _kind:
+        payload["failure_kind"] = _kind
+print(json.dumps(payload))
 sys.exit(0)

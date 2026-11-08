@@ -402,3 +402,51 @@ def test_tier1_abstains_when_eslint_is_killed_by_a_signal(tmp_path):
     assert payload["pass"] is False, evidence
     assert payload["lint_rc"] == -15, evidence
     assert payload["failure_kind"] == "toolchain", evidence
+
+
+# ── run_logged: the output a verifier needs to tell "never started" from
+#    "ran and rejected" ────────────────────────────────────────────────────────
+#
+# Every `failure_kind` branch above is only as good as the text handed to
+# `classify_spawn`. Verifiers send a spawn's output straight to their evidence
+# file, so they used to classify on "" and saw only rc — and the failures this
+# contract exists for (a manager refusing the repo, `npx` finding no local
+# install) exit 1, not 127. These pin the helper that closes that gap.
+
+def test_run_logged_returns_the_text_that_identifies_a_refused_manager(tmp_path):
+    evidence = tmp_path / "evidence.log"
+    argv = ["bash", "-c", "echo 'npm error code EBADDEVENGINES' >&2; exit 1"]
+
+    rc, tail = pm.run_logged(argv, str(evidence))
+
+    assert rc == 1
+    assert "EBADDEVENGINES" in tail
+    assert pm.classify_spawn(argv, rc, tail) == "toolchain"
+    assert "EBADDEVENGINES" in evidence.read_text()
+
+
+def test_run_logged_reports_a_missing_binary_as_rc_127(tmp_path):
+    """`subprocess` raises where a shell returns 127; callers get one shape."""
+    evidence = tmp_path / "evidence.log"
+    argv = ["mini-ork-no-such-binary-xyz"]
+
+    rc, tail = pm.run_logged(argv, str(evidence))
+
+    assert rc == 127
+    assert "command not found" in tail
+    assert pm.classify_spawn(argv, rc, tail) == "toolchain"
+
+
+def test_run_logged_shares_the_callers_stream_so_writes_stay_in_order(tmp_path):
+    """The parent's buffered offset must advance with the child's output.
+
+    A helper that opened its own append handle here would leave the caller's
+    offset stale, and its next write would land on top of the child's lines.
+    """
+    evidence = tmp_path / "evidence.log"
+    with open(evidence, "w") as stream:
+        stream.write("BEFORE\n")
+        pm.run_logged(["bash", "-c", "echo CHILD"], str(evidence), stream=stream)
+        stream.write("AFTER\n")
+
+    assert evidence.read_text().split() == ["BEFORE", "CHILD", "AFTER"]

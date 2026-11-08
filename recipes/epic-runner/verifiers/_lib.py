@@ -66,8 +66,13 @@ def check_psql_credentials_set():
     return all(os.environ.get(k) for k in ("PGPASSWORD", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE"))
 
 
-def emit_verifier_json(log, name, artifact_ref):
-    """Port of _emit_verifier_json (reads the checks TSV, prints the verdict)."""
+def emit_verifier_json(log, name, artifact_ref, failure_kind=None):
+    """Port of _emit_verifier_json (reads the checks TSV, prints the verdict).
+
+    ``failure_kind`` is opt-in and empty by default: a verifier that cannot
+    attribute its red verdict to a spawn that never launched says nothing extra,
+    which keeps every other epic verifier's schema unchanged.
+    """
     checks = []
     with open(log.checks_tsv, encoding="utf-8") as f:
         for line in f:
@@ -83,7 +88,7 @@ def emit_verifier_json(log, name, artifact_ref):
             })
 
     failed = [c["name"] for c in checks if not c["pass"]]
-    print(json.dumps({
+    payload = {
         "verifier": name,
         "pass": not failed,
         "verdict": "pass" if not failed else "fail",
@@ -94,4 +99,7 @@ def emit_verifier_json(log, name, artifact_ref):
         "reasons": [f"{c['name']} failed; see {log.evidence}" for c in checks if not c["pass"]],
         "checked_criteria": [c["name"] for c in checks],
         "artifact_ref": artifact_ref,
-    }, sort_keys=True))
+    }
+    if failure_kind:
+        payload["failure_kind"] = failure_kind
+    print(json.dumps(payload, sort_keys=True))

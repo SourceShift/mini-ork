@@ -15,8 +15,18 @@
 
 import json
 import os
-import subprocess
+import shlex
 import sys
+
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.realpath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
+from mini_ork.verify.pm import classify_spawn, run_logged  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 REPO_ROOT = os.environ.get("MO_TARGET_CWD") or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -28,6 +38,7 @@ open(EVIDENCE, "w").close()
 
 passed = True
 reasons = []
+failed_probes = []  # "toolchain" or "code", one entry per failed probe
 
 
 def _append_evidence(line):
@@ -37,11 +48,14 @@ def _append_evidence(line):
 
 def _run_to_evidence(argv, cwd=None, env=None, shell=False):
     with open(EVIDENCE, "ab") as f:
-        if shell:
-            return subprocess.run(argv, shell=True, cwd=cwd, stdout=f,
-                                  stderr=subprocess.STDOUT, env=env).returncode == 0
-        return subprocess.run(argv, cwd=cwd, stdout=f,
-                              stderr=subprocess.STDOUT, env=env).returncode == 0
+        rc, tail = run_logged(argv, EVIDENCE, cwd=cwd, env=env, shell=shell, stream=f)
+    if rc != 0:
+        # rc 127 / a signal kill means the probe never ran: a missing binary,
+        # not a failing feature. Each failed probe records WHICH it was, because
+        # one probe's missing tool must not excuse another probe's real failure.
+        kind = classify_spawn(argv if isinstance(argv, list) else shlex.split(argv), rc, tail)
+        failed_probes.append(kind or "code")
+    return rc == 0
 
 
 def _pytest(target):
@@ -183,12 +197,19 @@ if FORK and os.path.isfile(os.path.join(REPO_ROOT, TYPE_TARGETS[0])):
         passed = False
         reasons.append(f"pyright on {' '.join(TYPE_TARGETS)} not clean")
 
-print(json.dumps({
+payload = {
     "name": "feature-acceptance",
     "fork": FORK,
     "pass": passed,
     "evidence": EVIDENCE,
     "reasons": reasons,
-}))
+}
+# A red verdict is only a refutation when a tool actually judged the code. If
+# EVERY failed probe failed to launch, none of them judged anything and the
+# honest verdict is an abstention. A single real failure keeps it a refutation —
+# abstaining here would hide a regression behind a broken toolchain.
+if not passed and failed_probes and all(k == "toolchain" for k in failed_probes):
+    payload["failure_kind"] = "toolchain"
+print(json.dumps(payload))
 
 sys.exit(0 if passed else 1)

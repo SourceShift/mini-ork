@@ -36,7 +36,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
 from _verdict_merge import write_verdict  # noqa: E402
-from mini_ork.verify.pm import run_argv  # noqa: E402
+from mini_ork.verify.pm import classify_spawn, run_argv, run_logged  # noqa: E402
 
 # The frozen-kernel guard logic + its built-in default list live in the engine
 # (mini_ork/vcs/repo_integrity_guard.py) so the verifier and the apply boundary
@@ -133,13 +133,38 @@ _ev = open(EVIDENCE, "w")
 _tsv = open(CHECKS_TSV, "a")
 
 
+# Spawn bookkeeping for the toolchain abstention below. A check that fails
+# because ruff/typecheck/git never LAUNCHED has not judged the code; one that
+# fails because the tool ran and rejected it has. `_cur_check` attributes each
+# spawn to the check that issued it, so the two can be told apart at emit time
+# without every check having to thread a result object through.
+_cur_check = None
+_spawn_toolchain = {}   # cid -> a spawn during this check failed to launch
+_spawn_real_fail = set()  # cids where a spawn ran and genuinely rejected
+
+
+def _note_spawn(argv, rc, tail):
+    if rc == 0 or _cur_check is None:
+        return
+    if isinstance(argv, str):
+        argv = shlex.split(argv)
+    if classify_spawn(argv, rc, tail):
+        _spawn_toolchain[_cur_check] = True
+    else:
+        _spawn_real_fail.add(_cur_check)
+
+
 def _check(cid, desc, fn):
+    global _cur_check
     _ev.write(f"[{cid}] {desc}\n")
     _ev.flush()
+    _cur_check = cid
     try:
         ok = bool(fn())
     except Exception:
         ok = False
+    finally:
+        _cur_check = None
     _tsv.write(f"{cid}\t{desc}\t{'true' if ok else 'false'}\n")
     _tsv.flush()
     _ev.write("  ok\n" if ok else "  FAIL\n")
@@ -148,13 +173,14 @@ def _check(cid, desc, fn):
 
 def _run(argv, cwd=None, shell=False):
     """Run a command with output to the evidence log; return rc == 0."""
-    if shell:
-        return subprocess.run(argv, shell=True, cwd=cwd, stdout=_ev,
-                              stderr=subprocess.STDOUT).returncode == 0
-    _ev.write(f"$ {shlex.join(argv)}\n")
+    if not shell:
+        _ev.write(f"$ {shlex.join(argv)}\n")
+    # The child must share _ev's descriptor, or this file's buffered offset goes
+    # stale and the next parent write lands on top of the child's output.
     _ev.flush()
-    return subprocess.run(argv, cwd=cwd, stdout=_ev,
-                          stderr=subprocess.STDOUT).returncode == 0
+    rc, tail = run_logged(argv, EVIDENCE, cwd=cwd, shell=shell, stream=_ev)
+    _note_spawn(argv, rc, tail)
+    return rc == 0
 
 
 def _changed_files():
@@ -871,7 +897,7 @@ with open(CHECKS_TSV) as f:
                        "pass": passed == "true"})
 failed = [c["name"] for c in checks if not c["pass"]]
 changed = _changed_file_lines()
-VERIFIER_JSON = json.dumps({
+payload = {
     "verifier": NAME,
     "pass": not failed,
     "verdict": "pass" if not failed else "fail",
@@ -884,7 +910,14 @@ VERIFIER_JSON = json.dumps({
     "artifact_ref": "$MINI_ORK_RUN_DIR/framework-edit.diff",
     "changed_files": changed,
     "artifact_sha256": ARTIFACT_SHA256,
-})
+}
+# Abstain only when EVERY failed check owes its failure to a spawn that never
+# launched. A single check whose tool ran and rejected — or which failed with no
+# spawn at all, like a frozen-kernel refusal — keeps this a refutation.
+if failed and all(cid in _spawn_toolchain and cid not in _spawn_real_fail
+                  for cid in failed):
+    payload["failure_kind"] = "toolchain"
+VERIFIER_JSON = json.dumps(payload)
 
 static_pass = "true" if not failed else "false"
 write_verdict(static_pass, str(files_changed_count))

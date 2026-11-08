@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 
 MANAGERS = ("pnpm", "yarn", "bun", "npm")
 
@@ -238,3 +239,60 @@ def classify_suite_spawn(argv, rc, output):  # noqa: ARG001 — argv mirrors cla
         if needle in head:
             return "toolchain"
     return ""
+
+
+_TAIL_CHARS = 16384
+
+
+def run_logged(argv, evidence, *, cwd=None, env=None, shell=False, stream=None):
+    """Run ARGV with its output appended to EVIDENCE; return ``(rc, tail)``.
+
+    Verifiers send a spawn's output straight to their evidence file, which left
+    them classifying on ``""`` — and the failures this contract exists for are
+    exactly the ones whose only signal is that text. A manager refusing the
+    wrong repo (``EBADDEVENGINES``), ``npx`` finding no local install
+    (``could not determine executable to run``) and a shell's ``command not
+    found`` all exit non-zero *after* running, so rc alone says "the tool
+    rejected the code" when nothing judged it at all. The tail is the part of
+    the evidence this call wrote, bounded to :data:`_TAIL_CHARS`.
+
+    ``stream`` is the caller's own open handle on EVIDENCE. Pass it when the
+    caller also writes to that file: the child must share the same descriptor,
+    or the parent's buffered offset goes stale and its next write lands on top
+    of the child's output. Omit it and this opens an append handle itself.
+
+    A binary that does not exist raises ``FileNotFoundError`` instead of
+    returning rc 127 — the same state, reported as ``(127, "command not
+    found: …")`` so a caller needs one branch, not two.
+
+    ``TimeoutExpired`` is deliberately NOT swallowed: whether a killed suite is
+    an abstention or a refutation is the caller's call.
+    """
+    try:
+        start = os.path.getsize(evidence)
+    except OSError:
+        start = 0
+
+    def _spawn(target):
+        return subprocess.run(argv, cwd=cwd, env=env, shell=shell,
+                              stdout=target, stderr=subprocess.STDOUT).returncode
+
+    try:
+        if stream is not None:
+            stream.flush()
+            rc = _spawn(stream)
+        else:
+            with open(evidence, "ab") as fh:
+                rc = _spawn(fh)
+    except FileNotFoundError as exc:
+        return 127, f"command not found: {exc}"
+    except OSError as exc:  # e.g. PermissionError on a non-executable path
+        return 127, f"{type(exc).__name__}: {exc}"
+    try:
+        with open(evidence, "rb") as fh:
+            end = fh.seek(0, os.SEEK_END)
+            fh.seek(max(start, end - _TAIL_CHARS))
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        tail = ""
+    return rc, tail

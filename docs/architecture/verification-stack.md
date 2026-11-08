@@ -35,6 +35,33 @@ The features below close three holes that were measured in mini-ork itself:
 2. **The oracle had a recall hole.** It could not judge about 16% of correct fixes (recall 21/25).
 3. **Single tests can be gamed through coverage gaps.** A patch that special-cases the tested input passes the test.
 
+### A verifier that never ran is an abstention, not a refutation
+
+`UNVERIFIED` also has an operational form: a **spawn failure**. A verifier that
+shells out to a tool the host does not have — `pnpm`, `psql`, `stryker`,
+`playwright`, `pytest` — must not report that as "the code failed". One npm
+refusal on a pnpm repo (2026-10-11) was read as a code failure and cascaded into
+10 failed nodes and a rollback of a correct implementation.
+
+The contract is one field. A verifier emits `"failure_kind": "toolchain"`
+(alongside its `pass: false`) and `mini_ork/verify/levels.py` turns that verdict
+into an abstention (`ABSTAINING_KINDS`), so the run is re-verified instead of
+charged to the implementer.
+
+Two rules make it honest, and both are tested:
+
+- **Only when nothing judged the code.** A red verdict that ALSO contains a real
+  failure stays a refutation. `feature-acceptance` records one entry per failed
+  probe and abstains only when every one of them was a toolchain failure;
+  `static-check` does the same per check.
+- **Decided on the output, not just the exit code.** A manager that refuses the
+  repo (`EBADDEVENGINES`) and an `npx` with no local install exit 1, not 127 —
+  only their output says so. `mini_ork.verify.pm.classify_spawn` reads it, and
+  `run_logged(argv, evidence, stream=…)` is how a verifier gets that output back
+  while its log still lands in the evidence file (it also reports a missing
+  binary as `(127, "command not found: …")`, because `subprocess` raises where a
+  shell returns 127).
+
 ## Which "vacuous" guard you mean: three, not one
 
 "There is a vacuous-pass guard, but it is off behind a flag" and "a vacuous pass

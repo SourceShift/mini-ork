@@ -63,6 +63,16 @@ import subprocess
 import sys
 import tempfile
 
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.realpath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
+from mini_ork.verify.pm import classify_spawn  # noqa: E402
+
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 WT_RAW = os.environ.get("MINI_ORK_SELF_IMPROVE_WORKTREE") or os.environ.get(
     "MINI_ORK_ROOT", ""
@@ -322,7 +332,7 @@ try:
     else:
         passed = 0
 
-    _emit({
+    result = {
         "verifier": "self-tests-pass",
         "pass": passed == 1,
         "evidence_path": EVIDENCE,
@@ -333,7 +343,15 @@ try:
         "tests_passed": n_passed,
         "tests_failed": n_failed,
         "timed_out": False,
-    })
+    }
+    # rc 127 or a signal-killed runner: the suite never ran, so "nothing
+    # passed" says nothing about the code. Abstain rather than refute
+    # (mini_ork/verify/pm.py).
+    if passed != 1:
+        _kind = classify_spawn(cmd, rc, out)
+        if _kind:
+            result["failure_kind"] = _kind
+    _emit(result)
 finally:
     # Best-effort cleanup — symlinks only, no real payload to lose.
     try:

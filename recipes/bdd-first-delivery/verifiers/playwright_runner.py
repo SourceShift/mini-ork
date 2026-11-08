@@ -42,7 +42,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import exec_argv  # noqa: E402
+from mini_ork.verify.pm import classify_spawn, exec_argv  # noqa: E402
 
 SUB_EPIC_ID = os.environ.get("SUB_EPIC_ID", "")
 WORKDIR = os.environ.get("WORKDIR", "")
@@ -182,7 +182,7 @@ evidence_path = json_results_file or ""
 if not evidence_path and log_file:
     evidence_path = log_file
 
-verdict_json = json.dumps({
+verdict = {
     "verifier": "playwright",
     "sub_epic_id": SUB_EPIC_ID,
     "pass": verdict_pass,
@@ -197,7 +197,30 @@ verdict_json = json.dumps({
     "failure_summary": failure_summary,
     "evidence_path": evidence_path,
     "ran_at": _utc_now(),
-}, ensure_ascii=False)
+}
+
+# rc 127 (the runner was not installed) and a negative rc (killed before it
+# reached a verdict) both mean the tool never judged the spec. Without this the
+# engine reads that as a refutation and can roll back a correct change — the
+# exact cascade `failure_kind` exists to stop (see mini_ork/verify/pm.py).
+# The rc-only signals are not the whole story: a manager that refuses to start
+# (`EBADDEVENGINES`) or an `npx` with no local install (`could not determine
+# executable to run`) exits 1, and only the run log says so.
+_tail = ""
+if log_file:
+    try:
+        with open(log_file, "rb") as _f:
+            _end = _f.seek(0, os.SEEK_END)
+            _f.seek(max(0, _end - 16384))
+            _tail = _f.read().decode("utf-8", "replace")
+    except OSError:
+        _tail = ""
+if not verdict_pass:
+    _kind = classify_spawn(argv, exit_code, _tail)
+    if _kind:
+        verdict["failure_kind"] = _kind
+
+verdict_json = json.dumps(verdict, ensure_ascii=False)
 
 # Write to verdict dir if set.
 if verdict_dir:
