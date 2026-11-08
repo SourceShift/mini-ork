@@ -131,6 +131,14 @@ What CI runs: `.github/workflows/ci.yml` — ruff (blocking + advisory), pytest 
 3.11/3.12 sharded `unit-a`/`unit-b`/`rest`, the feature-registry ↔ skill check
 (`check-skill`), the README/doc claim check, the verifiers-pin check, and the
 web smoke suite; the `ci result` job is the single required status.
+
+**`cancelled` is not `failed`.** A push run is keyed on its commit, so every
+commit on `main` gets its own verdict instead of the next push killing the
+previous run's unit shards mid-flight; pull-request runs stay keyed on the ref,
+where a newer push really does make the old run worthless. When `ci result` is
+red, read *which* jobs failed before fixing anything: a cancelled run says
+nothing about the code, and the unit shards are the ones that take 10-17
+minutes to prove it either way.
 `.github/workflows/release.yml` re-runs the blocking lint plus a unit-layer
 pytest smoke before building artifacts. `mini-ork garden` (drift detection) is
 **not** in CI yet, so it is not a step here — run it deliberately when you

@@ -10,7 +10,20 @@ on:
   workflow_call:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A newer push to the same PR (or a newer release attempt) makes the older
+  # run worthless, so a ref-keyed group is right there. A push to MAIN is not
+  # that: main takes pushes from several agents working in parallel (measured:
+  # three in ten minutes on 2026-11-08), and with a ref-keyed group each push
+  # cancelled the previous run's unit shards 10-17 minutes in. The result was
+  # that `python tests` on main had not completed once that day and `ci result`
+  # was red on work that had been cancelled, never on work that had failed --
+  # a green main signal that could not be produced at all.
+  #
+  # Keying a push run on the COMMIT gives every commit its own verdict. The
+  # cost is a queue (runs overlap on the shared runner pool) instead of a
+  # missing signal, which is the right trade for a gate that other work builds
+  # on. Pull requests keep the ref key, so iterating on a PR still cancels.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
