@@ -107,4 +107,28 @@ RRL-1..3 run in parallel (disjoint files). Kickoffs live in the planning worktre
 
 ## Status
 
-- 2026-10-29: research done (30 papers); plan written; RRL-1..3 kickoffs authored.
+- 2026-10-29 09:50: research done (30 papers); plan written; RRL-1..3 kickoffs authored.
+- 2026-10-29, built and merged (each by a framework-edit run, checked by hand against
+  its spec, tests re-run, gaming grep) —
+
+  | Step | Commit | Notes |
+  |---|---|---|
+  | RRL-1 `impact.py` | `8d792bcc` | 46 tests |
+  | RRL-3 benchmarks + `verifier-replay` | `a8ab7d79` | salvaged: the run rolled back on 2 defective blind spec tests (missing `import json`; `is_dir()` after the required cleanup); 54/55 pass with the import fixed |
+  | RRL-2 research harvest | `d07ffa2a` | hand fix: the run subclassed the frozen `Candidate` to satisfy spec tests asserting an undefined `cand.reach`; removed. 54 of 130 techniques eligible on the 10-18 review |
+  | RRL-4a impact state + config | `8065bdb6` | |
+  | RRL-6a monitor, CLI verbs, operator doc | `108e8d1e` | |
+  | RRL-4b gate G12 wiring | `d9ef99cc` | |
+  | RRL-3b practical benchmark | `ad4f23f9` | live smoke found every CLI item skipped (unresolved `--repo`), whole-suite verifier runs timing out, and a whole-tree cache key; fixed with per-item scoped tests, resolved paths, a surface-keyed cache; hand fix: an errored item is never cached as a skip |
+  | RRL-5 revise loop + family ordering | `81272738` | |
+  | RRL-6b monitor in the cycle | — | running |
+  | RRL-5b `research.first` queues techniques | — | a dry run showed `domain_cap` drops every technique behind higher-severity gaps |
+
+- Benchmark calibration (scoped tests, current verifier, 39 stored patches): 36 scored,
+  accuracy 0.44 / 0.47 on two runs, 35 stable, 1 flaky; 0 false accepts, 15 false
+  rejects, 5 timeouts at 300 s. ~13 min per tree on 4 workers; the surface-keyed cache
+  makes a repeat free.
+- Incident: the pre-push review's lenses run tests that inherit git's `GIT_DIR` in a
+  linked worktree, so fixture commits landed on local `wt/rrl-3b` / `wt/rrl-5`. The
+  push sends the pre-hook sha, so `origin/main` stayed correct; the polluted branches
+  were discarded. Fix pending in PR #233 (high-risk path, needs approval).
