@@ -120,13 +120,13 @@ two halves, and `main` has moved 495 commits past the run's base:
   `tests/unit/test_certify_evidence_py.py` so the injected defect case must
   decide `UNVERIFIED` rather than `REFUTED`. `oracle_integrity.py`'s docstring
   records that this gap "was real once".
-- **Producer — still manual, and documented as such.**
-  `docs/architecture/verification-stack.md:104` lists instrument ⑦ as *"consumer
-  on, producer manual"*, and `promotion_gate.py:566` still reads
+- **Producer — manual at the time, wired on 2026-11-08 (`693dc18c`).**
+  `docs/architecture/verification-stack.md` then listed instrument ⑦ as
+  *"consumer on, producer manual"*, and `promotion_gate.py` read
   `oracle_integrity.latest(db_path)`, returning `{"status": "unmeasured"}` when
-  no one has run `mini-ork instruments oracle-integrity`. That is a known state
-  of the design, not a silent hole — but it does mean the guard cannot fire
-  unless an operator runs the producer first.
+  no one had run `mini-ork instruments oracle-integrity` — so the guard could
+  not fire unless an operator ran the producer first. The promotion gate now
+  runs the audit itself; see the close-out below.
 
 The revive attempt itself died for an environmental reason, not a work reason:
 the run recorded `placement: "remote"`, so the resumed `implementer` was shipped
@@ -137,10 +137,13 @@ to a node-agent that answered `HTTP 502: Bad Gateway` on
 holds 150 uncommitted lines over 4 files against a base 495 commits old; merging
 that delta would revert newer work, so it stays untouched.
 
-**Follow-up worth a fresh, small kickoff:** wire the oracle-integrity producer
-into the promotion path (the shape `judge_validity.promotion_check` already has),
-or schedule `mini-ork instruments oracle-integrity` — until then instrument ⑦
-reports `unmeasured` at every promotion.
+**Closed 2026-11-08 (`693dc18c`).** The producer is wired into the promotion path
+in the shape this note suggested: `oracle_integrity.promotion_check(db_path)` runs
+the hermetic audit (scripted runner and dispatch, ~0.06 s, no network, no model)
+for the promotion it is scoring, persists the record, and quarantines on a failed
+audit. ⑦ is no longer `unmeasured` by construction, and
+`mini-ork instruments oracle-integrity` is now the out-of-band producer rather
+than a prerequisite.
 
 ## Tier 3 — closed, no revive
 
