@@ -355,3 +355,74 @@ def test_cli_run_filter(home: Path, capsys) -> None:
 
     assert [r["run_id"] for r in out["reaped"]] == ["run-b"]
     assert _row(home, "run-a")["status"] == "executing"
+
+
+# ── the ps memo: one fork per pid per window ────────────────────────────────
+#
+# ``probe()`` reaches ``ps`` for every run whose ``.pid`` process is alive, and
+# the fleet/thread projection calls it once per row on a page that re-renders
+# every few seconds. The memo keeps that at one fork per pid per TTL instead of
+# one per row per refresh (flagged low, twice, in the pre-push reviews of
+# 788c4722 and c4000e81).
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_cache():
+    run_reaper.clear_process_cache()
+    yield
+    run_reaper.clear_process_cache()
+
+
+def _count_ps(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real = run_reaper._process_uncached
+
+    def fake(pid: int):
+        calls.append(pid)
+        return real(pid)
+
+    monkeypatch.setattr(run_reaper, "_process_uncached", fake)
+    return calls
+
+
+def test_repeated_probes_of_one_pid_fork_once(monkeypatch) -> None:
+    calls = _count_ps(monkeypatch)
+    first = run_reaper._process(os.getpid())
+    second = run_reaper._process(os.getpid())
+    assert calls == [os.getpid()]
+    assert first == second
+    assert first is not None and first[1] > 0     # a real answer, cached
+
+
+def test_the_memo_expires_so_a_death_is_still_seen(monkeypatch) -> None:
+    calls = _count_ps(monkeypatch)
+    monkeypatch.setenv("MO_PROBE_CACHE_TTL_S", "0.01")
+    run_reaper._process(os.getpid())
+    time.sleep(0.03)
+    run_reaper._process(os.getpid())
+    assert calls == [os.getpid(), os.getpid()]
+
+
+def test_ttl_zero_disables_the_memo(monkeypatch) -> None:
+    calls = _count_ps(monkeypatch)
+    monkeypatch.setenv("MO_PROBE_CACHE_TTL_S", "0")
+    run_reaper._process(os.getpid())
+    run_reaper._process(os.getpid())
+    assert calls == [os.getpid(), os.getpid()]
+
+
+def test_clearing_the_memo_forces_a_refetch(monkeypatch) -> None:
+    calls = _count_ps(monkeypatch)
+    run_reaper._process(os.getpid())
+    run_reaper.clear_process_cache()
+    run_reaper._process(os.getpid())
+    assert calls == [os.getpid(), os.getpid()]
+
+
+def test_the_memo_does_not_resurrect_a_dead_pid(tmp_path) -> None:
+    """Death is settled by ``os.kill`` before ``ps`` is ever consulted."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_pid(run_dir, _dead_pid())
+    assert run_reaper.probe(run_dir).verdict == "dead"
+    assert run_reaper.probe(run_dir).verdict == "dead"

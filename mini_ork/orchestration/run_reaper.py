@@ -412,8 +412,66 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
 
 # ── liveness probe ──────────────────────────────────────────────────────────
 
+#: How long a ``ps`` answer about one pid is reused. ``probe()`` is called per
+#: row by the fleet/thread projection (``acp.task_state.run_mark``), and every
+#: call that reaches the pid branch forks ``ps``; the board re-renders every few
+#: seconds, so without this the same handful of pids spawns a subprocess per row
+#: per refresh. Two seconds bounds that to at most one fork per pid per window
+#: while keeping "died a moment ago" honest — the reaper's own cadence is
+#: minutes. ``MO_PROBE_CACHE_TTL_S=0`` disables the cache.
+PROCESS_CACHE_TTL_S = 2.0
+
+#: ``pid -> (fetched_at, ps answer)``. Bounded: entries older than the TTL are
+#: dropped on every call, and a hard cap keeps a pathological pid stream from
+#: growing it without bound.
+_PROCESS_CACHE_MAX = 512
+_process_cache: dict[int, tuple[float, tuple[str, float] | None]] = {}
+
+
+def _process_cache_ttl() -> float:
+    raw = os.environ.get("MO_PROBE_CACHE_TTL_S")
+    if raw is None:
+        return PROCESS_CACHE_TTL_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return PROCESS_CACHE_TTL_S
+
+
+def clear_process_cache() -> None:
+    """Drop the ``ps`` cache — for a caller that just changed a run's owner."""
+    _process_cache.clear()
+
+
 def _process(pid: int) -> tuple[str, float] | None:
-    """``(stat, start epoch)`` from ``ps``; ``None`` when ``ps`` can't say."""
+    """``(stat, start epoch)`` from ``ps``; ``None`` when ``ps`` can't say.
+
+    Memoised for :data:`PROCESS_CACHE_TTL_S` (see :data:`_process_cache`): the
+    answer for one pid changes slowly, and this is the only fork on the render
+    path. A cached ``None`` is reused too — "``ps`` can't say" is the answer
+    ``_pid_alive`` treats as alive, and re-asking every row would just repeat
+    the same timeout.
+    """
+    ttl = _process_cache_ttl()
+    now = time.monotonic()
+    if ttl <= 0:
+        _process_cache.pop(pid, None)
+    else:
+        hit = _process_cache.get(pid)
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+        if len(_process_cache) >= _PROCESS_CACHE_MAX:
+            for stale in [p for p, (at, _) in _process_cache.items() if now - at >= ttl]:
+                _process_cache.pop(stale, None)
+            if len(_process_cache) >= _PROCESS_CACHE_MAX:
+                _process_cache.clear()
+    info = _process_uncached(pid)
+    if ttl > 0:
+        _process_cache[pid] = (now, info)
+    return info
+
+
+def _process_uncached(pid: int) -> tuple[str, float] | None:
     try:
         out = subprocess.run(["ps", "-o", "stat=", "-o", "lstart=", "-p", str(pid)],
                              capture_output=True, text=True, timeout=2,
