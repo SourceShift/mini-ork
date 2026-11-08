@@ -288,7 +288,7 @@ def _flatten(obj):
 def test_failed_audit_quarantines_instead_of_promoting(tmp_path, monkeypatch):
     db = _seed_db(tmp_path)
     _quiet_gate_env(monkeypatch)
-    oi.write_latest(db, _failing_record())
+    monkeypatch.setattr(oi, "run_default_audit", lambda **_kw: _failing_record())
     result = promotion_gate.promotion_evaluate(db, CANDIDATE)
     assert result["decision"] == "quarantined"
     assert result["oracle_integrity"]["reason"] == "oracle_integrity_failed"
@@ -300,19 +300,44 @@ def test_failed_audit_quarantines_instead_of_promoting(tmp_path, monkeypatch):
 def test_passed_audit_promotes_and_reports_pass(tmp_path, monkeypatch):
     db = _seed_db(tmp_path)
     _quiet_gate_env(monkeypatch)
-    oi.write_latest(db, _passing_record())
+    monkeypatch.setattr(oi, "run_default_audit", lambda **_kw: _passing_record())
     result = promotion_gate.promotion_evaluate(db, CANDIDATE)
     assert result["decision"] == "promoted"
     assert result["oracle_integrity"]["status"] == "pass"
     assert result["oracle_integrity"]["audited_at"] == 1760000000
 
 
-def test_missing_record_is_unmeasured_and_never_blocks(tmp_path, monkeypatch):
+def test_gate_produces_and_persists_the_audit_it_scored(tmp_path, monkeypatch):
+    """No operator, no sidecar: the guard measures the real judge at promotion time.
+
+    This is the whole point of the producer — before it, a promotion was scored
+    against a record that nothing in production wrote, so the guard could only
+    ever say "unmeasured".
+    """
     db = _seed_db(tmp_path)
     _quiet_gate_env(monkeypatch)
+    assert oi.latest(db) is None
     result = promotion_gate.promotion_evaluate(db, CANDIDATE)
     assert result["decision"] == "promoted"
-    assert result["oracle_integrity"] == {"status": "unmeasured"}
+    assert result["oracle_integrity"]["status"] == "pass"
+    stored = oi.latest(db)
+    assert stored is not None
+    assert stored["pass"] is True
+    assert result["oracle_integrity"]["audited_at"] == stored["audited_at"]
+
+
+def test_audit_that_raises_is_reported_as_error_and_never_blocks(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path)
+    _quiet_gate_env(monkeypatch)
+
+    def boom(**_kw):
+        raise RuntimeError("judge could not be imported")
+
+    monkeypatch.setattr(oi, "run_default_audit", boom)
+    result = promotion_gate.promotion_evaluate(db, CANDIDATE)
+    assert result["decision"] == "promoted"
+    assert result["oracle_integrity"]["status"] == "error"
+    assert "judge could not be imported" in result["oracle_integrity"]["error"]
 
 
 def test_knob_off_ignores_record_and_keeps_legacy_keys(tmp_path, monkeypatch):
@@ -323,6 +348,9 @@ def test_knob_off_ignores_record_and_keeps_legacy_keys(tmp_path, monkeypatch):
     assert result["decision"] == "promoted"
     assert "oracle_integrity" not in result
     assert set(result) == LEGACY_RESULT_KEYS
+    # The knob turns the producer off too, not just the reader: a disabled guard
+    # must not spend (or record) a measurement it will then ignore.
+    assert not oi.enabled()
 
 
 def test_hackable_gate_reject_still_wins(tmp_path, monkeypatch):
@@ -331,7 +359,7 @@ def test_hackable_gate_reject_still_wins(tmp_path, monkeypatch):
     monkeypatch.setenv("MO_PROMOTION_VERIFIER_AUDIT", "0")
     monkeypatch.delenv("MO_PROMOTION_GATE_HACKABILITY", raising=False)  # ON
     monkeypatch.delenv("MO_PROMOTION_MIN_RUNS", raising=False)
-    oi.write_latest(db, _failing_record())
+    monkeypatch.setattr(oi, "run_default_audit", lambda **_kw: _failing_record())
     monkeypatch.setattr(
         "mini_ork.gates.hackability.promotion_check",
         lambda db_path, task_class: {
@@ -342,6 +370,51 @@ def test_hackable_gate_reject_still_wins(tmp_path, monkeypatch):
     result = promotion_gate.promotion_evaluate(db, CANDIDATE)
     assert result["decision"] == "rejected"
     assert "gate-hackability" in result["rationale"]
+
+
+# ── the producer API ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("value", ["0", "off", "false", "no", " OFF "])
+def test_enabled_off_values(monkeypatch, value):
+    monkeypatch.setenv("MO_ORACLE_INTEGRITY", value)
+    assert oi.enabled() is False
+
+
+@pytest.mark.parametrize("value", [None, "1", "on", "true"])
+def test_enabled_on_values(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MO_ORACLE_INTEGRITY", raising=False)
+    else:
+        monkeypatch.setenv("MO_ORACLE_INTEGRITY", value)
+    assert oi.enabled() is True
+
+
+def test_promotion_check_returns_none_when_disabled_and_does_not_write(tmp_path, monkeypatch):
+    db = str(tmp_path / "oi.db")
+    monkeypatch.setenv("MO_ORACLE_INTEGRITY", "0")
+    assert oi.promotion_check(db) is None
+    assert oi.latest(db) is None
+
+
+def test_promotion_check_audits_and_persists(tmp_path, monkeypatch):
+    db = str(tmp_path / "oi.db")
+    monkeypatch.delenv("MO_ORACLE_INTEGRITY", raising=False)
+    monkeypatch.setattr(oi, "run_default_audit", lambda **_kw: _passing_record())
+    assert oi.promotion_check(db) == _passing_record()
+    assert oi.latest(db) == _passing_record()
+
+
+def test_promotion_check_survives_an_unwritable_record_dir(tmp_path, monkeypatch):
+    """A record that cannot be written must not turn a sound judge into a block."""
+    monkeypatch.delenv("MO_ORACLE_INTEGRITY", raising=False)
+    monkeypatch.setattr(oi, "run_default_audit", lambda **_kw: _passing_record())
+
+    def read_only(*_args, **_kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(oi, "write_latest", read_only)
+    assert oi.promotion_check(str(tmp_path / "oi.db")) == _passing_record()
 
 
 # ── the real judge, hermetically ─────────────────────────────────────────────

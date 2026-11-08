@@ -544,27 +544,38 @@ def promotion_evaluate(
                         if jv_mode == "shadow":
                             judge_val["mode"] = "shadow"
 
-        # ── Oracle-integrity consumer (vt8) ───────────────────────────────
+        # ── Oracle-integrity guard (vt8) ──────────────────────────────────
         # The verdict judge is itself an instrument; an audit that could be
         # fooled by fabricated execution evidence means every PROVEN it emitted
-        # is suspect. The audit record is read from the DB's sidecar file. A
-        # missing record is "unmeasured" and never blocks (hackability's
-        # discipline); a failed record quarantines a would-be promote. The guard
+        # is suspect. ``promotion_check`` is the *producer*: it audits the real
+        # judge here, hermetically, and persists the record, so this promotion
+        # is scored by a measurement taken for it. Reading the sidecar alone (as
+        # this gate once did) left the guard unable to fire — nothing in
+        # production ever wrote the file, so every promotion said "unmeasured".
+        # A failed audit quarantines a would-be promote ("fail closed"); an
+        # audit that raises is reported as "error" and never blocks. The guard
         # only acts on a promote that survived the gate-hackability check, so a
-        # hackable-gate reject still wins. Read on every branch so the result
-        # dict always reports the guard's state; the key itself is added only
-        # when the knob is on, preserving the legacy shape when it is off.
+        # hackable-gate reject still wins. The key is added only when the knob is
+        # on, preserving the legacy shape when it is off.
         oracle_int: dict[str, Any] | None = None
+        oi_mod = None
+        oi_enabled = True
         try:
-            oi_enabled = os.environ.get("MO_ORACLE_INTEGRITY", "1") != "0"
-        except Exception:  # noqa: BLE001 - os.environ.get cannot raise; keep parity
-            oi_enabled = True
-        if oi_enabled:
-            try:
-                from mini_ork.gates import oracle_integrity
+            from mini_ork.gates import oracle_integrity as oi_mod
 
-                record = oracle_integrity.latest(db_path)
+            oi_enabled = oi_mod.enabled()
+        except Exception as exc:  # noqa: BLE001 - a guard that cannot load cannot block
+            # Report the failure rather than pretend the judge was measured;
+            # blocking a promote on an import error would fail the wrong party.
+            oi_enabled = True
+            oracle_int = {"status": "error", "error": f"oracle_integrity unavailable: {exc}"}
+        if oi_enabled and oi_mod is not None:
+            try:
+                record = oi_mod.promotion_check(db_path)
                 if record is None:
+                    # Only reachable if the knob turned off between the read
+                    # above and this call (a scoped env in another thread).
+                    # Report that honestly instead of inventing a verdict.
                     oracle_int = {"status": "unmeasured"}
                 elif record.get("pass") is not True:
                     # Fail closed: a record that exists but does not certify the

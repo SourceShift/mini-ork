@@ -144,8 +144,9 @@ def test_oracle_integrity_failing_record_warns_that_promotion_stops(
                  "--db", str(tmp_path / "state.db")]) == 1
 
     err = capsys.readouterr().err
-    assert "FAILING record" in err
+    assert "FAILING audit" in err
     assert "stale_evidence_replay" in err
+    assert "oracle_integrity_failed" in err
     assert "MO_ORACLE_INTEGRITY=0" in err
 
 
@@ -160,7 +161,7 @@ def test_oracle_integrity_failing_record_is_quiet_when_consumer_off(
     assert _cli(["oracle-integrity",
                  "--db", str(tmp_path / "state.db")]) == 1
 
-    assert "FAILING record" not in capsys.readouterr().err
+    assert "FAILING audit" not in capsys.readouterr().err
 
 
 def test_oracle_integrity_passing_record_does_not_warn(tmp_path, monkeypatch,
@@ -172,7 +173,7 @@ def test_oracle_integrity_passing_record_does_not_warn(tmp_path, monkeypatch,
     assert _cli(["oracle-integrity",
                  "--db", str(tmp_path / "state.db")]) == 0
 
-    assert "FAILING record" not in capsys.readouterr().err
+    assert "FAILING audit" not in capsys.readouterr().err
 
 
 def test_oracle_integrity_runtime_error_exits_two_writes_nothing(

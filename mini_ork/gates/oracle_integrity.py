@@ -45,13 +45,27 @@ Public API::
 
     from mini_ork.gates.oracle_integrity import (
         Case, INJECTIONS, CONTROLS,
-        audit, run_default_audit,
+        audit, run_default_audit, promotion_check, enabled,
         write_latest, latest,
     )
 
+``promotion_check`` is the production producer: the promotion gate calls it, it
+audits the real judge and persists the record, so the guard scored at a
+promotion is the one produced by *that* promotion rather than whichever record
+an operator last wrote. ``mini-ork instruments oracle-integrity`` stays as the
+manual and scheduled path — an independent witness, not a prerequisite.
+
+Two tiers, one code path: on a laptop the producer simply runs inline at
+promotion (hermetic, ~0.06 s, no network, no model); on a shared deployment the
+same call runs per promotion and the scheduled ``instruments`` invocation adds
+an out-of-band record, with ``MO_ORACLE_INTEGRITY=0`` for hosts that must not
+run it. The audit is the same either way — there is no simple-tier shortcut that
+skips the measurement.
+
 Env knobs (read by consumers, never cached here):
 
-    MO_ORACLE_INTEGRITY  → promotion-gate consumer switch (default "1"; "0" disables)
+    MO_ORACLE_INTEGRITY  → producer and consumer switch (default "1"; "0",
+                           "off", "false", "no" disable)
 """
 from __future__ import annotations
 
@@ -67,10 +81,17 @@ __all__ = [
     "INJECTIONS",
     "CONTROLS",
     "audit",
+    "enabled",
     "run_default_audit",
+    "promotion_check",
     "write_latest",
     "latest",
 ]
+
+#: Values of ``MO_ORACLE_INTEGRITY`` that turn the guard off. Unset means ON:
+#: the guard shipped default-on, and flipping the default would silently drop a
+#: measured check from every promotion.
+_OFF_VALUES = frozenset({"0", "off", "false", "no"})
 
 #: The judge vocabulary. Duplicated here (rather than imported at module scope) to
 #: keep the audit importable on a stripped stdlib; these are load-bearing literals
@@ -556,3 +577,50 @@ def latest(db_path: str) -> dict | None:
     except (OSError, json.JSONDecodeError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+# ── producer ─────────────────────────────────────────────────────────────────
+
+
+def enabled() -> bool:
+    """True unless ``MO_ORACLE_INTEGRITY`` turns the guard off.
+
+    Unset is ON (``1``). The knob is read here, at call time, so a process-level
+    override or a scoped env block applies without clearing a cache.
+    """
+    raw = os.environ.get("MO_ORACLE_INTEGRITY")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in _OFF_VALUES
+
+
+def promotion_check(db_path: str, *, judge=None) -> dict | None:
+    """Audit the judge for the promotion gate and persist the record.
+
+    This is the production producer, and the reason the guard can fire at all:
+    before it existed, the gate only *read* ``latest.json``, so a promotion was
+    scored against a record that no production code had ever written — every
+    promotion reported ``unmeasured`` unless an operator had run
+    ``mini-ork instruments oracle-integrity`` first.
+
+    Returns ``None`` when the guard is off (the caller then omits the key
+    entirely, keeping the pre-guard shape). Returns the fresh audit otherwise.
+
+    The audit is hermetic — scripted runner, scripted dispatch, no network, no
+    model — so running it per promotion is a few milliseconds. A failure to
+    *persist* is deliberately not fatal: the measurement is the evidence, and
+    losing the file must not turn a sound judge into a blocked promotion. A
+    failure to *audit* propagates, because a measurement that did not happen is
+    not a pass — the promotion gate's own handler reports it as ``error``.
+    """
+    if not enabled():
+        return None
+    result = run_default_audit(judge=judge)
+    try:
+        write_latest(db_path, result)
+    except OSError:
+        # Read-only DB dir (a shared deployment mounting the DB read-only, a
+        # sandbox without the parent). The record is a cache of this call's
+        # result, never its source.
+        pass
+    return result

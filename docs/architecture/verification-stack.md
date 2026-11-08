@@ -82,16 +82,17 @@ flowchart TB
 ④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
 at promotion, or when a recipe opts in, or their producer is a manual command.
 
-Two instruments have a consumer but no automatic producer; `mini-ork
-instruments` is that producer. ⑦: `mini-ork instruments oracle-integrity
-[--db PATH]` writes `<db dir>/oracle-integrity/latest.json`, and exits `2`
-rather than write a record it could not measure. ⑩: `mini-ork instruments
-verifier-mutation --observable <observable.json> --card <card.json>` writes
-`<card>.mutation.json`, the sidecar the verify catalog reads; without `--card`
-it prints the score and writes nothing. ⑧ has no separate producer —
-`MO_JUDGE_VALIDITY=shadow` runs the audit from the promotion path, records the
-per-lane envelopes, and never quarantines, so an operator can see a lane's
-agreement before switching to enforcement.
+One instrument has a consumer but no automatic producer; `mini-ork instruments`
+is that producer. ⑩: `mini-ork instruments verifier-mutation --observable
+<observable.json> --card <card.json>` writes `<card>.mutation.json`, the sidecar
+the verify catalog reads; without `--card` it prints the score and writes
+nothing. ⑦ used to be the second: the promotion gate read a record nothing in
+production wrote, so every promotion reported `unmeasured` and the guard could
+never fire. The gate now runs the audit itself (`oracle_integrity.promotion_check`)
+and `mini-ork instruments oracle-integrity` is the out-of-band producer. ⑧ has
+no separate producer — `MO_JUDGE_VALIDITY=shadow` runs the audit from the
+promotion path, records the per-lane envelopes, and never quarantines, so an
+operator can see a lane's agreement before switching to enforcement.
 
 | # | Instrument | Runs in | State |
 |---|---|---|---|
@@ -101,7 +102,7 @@ agreement before switching to enforcement.
 | ④ | Level vector | the publisher, for recipes that declare levels (code_fix) | **live** |
 | ⑤ | Gate hackability | read by the promotion gate; records come only from a manual `mini-ork gate-fuzz --hackability` | consumer on, producer manual |
 | ⑥ | Equivalence operator | the behavioral verifier, for recipes whose contract declares an operator | opt-in per recipe |
-| ⑦ | Oracle integrity | read by the promotion gate; records come only from a manual `mini-ork instruments oracle-integrity` | consumer on, producer manual |
+| ⑦ | Oracle integrity | the promotion gate — it audits the judge, then records and scores that record | **live** (hermetic, ~0.06 s) |
 | ⑧ | Judge validity | the promotion gate | off by default; `shadow` measures without enforcing |
 | ⑨ | Reward↔evidence pairing | every GRPO writeback | **live** |
 | ⑩ | Verifier mutation | read by the verify catalog; records come only from a manual `mini-ork instruments verifier-mutation --card` | consumer on, producer manual |
@@ -324,13 +325,16 @@ flowchart TB
 
 **How it decides.**
 - **Pass.** Every defect rejected AND every control accepted.
-- **Fail.** Any defect accepted OR any control rejected. A failed audit is the latest record.
-- **Abstention.** A missing or unreadable record is *unmeasured*, never a pass; promotion is not blocked on it.
+- **Fail.** Any defect accepted OR any control rejected. A would-be promote becomes `quarantined` with reason `oracle_integrity_failed`.
+- **Could not run.** The audit raising is reported as `"status": "error"` on the result and never blocks: a measurement that did not happen is not a pass, but neither is it evidence the judge is broken.
+- **Abstention.** The only `unmeasured` case left is the knob flipping off between the gate's check and its call; it is never treated as a pass.
 
 **Knobs.**
-- `MO_ORACLE_INTEGRITY` (ON): promotion consumer of the audit.
+- `MO_ORACLE_INTEGRITY` (ON): producer and consumer together. `0`/`off`/`false`/`no` disables both — no audit is run, no record is written, and the result keeps its pre-guard shape.
 
-**Evidence.** Writes `<db dir>/oracle-integrity/latest.json`, produced by `mini-ork instruments oracle-integrity [--db PATH]` (never run automatically; exit `2` means the audit could not run and no record was written). A *failing* record is written on purpose — it is a real measurement — and the producer says so on stderr, because the consumer is on by default: until a passing record replaces it, every would-be promotion quarantines. Point `--db` at a scratch `state.db`, or set `MO_ORACLE_INTEGRITY=0`, to run the check without arming the gate. When `MO_ORACLE_INTEGRITY` is on and the latest record failed, the promotion decision is `quarantined` with reason `oracle_integrity_failed`.
+**Evidence.** The promotion gate is the producer: `oracle_integrity.promotion_check(db_path)` audits the real `judge` for the promotion it is scoring and then writes `<db dir>/oracle-integrity/latest.json`. The audit is hermetic — scripted runner, scripted dispatch, no network, no model — and measures ~0.06 s, so running it per promotion costs nothing and the record is always *this* promotion's measurement rather than whichever one an operator last wrote. `mini-ork instruments oracle-integrity [--db PATH]` remains the out-of-band producer (scheduled on a shared deployment, useful on a DB no promotion has touched); exit `2` means the audit could not run and no record was written, and a *failing* audit is written on purpose because it is a real measurement.
+
+Two tiers, one call site: on a laptop the audit runs inline at promotion — no daemon, no server, nothing to schedule; on a shared deployment the same call runs per promotion and a scheduled `mini-ork instruments oracle-integrity` adds out-of-band history, with `MO_ORACLE_INTEGRITY=0` for hosts that must not run it at all.
 
 ## ⑧ Judge validity (G10-T03): `mini_ork/gates/judge_validity.py`
 

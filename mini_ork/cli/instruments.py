@@ -36,7 +36,6 @@ function-locally, matching ``mini_ork/gates/oracle_integrity.py``.
 from __future__ import annotations
 
 import json
-import os
 import sys
 
 
@@ -132,20 +131,24 @@ def _oracle_integrity(argv: list[str]) -> int:
     missed = list(result.get("missed") or [])
     controls_failed = list(result.get("controls_failed") or [])
 
-    # This verb is a diagnostic, but its output is read by a live consumer. The
-    # promotion gate treats a failing record as grounds to quarantine, and its
-    # consumer is on unless MO_ORACLE_INTEGRITY is exactly "0" — mirror that
-    # predicate rather than a broader off-set, so the warning matches what the
-    # gate will actually do. Say it out loud: running a check must never be the
-    # silent reason promotions stopped landing.
-    if not passed and os.environ.get("MO_ORACLE_INTEGRITY", "1") != "0":
+    # This verb is a diagnostic, but the judge it measures also gates promotion:
+    # the promotion gate runs this same audit itself before a promote. So a
+    # failing result here is a preview of what every would-be promotion will see
+    # — they quarantine with oracle_integrity_failed until the judge passes. The
+    # file written above is the evidence, not the input; deleting it changes
+    # nothing. Use the module's own predicate rather than a second copy of the
+    # knob, so the warning can never disagree with what the gate will do. Say it
+    # out loud: running a check must never be the silent reason promotions
+    # stopped landing.
+    if not passed and oracle_integrity.enabled():
         sys.stderr.write(
-            "instruments oracle-integrity: wrote a FAILING record to "
-            f"{path}. The promotion gate's oracle-integrity consumer is on, so "
-            "every would-be promotion now quarantines with "
-            "oracle_integrity_failed until a passing record replaces this one. "
-            "Set MO_ORACLE_INTEGRITY=0 to keep promoting while you fix the "
-            f"judge, or point --db at a scratch state.db. Missed: "
+            "instruments oracle-integrity: FAILING audit, record written to "
+            f"{path}. The promotion gate re-runs this audit for every would-be "
+            "promotion, so each one now quarantines with "
+            "oracle_integrity_failed until the judge passes; removing the "
+            "record does not lift that. Set MO_ORACLE_INTEGRITY=0 to keep "
+            "promoting while you fix the judge, or point --db at a scratch "
+            f"state.db. Missed: "
             f"{', '.join(missed) if missed else '(none)'}"
             f"; controls failed: "
             f"{', '.join(controls_failed) if controls_failed else '(none)'}\n"
