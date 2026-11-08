@@ -310,3 +310,48 @@ def test_cli_json_and_usage(home: Path, capsys) -> None:
     assert run_reaper.main(["--home", str(home / "nope")]) == 2
     with pytest.raises(SystemExit):
         run_reaper.main(["--home", str(home), "--stale-after", "6 hours"])
+
+
+# ── the --run filter ────────────────────────────────────────────────────────
+
+def test_run_filter_reaps_only_the_named_run(home: Path) -> None:
+    """A sweep walks the whole home; the operator looking at one dead run does not.
+
+    Both rows are reapable, so a filter that only reorders the pass (instead of
+    scoping the query) would fail run-b as well.
+    """
+    for run_id in ("run-a", "run-b"):
+        _write_pid(_seed(home, run_id), _dead_pid())
+
+    reaped = run_reaper.reap(home, run_ids=["run-a"])
+
+    assert [r["run_id"] for r in reaped] == ["run-a"]
+    assert _row(home, "run-b")["status"] == "executing"
+
+
+def test_run_filter_names_a_run_that_does_not_exist(home: Path) -> None:
+    """An unknown id is a no-op, not a reason to fall back to a full sweep."""
+    _write_pid(_seed(home, "run-dead"), _dead_pid())
+
+    assert run_reaper.reap(home, run_ids=["run-typo"]) == []
+    assert _row(home, "run-dead")["status"] == "executing"
+
+
+def test_run_filter_repeats_and_deduplicates(home: Path) -> None:
+    _write_pid(_seed(home, "run-a"), _dead_pid())
+    _write_pid(_seed(home, "run-b"), _dead_pid())
+
+    reaped = run_reaper.reap(home, run_ids=["run-a", "run-a", "run-b"])
+
+    assert sorted(r["run_id"] for r in reaped) == ["run-a", "run-b"]
+
+
+def test_cli_run_filter(home: Path, capsys) -> None:
+    for run_id in ("run-a", "run-b"):
+        _write_pid(_seed(home, run_id), _dead_pid())
+
+    assert run_reaper.main(["--home", str(home), "--run", "run-b", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+
+    assert [r["run_id"] for r in out["reaped"]] == ["run-b"]
+    assert _row(home, "run-a")["status"] == "executing"

@@ -18,7 +18,7 @@ A row with no ``.pid`` is *unknown*: a queued child row, a legacy row, or an
 older engine between phases. It is reaped only when the operator opts in with
 ``--stale-after`` and the row has been idle that long.
 
-    mini-ork reap [--home H] [--dry-run] [--stale-after 6h] [--json]
+    mini-ork reap [--home H] [--dry-run] [--stale-after 6h] [--run ID ...] [--json]
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from mini_ork.dispatch.core import AGENT_PGIDS_FILE
 from mini_ork.remote.providers.base import clear_stale_run_lock
@@ -627,11 +627,17 @@ def _release_remote_nodes(run_dir: Path, run_id: str) -> int:
 
 
 def reap(home: Path, *, dry_run: bool = False, stale_after: int | None = None,
-         now: int | None = None) -> list[dict[str, Any]]:
+         now: int | None = None,
+         run_ids: Sequence[str] | None = None) -> list[dict[str, Any]]:
     """Fail every non-terminal run whose owner provably died.
 
     ``stale_after`` (seconds) also fails runs with no ``.pid`` that have been
     idle at least that long — an operator decision, never the default.
+
+    ``run_ids`` restricts the pass to those runs. Without it a reap walks every
+    non-terminal row, which is wrong when the operator is looking at one dead
+    run and does not want the sweep to touch the rest of the home.
+
     Returns one entry per reaped (or, with ``dry_run``, reapable) run.
     """
     home = Path(home)
@@ -643,9 +649,13 @@ def reap(home: Path, *, dry_run: bool = False, stale_after: int | None = None,
     con = sqlite3.connect(str(db_path), timeout=5.0)
     try:
         con.execute("PRAGMA busy_timeout = 5000")
-        rows = con.execute(
-            "SELECT id, status, updated_at FROM task_runs "
-            "WHERE status NOT IN " + SQL_TERMINAL).fetchall()
+        sql = "SELECT id, status, updated_at FROM task_runs WHERE status NOT IN " + SQL_TERMINAL
+        params: tuple[str, ...] = ()
+        if run_ids:
+            # Deduplicate: `--run x --run x` is one row, not a doubled pass.
+            params = tuple(dict.fromkeys(str(r) for r in run_ids))
+            sql += " AND id IN (" + ",".join("?" * len(params)) + ")"
+        rows = con.execute(sql, params).fetchall()
         for run_id, status, updated_at in rows:
             run_dir = home / "runs" / run_id
             found = probe(run_dir)
@@ -721,6 +731,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="list what would be reaped; write nothing")
     parser.add_argument("--stale-after", type=_duration, default=None, metavar="DUR",
                         help="also reap runs with no .pid idle at least DUR (e.g. 6h)")
+    parser.add_argument("--run", action="append", dest="run_ids", default=None,
+                        metavar="RUN_ID",
+                        help="only consider this run (repeatable); an id absent from "
+                             "state.db matches nothing")
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -732,7 +746,8 @@ def main(argv: list[str] | None = None) -> int:
     if not (home / "state.db").is_file():
         sys.stderr.write(f"mini-ork reap: no state.db under {home}\n")
         return 2
-    reaped = reap(home, dry_run=args.dry_run, stale_after=args.stale_after)
+    reaped = reap(home, dry_run=args.dry_run, stale_after=args.stale_after,
+                  run_ids=args.run_ids)
     if args.json:
         sys.stdout.write(json.dumps({"ok": True, "dry_run": args.dry_run, "reaped": reaped}) + "\n")
         return 0
