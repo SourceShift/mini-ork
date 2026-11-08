@@ -112,24 +112,42 @@ def check_recipe(root: Path, name: str) -> list[dict]:
             f"create recipes/{name}/ or drop the argument")
         return findings
 
-    for fn in REQUIRED_FILES:
-        if not (rd / fn).is_file():
-            add("warning", "incomplete", f"missing {fn}",
-                f"create {fn} in recipes/{name}/, or document why this entry "
-                f"is not a full recipe")
-
     wf_path = rd / "workflow.yaml"
+    loaded = None
+    wf_data: dict = {}
+    wf_err = None
     if wf_path.is_file():
-        data, err = _load_yaml(wf_path)
-        if err is not None:
-            add("error", "unparsable", f"workflow.yaml: {err}",
+        loaded, wf_err = _load_yaml(wf_path)
+        if isinstance(loaded, dict):
+            wf_data = loaded
+
+    # Two spellings of "this recipe has a task class" are loadable and in use:
+    # most recipes ship `task_class.yaml`, a few (`harness-bridge`) put
+    # `task_class:` at the top of workflow.yaml. tests/unit/test_docs_commands_py.py
+    # pins that convention for the whole tree, so flagging the second spelling
+    # would be a false positive — the kind that teaches people to ignore a gate.
+    satisfied = {
+        "task_class.yaml": (rd / "task_class.yaml").is_file()
+        or bool(wf_data.get("task_class")),
+        "artifact_contract.yaml": (rd / "artifact_contract.yaml").is_file(),
+    }
+    for fn in REQUIRED_FILES:
+        if satisfied.get(fn) or (fn == "workflow.yaml" and wf_path.is_file()):
+            continue
+        add("warning", "incomplete", f"missing {fn}",
+            f"create {fn} in recipes/{name}/, or declare it inline in "
+            f"workflow.yaml, or document why this entry is not a full recipe")
+
+    if wf_path.is_file():
+        if wf_err is not None:
+            add("error", "unparsable", f"workflow.yaml: {wf_err}",
                 "fix the YAML; nothing downstream can read this recipe")
-        elif not isinstance(data, dict):
+        elif not isinstance(loaded, dict):
             add("error", "unparsable",
-                f"workflow.yaml: expected a mapping, got {type(data).__name__}",
+                f"workflow.yaml: expected a mapping, got {type(loaded).__name__}",
                 "the top level of workflow.yaml must be `nodes:` / `edges:`")
         else:
-            for node in data.get("nodes") or []:
+            for node in wf_data.get("nodes") or []:
                 if not isinstance(node, dict):
                     continue
                 node_name = node.get("name") or "<unnamed>"

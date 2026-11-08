@@ -20,7 +20,7 @@ deterministic half of "a recipe is reviewable"; `recipe-eval` is the other half.
 | `unparsable` | error | `workflow.yaml`, `task_class.yaml` or `artifact_contract.yaml` does not parse |
 | `uncompilable` | error | `mini_ork.workflow.compiler.compile_workflow` refuses it — the recipe cannot be dispatched |
 | `missing-recipe` | error | a recipe you named by hand does not exist (and you asked for it) |
-| `incomplete` | warning | the directory is missing `task_class.yaml` or `artifact_contract.yaml` |
+| `incomplete` | warning | the directory is missing `task_class.yaml` or `artifact_contract.yaml` (a `task_class:` declared at the top of `workflow.yaml` counts — `harness-bridge` uses that spelling) |
 
 Errors fail the run. A warning is reported and shown in the summary but does
 not change the exit code — an incomplete directory is visible as an inventory

@@ -124,10 +124,23 @@ def test_uncompilable_workflow_is_an_error(tmp_path: Path, monkeypatch) -> None:
     assert _run(root, monkeypatch) == 1
 
 
+def test_task_class_declared_in_workflow_is_not_a_false_positive(tmp_path: Path) -> None:
+    """`harness-bridge` declares `task_class:` inline; that is a valid spelling.
+
+    tests/unit/test_docs_commands_py.py pins it, so reporting it as missing
+    would be the gate being wrong about the repo rather than the repo being
+    wrong about the gate.
+    """
+    root = _recipe(tmp_path)
+    (root / "recipes" / "demo" / "task_class.yaml").unlink()
+    assert recipes.check_recipe(root, "demo") == []
+
+
 def test_incomplete_recipe_warns_but_passes_unless_strict(tmp_path: Path, monkeypatch) -> None:
     root = _recipe(tmp_path, extra=False)
     findings = recipes.check_recipe(root, "demo")
-    assert [f["severity"] for f in findings] == ["warning", "warning"]
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert "artifact_contract.yaml" in findings[0]["detail"]
     assert _run(root, monkeypatch) == 0
     assert _run(root, monkeypatch, "--strict") == 1
 
