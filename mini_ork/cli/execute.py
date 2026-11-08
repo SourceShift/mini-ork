@@ -2729,7 +2729,20 @@ def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
         pass
     try:
         from mini_ork.dispatch import cost_pause
-        if cost_pause.check(run_id, float(cost)) != 0:
+
+        # Charge the sidecar delta first (it is the only number available when
+        # llm_calls has no rows yet), then raise the meter to the ledger total.
+        # The sidecar holds ONE call's cost — the last one to write it — so a
+        # node that dispatches several lanes (a judge/review panel, a fan-out
+        # implementer) moves it by the last call while the run spent the sum;
+        # ``reconcile`` uses ``max``, so the two cannot spend the same dollar
+        # twice and a lagging ledger cannot lose the delta either.
+        from mini_ork import cost_ledger
+        paused = cost_pause.check(run_id, float(cost))
+        ledger_total = cost_ledger.run_cost(db, run_id)
+        if ledger_total is not None and cost_pause.reconcile(run_id, ledger_total) != 0:
+            paused = 2
+        if paused != 0:
             publish_env({"MO_NODE_FINISH_REASON": "paused_for_approval"})
     except Exception:
         pass

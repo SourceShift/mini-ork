@@ -431,6 +431,49 @@ def test_charge_node_cost_parity(tmp_path):
     assert _sql(db_p, q5).stdout == "0.0100\n"
 
 
+def test_charge_node_cost_reconciles_the_pause_meter_to_the_ledger(
+        tmp_path, monkeypatch):
+    """A multi-lane node: the sidecar holds ONE call, the ledger holds them all.
+
+    The meter must follow the ledger total — charging only the sidecar let a
+    panel of three $10 lanes move the meter $10 and never reach the $25
+    threshold. The ledger total INCLUDES the sidecar's call, so the meter
+    lands on $30, not $40.
+    """
+    db_p = _seed_db(tmp_path, "cclr")
+    _seed_task_run(db_p, cost=0)
+    for i in range(3):  # three lanes, three ledger rows
+        _sql(db_p, "INSERT INTO llm_calls (provider,model_id,tier,feature_name,"
+                   "run_id,cost_usd,status) VALUES "
+                   "('anthropic','opus','smart','panel','r1',10.0,'success');")
+    run_dir = tmp_path / "run"; run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_PAUSE_EVERY_USD", "25")
+    cost_file = tmp_path / "cost"; cost_file.write_text("10")
+    ex.charge_node_cost(db_p, "r1", str(cost_file), root=str(tmp_path))
+
+    assert float((run_dir / ".cost-spent").read_text().strip()) == 30.0
+    assert (run_dir / ".cost-pause").is_file()
+    # task_runs still carries the sidecar delta; reconcile_run_cost settles it
+    # from the ledger at run end (that separation is unchanged).
+    assert _sql(db_p, "SELECT printf('%.4f', cost_usd) FROM task_runs WHERE id='r1';"
+                ).stdout.strip() == "10.0000"
+
+
+def test_charge_node_cost_leaves_the_meter_alone_without_ledger_rows(
+        tmp_path, monkeypatch):
+    """No llm_calls rows → run_cost is None → the sidecar delta stands."""
+    db_p = _seed_db(tmp_path, "ccln")
+    _seed_task_run(db_p, cost=0)
+    run_dir = tmp_path / "run"; run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MO_PAUSE_EVERY_USD", "25")
+    cost_file = tmp_path / "cost"; cost_file.write_text("0.5")
+    ex.charge_node_cost(db_p, "r1", str(cost_file), root=str(tmp_path))
+    assert float((run_dir / ".cost-spent").read_text().strip()) == 0.5
+    assert not (run_dir / ".cost-pause").exists()
+
+
 def _git_repo(d):
     d.mkdir(parents=True)
     for a in (["init", "-q", "-b", "main"], ["config", "user.email", "t@e"],

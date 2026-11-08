@@ -56,6 +56,47 @@ def raise_spent(run_id: str, spent_usd: float) -> float:
     return new_spent
 
 
+def reconcile(run_id: str, spent_usd: float) -> int:
+    """Raise the meter to the run's TRUE spend and pause if that crossed.
+
+    ``check(delta)`` can only charge what the dispatcher's ``.last-llm-cost``
+    sidecar recorded, and that file is rewritten by every call. A node that
+    dispatches several lanes — a judge/review panel, a fan-out implementer —
+    therefore moved the meter by the LAST lane's cost while the run spent the
+    sum of all of them. The ledger (``llm_calls``) holds every call, so it is
+    the truth this reconciles against.
+
+    Same window math and sentinel as :func:`check`; it never lowers the meter
+    (``max``), so a sidecar charge that was already counted cannot be spent
+    twice. Returns the same rc: 0 = proceed, 2 = paused.
+    """
+    if not run_id:
+        return 2
+    threshold = float(os.environ.get("MO_PAUSE_EVERY_USD", "25"))
+    sentinel = _sentinel_path(run_id)
+    spend_file = _spend_path(run_id)
+
+    prev_spent = _read_spent(spend_file)
+    try:
+        new_spent = max(prev_spent, float(spent_usd))
+    except (TypeError, ValueError):
+        new_spent = prev_spent
+    os.makedirs(os.path.dirname(spend_file) or ".", exist_ok=True)
+    with open(spend_file, "w") as fh:
+        fh.write(f"{new_spent}\n")
+
+    if int(new_spent // threshold) > int(prev_spent // threshold):
+        with open(sentinel, "w") as fh:
+            fh.write(json.dumps({
+                "threshold_usd": threshold, "spent_usd": new_spent,
+                "created_at": datetime.datetime.now(datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "run_id": run_id,
+            }) + "\n")
+        return 2
+    return 0
+
+
 def check(run_id: str, delta_usd: float) -> int:
     """rc semantics of mo_cost_pause_check: 0 = proceed, 2 = paused (sentinel
     written when cumulative spend crosses into a new threshold window)."""
