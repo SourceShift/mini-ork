@@ -90,20 +90,51 @@ push itself runs in a bounded retry (`MO_MERGE_PUSH_ATTEMPTS`, default 5).
   reviews the runtime parks: an in-run agent may never approve its own node, but
   the driving agent may approve a *completed* node review.
 
-## Quality gates (run before committing)
+## Validation policy (ordered — do not start at the bottom)
+
+Objective: fast delivery, with CI catching what is uncommon. Run the smallest
+check that can catch the mistake you just made, and widen only as the change
+gets closer to `main`.
+
+**While editing** — the changed test file, by path, no name filter:
 
 ```bash
-make test                    # existing test suite
-make lint                    # ruff blocking tier (F + E9; advisory: make lint-advisory)
-mini-ork validate            # pre-run static checks (kickoff needs numbered Done-When criteria)
-mini-ork fallbacks           # no `except: pass` / `return None` on error in changed .py files
-mini-ork garden              # drift detection
+python3 -m pytest tests/unit/test_<area>_py.py -q
 ```
 
-CI mirrors these: `.github/workflows/ci.yml` runs ruff (blocking + advisory
-tiers), pytest on 3.11/3.12 (sharded), UI typecheck, and web smoke;
-`.github/workflows/release.yml` re-runs the blocking lint + a unit-layer
-pytest smoke before building release artifacts.
+A bare `-k` / `-t` filter makes pytest collect the whole tree first (measured:
+11 workers x ~900 MB, load average 124–138 for 8+ minutes on an 11-core box).
+
+**When the change is done** — in this order, stopping at the first failure:
+
+1. `make lint` — ruff blocking tier (F + E9). Seconds, and it catches broken
+   code before anything expensive starts.
+2. `mini-ork validate` — pre-run static checks (a kickoff needs numbered
+   Done-When criteria).
+3. `mini-ork fallbacks` — no silent `except: pass` / `return None` on error in
+   the changed `.py` files.
+4. The targeted pytest files for the area you touched.
+5. `make test` — the full suite. Only before you merge; CI runs the same suite
+   on 3.11 and 3.12, sharded, at no cost to you.
+
+**While the PR is being reviewed** — do not re-run the full suite after a
+formatting fix, and do not add a full local run "to be safe": the required
+check is CI's `ci result`. Re-run locally only for a CI failure you cannot read
+from the log.
+
+**In-run agents** — a `code-fix` run's verifier nodes run the gate once, scoped
+to the change surface (`MINI_ORK_TOUCHED_FILES`, else the run's dirty set since
+its base ref). An implementer inside the run must not spend its budget
+re-running the suite; it runs the changed test file, if anything.
+
+What CI runs: `.github/workflows/ci.yml` — ruff (blocking + advisory), pytest on
+3.11/3.12 sharded `unit-a`/`unit-b`/`rest`, the feature-registry ↔ skill check
+(`check-skill`), the README/doc claim check, the verifiers-pin check, and the
+web smoke suite; the `ci result` job is the single required status.
+`.github/workflows/release.yml` re-runs the blocking lint plus a unit-layer
+pytest smoke before building artifacts. `mini-ork garden` (drift detection) is
+**not** in CI yet, so it is not a step here — run it deliberately when you
+touch docs, recipes or config.
 
 ## Feature delivery: two tiers, always
 

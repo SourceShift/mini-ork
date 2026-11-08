@@ -20,15 +20,12 @@ repos:
         args: ['--maxkb=500']
       - id: detect-private-key
 
-  - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.10.0.1
-    hooks:
-      - id: shellcheck
-        # mini-ork shell style is bash-only; suppress sh-only warnings.
-        args: ['--severity=warning', '--shell=bash']
-        # Lib files are sourced — disable SC2034 (unused vars set by caller).
-        files: '(bin/|lib/|hooks/|tests/|recipes/.*/(verifiers|lib)/).*\.sh$'
-
+  # No shellcheck hook: the bash runtime was removed in the 2026-07
+  # bash-removal (docs/plans/2026-07-26-bash-removal-plan.md) and the scope the
+  # hook carried (`bin/|lib/|hooks/|…`) matched nothing in a Python repo. A hook
+  # that can never fire reads as coverage and is not — and it pinned a third
+  # party action for the privilege. `bash -n` stays below: it costs nothing and
+  # still covers the shell that remains (docker/, examples/, hooks/, install.sh).
   - repo: local
     hooks:
       - id: bash-syntax
@@ -39,6 +36,15 @@ repos:
 
       - id: schema-validate-yaml
         name: validate task_class.yaml + workflow.yaml against schemas
-        entry: bash -c 'command -v check-jsonschema >/dev/null || { echo "skip: check-jsonschema not installed"; exit 0; }; for f in "$@"; do case "$f" in *workflow.yaml) check-jsonschema --schemafile schemas/workflow.schema.json "$f" ;; *task_class.yaml) check-jsonschema --schemafile schemas/task_class.schema.json "$f" ;; esac; done' --
+        # Folded block scalar: as a plain scalar this entry did not parse —
+        # the `in *workflow.yaml)` arm contains `: `, which YAML reads as a
+        # mapping start — so `pre-commit run` failed on the config itself.
+        entry: >-
+          bash -c 'command -v check-jsonschema >/dev/null || {
+          echo "skip: check-jsonschema not installed"; exit 0; };
+          for f in "$@"; do case "$f" in
+          *workflow.yaml) check-jsonschema --schemafile schemas/workflow.schema.json "$f" ;;
+          *task_class.yaml) check-jsonschema --schemafile schemas/task_class.schema.json "$f" ;;
+          esac; done' --
         language: system
         files: '(workflow|task_class)\.yaml$'

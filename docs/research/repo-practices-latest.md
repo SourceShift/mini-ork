@@ -39,6 +39,12 @@ three checks mini-ork has already written.
 
 Ranked by value ÷ effort, not by how impressive the reference looks.
 
+**Status (2026-11-08).** Items 1, 2, 5, 6 and 7 shipped in `a1752ad6` and
+`fc41fd3f`; item 3 (ordered validation policy) and item 4 (contributor-doc
+reconciliation + the claim-probe extension) shipped together. The text below is
+kept as written — it is the evidence the changes were made against, not a plan
+tracker.
+
 ### 1. Wire the three already-written gates into CI
 
 - **Evidence** (reference): `.github/workflows/feature_flag_cleanup.yml:42-52`

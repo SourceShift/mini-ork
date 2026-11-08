@@ -16,11 +16,14 @@ The suite is pure Python (the bash test layers were removed in the
 | Path | Contents |
 |---|---|
 | `tests/unit/` | Unit tests for `mini_ork/*` modules (`*_py.py`) |
-| `tests/` (root) | Integration-style suites (dispatch, recovery, web smoke, run artifacts, …) |
 | `tests/integration/` | Cross-component integration tests |
-| `tests/e2e/` | End-to-end flows |
-| `tests/optimize/` | GEPA/optimizer tests |
-| `tests/live/` | Live-provider tests (skipped without creds) |
+| `tests/langgraph_parity/` | Parity tests against the LangGraph reference |
+| `tests/live/` | Live-provider tests (skipped without credentials) |
+| `tests/fixtures/` | Shared fixtures |
+| `tests/_apply_loop_fixtures/` | Fixtures for the apply-loop tests |
+
+The table lists what exists; the CI matrix shards `tests/unit` into
+`unit-a`/`unit-b` and runs everything else as `rest`.
 
 ## Conventions
 
@@ -39,6 +42,7 @@ The suite is pure Python (the bash test layers were removed in the
 ## CI
 
 `.github/workflows/ci.yml` runs ruff (blocking + advisory), pytest on
-3.11/3.12 (sharded `unit-a`/`unit-b`/`rest`), the UI typecheck, and the
-web smoke suite. The merge green-gate is `python3 -m pytest -q` (scope
-per task with `MINI_ORK_TEST_CMD`).
+3.11/3.12 sharded `unit-a`/`unit-b`/`rest`, the README/doc claim check, the
+verifiers-pin check, and the web smoke suite; the `ci result` job aggregates
+them so one required status covers all of it. The merge green-gate is
+`python3 -m pytest -q` (scope per task with `MINI_ORK_TEST_CMD`).

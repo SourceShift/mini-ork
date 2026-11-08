@@ -123,8 +123,8 @@ def _jq_field(output: str, field: str, default: str) -> str:
 
 def run_layer1(repo_root: Path) -> int:
     """Layer 1 — mechanical claim-check. Returns the checker exit code."""
-    # TODO-port: scripts/readme-claim-check.sh is being ported to
-    # scripts/readme_claim_check.py (bash-removal Phase 4, scripts lane).
+    # The Python port is the only implementation (bash-removal Phase 4); the
+    # shell twin was deleted 2026-11-08 once CI and this hook both pointed here.
     argv = [sys.executable, str(repo_root / "scripts" / "readme_claim_check.py")]
     return subprocess.run(argv, check=False).returncode
 

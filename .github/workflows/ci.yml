@@ -21,8 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Run README mechanical claim check
-        run: bash scripts/readme-claim-check.sh
+      # Python is the only runtime (2026-07 bash-removal); the shell twin of
+      # this checker was deleted with the runtime it belonged to. The check
+      # now also probes the paths cited in CONTRIBUTING.md, the PR template and
+      # tests/README.md — a contributor follows those literally.
+      - name: Run README + contributor-doc claim check
+        run: python3 scripts/readme_claim_check.py
 
   python-lint:
     name: python lint (ruff)

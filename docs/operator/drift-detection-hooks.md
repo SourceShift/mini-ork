@@ -53,7 +53,7 @@ git push --no-verify
 
 ## What each layer catches
 
-### Layer 1 — mechanical (`scripts/readme-claim-check.sh`)
+### Layer 1 — mechanical (`scripts/readme_claim_check.py`)
 
 Probes:
 - `lib/*.sh` count claim in README matches `$(ls lib/*.sh | wc -l)`
@@ -66,6 +66,12 @@ Probes:
   is treated as drift).
 - Every backtick-quoted path under `recipes/ docs/ lib/ bin/ schemas/
   db/ examples/ kickoffs/` exists on disk.
+- Every path cited in `CONTRIBUTING.md`, `.github/PULL_REQUEST_TEMPLATE.md`
+  and `tests/README.md` exists on disk — those are instructions, and a
+  contributor (or an agent) follows them literally. Tokens containing a glob
+  or placeholder (`*`, `<`, `$`, …) are not claims and are skipped;
+  `DOC_CLAIM_SKIP` holds the few paths that are legitimately absent from a
+  fresh checkout (`.mini-ork/`, `config/secrets.local.sh`).
 
 Tunable via env:
 - `MO_README_DRIFT_TOLERANCE=0` (default; counts must match exactly)
@@ -74,9 +80,9 @@ Tunable via env:
 
 Run ad-hoc:
 ```bash
-bash scripts/readme-claim-check.sh
-bash scripts/readme-claim-check.sh --verbose
-bash scripts/readme-claim-check.sh --json
+python3 scripts/readme_claim_check.py
+python3 scripts/readme_claim_check.py --verbose
+python3 scripts/readme_claim_check.py --json
 ```
 
 ### Layer 2a — gatekeeper (`scripts/readme-drift-gatekeeper.sh`)

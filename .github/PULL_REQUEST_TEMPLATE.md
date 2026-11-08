@@ -11,9 +11,10 @@
 
 ## Testing
 
-- [ ] `bash tests/smoke.sh` passes locally
-- [ ] `shellcheck lib/*.sh bin/mini-ork` clean (no warnings)
-- [ ] Added/updated example in `examples/` if behavior changed
+- [ ] `make lint` clean (ruff blocking tier: F + E9)
+- [ ] Targeted pytest for the changed file passes (`python3 -m pytest tests/unit/test_<area>_py.py -q`)
+- [ ] Full suite green before merge (`python3 -m pytest -q`)
+- [ ] `mini-ork fallbacks` clean on the changed `.py` files (no silent `except: pass` / `return None`)
 - [ ] Updated `docs/` if config, env vars, or lifecycle changed
 
 ## Related Issues
@@ -23,8 +24,7 @@
 ## Checklist
 
 - [ ] Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)
-- [ ] No hard-coded paths outside `lib/config.sh`
-- [ ] No `eval` for argument construction (use bash arrays)
-- [ ] No `grep`/`sed`/`awk` to parse JSON (use `jq`)
-- [ ] `set -euo pipefail` present in any new `.sh` file
+- [ ] No hard-coded paths — every path derives from `MINI_ORK_HOME`
+- [ ] New behavior registered through a runtime registry, not patched into an executor core
+- [ ] No new `.sh` entrypoint (the runtime is Python only)
 - [ ] No secrets or internal identifiers in code, comments, or examples

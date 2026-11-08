@@ -154,7 +154,11 @@ parity tests already prove equivalence.
 - **CI**: delete `shellcheck` + `bash-tests` jobs; delete
   `mo-check-claude-invocations` advisory step (port is Python — wire it as
   a pytest or a ruff-style check); keep `readme-claim-check` (port to
-  Python or keep as the one sanctioned script).
+  Python or keep as the one sanctioned script). **Done 2026-11-08:** the port
+  is `scripts/readme_claim_check.py`; CI now calls it, and the shell twin was
+  deleted once the pre-push hook, the Makefile and CI all pointed at the port. **Done 2026-11-08:** the port
+  is `scripts/readme_claim_check.py`; CI now calls it, and the shell twin was
+  deleted once the pre-push hook, the Makefile and CI all pointed at the port.
 - **Makefile**: retarget `serve/dev/test-obs/worktree*` to Python entry
   points (port `scripts/mini-ork-worktree.sh` — it is the worktree-first
   dev loop, high value). **Done:** the `worktree*` targets drive

@@ -18,61 +18,88 @@ Use [GitHub Issues](https://github.com/SourceShift/mini-ork/issues/new?template=
 
 ## Pull Request Flow
 
-1. Fork the repo and create a branch from `main`: `git checkout -b fix/short-description`
-2. Make your changes (see Code Style below).
-3. Add or update an example under `examples/` that exercises the change.
-4. Run the smoke test: `bash tests/smoke.sh`
-5. Run shellcheck on every modified `.sh` file: `shellcheck lib/*.sh bin/mini-ork`
-6. Open a PR against `main`. Fill out the PR template.
-7. A maintainer will review within a few days. Address feedback with new commits (no force-push to open PRs).
+`main` is protected, and the repo's own guards assume the worktree flow: a
+`reference-transaction` hook refuses a feature branch created directly in the
+main checkout. Branch through a worktree rather than `git checkout -b`:
+
+1. `make install-hooks` once per clone — activates the branch guard and the
+   pre-push claim check.
+2. `make worktree SLUG=short-description [OWNS="path1 path2"]` — creates
+   `$MINI_ORK_WORKTREES_DIR/<slug>` on branch `wt/<slug>` off `origin/main`.
+   `OWNS` claims the file surface so a concurrent agent cannot edit the same
+   files.
+3. Make your changes inside the worktree (see Code Style below) and commit
+   there. Never commit to `main` in the primary checkout.
+4. Run the targeted checks in [Testing](#testing) as you go, and the full set
+   before you merge.
+5. `make worktree-merge SLUG=short-description` — rebases on `origin/main`,
+   runs the green gate (`python3 -m pytest -q`; scope it per task with
+   `MINI_ORK_TEST_CMD`), then pushes to `main`.
+6. `make worktree-clean SLUG=short-description` — removes the worktree.
+
+Contributors without the hooks installed (a fork, a scratch clone) can open a
+pull request against `main` as usual; CI runs the same checks and the
+`ci result` job is the one required status.
 
 ## Code Style
 
-**Shell**
+**Python**
 
-- Target bash 4.0+. Use `#!/usr/bin/env bash` shebangs.
-- `shellcheck` clean with no suppressed warnings. Run `shellcheck -x lib/*.sh bin/mini-ork` before pushing.
-- Use bash arrays (`arr=()`, `"${arr[@]}"`) — never `eval` to build argument lists.
-- Use `jq` for all JSON reads/writes. Never `grep`/`sed`/`awk` JSON fields.
-- Quote all variable expansions: `"${var}"`, `"${array[@]}"`.
-- `set -euo pipefail` at the top of every script.
-- Functions are `snake_case`. Local variables use `local`.
-- No hard-coded paths outside `lib/config.sh`. All paths derive from `MINI_ORK_HOME`.
+- Python 3.11+. The runtime is Python only — the bash entrypoints were removed
+  in the 2026-07 bash-removal
+  (`docs/plans/2026-07-26-bash-removal-plan.md`). Do not add a new `.sh`
+  entrypoint; port it or use an existing subcommand.
+- `ruff` is the linter. `make lint` runs the blocking tier — pyflakes (`F`)
+  plus the pycodestyle error class (`E9`) — and must stay at zero.
+  `make lint-advisory` runs the style tier (`E,W,I,UP,B`) as a non-blocking
+  ratchet, not a gate. Line length is 110.
+- No silent fallbacks. `except: pass` and `return None` on error are refused by
+  `mini-ork fallbacks` in changed files; a deliberate exception carries
+  `# fallback-guard: allow: <why>` on the handler.
+- Extend the runtime through its registries (`register_node_handler`,
+  `register_gate_evaluator`, `register_provider_kind`, …) instead of editing an
+  executor core module — see `docs/architecture`.
 
 **Naming**
 
 - State.db table names: `snake_case`, plural nouns (`epics`, `epic_reviews`, `runs`).
 - Environment variables: `MINI_ORK_<COMPONENT>_<NAME>` (all caps).
-- Epic IDs: 8-char hex prefix of SHA-256 of `<run_id>:<epic_index>`.
+- Epic IDs: 8-char hex prefix of SHA-256 of `<run_id>:<epic_index>`. `MINI_ORK_HOME`
+  is the one root every path derives from.
 
 **YAML / JSON**
 
 - `agents.yaml`: 2-space indent, no tabs.
-- No trailing whitespace. Files end with a single newline.
+- No trailing whitespace. Files end with a single newline. Every
+  `workflow.yaml` / `task_class.yaml` validates against the schema in
+  `schemas/`.
 
 **Markdown**
 
 - Wrap prose at 100 chars.
 - Code blocks always specify a language tag.
 
-## Testing via Examples
+## Testing
 
-The primary test harness is `tests/smoke.sh`, which runs `mini-ork deliver` against each file in `examples/`:
+The suite is pytest; there is no shell smoke harness (it went with the bash
+runtime). Run the file you changed while you work, and the full suite once,
+before you merge:
 
 ```bash
-bash tests/smoke.sh                  # all examples
-bash tests/smoke.sh examples/01-hello-world.md   # single example
+python3 -m pytest tests/unit/test_dispatch_retry_py.py -q   # the file you changed
+python3 -m pytest -q                                        # full suite (make test)
 ```
 
-Each example `kickoff.md` includes an `<!-- expected-verdict: PASS -->` comment. The smoke test asserts the final run verdict matches.
+Pass the test **file path**, never a bare `-k` / `-t` name filter: the filter
+makes pytest collect the whole tree first, measured at 11 workers x ~900 MB and
+8+ minutes of load average 124–138 on an 11-core box. If you cannot name the
+file, do not run the suite.
 
-To add a new test scenario:
-
-1. Create `examples/NN-short-name.md` with a minimal, self-contained kickoff.
-2. Include the expected-verdict comment.
-3. Keep the kickoff small — the smoke test must complete in under 60 seconds.
-
-Do not add LLM-dependent tests to the smoke suite. Smoke tests must run offline with a mocked `claude` binary (`tests/mocks/claude`).
+`tests/README.md` documents the layer split and the DB fixtures. CI runs the
+same checks locally available — ruff, the sharded pytest matrix on 3.11/3.12,
+the README/doc claim check, the verifiers-pin check and the web smoke suite —
+plus fast failures CI alone can afford; run the blocking lint before you push
+and let CI catch what is uncommon.
 
 ## Commit Messages
 

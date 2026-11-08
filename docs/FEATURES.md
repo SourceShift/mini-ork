@@ -2,7 +2,7 @@
 
 The complete inventory of what mini-ork provides, organized by the value it
 delivers. Counts are mechanically verified against the repo by
-`scripts/readme-claim-check.sh`. Every feature below points at the code that
+`scripts/readme_claim_check.py`. Every feature below points at the code that
 implements it.
 
 mini-ork is a **task operating system for agents**: it receives a goal,
