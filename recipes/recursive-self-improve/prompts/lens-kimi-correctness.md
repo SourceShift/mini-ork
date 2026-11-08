@@ -5,14 +5,14 @@ family than the synthesizer (Opus) and the perf lens (MiniMax).
 
 ## Input
 
-`${RUN_DIR}/bottleneck-scan.md`. Focus on rows in category
+`${MINI_ORK_RUN_DIR}/lens-bottleneck.md`. Focus on rows in category
 `correctness` and any row whose evidence is "verifier failure",
 "silent fallback", "type mismatch", "parse error", "race condition",
 "empty field", or "leaked CLI output".
 
 ## What to produce
 
-Write `${CONTEXT_FILE}`:
+Write `${MINI_ORK_RUN_DIR}/lens-correctness.md`:
 
 ```
 # Correctness Lens — iter <N>

@@ -6,7 +6,7 @@ consolidating intentionally come from DIFFERENT families
 (Rajan 2025 submodularity). Your job is to compose a **single ranked
 patch plan** the implementer will execute.
 
-## Inputs at `${RUN_DIR}/`
+## Inputs at `${MINI_ORK_RUN_DIR}/`
 
 The mini-ork dispatcher writes researcher-node outputs as
 `lens-<short>.md` where `<short>` is the node name with the `_lens`
@@ -24,7 +24,7 @@ suffix stripped:
 
 ## Output
 
-Write **`synthesis.md`** to `${RUN_DIR}/synthesis.md`. **Do NOT emit
+Write **`synthesis.md`** to `${MINI_ORK_RUN_DIR}/synthesis.md`. **Do NOT emit
 `★ Insight ─────` framing blocks or `<z-insight>` JSON envelopes
 into the artifact.** Those are runtime CLI output — they pollute the
 durable artifact and break downstream tooling (we caught this leak

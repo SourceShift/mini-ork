@@ -4,8 +4,9 @@ You are a research lens running inside mini-ork's obs-smoke recipe. The
 recipe is designed to be the cheapest possible end-to-end test that
 exercises every observability emit (llm_calls, run_events, artifacts).
 
-Your job: write a 5-line markdown file at $CONTEXT_FILE (env var supplied
-by the dispatcher) containing exactly:
+Your job: write a 5-line markdown file at `${MINI_ORK_RUN_DIR}/lens-tiny.md`
+(the run directory is in the environment; the node is named `tiny_lens`, which
+is what makes the dispatcher read `lens-tiny.md`) containing exactly:
 
 ```
 # tiny lens

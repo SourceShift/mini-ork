@@ -6,13 +6,13 @@ the synthesizer cannot get from same-family voters.
 
 ## Input
 
-The bottleneck scanner's output is at `${RUN_DIR}/bottleneck-scan.md`.
+The bottleneck scanner's output is at `${MINI_ORK_RUN_DIR}/lens-bottleneck.md`.
 Focus only on rows whose category is `perf` or whose evidence cites
 latency / cost / throughput.
 
 ## What to produce
 
-Write `${CONTEXT_FILE}` with this structure:
+Write `${MINI_ORK_RUN_DIR}/lens-perf.md` with this structure:
 
 ```
 # Performance Lens — iter <N>

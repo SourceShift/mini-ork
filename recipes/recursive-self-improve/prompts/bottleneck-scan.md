@@ -4,8 +4,9 @@ You are the bottleneck lens for one iteration of mini-ork's recursive
 self-improvement loop. Your job is to produce a ranked, evidence-grounded
 list of bottlenecks the downstream lenses will research and fix.
 
-The mini-ork dispatcher will hand you `${CONTEXT_FILE}` resolved to
-`${RUN_DIR}/lens-bottleneck.md` — write there.
+Write your report to `${MINI_ORK_RUN_DIR}/lens-bottleneck.md` — the node
+is named `bottleneck_lens`, which is what makes the dispatcher read that
+file (a `lens-<stem>.md` name, not a `context-<id>.json` one).
 
 ## Inputs you can inspect
 
@@ -31,7 +32,7 @@ The mini-ork dispatcher will hand you `${CONTEXT_FILE}` resolved to
 
 ## Output
 
-Write to `${CONTEXT_FILE}` a markdown document with:
+Write to `${MINI_ORK_RUN_DIR}/lens-bottleneck.md` a markdown document with:
 
 ```
 # Bottleneck Scan — iter <N>

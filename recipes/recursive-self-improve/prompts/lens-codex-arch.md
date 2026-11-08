@@ -6,14 +6,14 @@ wrapper). Different family than synthesizer (Opus), perf lens
 
 ## Input
 
-`${RUN_DIR}/bottleneck-scan.md`. Focus on rows in category `arch`
+`${MINI_ORK_RUN_DIR}/lens-bottleneck.md`. Focus on rows in category `arch`
 and any row whose evidence cites "duplicate logic", "fragile routing",
 "missing abstraction", "leaky boundary", "single point of failure",
 "recipe coupling", or "verifier surface gap".
 
 ## What to produce
 
-Write `${CONTEXT_FILE}`:
+Write `${MINI_ORK_RUN_DIR}/lens-arch.md`:
 
 ```
 # Architecture Lens — iter <N>

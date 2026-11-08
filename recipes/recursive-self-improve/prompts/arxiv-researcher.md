@@ -7,12 +7,12 @@ repo-locality, not narrative writing).
 ## Goal
 
 For each suggested arXiv search query from
-`${RUN_DIR}/lens-bottleneck.md`, find 1-3 directly relevant papers,
+`${MINI_ORK_RUN_DIR}/lens-bottleneck.md`, find 1-3 directly relevant papers,
 extract the concrete technique they propose, and map that technique
 to a specific mini-ork file or module where it could land.
 
-The dispatcher will hand you `${CONTEXT_FILE}` resolved to
-`${RUN_DIR}/lens-arxiv.md` — write there.
+Write your report to `${MINI_ORK_RUN_DIR}/lens-arxiv.md` — the node is
+named `arxiv_lens`, which is what makes the dispatcher read that file.
 
 ## Tools
 
@@ -32,7 +32,7 @@ budget.
 
 ## What to produce
 
-Write `${CONTEXT_FILE}` as:
+Write `${MINI_ORK_RUN_DIR}/lens-arxiv.md` as:
 
 ```
 # arXiv Refs — iter <N>
