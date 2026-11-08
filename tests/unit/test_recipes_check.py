@@ -10,6 +10,7 @@ itself fail, and the real repo is clean.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from mini_ork.cli import recipes
@@ -74,6 +75,42 @@ def test_unparsable_workflow_is_an_error(tmp_path: Path, monkeypatch) -> None:
     kinds = [f["kind"] for f in recipes.check_recipe(root, "demo")]
     assert kinds == ["unparsable"]
     assert _run(root, monkeypatch) == 1
+
+
+def test_workflow_that_is_not_a_mapping_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    """A YAML list parses fine and then has no `.get` — a finding, not a crash."""
+    root = _recipe(tmp_path, workflow="- just\n- a list\n")
+    findings = recipes.check_recipe(root, "demo")
+    assert [f["kind"] for f in findings] == ["unparsable"]
+    assert "expected a mapping" in findings[0]["detail"]
+    assert _run(root, monkeypatch) == 1
+
+
+def test_dangling_artifact_contract_ref_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    """task_class.yaml names files too; a rename dangles it the same way."""
+    root = _recipe(tmp_path)
+    (root / "recipes" / "demo" / "task_class.yaml").write_text(
+        "name: demo\nartifact_contract_ref: contracts/main.yaml\n", encoding="utf-8")
+    findings = recipes.check_recipe(root, "demo")
+    assert [f["kind"] for f in findings] == ["dangling-ref"]
+    assert "artifact_contract_ref" in findings[0]["detail"]
+    assert _run(root, monkeypatch) == 1
+
+
+def test_missing_compiler_dependency_is_a_usage_error_not_52_findings(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """An unimportable compiler must not be reported as "every recipe is broken"."""
+    root = _recipe(tmp_path)
+    monkeypatch.setenv("MINI_ORK_ROOT", str(root))
+    monkeypatch.setitem(sys.modules, "mini_ork.workflow.compiler", None)
+    assert recipes.main(["check"]) == 2
+    assert "pyyaml" in capsys.readouterr().err
+
+
+def test_no_recipes_directory_is_a_usage_error(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    assert recipes.main(["check"]) == 2
 
 
 def test_uncompilable_workflow_is_an_error(tmp_path: Path, monkeypatch) -> None:

@@ -18,7 +18,8 @@ class of rot a red exit code instead.
 Exit codes:
     0  every recipe is intact
     1  at least one finding of the severity the run considers fatal
-    2  usage error (or no recipes directory)
+    2  usage error, no recipes directory, or the compiler's dependencies
+       (yaml, jsonschema) cannot be imported
 
 Severity: a *dangling reference* or an *uncompilable workflow* is an error
 because the recipe cannot run. An *incomplete* recipe — missing
@@ -83,6 +84,18 @@ def _load_yaml(path: Path):
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _compiler():
+    """The real compiler; imported lazily so ``--help`` stays dependency-free.
+
+    ``mini_ork.recovery.condition`` imports ``jsonschema`` at module scope, so
+    this needs yaml *and* jsonschema. ``main`` preflights it and refuses with a
+    legible message rather than reporting every recipe as uncompilable.
+    """
+    from mini_ork.workflow.compiler import compile_workflow
+
+    return compile_workflow
+
+
 def check_recipe(root: Path, name: str) -> list[dict]:
     """Findings for one recipe: dangling refs, unparsable files, missing files."""
     rd = root / "recipes" / name
@@ -111,7 +124,11 @@ def check_recipe(root: Path, name: str) -> list[dict]:
         if err is not None:
             add("error", "unparsable", f"workflow.yaml: {err}",
                 "fix the YAML; nothing downstream can read this recipe")
-        elif data:
+        elif not isinstance(data, dict):
+            add("error", "unparsable",
+                f"workflow.yaml: expected a mapping, got {type(data).__name__}",
+                "the top level of workflow.yaml must be `nodes:` / `edges:`")
+        else:
             for node in data.get("nodes") or []:
                 if not isinstance(node, dict):
                     continue
@@ -128,10 +145,8 @@ def check_recipe(root: Path, name: str) -> list[dict]:
         # Compile last: a dangling ref is a more useful message than the
         # compiler's generic failure for the same recipe.
         if not any(f["kind"] == "unparsable" for f in findings):
-            from mini_ork.workflow.compiler import compile_workflow
-
             try:
-                compile_workflow(wf_path)
+                _compiler()(wf_path)
             except Exception as exc:  # any compile failure is a finding
                 add("error", "uncompilable", f"{type(exc).__name__}: {exc}",
                     "fix workflow.yaml; this recipe cannot be dispatched")
@@ -139,10 +154,27 @@ def check_recipe(root: Path, name: str) -> list[dict]:
     for fn in ("task_class.yaml", "artifact_contract.yaml"):
         path = rd / fn
         if path.is_file():
-            _, err = _load_yaml(path)
+            data, err = _load_yaml(path)
             if err is not None:
                 add("error", "unparsable", f"{fn}: {err}",
                     "fix the YAML; the loader fails closed on this file")
+                continue
+            if not isinstance(data, dict):
+                add("error", "unparsable",
+                    f"{fn}: expected a mapping, got {type(data).__name__}",
+                    "the top level of this file must be a mapping")
+                continue
+            if fn == "task_class.yaml":
+                # `artifact_contract_ref` / `default_workflow` name files the
+                # same way a node's refs do; a rename dangles them just as
+                # silently.
+                for key in ("artifact_contract_ref", "default_workflow"):
+                    ref = data.get(key)
+                    if ref and not (rd / str(ref)).is_file():
+                        add("error", "dangling-ref",
+                            f"task_class.yaml: {key} -> {ref} does not exist",
+                            f"create {ref}, or repoint {key} at the file that "
+                            f"replaced it")
 
     return findings
 
@@ -203,6 +235,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     names = requested or available
+    try:
+        _compiler()
+    except Exception as exc:  # a missing dependency is not a recipe finding
+        sys.stderr.write(
+            f"cannot import the workflow compiler: {type(exc).__name__}: {exc}\n"
+            "recipe integrity needs pyyaml + jsonschema (both are pinned in "
+            "pyproject.toml)\n"
+        )
+        return 2
     results = {name: check_recipe(root, name) for name in names}
 
     errors = sum(1 for fs in results.values() for f in fs if f["severity"] == "error")

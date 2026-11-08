@@ -54,7 +54,9 @@ mini-ork recipes check --strict        # warnings fail too
 mini-ork recipes check --json          # machine-readable, for a gate or a dashboard
 ```
 
-Exit `0` clean, `1` findings, `2` usage error or no `recipes/` directory.
+Exit `0` clean, `1` findings, `2` usage error, no `recipes/` directory, or the
+workflow compiler's dependencies (`yaml`, `jsonschema`) cannot be imported — the
+last case is reported as such rather than as "every recipe is uncompilable".
 
 **Secure / CI** — the `python-lint` job runs it next to `check-skill`:
 

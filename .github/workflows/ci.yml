@@ -71,10 +71,12 @@ jobs:
       # files beside it. Rename a prompt or delete a verifier and the recipe
       # still parses: the break surfaces as a dispatch error inside a paid run.
       # `recipe-eval` scores style and always exits 0, so nothing checked this.
-      # Needs PyYAML (in the base install spec), not the full test extras.
+      # Compiling a workflow pulls `mini_ork.recovery.condition`, which imports
+      # jsonschema at module scope — so the step installs both rather than
+      # discovering the gap as a crash. Both are pinned in pyproject.toml.
       - name: "Recipe integrity (refs resolve, workflows compile)"
         run: |
-          pip install pyyaml
+          pip install pyyaml jsonschema
           python -m mini_ork.cli.main recipes check
 
   python-tests:
