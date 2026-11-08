@@ -133,15 +133,73 @@ def test_load_plugins_records_enabled_plugins():
     assert enabled_plugins()["visible-plugin"].module
 
 
+class _EPs(list):
+    """Stand-in for ``EntryPoints``, which is filtered with ``.select``."""
+
+    seen: dict = {}
+
+    def select(self, *, group):
+        type(self).seen["group"] = group
+        return self
+
+
 def test_scan_requests_the_plugin_group(monkeypatch):
     seen = {}
-
-    class _EPs(list):
-        def select(self, *, group):
-            seen["group"] = group
-            return self
-
-    monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points", lambda: _EPs())
+    monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
+                        lambda: _EPs([_EP("noop", lambda ctx: None)]))
+    monkeypatch.setattr(_EPs, "seen", seen)
     report = load_plugins()
     assert report.ok is True
     assert seen["group"] == ENTRY_POINT_GROUP == "mini_ork.plugins"
+
+
+def test_the_cli_runs_discovery_once_before_dispatch(monkeypatch):
+    """The documented host seam must actually be wired.
+
+    ``mini_ork/plugins.py`` says the host calls ``load_plugins`` at startup.
+    While the CLI never did, ``MO_BUDGET_POLICY=acme`` could only fail closed in
+    every real deployment, so the budget's secure tier was unreachable.
+    """
+    from mini_ork.cli import main as cli_main
+
+    calls: list[str] = []
+
+    def register(context):
+        calls.append(context.__class__.__name__)
+
+    monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
+                        lambda: _EPs([_EP("acme", register)]))
+    monkeypatch.delenv("MINI_ORK_NO_PLUGINS", raising=False)
+    monkeypatch.setattr(cli_main, "_PLUGINS_LOADED", False)
+
+    cli_main._load_plugins_once()
+    cli_main._load_plugins_once()  # idempotent: one scan per process
+
+    assert calls == ["PluginContext"]
+
+
+def test_a_broken_plugin_warns_instead_of_killing_the_cli(monkeypatch, capsys):
+    from mini_ork.cli import main as cli_main
+
+    monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
+                        lambda: _EPs([_EP("bad", ImportError("nope"))]))
+    monkeypatch.delenv("MINI_ORK_NO_PLUGINS", raising=False)
+    monkeypatch.setattr(cli_main, "_PLUGINS_LOADED", False)
+
+    cli_main._load_plugins_once()
+
+    assert "warning: plugin bad" in capsys.readouterr().err
+
+
+def test_the_cli_plugin_scan_can_be_opted_out(monkeypatch):
+    from mini_ork.cli import main as cli_main
+
+    scanned: list[bool] = []
+    monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
+                        lambda: scanned.append(True) or _EPs())
+    monkeypatch.setenv("MINI_ORK_NO_PLUGINS", "1")
+    monkeypatch.setattr(cli_main, "_PLUGINS_LOADED", False)
+
+    cli_main._load_plugins_once()
+
+    assert scanned == []

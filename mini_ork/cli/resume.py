@@ -118,6 +118,7 @@ def _resume_budget_park(
     approver: str | None,
     now: datetime.datetime | None,
     restart: bool,
+    clear: bool = True,
 ) -> tuple[int, str, str | None, bool] | None:
     """Resume a run parked by its per-run ceiling; ``None`` when no such park.
 
@@ -132,6 +133,12 @@ def _resume_budget_park(
     * the operator removed the declared ceiling instead of raising it → refuse
       too. A parked run must not become unlimited because a variable was
       unset; the message says so and names the spend it has to cover.
+
+    ``clear=False`` asks the question without answering it: a blocking park
+    still refuses, and a park that now fits returns ``None`` so the caller can
+    finish its own work first. Used when a ``.cost-pause`` sentinel is also
+    present — the two holds must be resolved together, or resume reports
+    success while the budget gate re-parks the run on its very next dispatch.
     """
     from mini_ork.cost import budget  # noqa: PLC0415
 
@@ -155,6 +162,9 @@ def _resume_budget_park(
             f"does not make a parked run unlimited.\n"
         )
         return 1, "", None, False
+
+    if not clear:
+        return None  # it fits; let the caller finish its own bookkeeping first
 
     approvals = os.path.join(run_dir, ".cost-pause-approvals.jsonl")
     if approver is None:
@@ -190,7 +200,9 @@ def resume(
     rc semantics match bash exactly:
       * 1 — ``run_dir`` does not exist (stderr is written by this fn).
       * 1 — the run is parked by its per-run budget and still does not fit
-             (see :func:`_resume_budget_park`); nothing is cleared.
+             (see :func:`_resume_budget_park`); nothing is cleared. This holds
+             even when a ``.cost-pause`` sentinel is also present — both holds
+             are answered before either file is touched.
       * 0 — no sentinel and no budget marker present (stderr warning is
              written by this fn, ``audit_path`` is ``None``,
              ``sentinel_removed`` is ``False``).
@@ -218,6 +230,17 @@ def resume(
         return 1, "", None, False
 
     sentinel = os.path.join(run_dir, ".cost-pause")
+    # Both holds can be present. Refuse here, before either is touched: clearing
+    # the sentinel and reporting "resumed" while ``.budget-exhausted`` stays
+    # would hand the operator rc 0 for a resume that unblocks nothing — the
+    # restarted run meets the budget gate on its very next dispatch and parks
+    # again. Asking first also keeps the message honest about which knob stops
+    # the run. A park that already fits returns ``None`` and each branch below
+    # finishes its own bookkeeping.
+    blocked = _resume_budget_park(run_id, run_dir, approver=approver, now=now,
+                                  restart=False, clear=False)
+    if blocked is not None:
+        return blocked
     if not os.path.isfile(sentinel):
         # A run parked by its per-run ceiling has no cost-pause sentinel — the
         # gate refuses the *next* node and leaves ``.budget-exhausted``. The
@@ -245,6 +268,12 @@ def resume(
     with open(approvals, "a") as fh:
         fh.write(row)
     os.remove(sentinel)
+    # If a budget marker was also present it fits (the pre-check above only
+    # returned None for "no park" or "park that now fits"), so clear it in the
+    # same run and give it its own audit row — one resume, one approval per
+    # hold, nothing left that the next dispatch would re-park on.
+    _resume_budget_park(run_id, run_dir, approver=approver, now=now,
+                        restart=False)
 
     stdout_msg = (
         f"[mini-ork-resume] resumed {run_id} (approver={approver}, "

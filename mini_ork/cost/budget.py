@@ -178,6 +178,20 @@ def _declared_verdict(db, run_id, run_dir) -> Verdict:
         return Verdict(spent=spent, budget=None, exhausted=True,
                        detail=f"per-run budget is unusable: {exc}")
     if budget is None:
+        # No ceiling NOW is not the same as no ceiling WAS. A run parked while
+        # ``MO_RUN_BUDGET_USD`` was set, restarted by a process that no longer
+        # has it, would otherwise read as unlimited and have its marker erased
+        # by ``record`` — the park evaporates because a variable was lost
+        # between processes. The marker is the only durable evidence that a
+        # ceiling applied, so while it exists this run stays parked: re-declare
+        # a ceiling above the spend, or remove the marker deliberately.
+        if read_marker(run_dir) is not None:
+            return Verdict(
+                spent=spent, budget=None, exhausted=True,
+                detail=(f"this run was parked by a ceiling that is no longer "
+                        f"declared (spent ${spent:.2f}); re-declare "
+                        f"{BUDGET_ENV} above that, or remove {MARKER_NAME} "
+                        f"deliberately"))
         return Verdict(spent=spent, budget=None, exhausted=False,
                        detail=f"no per-run budget declared (spent ${spent:.2f})")
     if spent >= budget:
@@ -249,8 +263,13 @@ def record(run_dir: str | os.PathLike | None, v: Verdict) -> None:
         except OSError:
             pass
         return
+    # Write-then-rename: a reader (the IDE page, ``mini-ork resume``, the
+    # attention inbox) must never see a half-written marker, because an empty
+    # file reads as a park with no numbers and a truncated one as garbage.
+    # ``os.replace`` is atomic on the same filesystem.
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({
                 "spent_usd": round(v.spent, 6),
                 "budget_usd": v.budget,
@@ -258,12 +277,23 @@ def record(run_dir: str | os.PathLike | None, v: Verdict) -> None:
                 "recorded_at": int(time.time()),
             }, fh)
             fh.write("\n")
+        os.replace(tmp, path)
     except OSError:
-        pass  # the gate's refusal does not depend on the marker landing
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        # the gate's refusal does not depend on the marker landing
 
 
 def read_marker(run_dir: str | os.PathLike | None) -> dict | None:
-    """The marker's payload, or ``None`` when there is no (readable) marker."""
+    """The marker's payload, or ``None`` when there is no marker file.
+
+    A marker that exists but cannot be parsed comes back as ``{}`` — *present
+    but unreadable*, which is not the same as absent. Every caller here only
+    asks "is there a park?", so ``{}`` keeps answering yes; the numbers in the
+    payload are a convenience for the page, never the gate's input.
+    """
     path = marker_path(run_dir)
     if not path or not os.path.isfile(path):
         return None

@@ -225,9 +225,46 @@ def test_budget_park_refuses_when_the_ceiling_was_removed(tmp_path):
         env_overrides=_budget_env(""))
 
     assert rc == 1
-    assert "no per-run budget is declared" in err
+    assert "no longer declared" in err
     assert "does not make a parked run unlimited" in err
     assert (run_dir / ".budget-exhausted").is_file()
+
+
+def test_a_second_hold_is_not_resumed_past(tmp_path):
+    """A cost-pause sentinel must not buy a budget-parked run a free resume.
+
+    Both holds are real. Clearing the sentinel and returning rc 0 would report
+    success for a run the budget gate re-parks on its very next dispatch.
+    """
+    run_dir = _seed_budget_park(tmp_path, "run-h", spent=0.84, budget=0.5)
+    (run_dir / ".cost-pause").write_text("{}\n")
+    rc, out, err, lines, sent = _py_resume(
+        ["run-h", "--no-restart"], tmp_path,
+        env_overrides=_budget_env("0.5"))
+
+    assert rc == 1
+    assert out == ""
+    assert "still parked" in err
+    assert sent is True, "the sentinel must be untouched when the resume is refused"
+    assert (run_dir / ".budget-exhausted").is_file()
+    assert lines == []
+
+
+def test_both_holds_clear_together_once_the_run_fits(tmp_path):
+    run_dir = _seed_budget_park(tmp_path, "run-i", spent=0.84, budget=0.5)
+    (run_dir / ".cost-pause").write_text("{}\n")
+    rc, out, err, lines, sent = _py_resume(
+        ["run-i", "--no-restart"], tmp_path,
+        env_overrides=_budget_env("12"), user="alice")
+
+    assert rc == 0, err
+    assert "resumed run-i" in out
+    assert sent is False
+    assert not (run_dir / ".budget-exhausted").exists()
+    # one audit row per hold: the sentinel's, then the budget park's
+    assert len(lines) == 2
+    assert "sentinel_payload" in json.loads(lines[0])
+    assert json.loads(lines[1])["sentinel_payload"]["marker"] == ".budget-exhausted"
 
 
 def test_budget_park_names_a_corrupt_profile_instead_of_a_removed_ceiling(tmp_path):

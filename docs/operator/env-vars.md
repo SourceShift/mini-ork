@@ -114,17 +114,28 @@ Refusals are the interesting half of the contract:
   they parse as floats and pass every `spent >= budget` comparison.
 - A `run_profile.json` that **exists but cannot be read** (corrupt JSON, not an
   object) **refuses** — it may carry a ceiling, so reading it as "no ceiling"
-  would raise the run's spend. Only an absent profile means "nothing declared".
+  would raise the run's spend. A profile with no `budget_usd` key (or `null` /
+  empty) declares no ceiling, like having no profile at all: only a declared
+  value that is present and unusable refuses.
 - A named policy that is not registered, or one that raises, **refuses** —
   never "unlimited".
 - A missing or unreadable ledger reads as `$0.00` spent, the same fail-open
   choice the daily cap makes, so a fresh home is never blocked by a database
   that does not exist yet.
+- A run that was **parked by a ceiling which is no longer declared** stays
+  parked. The marker is the durable evidence that a ceiling applied, so a
+  restart in a process that lost `MO_RUN_BUDGET_USD` (and whose profile has no
+  `budget_usd`) is refused at the gate rather than silently dispatching with no
+  ceiling and erasing the marker. Re-declare a ceiling above the spend, or
+  delete `<run_dir>/.budget-exhausted` deliberately.
 - `mini-ork resume` re-asks the policy before un-parking: a run still over its
   ceiling gets rc 1 and the number to exceed, and a run whose ceiling was
   **removed** is refused too — unsetting `MO_RUN_BUDGET_USD` does not make a
   parked run unlimited. Only when the run fits is `.budget-exhausted` cleared
-  (and the approval audited to `.cost-pause-approvals.jsonl`).
+  (and the approval audited to `.cost-pause-approvals.jsonl`). When a run holds
+  **both** a `.cost-pause` sentinel and a budget marker, both are answered
+  together: a still-blocking budget refuses the resume before the sentinel is
+  touched, and a resume that succeeds clears both with one audit row each.
 - The marker is removed as soon as the run fits under the ceiling again, so a
   raised ceiling does not leave a stale "needs you" row behind.
 
@@ -145,8 +156,12 @@ register_budget_policy("myorg", _quota)
 
 Out of tree, register it through the plugin seam instead of patching core — an
 entry point in the `mini_ork.plugins` group whose target calls
-`context.budget_policy("myorg", _quota)` (see `mini_ork/plugins.py`; the host
-must call `load_plugins()` at startup).
+`context.budget_policy("myorg", _quota)` (see `mini_ork/plugins.py`). The CLI
+now runs that discovery once per process before dispatch, so
+`MO_BUDGET_POLICY=myorg` resolves in a normal `mini-ork …` invocation; a
+plugin that fails to load is reported on stderr and skipped. Set
+`MINI_ORK_NO_PLUGINS=1` to skip discovery in a process that must not execute
+third-party code.
 
 ```bash
 MO_BUDGET_POLICY=myorg mini-ork run code-fix kickoff.md

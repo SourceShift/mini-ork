@@ -228,6 +228,60 @@ def test_the_marker_is_written_then_removed_when_the_run_fits_again(tmp_path, mo
     assert budget.read_marker(run_dir) is None
 
 
+def test_a_parked_run_stays_parked_when_its_ceiling_vanishes(tmp_path, monkeypatch):
+    """Losing the variable between processes must not evaporate the park.
+
+    The ceiling can be declared only in the environment (no profile
+    ``budget_usd``), so the restarting process sees no ceiling at all. The
+    marker is then the only durable evidence one applied — the gate must refuse
+    rather than dispatch with no ceiling and erase the marker.
+    """
+    budget = _cost_budget()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MO_RUN_BUDGET_USD", "5")
+    budget.record(run_dir, budget.verdict(_db(tmp_path), "r1", run_dir))
+    assert budget.read_marker(run_dir) is not None
+
+    monkeypatch.delenv("MO_RUN_BUDGET_USD")
+    v = budget.verdict(_db(tmp_path), "r1", run_dir)
+    assert v.exhausted is True and v.budget is None
+    assert "no longer declared" in v.detail
+    budget.record(run_dir, v)
+    assert (run_dir / ".budget-exhausted").is_file(), "the park must survive"
+
+    # Re-declaring a ceiling that covers the spend un-parks it.
+    monkeypatch.setenv("MO_RUN_BUDGET_USD", "50")
+    budget.record(run_dir, budget.verdict(_db(tmp_path), "r1", run_dir))
+    assert not (run_dir / ".budget-exhausted").exists()
+
+
+def test_the_gate_refuses_a_park_whose_ceiling_vanished(tmp_path, monkeypatch):
+    from mini_ork.cli import execute_handlers as eh
+    from mini_ork.gates import node_review
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / ".budget-exhausted").write_text('{"spent_usd": 10.0}\n')
+    monkeypatch.delenv("MO_RUN_BUDGET_USD", raising=False)
+    monkeypatch.delenv("MO_BUDGET_POLICY", raising=False)
+    monkeypatch.setenv("MO_NODE_FINISH_REASON", "")
+
+    decided = eh._budget_gate(_db(tmp_path), "r1", str(run_dir), "implementer")
+    assert decided == (node_review.REVIEW_PAUSE_RC, "budget_exhausted")
+    assert (run_dir / ".budget-exhausted").is_file()
+
+
+def test_the_marker_is_replaced_atomically(tmp_path, monkeypatch):
+    """No reader may see a truncated marker, so record() writes then renames."""
+    budget = _cost_budget()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MO_RUN_BUDGET_USD", "5")
+    budget.record(run_dir, budget.verdict(_db(tmp_path), "r1", run_dir))
+    assert [p.name for p in run_dir.iterdir()] == [budget.MARKER_NAME]
+
+
 def test_record_is_a_noop_without_a_run_dir():
     budget = _cost_budget()
     budget.record(None, budget.Verdict(spent=1.0, budget=1.0, exhausted=True, detail="x"))

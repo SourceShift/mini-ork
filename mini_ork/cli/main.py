@@ -2488,6 +2488,38 @@ def _load_feature_defaults() -> None:
         sys.stderr.write(f"warning: feature defaults not loaded: {exc}\n")
 
 
+_PLUGINS_LOADED = False
+
+
+def _load_plugins_once() -> None:
+    """Discover out-of-tree plugins, once per process.
+
+    :mod:`mini_ork.plugins` has always documented that the host — "the CLI, a
+    service, or an embedding application" — calls ``load_plugins`` at startup,
+    but the CLI never did. The consequence was concrete: the per-run budget's
+    secure tier says ``MO_BUDGET_POLICY=acme`` selects a policy the deployment
+    registered, and no CLI process could ever register one, so that tier could
+    only fail closed. The same was true of node handlers, routing policies and
+    subcommands offered by a plugin.
+
+    Discovery stays explicit and cheap: importing ``mini_ork`` never scans, the
+    scan here is one entry-point metadata read, and a plugin that raises is
+    reported on stderr and skipped rather than turning every command into a
+    traceback. ``MINI_ORK_NO_PLUGINS=1`` opts a process out.
+    """
+    global _PLUGINS_LOADED
+    if _PLUGINS_LOADED:
+        return
+    _PLUGINS_LOADED = True
+    if os.environ.get("MINI_ORK_NO_PLUGINS", "").strip() not in ("", "0"):
+        return
+    from mini_ork.plugins import load_plugins
+
+    report = load_plugins()
+    for failure in report.failed:
+        sys.stderr.write(f"warning: plugin {failure.name}: {failure.error}\n")
+
+
 def main(argv=None, *, root=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # The engine root is the directory that CONTAINS ``mini_ork`` — three levels
@@ -2500,6 +2532,9 @@ def main(argv=None, *, root=None) -> int:
     os.environ["MINI_ORK_ROOT"] = root
     _load_feature_defaults()
     _load_secret_store_env()
+    # Out-of-tree plugins register into this process's registries; the scan has
+    # to happen before dispatch or a selected policy/handler cannot exist.
+    _load_plugins_once()
     # The selected profile (``MINI_ORK_PROFILE``) fills the knobs its tier sets
     # and leaves an operator's export alone. Applied here, once, so every
     # subcommand and every spawned child sees the same values — the execute
