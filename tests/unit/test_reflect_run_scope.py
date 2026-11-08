@@ -420,7 +420,7 @@ def test_pinned_timeout_env_beats_the_derived_bound(tmp_path, monkeypatch):
     assert bound == 7
 
 
-# ── 4. the lesson_themes upsert ─────────────────────────────────────────────
+# ── 4. the theme-store upsert ───────────────────────────────────────────────
 
 _GRADIENT_DDL = """
 CREATE TABLE IF NOT EXISTS gradient_records (
@@ -471,14 +471,25 @@ def test_two_lesson_theme_writes_with_same_theme_id_do_not_raise(
     assert report["assigned"] == 2, f"both gradients must be assigned: {report}"
     con = sqlite3.connect(db)
     try:
-        theme_rows = con.execute(
-            "SELECT COUNT(*) FROM lesson_themes WHERE theme_id = 'th-spec-collide'"
+        # The collision target is the cluster store: assign_new writes one
+        # ``theme_clusters`` row per theme, and the second same-id insert must
+        # upsert onto it rather than raise.
+        cluster_rows = con.execute(
+            "SELECT COUNT(*) FROM theme_clusters"
+            " WHERE theme_id = 'th-spec-collide'"
         ).fetchone()[0]
         member_rows = con.execute(
             "SELECT COUNT(*) FROM gradient_theme"
             " WHERE theme_id = 'th-spec-collide'"
         ).fetchone()[0]
+        # Clustering never authors a lesson: only ``promote`` writes
+        # ``lesson_themes``, and only with non-blank ``lesson_text``.
+        lesson_rows = con.execute(
+            "SELECT COUNT(*) FROM lesson_themes"
+            " WHERE theme_id = 'th-spec-collide'"
+        ).fetchone()[0]
     finally:
         con.close()
-    assert theme_rows == 1
+    assert cluster_rows == 1
     assert member_rows == 2
+    assert lesson_rows == 0
