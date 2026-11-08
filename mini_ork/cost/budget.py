@@ -115,13 +115,20 @@ def _budget_from_profile(run_dir: str | os.PathLike | None) -> float | None:
         return None
     path = os.path.join(os.fspath(run_dir), "run_profile.json")
     if not os.path.isfile(path):
+        # No profile yet is a fresh run (classify writes it before dispatch) —
+        # it declares no ceiling, and that is not an error.
         return None
     try:
         with open(path, encoding="utf-8") as fh:
             profile = json.load(fh)
-    except (OSError, ValueError):
-        return None  # an unreadable profile declares nothing; not a ceiling typo
-    if not isinstance(profile, dict) or "budget_usd" not in profile:
+    except (OSError, ValueError) as exc:
+        # A profile that EXISTS but cannot be read is not "no ceiling": it may
+        # well carry one, and reading it as unlimited would let a corrupted
+        # file quietly raise the run's spend. Fail closed, and say which file.
+        raise ValueError(f"{path} is unreadable: {exc}") from None
+    if not isinstance(profile, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    if "budget_usd" not in profile:
         return None
     raw = profile["budget_usd"]
     if raw is None or (isinstance(raw, str) and not raw.strip()):

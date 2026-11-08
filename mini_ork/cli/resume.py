@@ -141,8 +141,13 @@ def _resume_budget_park(
     db = _budget_db(run_dir)
     verdict = budget.verdict(db, run_id, run_dir)
     if verdict.exhausted or verdict.budget is None:
-        ceiling = ("no per-run budget is declared for this run"
-                   if verdict.budget is None else verdict.detail)
+        # The policy's own detail names the real reason (a corrupt profile, an
+        # unknown policy, a spent quota); only a policy that reports *no*
+        # ceiling at all — where the marker is the sole remaining evidence —
+        # gets the removal wording. Reporting "removed" for a corrupt profile
+        # sent the operator to the wrong knob.
+        ceiling = (verdict.detail if verdict.exhausted
+                   else "no per-run budget is declared for this run")
         sys.stderr.write(
             f"[mini-ork-resume] {run_id} is still parked: {ceiling}. "
             f"Set {budget.BUDGET_ENV} (or run_profile.json budget_usd) above "

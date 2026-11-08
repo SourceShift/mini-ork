@@ -230,6 +230,25 @@ def test_budget_park_refuses_when_the_ceiling_was_removed(tmp_path):
     assert (run_dir / ".budget-exhausted").is_file()
 
 
+def test_budget_park_names_a_corrupt_profile_instead_of_a_removed_ceiling(tmp_path):
+    """The refusal must point at the real knob.
+
+    A profile that exists but cannot be parsed reported "no per-run budget is
+    declared", sending the operator to unset/raise a variable when the file was
+    the problem.
+    """
+    run_dir = _seed_budget_park(tmp_path, "run-e", spent=0.84, budget=0.5)
+    (run_dir / "run_profile.json").write_text("{not json")
+    rc, _out, err, _lines, _sent = _py_resume(
+        ["run-e", "--no-restart"], tmp_path,
+        env_overrides=_budget_env(""))
+
+    assert rc == 1
+    assert "unreadable" in err
+    assert "no per-run budget is declared" not in err
+    assert (run_dir / ".budget-exhausted").is_file()
+
+
 def test_a_run_with_neither_sentinel_nor_marker_still_warns(tmp_path):
     """The budget branch must not swallow the pre-existing no-sentinel path."""
     _seed_run_dir(tmp_path, "run-plain", with_sentinel=False)

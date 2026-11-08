@@ -118,6 +118,30 @@ def test_a_broken_profile_ceiling_refuses(tmp_path, monkeypatch):
     assert "budget_usd='a lot'" in v.detail
 
 
+@pytest.mark.parametrize("body", ["{not json", "[]", "null"])
+def test_a_corrupt_profile_refuses_rather_than_reads_as_unlimited(body, tmp_path, monkeypatch):
+    """A profile that EXISTS but cannot be read is not "no ceiling".
+
+    Treating it as unlimited would let a corrupted file quietly raise the run's
+    spend; only an absent profile (a run classify has not reached yet) means
+    "nothing declared".
+    """
+    monkeypatch.delenv("MO_RUN_BUDGET_USD", raising=False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run_profile.json").write_text(body)
+    v = _cost_budget().verdict(_db(tmp_path), "r1", run_dir)
+    assert v.exhausted is True
+    assert v.budget is None
+    assert "unreadable" in v.detail or "not a JSON object" in v.detail
+
+
+def test_an_absent_profile_is_not_a_refusal(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_RUN_BUDGET_USD", raising=False)
+    v = _cost_budget().verdict(_db(tmp_path), "r1", tmp_path / "run")
+    assert v.exhausted is False and v.budget is None
+
+
 @pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
 def test_a_non_finite_profile_ceiling_refuses(bad, tmp_path, monkeypatch):
     """``inf``/``nan`` pass every ``<=`` test, so they must refuse, not become unlimited.

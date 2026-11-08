@@ -112,6 +112,9 @@ Refusals are the interesting half of the contract:
   a typo must not buy a run more spending room. The same strictness applies to
   `run_profile.json` → `budget_usd`; `nan`/`inf` are refused there too, because
   they parse as floats and pass every `spent >= budget` comparison.
+- A `run_profile.json` that **exists but cannot be read** (corrupt JSON, not an
+  object) **refuses** — it may carry a ceiling, so reading it as "no ceiling"
+  would raise the run's spend. Only an absent profile means "nothing declared".
 - A named policy that is not registered, or one that raises, **refuses** —
   never "unlimited".
 - A missing or unreadable ledger reads as `$0.00` spent, the same fail-open
