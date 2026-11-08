@@ -26,6 +26,90 @@ def test_native_writer_persists_success_row_and_optional_cost_columns(tmp_path, 
     assert row == ("success", 1234, "researcher", 0.0021, 120, "s1")
 
 
+def test_native_writer_populates_lane_column_from_model_id(tmp_path):
+    """The PRAGMA-gated optional-columns loop writes ("lane", model_id), so a
+    migrated ledger records the lane under its own field too. The DDLs above
+    deliberately stay lane-less — they are the un-migrated fail-soft case."""
+    db = tmp_path / "calls_with_lane.db"
+    with sqlite3.connect(db) as con:
+        con.execute("""CREATE TABLE llm_calls (
+            provider TEXT, model_id TEXT, tier TEXT, feature_name TEXT, actor TEXT,
+            status TEXT, duration_ms INTEGER, cost_usd REAL, error_message TEXT,
+            input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER,
+            metadata_json TEXT, iter INTEGER, run_id TEXT, traceparent TEXT,
+            session_id TEXT, lane TEXT
+        )""")
+    write_llm_calls_row(str(db), "anthropic", "glm53_lens", "default",
+                        "mini-ork:test", "researcher", "success", 1234, 0.0021, "",
+                        100, 20)
+    with sqlite3.connect(db) as con:
+        row = con.execute("SELECT model_id, lane FROM llm_calls").fetchone()
+    assert row == ("glm53_lens", "glm53_lens"), row
+
+
+_LANE_DDL = """CREATE TABLE llm_calls (
+    provider TEXT, model_id TEXT, tier TEXT, feature_name TEXT, actor TEXT,
+    status TEXT, duration_ms INTEGER, cost_usd REAL, error_message TEXT,
+    input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER,
+    metadata_json TEXT, cached_input_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cost_input_uncached_usd REAL,
+    cost_input_cached_usd REAL, cost_cache_write_usd REAL,
+    iter INTEGER, run_id TEXT, traceparent TEXT, session_id TEXT, lane TEXT
+)"""
+
+
+def _lane_of(db) -> object:
+    with sqlite3.connect(db) as con:
+        return con.execute("SELECT lane FROM llm_calls").fetchone()[0]
+
+
+def test_persist_call_records_the_serving_lane(tmp_path):
+    """``persist_call`` stores the model that produced the row as its lane."""
+    from mini_ork.dispatch.telemetry import DispatchResult, persist_call
+
+    db = tmp_path / "lane.db"
+    with sqlite3.connect(db) as con:
+        con.execute(_LANE_DDL)
+    persist_call(db, DispatchResult(ok=True, rc=0, text="hi", model="glm-4.6",
+                                    cost_usd=0.01, duration_ms=5),
+                 provider="gateway", feature_name="f")
+    assert _lane_of(db) == "glm-4.6"
+
+
+def test_persist_call_without_a_model_writes_null_not_empty(tmp_path):
+    """An unresolved lane is NULL: a per-lane roll-up must not see a "" group.
+
+    ``DispatchResult`` defaults ``model`` to ``""``, so the empty string is the
+    "nothing resolved a lane" case and has to stay distinguishable from a row
+    written before the column existed.
+    """
+    from mini_ork.dispatch.telemetry import DispatchResult, persist_call
+
+    db = tmp_path / "lane.db"
+    with sqlite3.connect(db) as con:
+        con.execute(_LANE_DDL)
+    persist_call(db, DispatchResult(ok=False, rc=1, text="", model="",
+                                    cost_usd=0.0, duration_ms=5),
+                 provider="gateway", feature_name="f")
+    assert _lane_of(db) is None
+
+
+def test_persist_call_drops_lane_on_an_unmigrated_ledger(tmp_path):
+    """No lane column -> the key is filtered out, the row still lands."""
+    from mini_ork.dispatch.telemetry import DispatchResult, persist_call
+
+    db = tmp_path / "old.db"
+    with sqlite3.connect(db) as con:
+        con.execute(_LANE_DDL.replace(" session_id TEXT, lane TEXT", " session_id TEXT"))
+    rowid = persist_call(db, DispatchResult(ok=True, rc=0, text="hi",
+                                           model="glm-4.6", cost_usd=0.01,
+                                           duration_ms=5),
+                         provider="gateway", feature_name="f")
+    assert rowid is not None
+    with sqlite3.connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM llm_calls").fetchone()[0] == 1
+
+
 _LEDGER_DDL = """CREATE TABLE llm_calls (
     provider TEXT, model_id TEXT, tier TEXT, feature_name TEXT, actor TEXT,
     status TEXT, duration_ms INTEGER, cost_usd REAL, error_message TEXT,

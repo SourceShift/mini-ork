@@ -137,6 +137,11 @@ def persist_call(
     candidate: dict[str, object] = {
         "provider": provider,
         "model_id": result.model or "",
+        # The lane that served. ``""`` is not a lane (DispatchResult defaults
+        # model to ""), so normalize to NULL: "not recorded" and "empty" must
+        # not collapse into one group in a per-lane cost roll-up. The
+        # column-existence filter below drops this key on an un-migrated schema.
+        "lane": result.model or None,
         "tier": tier,
         "feature_name": feature_name,
         "actor": actor,

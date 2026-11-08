@@ -739,7 +739,8 @@ def _insert_llm_calls_row(con, provider, model_id, tier, feature_name, actor, st
               _int_or(os.environ.get("MO_RECURSIVE_ITER"), None),
               context_env("MINI_ORK_RUN_ID") or None, os.environ.get("MO_TRACEPARENT") or None,
               in_tok, out_tok, in_tok + out_tok, metadata_json or "{}", _sess]
-    for name, val in (("error_category", error_category), ("retryable", retryable),
+    for name, val in (("lane", model_id),
+                      ("error_category", error_category), ("retryable", retryable),
                       ("cached_input_tokens", cached_in),
                       ("cache_creation_input_tokens", cache_create),
                       ("thinking_tokens", _int_or(thinking_tokens, None)),
