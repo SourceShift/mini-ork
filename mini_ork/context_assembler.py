@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import sqlite3
@@ -450,6 +451,100 @@ def _limbo_limit(node_type: str, base: int) -> int:
     return base
 
 
+# ── per-lesson holdout ──────────────────────────────────────────────────────
+
+# Every lesson the loop has ever learned is in-sample for the run that
+# learned it, so a "held-out" score measures nothing: the guidance the node
+# was given is the same guidance it is graded against. A deterministic slice
+# of the lessons is therefore withheld from the prompt and graded on its own.
+_LESSON_HOLDOUT_RATE_DEFAULT = 0.10
+_LESSON_HOLDOUT_RATE_MAX = 0.5
+
+
+def _lesson_holdout_rate() -> float:
+    """The fraction of lessons withheld from the prompt.
+
+    ``MO_LESSON_HOLDOUT_RATE`` is the operator's dial: ``0`` turns the holdout
+    off entirely, and anything above ``0.5`` is clamped back to it — half the
+    lessons withheld is the most a prompt can lose and still be a prompt. An
+    unparseable value falls back to the default rather than failing the
+    render: a typo in an env var must not cost a node its guidance.
+    """
+    try:
+        rate = float(context_env("MO_LESSON_HOLDOUT_RATE",
+                                 str(_LESSON_HOLDOUT_RATE_DEFAULT)))
+    except (TypeError, ValueError):
+        return _LESSON_HOLDOUT_RATE_DEFAULT
+    return min(max(rate, 0.0), _LESSON_HOLDOUT_RATE_MAX)
+
+
+def _lesson_held_out(kind: str, lesson_id: str) -> bool:
+    """True when this lesson belongs in the held-out arm.
+
+    The bucket is ``sha1("kind:id")`` and nothing else — the same shape as
+    ``context_v2.in_holdout`` (the leading 32 bits of the digest over
+    ``0xFFFFFFFF``). It does not depend on the run, the node, the database or
+    the pool the lesson was selected from, so a lesson stays in the same arm
+    across runs and nodes: the same lesson is withheld the same way every time
+    it is offered, which is what makes the withheld slice comparable across
+    nodes. The kind is part of the hashed string because the same id read
+    through two different channels (a gradient and a theme) is two different
+    lessons.
+    """
+    rate = _lesson_holdout_rate()
+    if rate <= 0.0:
+        return False
+    lesson_id = str(lesson_id or "").strip()
+    if not lesson_id:
+        return False
+    digest = hashlib.sha1(f"{kind}:{lesson_id}".encode("utf-8")).hexdigest()
+    return (int(digest[:8], 16) / 0xFFFFFFFF) < rate
+
+
+def _lesson_reserved(sources: list[dict] | None, kind: str,
+                     lesson_id: str) -> bool:
+    """True when this lesson is withheld from the prompt.
+
+    The reservation is only taken when the caller supplied a ``sources`` sink.
+    A withheld lesson that nobody can record is a silent degradation of the
+    prompt: the node would see less guidance and nothing would say why. The
+    paths that put a lesson in front of a model both supply the sink — the
+    node prompt path (``_learned_block``) and the Rules-tab preview, which
+    exists to show exactly what a node would receive — so the producer that
+    records the held-out injection stays live. A render with no sink (the
+    planner's context pack) withholds nothing and keeps today's bytes.
+
+    This makes ``sources`` a selection input, not only an observation: with a
+    sink, the block it renders is the block the caller is told about.
+    """
+    if sources is None:
+        return False
+    return _lesson_held_out(kind, lesson_id)
+
+
+def _record_held_out(sources: list[dict] | None, kind: str,
+                     lesson_id: str) -> None:
+    """Note a reserved lesson on the ``sources`` out-param.
+
+    The reserved lesson never reaches the prompt; the out-param is how the
+    writer learns it existed, so the ledger can record a held-out injection
+    instead of silently recording nothing. Appended once per lesson: the
+    semantic channel and its static fallback select from the same pool, and a
+    lesson reserved in both must not be reported twice.
+    """
+    if sources is None:
+        return
+    lesson_id = str(lesson_id or "").strip()
+    if not lesson_id:
+        return
+    for src in sources:
+        if (isinstance(src, dict) and src.get("held_out")
+                and src.get("kind") == kind
+                and str(src.get("id")) == lesson_id):
+            return
+    sources.append({"kind": kind, "id": lesson_id, "held_out": True})
+
+
 def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
                      *, node_type: str = "", lane: str = "",
                      node_id: str = "",
@@ -465,8 +560,17 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
     block costs is attributable. All three default to today's flat behaviour.
 
     `sources` is an out-param: when supplied, one dict is appended per row that
-    was actually injected, in prompt order. With ``sources=None`` the returned
-    markdown is byte-identical to the same call with a list.
+    was actually injected, in prompt order, plus one ``{"kind", "id",
+    "held_out": True}`` dict per lesson the holdout reserved.
+
+    A deterministic slice of the lessons is held out of the prompt
+    (``_lesson_reserved``): every lesson the loop has learned is otherwise
+    in-sample, so a "held-out" score measures nothing. The reserved lesson is
+    omitted from the markdown and reported through `sources` instead, which is
+    how the writer records a held-out injection on the ledger. The reservation
+    is only taken where it can be recorded — a render with no `sources` sink
+    withholds nothing, so its markdown stays byte-identical to the same call
+    with a list. Every production render path supplies the sink.
 
     `read_only` renders the same block without touching the store — no
     retrieval is logged and no mirror is written or swept (see
@@ -517,11 +621,13 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
         rows = rows[:limit]
     out = []
     if rows:
-        out.append("--- Learned failure modes (from prior runs of this task class) ---")
-        out.append("Avoid repeating these known issues:")
+        block = []
         for gradient_id, target, signal, change in rows:
-            out.append(f"- [{target}] {signal.strip()}")
-            out.append(f"  Suggested fix (not verified as applied): {change.strip()}")
+            if _lesson_reserved(sources, "gradient", gradient_id):
+                _record_held_out(sources, "gradient", gradient_id)
+                continue
+            block.append(f"- [{target}] {signal.strip()}")
+            block.append(f"  Suggested fix (not verified as applied): {change.strip()}")
             if sources is not None:
                 sources.append({
                     "kind": "gradient",
@@ -530,7 +636,13 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
                     "signal": signal,
                     "suggested_change": change,
                 })
-        out.append("--- /learned failure modes ---")
+        # A section whose every row was reserved says nothing; it is dropped
+        # rather than rendered as an empty header.
+        if block:
+            out.append("--- Learned failure modes (from prior runs of this task class) ---")
+            out.append("Avoid repeating these known issues:")
+            out.extend(block)
+            out.append("--- /learned failure modes ---")
 
     # Verified theme lessons — the loop-verified complement to the raw gradient
     # block above (user rule 2026-10-07). Uses the same post-LIMBO ``limit``.
@@ -587,6 +699,9 @@ def _verified_theme_lessons(dbp: str, task_class: str, limit: int,
     Cold-safe by construction: missing table or columns is no section and no
     error — this runs on the prompt-injection path, where a raise would abort
     a dispatch whose spend already happened. A ``limit <= 0`` emits nothing.
+
+    A theme the holdout reserves is left out of the block and reported on
+    ``sources`` instead (``_lesson_reserved``).
     """
     if limit <= 0:
         return ""
@@ -602,11 +717,19 @@ def _verified_theme_lessons(dbp: str, task_class: str, limit: int,
         f"--- Lessons induced from prior runs ({task_class}; "
         f"guardrail-checked, effect not yet measured) ---"
     ]
+    rendered = 0
     for row in rows:
+        if _lesson_reserved(sources, "theme", row["theme_id"]):
+            _record_held_out(sources, "theme", row["theme_id"])
+            continue
+        rendered += 1
         out.append(f"- {row['lesson_text']}  (seen in {row['n_runs']} runs)")
         if sources is not None:
             sources.append({"kind": "theme", "id": row["theme_id"],
                             "text": row["lesson_text"]})
+    if not rendered:
+        # Every selected theme was reserved: an empty section is noise.
+        return ""
     out.append("--- /induced lessons ---")
     return "\n".join(out)
 
@@ -852,6 +975,10 @@ def _static_emergent_block(dbp: str, limit: int, *,
     ``MO_EMERGENT_INJECT_UNLESSONED=1`` restores the prior "inject every
     approved row" behaviour. The block is omitted — not emitted with an
     empty header — when nothing remains.
+
+    A pattern the holdout reserves is left out of the block and reported on
+    ``sources`` instead (``_lesson_reserved``); the ranking happens first, so
+    a reserved pattern does not let another one take its place.
     """
     unlessoned = os.environ.get("MO_EMERGENT_INJECT_UNLESSONED", "0") == "1"
     rows = _approved_emergent_rows(dbp, task_class=task_class, limit=limit)
@@ -861,7 +988,12 @@ def _static_emergent_block(dbp: str, limit: int, *,
     if not rows:
         return ""
     lines = ["--- Lessons from recurring patterns (prior runs) ---"]
+    rendered = 0
     for pattern_id, label, feats, _strength, lesson in rows:
+        if _lesson_reserved(sources, "pattern", pattern_id):
+            _record_held_out(sources, "pattern", pattern_id)
+            continue
+        rendered += 1
         text = _emergent_text(feats, label, lesson)
         lines.append(f"- {text}")
         if sources is not None:
@@ -870,6 +1002,9 @@ def _static_emergent_block(dbp: str, limit: int, *,
                 "id": pattern_id,
                 "text": text,
             })
+    if not rendered:
+        # Every selected pattern was reserved: an empty section is noise.
+        return ""
     lines.append("--- /lessons from recurring patterns ---")
     return "\n".join(lines)
 
@@ -919,6 +1054,11 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
 
     Returns '' when the channel is opted out, unavailable, or has nothing to
     say — the caller decides what to fall back to.
+
+    A pattern the holdout reserves is ranked like any other and then left out
+    of the block, and it earns no retrieval row: it was never retrieved, and
+    logging one would credit a memory for a lesson the node never saw. It is
+    reported on ``sources`` instead (``_lesson_reserved``).
     """
     from mini_ork import memory as semantic
 
@@ -991,13 +1131,28 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
             candidates, scope=scope, top_k=limit, db_path=dbp,
         )
 
+        # Split the ranked hits into the ones the prompt gets and the ones the
+        # holdout reserves. The split happens AFTER the ranking: filtering the
+        # candidate pool first would let a different lesson take the reserved
+        # one's place, and the reserved lesson would no longer be the lesson
+        # that would otherwise have been shown.
+        delivered, reserved = [], []
+        for hit in ordered:
+            pattern_id = memory_to_pattern.get(hit["memory_id"], "")
+            if _lesson_reserved(sources, "pattern", pattern_id):
+                reserved.append((hit, pattern_id))
+            else:
+                delivered.append((hit, pattern_id))
+
         # Log the retrieval only when the caller is inside a run: an
         # unattributable retrieval can never be resolved to a win, so writing
         # one would depress this memory's utility for no information gained.
+        # A reserved lesson was never retrieved, so it earns no retrieval row:
+        # logging one would credit a memory for a lesson the node never saw.
         run_id = "" if read_only else context_env("MINI_ORK_RUN_ID", "")
-        if run_id:
+        if run_id and delivered:
             semantic.record_retrievals(
-                [hit["memory_id"] for hit in ordered],
+                [hit["memory_id"] for hit, _pid in delivered],
                 scope=scope,
                 run_id=run_id,
                 task_class=task_class or "",
@@ -1006,8 +1161,11 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
                 db_path=dbp,
             )
 
+        for _hit, pattern_id in reserved:
+            _record_held_out(sources, "pattern", pattern_id)
+
         lines = ["--- Lessons from recurring patterns (prior runs) ---"]
-        for hit in ordered:
+        for hit, _pattern_id in delivered:
             # Credit is only ever claimed, never speculated: a retrieval whose
             # run has not reported yet says nothing about this memory, so it
             # gets no suffix rather than an implied "helped 0/N".
@@ -1018,9 +1176,12 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
             if sources is not None:
                 sources.append({
                     "kind": "pattern",
-                    "id": memory_to_pattern.get(hit["memory_id"], ""),
+                    "id": _pattern_id,
                     "text": hit["text"],
                 })
+        if not delivered:
+            # Every ranked pattern was reserved: an empty section is noise.
+            return ""
         lines.append("--- /lessons from recurring patterns ---")
         return "\n".join(lines)
     except Exception:

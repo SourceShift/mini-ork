@@ -438,6 +438,13 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
       list collected by ``_learned_block`` (gradient / pattern / steering
       rows, in prompt order).
 
+    A source the per-lesson holdout reserved is a lesson the node did NOT
+    see: it is withheld from the prompt and reported on ``sources`` with
+    ``held_out: True``. Those rows are excluded from the JSON record — the
+    record says what the node was told, and a reserved lesson was not — and
+    are written to the injection ledger with ``held_out=1`` instead, so the
+    withheld slice is still measurable.
+
     The IDE "Learning" tab reads both files; this is the only inspectable
     surface for what the learner actually saw (F5-B, learn-inject kickoff).
 
@@ -479,6 +486,16 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
                 arm = context_v2.arm(run_id)
             except Exception:  # noqa: BLE001 — provenance never blocks a dispatch
                 arm = None
+        # The record says what the node was TOLD. A lesson the holdout
+        # reserved was withheld from the prompt, so it is not a delivered
+        # source and must not appear in the record as one — it is separated
+        # here and written to the ledger with ``held_out=1`` below.
+        delivered, reserved = [], []
+        for src in (sources or []):
+            if isinstance(src, dict) and src.get("held_out"):
+                reserved.append(src)
+            else:
+                delivered.append(src)
         record = {
             "node_id": node_id,
             "node_type": node_type,
@@ -488,7 +505,7 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
             "written_at": int(time.time()),
             "injected": injected,
             "reason": reason,
-            "sources": list(sources) if sources else [],
+            "sources": list(delivered),
             "arm": arm,
             "held_out": (arm == "holdout") if arm is not None else None,
         }
@@ -523,21 +540,40 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
         # Ledger — only when something was actually injected. Own try/except so
         # a DB blip can never cascade back into the JSON/MD writes above
         # (kickoff learn-ledger §"_write_learned_record change").
-        if injected:
+        #
+        # Two calls, one per arm: the lessons the node was told, and the
+        # lessons the holdout withheld. The held-out call is driven by the
+        # reserved list being non-empty, not by ``injected`` — a node whose
+        # whole block was withheld injected nothing and yet still has a
+        # held-out row to record, and that row is the whole point of the
+        # holdout: it is what makes the withheld slice measurable.
+        if injected or reserved:
             try:
                 from mini_ork.learning import ledger as _ledger
                 _run_id = os.environ.get("MINI_ORK_RUN_ID") or os.path.basename(
                     run_dir.rstrip(os.sep)
                 )
-                _ledger.record_injections(
-                    run_id=_run_id,
-                    node_id=node_id,
-                    node_type=node_type,
-                    lane=lane,
-                    task_class=task_class,
-                    attempt=int(attempt),
-                    sources=record["sources"],
-                )
+                if injected:
+                    _ledger.record_injections(
+                        run_id=_run_id,
+                        node_id=node_id,
+                        node_type=node_type,
+                        lane=lane,
+                        task_class=task_class,
+                        attempt=int(attempt),
+                        sources=record["sources"],
+                    )
+                if reserved:
+                    _ledger.record_injections(
+                        run_id=_run_id,
+                        node_id=node_id,
+                        node_type=node_type,
+                        lane=lane,
+                        task_class=task_class,
+                        attempt=int(attempt),
+                        sources=reserved,
+                        held_out=True,
+                    )
             except Exception:
                 # ledger writers are silent on the write path; the outer swallow
                 # already protects the dispatch.

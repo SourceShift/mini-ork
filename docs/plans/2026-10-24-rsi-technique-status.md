@@ -434,7 +434,7 @@ Commits are on `origin/main`.
 | RHO prompt win rates | comp A10 | `rho_aggregator.py` | DORMANT | 98 rows, newest 07-11 | no prompt_version_hash |
 | Grounded-rejection anti-reward | LLL §2 | `gates/common.py:111` | DORMANT | 36 rows (bash era) | 0 callers |
 | ContextNest outcome settle (EvoMem) | comp C9 | fa904f5a | DORMANT | 0 outcome files | regex mismatch (④) |
-| Injection ledger + efficacy arms | LMP D5, LLF R13 | `ledger.py` bf7ab7f9 | PARTIAL | 22,000 rows · held_out 0 | arms indistinguishable |
+| Injection ledger + efficacy arms | LMP D5, LLF R13 | `ledger.py` bf7ab7f9 | LIVE | 22,000 rows · `held_out=1` now produced at selection time (`MO_LESSON_HOLDOUT_RATE`, default 0.10, deterministic per lesson) | the withheld slice is recorded from 2026-11-08 forward; the 22,000 historical rows stay `held_out=0`, so an arm comparison must window on the new rows |
 | Patch-id landing | LLF R11b | 220faf02 | PARTIAL | last run 10-17 | CLI only |
 | Per-class memory | RMEL §1 | `memory/store.py` | PARTIAL | 91 rows, last write 07-12 | success side dead |
 | Failure-aware memory (AdMem) | cost survey | v2 "prior attempts" | PARTIAL | — | CN settle dead |
