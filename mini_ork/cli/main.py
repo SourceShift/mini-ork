@@ -56,6 +56,11 @@ _NATIVE_SUBS = {
     # here (not `_NATIVE_MODULE_SUBS`) because that table is pinned as a
     # mirror of the retired runtime-select.sh mapping.
     "fallbacks",
+    # Recipe integrity (`recipes check`): a dangling prompt_ref/verifier_ref or
+    # an uncompilable workflow is rot that only shows up inside a paid run.
+    # Added here for the same reason as `fallbacks` — `_NATIVE_MODULE_SUBS` is
+    # pinned as a mirror of the retired runtime-select.sh mapping.
+    "recipes",
 }
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this
@@ -203,7 +208,10 @@ Lifecycle:
   why <run> <node>               Provenance for one node's artifact: the lane it
                                    asked for, the lane that served it, the route
                                    reason, the chain walked and the memory injected
-  recipe-eval                    Static evaluation of recipe definitions
+  recipe-eval                    Static evaluation of recipe definitions (style
+                                   score; never gates)
+  recipes check [<recipe>...]    Recipe integrity: every prompt_ref / verifier_ref
+                                   resolves and every workflow compiles (gates)
   reviewer-eval [list|add-case|run|status|score]
                                    Score the framework-edit reviewer on incidents + clean changes.
   version

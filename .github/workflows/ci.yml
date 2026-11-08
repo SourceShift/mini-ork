@@ -67,6 +67,16 @@ jobs:
       - name: "Feature registry ↔ skill sync (check-skill)"
         run: python -m mini_ork.cli.features check-skill
 
+      # A recipe is a set of references — `prompt_ref` / `verifier_ref` name
+      # files beside it. Rename a prompt or delete a verifier and the recipe
+      # still parses: the break surfaces as a dispatch error inside a paid run.
+      # `recipe-eval` scores style and always exits 0, so nothing checked this.
+      # Needs PyYAML (in the base install spec), not the full test extras.
+      - name: "Recipe integrity (refs resolve, workflows compile)"
+        run: |
+          pip install pyyaml
+          python -m mini_ork.cli.main recipes check
+
   python-tests:
     name: python tests (${{ matrix.python-version }} / ${{ matrix.shard }})
     runs-on: ubuntu-latest
