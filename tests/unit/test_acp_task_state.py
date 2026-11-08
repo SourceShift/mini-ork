@@ -11,6 +11,8 @@ emits, mirrored here verbatim).
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +28,8 @@ from mini_ork.acp.task_state import (  # noqa: E402
     MARKS,
     NEEDS_YOU_PREFIX,
     PUBLISHED_DETAIL,
+    STALLED_PREFIX,
+    STALLED_SUFFIX,
     STARTING_DETAIL,
     TaskState,
     run_mark,
@@ -217,6 +221,81 @@ def test_rule5_working_with_only_ends_uses_last_seen_node(tmp_path):
     ts = task_state(run_dir, snap)
     assert ts.state == "working"
     assert ts.step == "planner"
+
+
+# ── rule 6: a live status with a dead owner ─────────────────────────────────
+
+
+def _dead_pid() -> int:
+    """A pid that is provably not running this run — spawned, then reaped.
+
+    Either the pid is now free (``os.kill`` raises ``ProcessLookupError``) or
+    the OS recycled it for a process that started after the ``.pid`` mtime,
+    which the reaper's start-time guard already refuses to count as the owner.
+    Deterministic both ways.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_rule6_classified_with_a_dead_dispatcher_is_failed(tmp_path):
+    """A killed classification is not working forever (``classified-state-working``)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    dead = _dead_pid()
+    (run_dir / ".pid").write_text(f"{dead}\n", encoding="utf-8")
+    ts = task_state(run_dir, _snapshot(status="classified"))
+    assert ts.state == "failed"
+    assert ts.detail.startswith(STALLED_PREFIX)
+    assert str(dead) in ts.detail
+    assert ts.detail.endswith(STALLED_SUFFIX)
+
+
+def test_rule6_a_live_dispatcher_keeps_the_run_working(tmp_path):
+    """The probe's own process is alive: nothing changes."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / ".pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    ts = task_state(run_dir, _snapshot(status="executing"))
+    assert ts.state == "working"
+    assert ts.detail == STARTING_DETAIL
+
+
+def test_rule6_no_pid_file_is_not_evidence_of_death(tmp_path):
+    """``unknown`` (no ``.pid``: a recursive run, a mirrored remote one) keeps working."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ts = task_state(run_dir, _snapshot(status="planned"))
+    assert ts.state == "working"
+
+
+def test_rule6_a_dead_pid_does_not_override_a_terminal_row(tmp_path):
+    """Rule order is untouched: a published row is done even with a stale ``.pid``."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / ".pid").write_text(f"{_dead_pid()}\n", encoding="utf-8")
+    ts = task_state(run_dir, _snapshot(status="published"))
+    assert ts.state == "done"
+
+
+def test_run_mark_agrees_with_rule6_on_a_dead_dispatcher(tmp_path):
+    """The cheap tile marks a dead live-status run ✗, matching the precise row."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / ".pid").write_text(f"{_dead_pid()}\n", encoding="utf-8")
+    assert run_mark("classified", run_dir) == MARKS["failed"]
+    assert run_mark("executing", run_dir) == MARKS["failed"]
+
+
+def test_run_mark_keeps_working_for_a_live_or_absent_pid(tmp_path):
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / ".pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    assert run_mark("classified", live) == MARKS["working"]
+    absent = tmp_path / "absent"
+    absent.mkdir()
+    assert run_mark("classified", absent) == MARKS["working"]
 
 
 # ── diff count edge cases ───────────────────────────────────────────────────

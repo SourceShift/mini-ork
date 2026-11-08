@@ -3,10 +3,11 @@
 A single ``task_state(run_dir, snapshot)`` call answers the kickoff's
 rule question — *what is this run doing right now, and is the user
 needed?* — with no I/O beyond three cheap sentinels (``.cost-pause``,
-``retry-gate.json``, ``landed.json``), the cached diff list and the
-run's small level report (``verdict.json`` / ``run-verdict.json``);
-every file read is skipped unless the run is terminal, and every read
-fails soft. ``run_mark`` is the cheap sibling used by ``list_sessions``
+``retry-gate.json``, ``landed.json``), the cached diff list, the
+run's small level report (``verdict.json`` / ``run-verdict.json``) and
+a ``.pid`` liveness probe for a run that still claims to be moving;
+every one of those reads is skipped when its row does not need it, and
+every read fails soft. ``run_mark`` is the cheap sibling used by ``list_sessions``
 for the run rows in the thread list — file reads only, never events or
 diffs; ``title_with_state`` formats the title that lands in Zed's
 thread list.
@@ -71,6 +72,11 @@ WORKING_PREFIX = "Working: "
 STARTING_DETAIL = "Starting"
 FAILED_FALLBACK = "Failed"
 FAILED_AT_PREFIX = "Failed at "
+# Detail for a live status whose dispatcher is gone (rule 6). The middle is the
+# reaper's own probe detail (``pid N gone (.pid written <iso>)``) so the row
+# names the pid the operator can grep for; the tail names the two ways out.
+STALLED_PREFIX = "Failed: the dispatcher is gone — "
+STALLED_SUFFIX = "; /recover restarts it, /stop closes it"
 FAILED_AT_SUFFIX_OPEN = " ("
 FAILED_AT_SUFFIX_CLOSE = ")"
 WITHHELD_PREFIX = "Not published: "
@@ -467,13 +473,40 @@ def landed_report(run_dir: Path | None) -> dict[str, Any] | None:
     }
 
 
+def _dispatcher_gone_detail(path: Path | None) -> str | None:
+    """The failed-detail for a run whose ``.pid`` names only dead processes.
+
+    ``mini_ork.orchestration.run_reaper.probe`` is the one liveness answer in
+    the tree (it also tells a parked/remote/finished run from an abandoned
+    one), so this asks it rather than re-implementing a pid probe: a second
+    copy would drift from the reaper, and the reaper is what will eventually
+    fail the row. Only ``dead`` counts — ``unknown`` (no ``.pid`` at all: a
+    recursive run classified in its parent, a mirrored remote run) is not
+    evidence of anything, so the row keeps the benefit of the doubt.
+    ``None`` means "not provably gone", never "alive".
+    """
+    if path is None:
+        return None
+    from mini_ork.orchestration.run_reaper import probe  # noqa: PLC0415
+
+    found = probe(path)
+    if found.verdict != "dead":
+        return None
+    return STALLED_PREFIX + found.detail + STALLED_SUFFIX
+
+
 def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
-    """Map a run snapshot to its ``TaskState`` per the five-rule kickoff spec.
+    """Map a run snapshot to its ``TaskState`` per the kickoff's rule spec.
 
     First match wins. The diff count is computed only for the
     ``done`` branch — every other state returns ``(0, 0)`` to keep
     the projection cheap. ``run_dir`` may be ``None``-typed at the
     call site; the ``Path`` cast in this function accepts both.
+
+    Rule 6 is the only branch that reads the run's ``.pid``: a live status
+    with a dead owner is not working (see ``_dispatcher_is_gone``), and
+    reporting it as working left a killed classification showing "Working:
+    Starting" with a growing wall clock (``classified-state-working``).
     """
     path = Path(run_dir) if run_dir is not None else None
     status = snapshot.get("status")
@@ -731,7 +764,20 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
         )
 
     # Rule 6: anything else (None, classified, planned, executing, ...)
-    # is working; the detail is the current step or "Starting".
+    # is working — unless the process that owns the run is gone. A live
+    # status is a claim by the dispatcher about itself; when the .pid
+    # names only dead processes nothing will ever advance that status, so
+    # the honest projection is failed, not "Working: Starting" forever.
+    # Same verdict ``reap --stale-after`` reaches by a different route.
+    stalled = _dispatcher_gone_detail(path)
+    if stalled is not None:
+        return TaskState(
+            state="failed",
+            detail=stalled,
+            step=_current_step(events),
+            added=0,
+            removed=0,
+        )
     step = _current_step(events)
     detail = WORKING_PREFIX + step if step else STARTING_DETAIL
     return TaskState(
@@ -813,6 +859,7 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
     refuted, no failing node) is "needs you"; a terminal run with an open
     workspace record whose branch still changes also flips to ✋ (S5);
     published → done; failed / rolled_back → failed; ``not_needed`` → ⊘;
+    a live status whose ``.pid`` names only dead processes → failed (rule 6);
     anything else → working. The mark is the prefix Zed's thread list shows next
     to the run's title, so it must agree with ``task_state`` — both re-read the
     same helpers.
@@ -882,6 +929,13 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
     # Checked before the fallthrough so a closed run is not counted as ●.
     if status == "not_needed":
         return MARKS["not_needed"]
+    # Mirrors ``task_state`` rule 6: a live status whose dispatcher is gone
+    # projects as failed, so the cheap tile count cannot call a dead run ●
+    # while the precise row calls it ✗ ("one count"). Terminal rows keep the
+    # branches above — this only asks about the statuses that claim to move.
+    if status not in ("published", "failed", "rolled_back", "not_needed"):
+        if _dispatcher_gone_detail(path) is not None:
+            return MARKS["failed"]
     return MARKS["working"]
 
 
