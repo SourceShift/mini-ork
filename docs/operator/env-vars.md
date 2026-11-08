@@ -40,11 +40,16 @@ so in the certificate (`key_source`).
 
 ## Cost
 
-A single environment variable gates every dispatch:
+Two different ceilings gate a dispatch, and they answer different questions:
+`MO_DAILY_BUDGET_USD` is the machine-wide rolling window, `MO_RUN_BUDGET_USD`
+is what one run was allowed to spend.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MO_DAILY_BUDGET_USD` | `50` | Rolling-24-hour USD spend cap. Dispatch halts once trailing spend reaches it. |
+| `MO_DAILY_BUDGET_USD` | `50` | Rolling-24-hour USD spend cap across every run on the machine. Dispatch halts once trailing spend reaches it. |
+| `MO_RUN_BUDGET_USD` | *(unset)* | Declared ceiling for **this one run**. Once its `llm_calls` total reaches the ceiling, the next node is refused and the run parks as `budget_exhausted` — resumable, never failed. Unset = no per-run ceiling. Read by `mini_ork.cost.budget`; a value that does not parse is a refusal, not "unlimited". |
+| `MO_BUDGET_POLICY` | `declared` | Which budget policy answers "may this run spend another node?". `declared` reads `MO_RUN_BUDGET_USD` (then `run_profile.json` → `budget_usd`). A deployment can register its own policy naming a real cost service (`register_budget_policy`); an unknown name refuses rather than falling back to unlimited. |
+| `MO_PAUSE_EVERY_USD` | `25` | Reactive pause interval. Every whole multiple of this the run crosses writes `<run_dir>/.cost-pause`; `mini-ork resume` clears it. Independent of both ceilings. |
 | `MO_LANE_HEALTH_GATE` | `"1"` | Pre-run lane-health gate. `1` probes every model the DAG will dispatch and aborts the run with rc=75 / `blocked_reason=lane_unhealthy` if any lane is dead. `0` skips enforcement (the run can still see per-dispatch refusals; see `MO_LANE_PROBE`). |
 | `MO_LANE_REQUIRE_VERIFICATION` | `"0"` | Fail-closed switch for lanes the gate could **not** verify — `ok` but no probe answered (a native lane the CLI authenticates, a probe switched off, an endpoint that never replied). `0` (default) warns on stderr, records them under `unverified` in `<run_dir>/lane-preflight.json` with `verdict: proceed`, and starts the run. `1` aborts instead: rc=75, `blocked_reason=lane_unverified`, `verdict: blocked`. A dead lane always blocks first, as `lane_unhealthy`. |
 
@@ -72,6 +77,64 @@ before the run:
 
 ```bash
 MO_DAILY_BUDGET_USD=400 mini-ork run framework-edit kickoff.md
+```
+
+### Per-run ceiling (`MO_RUN_BUDGET_USD`)
+
+The daily cap is shared: one runaway run starves every other run on the
+machine, and a cheap run cannot be handed headroom of its own. The per-run
+ceiling is the other axis — a limit on **one** run, checked before every
+dispatch against that run's `llm_calls` total (`mini_ork.cost.budget`):
+
+```bash
+MO_RUN_BUDGET_USD=12 mini-ork run code-fix kickoff.md
+```
+
+It can also be recorded in the run's profile (`run_profile.json` →
+`"budget_usd": 12`) so the ceiling travels with the run into recovery and the
+IDE; `MO_RUN_BUDGET_USD` wins when both are present, so a single retry can be
+given a different ceiling without rewriting the profile.
+
+When the ceiling is reached the next node is refused with finish reason
+`budget_exhausted`, the run **parks** with the same rc a review pause uses
+(9) — the plan, the worktree and every finished node survive — and
+`<run_dir>/.budget-exhausted` records `spent_usd` / `budget_usd` / `detail`
+for the IDE and the attention inbox (`mini-ork board inbox` leads with it,
+above the periodic cost-pause). Raise the ceiling and resume the same run:
+
+```bash
+MO_RUN_BUDGET_USD=40 mini-ork resume <run-id>
+```
+
+Refusals are the interesting half of the contract:
+
+- A declared value that does not parse (`twelve`, `-5`, `nan`) **refuses** —
+  a typo must not buy a run more spending room.
+- A named policy that is not registered, or one that raises, **refuses** —
+  never "unlimited".
+- A missing or unreadable ledger reads as `$0.00` spent, the same fail-open
+  choice the daily cap makes, so a fresh home is never blocked by a database
+  that does not exist yet.
+- The marker is removed as soon as the run fits under the ceiling again, so a
+  raised ceiling does not leave a stale "needs you" row behind.
+
+To source the ceiling from a real cost service instead of the environment,
+register a policy and select it by name (the secure tier — the policy owns
+where the number comes from, this module owns when it is asked):
+
+```python
+from mini_ork.cost.budget import Verdict, register_budget_policy
+
+def _quota(db, run_id, run_dir) -> Verdict:
+    remaining = my_cost_service.remaining(run_id)   # fails closed on error
+    return Verdict(spent=0.0, budget=remaining, exhausted=remaining <= 0,
+                   detail=f"${remaining:.2f} left on the org quota")
+
+register_budget_policy("myorg", _quota)
+```
+
+```bash
+MO_BUDGET_POLICY=myorg mini-ork run code-fix kickoff.md
 ```
 
 The lane-health gate (`MO_LANE_HEALTH_GATE`, default `"1"`) reads the same

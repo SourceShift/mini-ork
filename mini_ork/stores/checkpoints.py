@@ -91,6 +91,10 @@ _FINISH_REASON_FAILURE_CLASS = {
     "rc_137": "infra_interrupt",
     "rc_143": "infra_interrupt",
     "paused_for_approval": "input_required",
+    # The run spent its declared per-run ceiling (mini_ork/cost/budget.py): it
+    # waits on the operator to raise the budget, exactly like a gate that waits
+    # on an approval — not a defect in the work, so never a failing class.
+    "budget_exhausted": "input_required",
     "needs_input": "input_required",
     "input_required": "input_required",
     "output_invalid": "output_invalid",

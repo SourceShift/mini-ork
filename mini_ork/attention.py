@@ -86,6 +86,14 @@ class TaxonomyRow:
 #: Ordered most-consequential-first. The order is the inbox's order.
 TAXONOMY: tuple[TaxonomyRow, ...] = (
     TaxonomyRow(
+        key="budget_exhausted",
+        state=STATE_PERSON,
+        label="Budget spent",
+        waits_for="a higher per-run ceiling",
+        must_do="raise MO_RUN_BUDGET_USD (or run_profile.json budget_usd), then resume",
+        command="mini-ork resume {run}",
+    ),
+    TaxonomyRow(
         key="cost_pause",
         state=STATE_PERSON,
         label="Paused",
@@ -339,6 +347,13 @@ def _is_paused(home: Path, run_id: str) -> bool:
     return (_run_dir(home, run_id) / ".cost-pause").is_file()
 
 
+def _budget_marker(home: Path, run_id: str) -> dict[str, Any] | None:
+    """The per-run budget marker, when the run has spent its declared ceiling."""
+    from mini_ork.cost import budget  # noqa: PLC0415
+
+    return budget.read_marker(_run_dir(home, run_id))
+
+
 def _retry_hint(home: Path, run_id: str) -> dict[str, Any] | None:
     """The retry hint for a failed run, read-only (never written into the run)."""
     try:
@@ -373,13 +388,24 @@ def stage_of(
     """Which of the four stages ``run_id`` is in, and why.
 
     Precedence is the taxonomy's order, because the most consequential reason a
-    run is stuck is the one to report: a paused run whose merge is also pending
-    is paused *first* (it is spending nothing and moving nowhere), and a
-    worktree is only "awaiting you" once no gate is already holding the run.
+    run is stuck is the one to report: a run that spent its declared per-run
+    ceiling is reported *first* (nothing releases it but a new number), then a
+    paused run whose merge is also pending is paused next (it is spending
+    nothing and moving nowhere), and a worktree is only "awaiting you" once no
+    gate is already holding the run.
     """
     home = Path(home)
     db_path = db_path if db_path is not None else _db_path(home)
     gates = gates if gates is not None else _gate_index(db_path)
+
+    # A declared per-run ceiling outranks the periodic cost-pause: both need a
+    # person, but only this one needs a *number* from them, and acknowledging
+    # the pause cannot release a run that is still over its ceiling.
+    marker = _budget_marker(home, run_id)
+    if marker is not None:
+        return Stage(run_id, STATE_PERSON, "budget_exhausted",
+                     str(marker.get("detail")
+                         or "the run spent its declared per-run budget"))
 
     if _is_paused(home, run_id):
         return Stage(run_id, STATE_PERSON, "cost_pause",

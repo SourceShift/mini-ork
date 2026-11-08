@@ -676,6 +676,36 @@ def _record_step_completion(db, run_id, node_id, *, rc, retry_exhausted,
               file=sys.stderr)
 
 
+def _budget_gate(db, run_id, run_dir, node_id):
+    """Park the run when it has spent its declared per-run ceiling.
+
+    Returns ``(rc, finish_reason)`` to refuse the dispatch, or ``None`` to
+    proceed. The verdict comes from ``mini_ork.cost.budget``, which fails
+    closed: an unusable ceiling (a typo, a negative) or an unknown/raising
+    policy refuses the node rather than lowering the ceiling to "unlimited".
+
+    The durable ``<run_dir>/.budget-exhausted`` marker is kept truthful here —
+    written on a refusal, removed once the run fits under the ceiling again —
+    because the IDE and the attention inbox read the marker, not this gate.
+    """
+    from mini_ork.cost import budget as cost_budget  # noqa: PLC0415
+
+    verdict = cost_budget.verdict(db, run_id, run_dir)
+    cost_budget.record(run_dir, verdict)
+    if not verdict.exhausted:
+        return None
+    publish_env({"MO_NODE_FINISH_REASON": "budget_exhausted"})
+    print(
+        f"  [budget] {verdict.detail} — not dispatching node_id={node_id}; "
+        f"raise {cost_budget.BUDGET_ENV} and resume with: "
+        f"mini-ork resume {run_id}",
+        file=sys.stderr,
+    )
+    from mini_ork.gates import node_review  # noqa: PLC0415
+
+    return node_review.REVIEW_PAUSE_RC, "budget_exhausted"
+
+
 @_node_publish_boundary
 def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                   dispatch_fn, recipe="", workflow="", trace_fn=None,
@@ -865,6 +895,18 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     if os.path.isfile(os.path.join(run_dir_eff, ".stop-requested")):
         print(f"  [stop] .stop-requested present — skipping node_id={node_id}", file=sys.stderr)
         return 1, "interrupted"
+
+    # Per-run budget gate (mini_ork.cost.budget): the operator's DECLARED
+    # ceiling for this run, checked against the ledger before every dispatch.
+    # It runs ahead of the periodic cost-pause because the two refuse for
+    # different reasons and only this one cannot be resumed by acknowledging a
+    # threshold — the operator has to raise the ceiling (``MO_RUN_BUDGET_USD``
+    # or ``run_profile.json`` → ``budget_usd``) and then ``mini-ork resume``.
+    # Parking, never failing: the worktree and plan survive, so raising the
+    # ceiling continues the same run instead of starting one over.
+    _budget = _budget_gate(db, run_id, run_dir_eff, node_id)
+    if _budget is not None:
+        return _budget
 
     # Cost-pause gate: ``cost_pause.check()`` writes ``<run_dir>/.cost-pause``
     # when cumulative run spend crosses the cap, but nothing else in the
