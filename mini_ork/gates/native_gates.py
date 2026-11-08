@@ -212,6 +212,14 @@ def _eval_panel_health(
         verdict = payload.get("verdict", "indeterminate")
     except Exception:
         return "defer"
+    # `indeterminate` → pass is a SEEDED weakness, not an oversight: this gate is
+    # the positive control for the hackability audit (`kickoffs/auto/
+    # vt2-hackability-audit.smoke.md` expects a floor of 1/5 and a hollow
+    # `{"voters":[{}]}` document to get through, "so a real proposer has
+    # something to find"). Flipping it to `defer` — the answer an unmeasurable
+    # panel deserves — removes the last canary in that smoke and must ship with
+    # a replacement (the smoke names `oracle-liveness` / `oracle-stability`),
+    # not as a lone one-line fix. Tracked as `panel-health-hackability`.
     if verdict in ("panel_healthy", "indeterminate"):
         return "pass"
     if verdict == "authority_capture_suspected":

@@ -269,6 +269,13 @@ def test_panel_health_healthy_passes(db, tmp_path):
 
 
 def test_panel_health_indeterminate_passes(db, tmp_path):
+    """Deliberate: this gate is the hackability audit's positive control.
+
+    See `kickoffs/auto/vt2-hackability-audit.smoke.md` — the smoke expects an
+    `indeterminate` panel to pass so its proposer has something real to find.
+    Flipping this to `defer` is a defensible fix, but it must land with a
+    replacement canary, not alone.
+    """
     vf = _write_verdict(tmp_path, "indet.json", {"voters": [
         {"voter_id": "a", "vote": "approve", "confidence": 0.9},
         {"voter_id": "b", "vote": "reject", "confidence": 0.8},
