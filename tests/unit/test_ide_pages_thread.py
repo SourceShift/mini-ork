@@ -16,6 +16,7 @@ the presentation contract:
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import sys
 import zipfile
@@ -151,6 +152,62 @@ def test_a_thread_shows_its_runs_and_its_transcript(home):
     transcript = next(s for s in _sections(page) if s.get("title") == "Transcript")
     assert "### You · turn 1" in transcript["text"]
     assert "Also handle 503s." in transcript["text"]
+
+
+def _node_event(home: Path, run_id: str, node: str, kind: str, n: int) -> None:
+    """One run lifecycle row, written the way the emitter writes them."""
+    con = sqlite3.connect(str(home / "state.db"))
+    try:
+        con.execute(
+            "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"e{n}", run_id, kind, json.dumps({"node_id": node, "model_lane": "opus"}), n),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _runs_section(page: dict) -> dict:
+    return next(s for s in _sections(page) if s.get("title") == "Runs")
+
+
+def test_a_running_attempt_shows_the_node_it_is_on(home):
+    """The runs table answers "what is this thread doing now": the open node of
+    the live attempt, and a dash for the attempts that have finished."""
+    _seed(home)
+    live_run = f"{THREAD_ID}-t2"
+    _node_event(home, live_run, "implementer", "node_start", 1)
+
+    page = build_page(home, "thread", None, {"thread": THREAD_ID})
+    runs = _runs_section(page)
+
+    assert "node" in runs["head"]
+    idx = runs["head"].index("node")
+    assert [row["cells"][idx]["t"] for row in runs["rows"]] == ["—", "implementer"]
+    assert runs["rows"][1]["cells"][idx]["c"] == "blue"
+
+
+def test_a_finished_node_leaves_the_cell_empty_again(home):
+    """The column is liveness, not history: once the node ends the run is
+    between nodes, and the drilldown carries the history."""
+    _seed(home)
+    live_run = f"{THREAD_ID}-t2"
+    _node_event(home, live_run, "implementer", "node_start", 1)
+    _node_event(home, live_run, "implementer", "node_end", 2)
+
+    runs = _runs_section(build_page(home, "thread", None, {"thread": THREAD_ID}))
+    idx = runs["head"].index("node")
+    assert [row["cells"][idx]["t"] for row in runs["rows"]] == ["—", "—"]
+
+
+def test_a_run_row_opens_the_run_for_its_node_detail(home):
+    """A node id in a table is a pointer, not the detail — the row opens the
+    run, whose page draws the DAG with that node selected."""
+    _seed(home)
+    runs = _runs_section(build_page(home, "thread", None, {"thread": THREAD_ID}))
+    assert [row["do"]["run"] for row in runs["rows"]] == [THREAD_ID, f"{THREAD_ID}-t2"]
+    assert all(row["do"]["title"].startswith(THREAD_ID) for row in runs["rows"])
 
 
 def test_the_header_carries_the_identity_the_rest_of_the_system_uses(home):

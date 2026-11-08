@@ -88,29 +88,51 @@ def _index(home: Path) -> list[dict[str, Any]]:
     ]
 
 
-def _runs(thread: Any, db: str) -> dict[str, Any]:
+def _runs(thread: Any, db: str, home: Path) -> dict[str, Any]:
+    from mini_ork.ide_pages.runs import _live_nodes_bulk
     from mini_ork.threads import store
 
+    runs = store.runs_for(thread.id, db=db)
+    # The open node of each attempt that is still moving — one batched query for
+    # the whole table rather than one per row. ``runs`` owns the query (it has
+    # to render the same column on the board), so this borrows its reduction
+    # instead of keeping a second copy of the event walk here.
+    live = _live_nodes_bulk(
+        home, [run.run_id for run in runs if str(run.status) == "running"]
+    )
     rows = []
-    for run in store.runs_for(thread.id, db=db):
+    for run in runs:
+        node = str((live.get(run.run_id) or {}).get("node") or "")
         rows.append(
-            [
-                S.mono(run.attempt),
-                S.mono(run.run_id),
-                S.cell(str(run.status), _RUN_TONE.get(str(run.status), "sub")),
-                S.cell(run.recipe or "—", "sub"),
-                S.cell(run.started_at or "", "sub"),
-                S.cell(run.ended_at or "", "sub"),
-            ]
+            {
+                "cells": [
+                    S.mono(run.attempt),
+                    S.mono(run.run_id),
+                    # "—" on a finished attempt: this column answers "what is it
+                    # doing now", and a run that ended is doing nothing. Its DAG
+                    # is one click away, below.
+                    S.mono(node or "—", "blue" if node else "sub"),
+                    S.cell(str(run.status), _RUN_TONE.get(str(run.status), "sub")),
+                    S.cell(run.recipe or "—", "sub"),
+                    S.cell(run.started_at or "", "sub"),
+                    S.cell(run.ended_at or "", "sub"),
+                ],
+                # A run row opens the run, where the node this thread is on has
+                # its logs, artifacts and checks — the drilldown a node id in a
+                # table could only point at.
+                "do": S.open_run(run.run_id, f"{thread.id} · attempt {run.attempt}"),
+            }
         )
     return S.table(
         "Runs",
-        [S.col(60), S.col(fr=2.0), S.col(80), S.col(fr=1.4), S.col(fr=1.2), S.col(fr=1.2)],
-        ["attempt", "run", "state", "recipe", "started", "ended"],
+        [S.col(60), S.col(fr=2.0), S.col(fr=1.2), S.col(80), S.col(fr=1.4),
+         S.col(fr=1.2), S.col(fr=1.2)],
+        ["attempt", "run", "node", "state", "recipe", "started", "ended"],
         rows,
         full=True,
         note="Attempt 1 is the initial run; every later attempt is a continuation in "
-             "this same thread — which is what replaced the old 409.",
+             "this same thread — which is what replaced the old 409. Click a row to "
+             "open the run and its node DAG.",
     )
 
 
@@ -274,7 +296,7 @@ def _one(home: Path, thread_id: str) -> list[dict[str, Any]]:
             actions=[S.btn("Attach file…", S.pick_files(
                 ["threads", "attach", thread.id], prompt="Attach to thread"), "ghost")],
         ),
-        _runs(thread, db),
+        _runs(thread, db, home),
         *_transcript(thread, db),
         S.composer(
             "Continue this thread…",
