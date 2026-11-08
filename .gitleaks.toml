@@ -8,27 +8,39 @@ useDefault = true
 # 1. Synthetic credentials in test fixtures.
 #
 # Tests must contain tokens that *look* like credentials — that is how the code
-# that handles them gets exercised. The exemption is matched on the SECRET
-# VALUE, not on the path, so a real credential pasted into a test file is still
-# a finding: only values carrying an obvious dummy marker (or the RFC 6455
-# handshake nonce, base64 of "the sample nonce") are skipped.
+# that handles them gets exercised. The exemption is the fixture value's SHAPE
+# and nothing else: there is deliberately NO path scope here. A gitleaks
+# allowlist entry matches when ANY of its conditions match, so `paths =
+# ['^tests/.*']` would wave through every secret in the tree, real ones
+# included (`condition = "AND"` exists in some releases but is not honoured by
+# all of them — a config must not mean one thing locally and another in CI).
+# Each pattern below is anchored and matched against the secret, so a genuine
+# credential is reported wherever it lives, tests/ included. Found one in a test
+# file? That is the gate working.
+#
+# Adding a fixture with a new shape? Add the shape here — that review is the
+# point, and `make secrets` names the value that needs it.
 [[allowlists]]
 description = "synthetic credentials used as test fixtures"
-paths = ['''^tests/.*''']
 regexTarget = "secret"
 regexes = [
-  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
-  '''(?i)(this-is-the-secret|sample|dummy|fake|placeholder|example|secret|0123456789|1234567890|abcdef|888888|live-9f3c2b1a)''',
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',              # RFC 6455 handshake nonce
+  '''^sk-live-[0-9a-f]{8}$''',
+  '''^sk-abcdef[0-9a-z]+$''',
+  '''^sk-this-is-the-secret-[0-9]+$''',
+  '''^(glm|deepseek)-secret-[0-9]+$''',
+  '''^lin_api_secret[0-9]+$''',
+  '''^xoxb-[0-9]{10}-[0-9]{10}-$''',
+  '''^ambient-anthropic-[0-9]+$''',
 ]
 
 # 2. Public client-side analytics keys.
 #
 # PostHog project keys (phc_…) are shipped to the browser by design — they are
-# write-only ingestion tokens, not credentials. Scoped to the built asset tree
-# and matched on the value, so any other key shape there is still a finding.
+# write-only ingestion tokens, not credentials. Anchored on the `phc_` prefix,
+# which no other credential format uses.
 [[allowlists]]
-description = "posthog project key in built web assets"
-paths = ['''^mini_ork/web/static/assets/.*''']
+description = "posthog project key"
 regexTarget = "secret"
 regexes = ['''^phc_[A-Za-z0-9]+$''']
 
@@ -40,6 +52,8 @@ regexes = ['''^phc_[A-Za-z0-9]+$''']
 # is the authority on all of them; this list mirrors it because gitleaks has no
 # way to read it. Scanning these would fail every local run on files that are
 # correct by design. CI scans a checkout, where none of them exist.
+# Path-only by design: these are whole trees Git cannot commit, so there is no
+# value shape to match against.
 [[allowlists]]
 description = "git-ignored local state and third-party trees"
 paths = [

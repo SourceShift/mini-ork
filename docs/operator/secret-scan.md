@@ -56,21 +56,32 @@ requires a paid licence on organisation accounts.
 ## What the config exempts, and why it is narrow
 
 `.gitleaks.toml` extends the default ruleset (dropping `useDefault` would leave
-two allowlists and no rules at all) and adds three exemptions. Each one is
-scoped by **path *and* value**, never by path alone:
+two allowlists and no rules at all) and adds three exemptions. A gitleaks
+allowlist matches when **any** of its conditions match, so an entry that names a
+path exempts everything under it — which is why the two value exemptions name no
+path at all:
 
-- **Test fixtures** — `tests/` values that carry an obvious dummy marker
-  (`sample`, `dummy`, `1234567890`, …) or are the RFC 6455 handshake nonce. A
-  real-looking credential pasted into a test file is still a finding, because a
-  test file is exactly where people paste one.
+- **Test fixtures** — anchored patterns on the *fixture value's shape*
+  (`sk-live-<8 hex>`, `glm-secret-<digits>`, the RFC 6455 handshake nonce, …),
+  matched against the secret and applied repository-wide. A real-looking
+  credential pasted into a test file is still a finding, because a test file is
+  exactly where people paste one. A new fixture with a new shape needs its
+  pattern added here; `make secrets` names the value.
 - **PostHog project keys** — `phc_…` is a write-only ingestion token shipped to
-  the browser by design; only that value shape, only in the built asset tree.
+  the browser by design; the exemption is that prefix and nothing else.
 - **Git-ignored trees** — `.mini-ork/config/`, `config/secrets.local.sh`,
   `docker/openbao/`, `.runtime/`, `node_modules/`, `.venv/`. These are *supposed*
   to hold this install's real keys; scanning them would fail every local run on
   a file that is correct by design. CI scans a checkout, where none exist.
   `__pycache__/` is here for a different reason: a stale `.pyc` reports a
-  finding the source no longer contains, and the source is scanned anyway.
+  finding the source no longer contains, and the source is scanned anyway. These
+  are path-only by design — there is no value shape to anchor on.
+
+Do not reach for `condition = "AND"` to combine a path with a value: it is not
+honoured by every gitleaks release, so the config would mean one thing locally
+and another in CI. The two behavioural tests in `tests/unit/test_secret_scan_py.py`
+plant a real-shaped credential — one outside `tests/`, one inside — and require
+both to be reported.
 
 `.gitleaks.toml` is a **high-risk path** in `config/risk-tiers.yaml`, so widening
 an exemption needs a merge approval. That is the point: the allowlist is the
