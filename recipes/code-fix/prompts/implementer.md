@@ -68,11 +68,14 @@ implementation is acceptable or if `REQUEST_CHANGES` is warranted.
 
 8. **If you run the suite, scope it to the test file.** You rarely need to — the
    verifier nodes run the gate once, scoped. Pass the **changed test file path**,
-   never a name filter alone (`pytest path/to/test_x.py`, not `-k "some name"`):
-   a filter collects the whole repo first and spawns one worker per file. The
-   ordering, the while-editing rule and the stopping rule are the repo's
-   validation policy in `AGENTS.md` ("Validation policy"); if you cannot name
-   the file, do not run the suite at all.
+   never a name filter alone: `pytest path/to/test_x.py -q`, or
+   `npx jest path/to/x.test.ts --maxWorkers=2`. A filter — `-k "some name"`,
+   `--testNamePattern`, `jest -t` — will collect the whole repo first and spawn
+   one worker per file: 11 workers × ~900 MB on an 11-core box is how one lane
+   pinned the machine at load 124 for eight minutes. The ordering, the
+   while-editing rule and the stopping rule are the repo's validation policy in
+   `AGENTS.md` ("Validation policy"); if you cannot name the file, do not run
+   the suite at all.
 
 ---
 

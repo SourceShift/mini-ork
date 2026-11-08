@@ -38,7 +38,9 @@ PINNED_STATES = {
     "④": "live",
     "⑤": "consumer on, producer manual",
     "⑥": "opt-in per recipe",
-    "⑦": "consumer on, producer manual",
+    # 693dc18c made promotion_check the producer it used to only consume from:
+    # the hermetic audit runs inside the gate (~0.06 s, no network, no model).
+    "⑦": "live (hermetic, ~0.06 s)",
     "⑧": "off by default; `shadow` measures without enforcing",
     "⑨": "live",
     "⑩": "consumer on, producer manual",
