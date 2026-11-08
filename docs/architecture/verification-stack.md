@@ -48,7 +48,7 @@ The contract is one field. A verifier emits `"failure_kind": "toolchain"`
 into an abstention (`ABSTAINING_KINDS`), so the run is re-verified instead of
 charged to the implementer.
 
-Two rules make it honest, and both are tested:
+Three rules make it honest, and all are tested:
 
 - **Only when nothing judged the code.** A red verdict that ALSO contains a real
   failure stays a refutation. `feature-acceptance` records one entry per failed
@@ -56,11 +56,21 @@ Two rules make it honest, and both are tested:
   `static-check` does the same per check.
 - **Decided on the output, not just the exit code.** A manager that refuses the
   repo (`EBADDEVENGINES`) and an `npx` with no local install exit 1, not 127 —
-  only their output says so. `mini_ork.verify.pm.classify_spawn` reads it, and
-  `run_logged(argv, evidence, stream=…)` is how a verifier gets that output back
-  while its log still lands in the evidence file (it also reports a missing
-  binary as `(127, "command not found: …")`, because `subprocess` raises where a
-  shell returns 127).
+  only their output says so. `run_logged(argv, evidence, stream=…)` is how a
+  verifier gets that output back while its log still lands in the evidence file
+  (it also reports a missing binary as `(127, "command not found: …")`, because
+  `subprocess` raises where a shell returns 127).
+- **Two classifiers, because a suite log is not a launcher's output.** A test
+  that raises `FileNotFoundError` prints `No such file or directory` while the
+  runner worked perfectly, so scanning a whole suite log with that needle turns
+  a real failing test into an abstention — it excuses the regression the
+  abstention exists to avoid blaming on the toolchain.
+  `mini_ork.verify.pm.classify_spawn` keeps the broad needles for a tool that
+  speaks for itself (`git apply`, `psql`, a linter). Every verifier that spawns
+  a test/typecheck SUITE uses `classify_suite_spawn` instead: unambiguous
+  launcher messages only (`command not found`, `EBADDEVENGINES`, `npx`'s "could
+  not determine executable to run"), and only in the first 20 lines of the log.
+  rc 126/127 and a signal-killed runner abstain in both.
 
 ## Which "vacuous" guard you mean: three, not one
 

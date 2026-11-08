@@ -66,14 +66,21 @@ def test_verifier_can_declare_a_toolchain_abstention(rel: str) -> None:
 
     A static check, not a re-implementation of the verifier: it catches the
     regression that matters (the branch deleted in a refactor) without pinning
-    the mechanism. Most verifiers route through ``classify_spawn``; spec-tests
+    the mechanism. Every verifier here spawns a test/comptime SUITE, so the
+    attribution must go through ``classify_suite_spawn`` — the strict variant.
+    ``classify_spawn`` scans the whole log with broad needles, which turns a
+    failing test that raises ``FileNotFoundError`` into an abstention; spec-tests
     knows the answer structurally (no rc and no timeout means the spawn never
     ran) and writes the literal, which is just as honest.
     """
     src = (REPO_ROOT / rel).read_text(encoding="utf-8")
     assert '"failure_kind"' in src or "failure_kind=" in src, f"{rel} never emits failure_kind"
-    assert "classify_spawn" in src or '"toolchain"' in src, (
+    assert "classify_suite_spawn" in src or '"toolchain"' in src, (
         f"{rel} emits failure_kind but can never attribute it to a toolchain"
+    )
+    assert "classify_spawn(" not in src.replace("classify_suite_spawn(", ""), (
+        f"{rel} classifies suite output with the broad classifier; a failing test "
+        "that prints 'No such file or directory' would abstain instead of refute"
     )
 
 
@@ -126,3 +133,38 @@ def test_epic_verifier_lib_accepts_an_opt_in_failure_kind() -> None:
     )
     assert "def emit_verifier_json(log, name, artifact_ref, failure_kind=None)" in lib_src
     assert 'payload["failure_kind"] = failure_kind' in lib_src
+
+
+def _load_spec_tests():
+    """The spec-tests verifier as a module — it is a script, not an import."""
+    import importlib.util
+
+    path = REPO_ROOT / "recipes" / "framework-edit" / "verifiers" / "spec-tests.py"
+    spec = importlib.util.spec_from_file_location("_spec_tests_redaction_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_held_out_parametrization_is_masked_in_the_evidence_log() -> None:
+    """A parametrized held-out probe leaks its case id in the KEPT lines.
+
+    ``redact_held_out`` replaces the failure block but keeps the probe's name
+    so the verdict still says which probe failed. pytest renders a parametrized
+    unit as ``test_x[<case>]`` — and with no explicit ``id=`` the bracket holds
+    the argument reprs, expected values included — so keeping the line verbatim
+    handed back exactly what the authorship split withheld.
+    """
+    module = _load_spec_tests()
+    output = (
+        "___ test_held_out[acme_corp__4096] ___\n"
+        "    assert 4096 == expected\n"
+        "=== short test summary info ===\n"
+        "FAILED test_spec.py::test_held_out[acme_corp__4096]\n"
+        "1 failed in 0.02s\n"
+    )
+    redacted = module.redact_held_out(output, {"test_held_out"})
+    assert "acme_corp__4096" not in redacted
+    assert "4096 == expected" not in redacted
+    assert "test_held_out" in redacted
+    assert module._HELD_OUT_PARAM in redacted

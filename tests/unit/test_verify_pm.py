@@ -191,6 +191,60 @@ def test_classify_spawn_is_fail_closed():
     assert pm.classify_spawn(["eslint", "a.ts"], 0, "") == ""
 
 
+def test_classify_spawn_toolchain_on_a_launch_refusal():
+    """rc 126 = found but not executable: the tool still never produced a verdict.
+
+    ``subprocess`` raises ``PermissionError`` for a non-executable path, and a
+    corrupt shebang surfaces the same way — neither judged the code.
+    """
+    assert pm.classify_spawn(["eslint"], 126, "") == "toolchain"
+    assert pm.classify_spawn(["pytest", "-q"], 126, "") == "toolchain"
+
+
+# ── layer 1c: the STRICTER classifier every suite verifier uses ────────────
+# A test/typecheck log is not a launcher's output: a test that raises
+# FileNotFoundError prints "No such file or directory" while the runner worked.
+# classify_spawn reads the whole log with that needle, so wiring a suite through
+# it turns a real failing test into an abstention (the pre-push review on this
+# sweep found exactly that). classify_suite_spawn restricts both the needles and
+# the region it reads.
+
+
+def test_classify_suite_spawn_toolchain_on_an_unlaunched_runner():
+    assert pm.classify_suite_spawn(["pytest", "-q"], 127, "") == "toolchain"
+    assert pm.classify_suite_spawn(["pytest", "-q"], 126, "") == "toolchain"
+    assert pm.classify_suite_spawn(["npm", "test"], -15, "") == "toolchain"
+    out = "npm error code EBADDEVENGINES\nnpm error Invalid name \"pnpm\" does not match \"npm\"\n"
+    assert pm.classify_suite_spawn(["npm", "run", "test"], 1, out) == "toolchain"
+
+
+def test_classify_suite_spawn_refutes_a_test_that_hit_enoent():
+    """The regression this variant exists for: a failing test names a missing file."""
+    log = (
+        "===================== FAILURES =====================\n"
+        "___ test_reads_config ___\n"
+        "    with open(path) as fh:\n"
+        "E   FileNotFoundError: [Errno 2] No such file or directory: '/tmp/missing'\n"
+        "=========================== short test summary info ============\n"
+        "FAILED test_a.py::test_reads_config - FileNotFoundError: [Errno 2] No such file or dir…\n"
+        "1 failed in 0.02s\n"
+    )
+    assert pm.classify_suite_spawn(["pytest", "-q"], 1, log) == ""
+    assert pm.classify_spawn(["pytest", "-q"], 1, log) == "toolchain"  # the old wiring
+
+
+def test_classify_suite_spawn_reads_only_the_head_of_the_log():
+    """A launcher message buried in test output is test output, not a signal."""
+    lines = ["some test output"] * 30 + ["sh: pytest: command not found"]
+    assert pm.classify_suite_spawn(["pytest"], 1, "\n".join(lines)) == ""
+
+
+def test_classify_suite_spawn_is_fail_closed():
+    assert pm.classify_suite_spawn(["pytest"], 1, "1 failed, 2 passed in 0.1s") == ""
+    assert pm.classify_suite_spawn(["pytest"], 5, "no tests ran") == ""
+    assert pm.classify_suite_spawn(["pytest"], 0, "3 passed in 0.01s") == ""
+
+
 # ── layer 2: end-to-end regression on the real verifier ───────────────────
 
 

@@ -42,7 +42,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import classify_spawn, exec_argv  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn, exec_argv  # noqa: E402
 
 SUB_EPIC_ID = os.environ.get("SUB_EPIC_ID", "")
 WORKDIR = os.environ.get("WORKDIR", "")
@@ -216,7 +216,7 @@ if log_file:
     except OSError:
         _tail = ""
 if not verdict_pass:
-    _kind = classify_spawn(argv, exit_code, _tail)
+    _kind = classify_suite_spawn(argv, exit_code, _tail)
     if _kind:
         verdict["failure_kind"] = _kind
 

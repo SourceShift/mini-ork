@@ -20,7 +20,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import classify_spawn, run_logged  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn, run_logged  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 REPO_ROOT = os.environ.get("MO_TARGET_CWD") or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -93,7 +93,7 @@ result = {
 # kill) proved nothing about parity. Declared so the engine abstains instead of
 # refuting the migration (see mini_ork/verify/pm.py).
 if not passed and failed_argv:
-    _kind = classify_spawn(failed_argv, failed_rc, failed_tail)
+    _kind = classify_suite_spawn(failed_argv, failed_rc, failed_tail)
     if _kind:
         result["failure_kind"] = _kind
 with open(STATE, "w", encoding="utf-8") as handle:

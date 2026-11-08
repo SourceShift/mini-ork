@@ -36,7 +36,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
 from _verdict_merge import write_verdict  # noqa: E402
-from mini_ork.verify.pm import classify_spawn, run_argv, run_logged  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn, run_argv, run_logged  # noqa: E402
 
 # The frozen-kernel guard logic + its built-in default list live in the engine
 # (mini_ork/vcs/repo_integrity_guard.py) so the verifier and the apply boundary
@@ -148,7 +148,7 @@ def _note_spawn(argv, rc, tail):
         return
     if isinstance(argv, str):
         argv = shlex.split(argv)
-    if classify_spawn(argv, rc, tail):
+    if classify_suite_spawn(argv, rc, tail):
         _spawn_toolchain[_cur_check] = True
     else:
         _spawn_real_fail.add(_cur_check)

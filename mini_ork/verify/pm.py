@@ -194,7 +194,10 @@ def classify_spawn(argv, rc, output):  # noqa: ARG001 — argv is part of the co
     input" is domain knowledge about the runners — refine it here. Every
     shell-out verifier calls this one function, so a fix here is a fix everywhere.
     """
-    if rc == 127:  # the shell's own "command not found"
+    if rc in (126, 127):
+        # 127 is the shell's own "command not found"; 126 is "found but not
+        # executable" (wrong permissions, a directory, a corrupt shebang). Both
+        # mean the tool never produced a verdict, which is the definition here.
         return "toolchain"
     # A negative rc is a tool killed by a signal before it finished: it never
     # reached a verdict on the code. m3b-activity-feed-backend-removal
@@ -226,11 +229,15 @@ _SUITE_HEAD_LINES = 20
 def classify_suite_spawn(argv, rc, output):  # noqa: ARG001 — argv mirrors classify_spawn
     """``"toolchain"`` when a test/typecheck SUITE never started its tool, else ``""``.
 
-    Stricter than :func:`classify_spawn`: the rc rules are the same (127, or killed
-    by a signal), but only :data:`_SUITE_SPAWN_FAILURES` count, and only in the first
-    :data:`_SUITE_HEAD_LINES` lines. ``""`` keeps today's verdict (fail-closed).
+    Stricter than :func:`classify_spawn`: only :data:`_SUITE_SPAWN_FAILURES` count,
+    and only in the first :data:`_SUITE_HEAD_LINES` lines. ``""`` keeps today's
+    verdict (fail-closed).
+
+    The rc rules match :func:`classify_spawn` but stop short of 127: a suite
+    REPORTS a missing binary as rc 1 and a missing *test file* as rc 4/5, so 127
+    is still the shell saying the runner itself is not installed.
     """
-    if rc == 127:
+    if rc in (126, 127):
         return "toolchain"
     if isinstance(rc, int) and rc < 0:
         return "toolchain"

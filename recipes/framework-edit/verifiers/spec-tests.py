@@ -724,6 +724,20 @@ def shadowed_selections(selected: list[str], targets: list[str]) -> list[str]:
 
 _HELD_OUT_PLACEHOLDER = ("[held-out probe: its clause and assertion output are "
                          "withheld by the authorship split]")
+_HELD_OUT_PARAM = "[held-out case]"
+
+
+def _mask_params(token: str) -> str:
+    """TOKEN with a parametrization bracket replaced by ``[held-out case]``.
+
+    pytest renders a parametrized unit as ``test_x[a-b]``, and the bracket is
+    where the withheld information lives: an id like ``acme__2024`` names the
+    case, and a bare ``pytest.mark.parametrize`` without ids puts the argument
+    reprs — input AND expected — in there verbatim. The unit name still goes to
+    the log (the revise round must know WHICH probe failed); the case does not.
+    """
+    head, sep, _ = token.partition("[")
+    return f"{head}{_HELD_OUT_PARAM}" if sep else token
 
 
 def redact_held_out(output: str, withheld: set[str]) -> str:
@@ -733,7 +747,9 @@ def redact_held_out(output: str, withheld: set[str]) -> str:
     docstring clause included — followed by the assertion's expected values
     (``assert 7 == 42``). The evidence log is text the revise round reads, so an
     unredacted block hands back exactly what the split withheld. The header
-    stays: the probe is still named, its content is not.
+    stays: the probe is still named, its content is not — except a parametrized
+    probe's ``[...]``, which carries the case id (or, with no explicit id, the
+    argument reprs) and is masked here just as hard as the block body.
 
     Walked the same way `harness_defects` walks the output: a header line opens
     a block, the unit is stripped of the `ERROR at setup of ` prefix (a held-out
@@ -765,7 +781,7 @@ def redact_held_out(output: str, withheld: set[str]) -> str:
         if in_summary:
             summary = _ITEM_LINE_RE.match(stripped)
             if summary:
-                kept.append(f"{summary.group(1)} {summary.group(2)}")
+                kept.append(f"{summary.group(1)} {_mask_params(summary.group(2))}")
                 continue
             if _SUMMARY_TOTAL_RE.match(stripped) or stripped.startswith("==="):
                 in_summary = False
@@ -779,18 +795,21 @@ def redact_held_out(output: str, withheld: set[str]) -> str:
             continue
         summary = _ITEM_LINE_RE.match(stripped)
         if summary and _unit_key(summary.group(2)) in withheld:
-            kept.append(f"{summary.group(1)} {summary.group(2)}")
+            kept.append(f"{summary.group(1)} {_mask_params(summary.group(2))}")
             continue
         header = _TRACEBACK_HEADER_RE.match(line.strip())
         if header:
             name = header.group(1)
+            raw_name = name
             if any(ch.isalnum() for ch in name):
                 for prefix in _SETUP_ERROR_PREFIXES:
                     if name.startswith(prefix):
                         name = name[len(prefix):]
                         break
                 hiding = _unit_key(name) in withheld
-                kept.append(line)
+                # The header is kept so the probe is still named, but a
+                # parametrized one carries its case id in the bracket.
+                kept.append(f"___ {_mask_params(raw_name)} ___" if hiding else line)
                 if hiding:
                     kept.append(_HELD_OUT_PLACEHOLDER)
                 continue

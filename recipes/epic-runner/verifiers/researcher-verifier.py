@@ -27,7 +27,7 @@ from _lib import (  # noqa: E402
     check_psql_credentials_set,
     emit_verifier_json,
 )
-from mini_ork.verify.pm import classify_spawn, exec_argv, run_argv, run_logged  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn, exec_argv, run_argv, run_logged  # noqa: E402
 
 NAME = "researcher"
 
@@ -51,7 +51,7 @@ _spawn_real_fail = set()  # cids where a spawn ran and genuinely rejected
 def _note_spawn(argv, rc, tail):
     if rc == 0 or _cur_check is None:
         return
-    if classify_spawn(argv, rc, tail):
+    if classify_suite_spawn(argv, rc, tail):
         _spawn_toolchain[_cur_check] = True
     else:
         _spawn_real_fail.add(_cur_check)

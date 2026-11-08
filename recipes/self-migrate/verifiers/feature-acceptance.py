@@ -26,7 +26,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import classify_spawn, run_logged  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn, run_logged  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 REPO_ROOT = os.environ.get("MO_TARGET_CWD") or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -53,7 +53,7 @@ def _run_to_evidence(argv, cwd=None, env=None, shell=False):
         # rc 127 / a signal kill means the probe never ran: a missing binary,
         # not a failing feature. Each failed probe records WHICH it was, because
         # one probe's missing tool must not excuse another probe's real failure.
-        kind = classify_spawn(argv if isinstance(argv, list) else shlex.split(argv), rc, tail)
+        kind = classify_suite_spawn(argv if isinstance(argv, list) else shlex.split(argv), rc, tail)
         failed_probes.append(kind or "code")
     return rc == 0
 

@@ -71,7 +71,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import classify_spawn  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 WT_RAW = os.environ.get("MINI_ORK_SELF_IMPROVE_WORKTREE") or os.environ.get(
@@ -348,7 +348,7 @@ try:
     # passed" says nothing about the code. Abstain rather than refute
     # (mini_ork/verify/pm.py).
     if passed != 1:
-        _kind = classify_spawn(cmd, rc, out)
+        _kind = classify_suite_spawn(cmd, rc, out)
         if _kind:
             result["failure_kind"] = _kind
     _emit(result)

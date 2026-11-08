@@ -21,7 +21,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import classify_spawn, exec_argv, run_argv, run_logged  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn, exec_argv, run_argv, run_logged  # noqa: E402
 
 
 def _root_multi_project_config() -> str:
@@ -168,7 +168,7 @@ payload = {
 # a killed process, not a failing test. Declared so the engine abstains instead
 # of refuting (see mini_ork/verify/pm.py).
 if not passed:
-    _kind = classify_spawn(argv, jest_rc, jest_tail)
+    _kind = classify_suite_spawn(argv, jest_rc, jest_tail)
     if _kind:
         payload["failure_kind"] = _kind
 print(json.dumps(payload))

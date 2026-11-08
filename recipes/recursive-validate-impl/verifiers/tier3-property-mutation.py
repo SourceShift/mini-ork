@@ -19,7 +19,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import classify_spawn, exec_argv, run_logged  # noqa: E402
+from mini_ork.verify.pm import classify_suite_spawn, exec_argv, run_logged  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -106,7 +106,7 @@ payload = {
 # Stryker not installed (rc 127) or killed before it scored anything is not a
 # verdict on the code — abstain rather than refute (mini_ork/verify/pm.py).
 if not passed and mutation_rc is not None:
-    _kind = classify_spawn(mutation_argv, mutation_rc, mutation_tail)
+    _kind = classify_suite_spawn(mutation_argv, mutation_rc, mutation_tail)
     if _kind:
         payload["failure_kind"] = _kind
 print(json.dumps(payload))
