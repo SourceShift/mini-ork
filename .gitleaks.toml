@@ -1,0 +1,60 @@
+# Secret scanning for mini-ork. The engine is gitleaks in both delivery tiers:
+# `make secrets` (local, no network) and the `secret-scan` job in
+# .github/workflows/ci.yml. CI pins the gitleaks version; see
+# docs/operator/secret-scan.md.
+[extend]
+useDefault = true
+
+# 1. Synthetic credentials in test fixtures.
+#
+# Tests must contain tokens that *look* like credentials — that is how the code
+# that handles them gets exercised. The exemption is matched on the SECRET
+# VALUE, not on the path, so a real credential pasted into a test file is still
+# a finding: only values carrying an obvious dummy marker (or the RFC 6455
+# handshake nonce, base64 of "the sample nonce") are skipped.
+[[allowlists]]
+description = "synthetic credentials used as test fixtures"
+paths = ['''^tests/.*''']
+regexTarget = "secret"
+regexes = [
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+  '''(?i)(this-is-the-secret|sample|dummy|fake|placeholder|example|secret|0123456789|1234567890|abcdef|888888|live-9f3c2b1a)''',
+]
+
+# 2. Public client-side analytics keys.
+#
+# PostHog project keys (phc_…) are shipped to the browser by design — they are
+# write-only ingestion tokens, not credentials. Scoped to the built asset tree
+# and matched on the value, so any other key shape there is still a finding.
+[[allowlists]]
+description = "posthog project key in built web assets"
+paths = ['''^mini_ork/web/static/assets/.*''']
+regexTarget = "secret"
+regexes = ['''^phc_[A-Za-z0-9]+$''']
+
+# 3. Trees that cannot be committed.
+#
+# `.mini-ork/config/` and `config/secrets.local.sh` are SUPPOSED to hold this
+# install's real keys, `docker/openbao/openbao.env` the dev vault's, and
+# `.runtime/`, `node_modules/`, `.venv/` are local or third-party. `.gitignore`
+# is the authority on all of them; this list mirrors it because gitleaks has no
+# way to read it. Scanning these would fail every local run on files that are
+# correct by design. CI scans a checkout, where none of them exist.
+[[allowlists]]
+description = "git-ignored local state and third-party trees"
+paths = [
+  '''^\.git/''',
+  '''^\.runtime/''',
+  '''^(.*/)?node_modules/''',
+  # Bytecode mirrors a source file that is scanned anyway, and a stale .pyc
+  # reports a finding the source no longer contains — which sends the reader
+  # looking for a secret that is not there.
+  '''^(.*/)?__pycache__/''',
+  '''^\.venv/''',
+  '''^\.mini-ork/''',
+  '''^config/secrets\.local\.sh$''',
+  '''^docker/openbao/''',
+  '''^web/dist/''',
+  '''^dist/''',
+  '''^build/''',
+]

@@ -9,6 +9,7 @@ risk_tiers:
     - config/risk-tiers.yaml
     - config/kernel-frozen.yaml
     - .github/workflows/**
+    - .gitleaks.toml
     - .githooks/**
     - db/migrations/**
     - install.sh

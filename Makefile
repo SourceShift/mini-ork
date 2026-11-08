@@ -12,7 +12,7 @@
 
 .PHONY: install install-system-deps install-hooks uninstall-hooks readme-claim-check readme-drift-panel help test \
         web-serve web-test \
-        lint lint-advisory \
+        lint lint-advisory secrets \
         worktree worktree-merge worktree-clean worktree-list
 
 PORT ?= 7090
@@ -31,6 +31,7 @@ help:
 	@echo "  make readme-drift-panel  run 4-lens LLM drift audit (Layer 2b, ~\$$0.30)"
 	@echo "  make lint                ruff blocking tier (F + E9) — must stay green"
 	@echo "  make lint-advisory       ruff advisory tier (E,W,I,UP,B) — ratchet report"
+	@echo "  make secrets             gitleaks scan of the working tree — must stay green"
 	@echo "  make test                run the Python test suite"
 	@echo ""
 	@echo "Observability API:"
@@ -84,6 +85,17 @@ lint:
 lint-advisory:
 	@command -v ruff >/dev/null || { echo "ruff not found — pip install ruff"; exit 1; }
 	-ruff check mini_ork/ tests/ --select E,W,I,UP,B --statistics
+
+# ── secret scan (simple tier) ────────────────────────────────────────────────
+# The same `.gitleaks.toml` and the same engine as CI's `secret-scan` job, so a
+# green `make secrets` means the gate will pass; CI additionally pins the
+# gitleaks version. Fails closed on a missing binary rather than reporting a
+# clean tree it never looked at. `--redact` keeps a hit out of the terminal,
+# the scrollback and the shell history — rotate the key first, then read
+# `.gitleaks.toml` to widen an allowlist.
+secrets:
+	@command -v gitleaks >/dev/null || { echo "gitleaks not found — brew install gitleaks (docs/operator/secret-scan.md)"; exit 1; }
+	gitleaks detect --no-git --source . --config .gitleaks.toml --redact --exit-code 1 --no-banner
 
 # ── worktree-first dev ───────────────────────────────────────────────────────
 worktree:
