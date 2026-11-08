@@ -45,6 +45,29 @@ def write(root: Path, files: dict[str, str]) -> None:
         path.write_text(text, encoding="utf-8")
 
 
+#: Both writes a benchmark delta is measured from, plus a caller for each.
+#:
+#: L9's delta is not free: `record_benchmark_delta` averages
+#: `benchmark_results.utility_score` against `benchmark_tasks.
+#: baseline_utility_score`, and those tables have no other writers. A delta
+#: writer over a benchmark nothing produces is a NULL column with extra steps.
+_BENCH_SUITE_SRC = (
+    "def add(db):\n"
+    "    db.execute('INSERT INTO benchmark_tasks'\n"
+    "               ' (benchmark_id, baseline_utility_score) VALUES (?,?)', ('b', 0.5))\n"
+    "def run(db):\n"
+    "    db.execute('INSERT INTO benchmark_results'\n"
+    "               ' (candidate_id, benchmark_id, utility_score) VALUES (?,?,?)',\n"
+    "               ('c', 'b', 0.6))\n"
+)
+BENCH_PRODUCERS = {
+    "mini_ork/learning/benchmark_suite.py": _BENCH_SUITE_SRC,
+    "mini_ork/cli/bench.py":
+        "from mini_ork.learning.benchmark_suite import add, run\n"
+        "def bench(db):\n    add(db)\n    run(db)\n",
+}
+
+
 def report(root: Path, con: sqlite3.Connection, probes=()) -> HarvestReport:
     return harvest(root, con, now=NOW, probes=probes)
 
@@ -278,6 +301,7 @@ def test_l9_closes_when_a_code_path_writes_the_column(tmp_path, con):
     write(tmp_path, {"mini_ork/cli/self_improve.py":
                      "con.execute('UPDATE learning_record SET benchmark_delta=?,"
                      " updated_at=? WHERE run_id=?', (d, t, r))\n"})
+    write(tmp_path, BENCH_PRODUCERS)
     assert "L9" in report(tmp_path, con).closed
 
 
@@ -289,6 +313,7 @@ def test_l9_closes_on_an_insert_that_names_the_column_last(tmp_path, con):
     write(tmp_path, {"mini_ork/learning/ledger.py":
                      "cur.execute('INSERT INTO learning_record (created_at, benchmark_delta)"
                      " VALUES (?,?)', (t, d))\n"})
+    write(tmp_path, BENCH_PRODUCERS)
     assert "L9" in report(tmp_path, con).closed
 
 
@@ -319,6 +344,7 @@ def test_l9_closes_when_the_writer_is_called(tmp_path, con):
         "mini_ork/cli/self_improve.py":
             "def _iter_run(db):\n    record_benchmark_delta(db, 1)\n",
     })
+    write(tmp_path, BENCH_PRODUCERS)
     assert "L9" in report(tmp_path, con).closed
 
 
@@ -363,7 +389,54 @@ def test_l9_closes_when_the_imported_writer_is_called(tmp_path, con):
             "from mini_ork.learning.ledger import record_benchmark_delta\n"
             "def _iter_run(db):\n    record_benchmark_delta(db, 1)\n",
     })
+    write(tmp_path, BENCH_PRODUCERS)
     assert "L9" in report(tmp_path, con).closed
+
+
+def test_l9_is_not_closed_by_a_writer_over_a_benchmark_nothing_produces(tmp_path, con):
+    """A live delta writer is not a live delta.
+
+    Measured: `record_benchmark_delta` averages `benchmark_results` joined to
+    `benchmark_tasks`; `benchmark_suite.run()` / `.add()` are the only writers
+    of those tables and nothing calls either, so the AVG is NULL and the UPDATE
+    is a no-op on every iteration. A rule that stopped at "a called writer
+    exists" reported this gap closed over exactly that tree (cycle
+    rsi-c1793812835) — the column never moved.
+    """
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {"mini_ork/cli/self_improve.py":
+                     "def record_benchmark_delta(db, run_id):\n"
+                     "    db.execute('UPDATE learning_record SET benchmark_delta=?'\n"
+                     "               ' WHERE run_id=?', (0.1, run_id))\n"
+                     "def _iter_run(db):\n    record_benchmark_delta(db, 1)\n",
+                     "mini_ork/learning/benchmark_suite.py": _BENCH_SUITE_SRC})
+    cand = one(report(tmp_path, con), "db:L9")
+    assert cand.kind == "producer_missing"
+    assert sorted(cand.evidence["unwired_producers"]) == [
+        "benchmark_suite.add()", "benchmark_suite.run()",
+    ]
+
+
+def test_l9_names_only_the_benchmark_producer_that_is_missing(tmp_path, con):
+    """Half a producer is not a producer: the delta needs both the baseline and
+    the candidate's measured score."""
+    ddl(con, "CREATE TABLE learning_record (benchmark_delta REAL, created_at TEXT);")
+    con.execute("INSERT INTO learning_record VALUES (NULL, ?)", (NOW - 40 * DAY,))
+    con.commit()
+    write(tmp_path, {
+        "mini_ork/cli/self_improve.py":
+            "def record_benchmark_delta(db, run_id):\n"
+            "    db.execute('UPDATE learning_record SET benchmark_delta=?', (0.1,))\n"
+            "def _iter_run(db):\n    record_benchmark_delta(db, 1)\n",
+        "mini_ork/learning/benchmark_suite.py": _BENCH_SUITE_SRC,
+        "mini_ork/cli/bench.py":
+            "from mini_ork.learning.benchmark_suite import add\n"
+            "def bench(db):\n    add(db)\n",
+    })
+    cand = one(report(tmp_path, con), "db:L9")
+    assert cand.evidence["unwired_producers"] == ["benchmark_suite.run()"]
 
 
 def test_l9_is_not_closed_when_the_import_points_at_the_other_module(tmp_path, con):
@@ -399,6 +472,7 @@ def test_l9_closes_on_a_qualified_call_of_the_writer(tmp_path, con):
             "import mini_ork.learning.ledger as ledger\n"
             "def _iter_run(db):\n    ledger.record_benchmark_delta(db, 1)\n",
     })
+    write(tmp_path, BENCH_PRODUCERS)
     assert "L9" in report(tmp_path, con).closed
 
 
@@ -414,6 +488,7 @@ def test_l9_closes_on_the_sqlite_write_forms_beyond_plain_insert(tmp_path, con):
     write(tmp_path, {"mini_ork/learning/ledger.py":
                      "cur.execute('REPLACE INTO learning_record (benchmark_delta)"
                      " VALUES (?)', (d,))\n"})
+    write(tmp_path, BENCH_PRODUCERS)
     assert "L9" in report(tmp_path, con).closed
 
 

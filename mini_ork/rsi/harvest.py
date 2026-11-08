@@ -595,6 +595,24 @@ def _live_writer_of(root: Path, table: str, column: str) -> bool:
     return False
 
 
+#: The two writes a benchmark delta is measured from: ``benchmark_suite.add()``
+#: seeds a task and its baseline, ``benchmark_suite.run()`` records a
+#: candidate's utility against it. ``record_benchmark_delta`` averages the pair.
+_BENCHMARK_PRODUCERS: tuple[tuple[str, str, str], ...] = (
+    ("benchmark_tasks", "baseline_utility_score", "benchmark_suite.add()"),
+    ("benchmark_results", "utility_score", "benchmark_suite.run()"),
+)
+
+
+def _missing_benchmark_producers(root: Path) -> list[str]:
+    """Names of the benchmark producers that nothing calls (empty = all wired)."""
+    return [
+        name
+        for table, column, name in _BENCHMARK_PRODUCERS
+        if not _live_writer_of(root, table, column)
+    ]
+
+
 # --------------------------------------------------------------------------
 # Candidate constructor
 # --------------------------------------------------------------------------
@@ -887,10 +905,49 @@ def _l9_benchmark_delta_never_computed(ctx: _Ctx, domain: str, rule_id: str) -> 
         raise _GapClosed(f"{with_delta} records carry a benchmark delta")
     # The rows in the live DB are history: no code change can backfill them, so a
     # data-only predicate would stay red for every patch that wires the producer
-    # and G8 would quarantine each one. A writer present means the path exists;
-    # the NULLs are then the past, not the gap. Same shape as L2.
+    # and G8 would quarantine each one. A wired writer is therefore what closes
+    # the rule — but this column is MEASURED, so the writer only counts when the
+    # chain that produces its numbers is wired too (below). Same shape as L2.
     if _live_writer_of(ctx.root, "learning_record", "benchmark_delta"):
-        raise _GapClosed("a called code path writes learning_record.benchmark_delta")
+        unwired = _missing_benchmark_producers(ctx.root)
+        if not unwired:
+            raise _GapClosed(
+                "a called code path writes learning_record.benchmark_delta over a "
+                "wired benchmark producer"
+            )
+        # A live writer is necessary, not sufficient: the delta is MEASURED, so
+        # the measurement needs a producer of its own. Measured shape (cycle
+        # rsi-c1793812835, and the pre-push review that refused its first fix):
+        # `record_benchmark_delta` averages `benchmark_results` joined to
+        # `benchmark_tasks`; the only writers of those tables are
+        # `benchmark_suite.run()` / `.add()`, and nothing calls either, so the
+        # AVG is NULL and the UPDATE is a no-op every iteration. Stopping at
+        # "a called writer exists" reports the gap closed while the column stays
+        # NULL — a hollow closure, worse for a gap finder than a stale candidate.
+        measured = {
+            table: _scalar(ctx, f"SELECT count(*) FROM {table}") if _table_exists(ctx, table) else None
+            for table in ("benchmark_results", "benchmark_tasks")
+        }
+        rows_text = ", ".join(f"{t}={'absent' if n is None else n}" for t, n in measured.items())
+        producers = " and ".join(unwired)
+        return [_cand(
+            ctx, domain, rule_id,
+            kind="producer_missing",
+            title="benchmark_delta has a writer but the benchmark it averages is never produced",
+            evidence_key="table:benchmark_results:no-producer",
+            files=("mini_ork/learning/benchmark_suite.py",),
+            detail=f"A called code path UPDATEs learning_record.benchmark_delta, but "
+                   f"{producers} ({'is' if len(unwired) == 1 else 'are'} called by nothing); "
+                   f"the tables it averages hold {rows_text}. {total} learning records "
+                   "still carry NULL.",
+            evidence={"table": "learning_record", "rows": total, "with_delta": 0,
+                      "unwired_producers": unwired, **measured},
+            reach=total,
+            fix_hint="Call benchmark_suite.add() to seed benchmark_tasks and "
+                     "benchmark_suite.run() to record benchmark_results for a candidate; "
+                     "the delta writer then has values to average.",
+            success_metric="benchmark_tasks and benchmark_results each have a live producer",
+        )]
     # Parse every timestamp rather than MAX(): the ':fZ' corruption (L4) means
     # the text column cannot be trusted to sort.
     stamps = [ts for ts in (parse_ts(r[0]) for r in _rows(
