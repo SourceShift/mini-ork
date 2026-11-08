@@ -141,6 +141,7 @@ _USAGE = """\
 Usage: mini-ork recover <run_id> [--from-node <id>] [--strategy NAME] [--status]
                                 [--carry-patch NAME] [--ack-change] [--force]
                                 [--lane <alias>=<lane>]… [--allow-local]
+                                [--take-lease]
 
 Recover a failed run by walking the workflow DAG, marking each node
 reusable via E1's `is_node_reusable`, and dispatching ONLY the
@@ -205,6 +206,13 @@ Options:
                                  on the host when that placement can no longer
                                  be restored (no node env resolvable). Without
                                  it such a revival is refused.
+  --take-lease                 Take the run's single-writer lease even from a
+                                 live holder. Only for a holder that is known
+                                 to be dead or hung (a killed recovery keeps
+                                 the lease for its 15-minute TTL); the
+                                 displaced worker's checkpoint writes are
+                                 fenced out, so this cannot become a second
+                                 writer.
   --workflow <path>            Override workflow.yaml location.
   --db <path>                  Override state.db location.
   --help, -h                   Show this help
@@ -1054,6 +1062,7 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     ack_change = False
     force = False
     allow_local = False
+    take_lease = False
     lane_overrides: list[str] = []
     positional: list[str] = []
     i = 0
@@ -1106,6 +1115,9 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             i += 1
         elif a == "--allow-local":
             allow_local = True
+            i += 1
+        elif a == "--take-lease":
+            take_lease = True
             i += 1
         elif a == "--lane":
             if i + 1 >= len(argv):
@@ -1394,12 +1406,27 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
         _from = plan.first_node or (from_node or "")
         _req = _lease.request_recovery(db_path, run_id, _from, strategy)
         _token = _lease.acquire_lease(db_path, run_id)
+        if _token is None and take_lease:
+            # N4 escape: the holder died or hung and never released, so the
+            # 15-minute TTL would block the operator for the rest of it.
+            # Fencing keeps the displaced worker's writes out (its token is no
+            # longer the holder), which is what makes an unconditional steal
+            # safe rather than a second writer.
+            _token, _displaced = _lease.take_lease(db_path, run_id)
+            if _token is not None:
+                sys.stdout.write(
+                    f"[mini-ork-recover] took the run lease from "
+                    f"{(_displaced or '<unknown>')[:12]}… (--take-lease); the "
+                    f"previous holder's checkpoint writes are fenced out.\n"
+                )
         if _token is None:
             _rid = _req[0] if _req else "<unknown>"
             sys.stdout.write(
                 f"[mini-ork-recover] run {run_id} is already being recovered "
                 f"(single-writer lease held by another worker; request_id={_rid}); "
-                f"not dispatching a second time.\n"
+                f"not dispatching a second time."
+                + ("\n" if take_lease else
+                   " If that holder is dead, --take-lease reclaims the run.\n")
             )
             return 0
         if _req is not None:

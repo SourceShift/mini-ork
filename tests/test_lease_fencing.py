@@ -125,6 +125,37 @@ def test_second_owner_blocked_while_live(db_path):
     assert lease.current_lease(db_path, "run1")["owner_token"] == "A"
 
 
+def test_take_lease_wins_a_live_lease_and_fences_the_displaced_owner(db_path):
+    """The N4 escape: a dead/hung holder's LIVE lease is taken, and the old
+    token stops being the holder — that, not the lease, keeps writes safe."""
+    a = lease.acquire_lease(db_path, "run1", owner_token="A", ttl_s=100, now=1000)
+    assert a == "A"
+    tok, displaced = lease.take_lease(db_path, "run1", owner_token="B", now=1050)
+    assert tok == "B"
+    assert displaced == "A"
+    assert lease.current_lease(db_path, "run1")["owner_token"] == "B"
+    assert lease.is_lease_holder(db_path, "run1", "A", now=1060) is False
+    assert lease.is_lease_holder(db_path, "run1", "B", now=1060) is True
+    # The displaced worker can no longer re-acquire on its own token either.
+    assert lease.acquire_lease(db_path, "run1", owner_token="A", now=1060) is None
+
+
+def test_take_lease_on_a_free_run_creates_the_row(db_path):
+    tok, displaced = lease.take_lease(db_path, "run1", owner_token="B", now=1000)
+    assert (tok, displaced) == ("B", None)
+    assert lease.current_lease(db_path, "run1")["owner_token"] == "B"
+
+
+def test_take_lease_without_the_table_reports_failure_not_a_token(tmp_path):
+    """A pre-0052 DB must not be handed a token that fences nothing."""
+    bare = tmp_path / "legacy.db"
+    con = sqlite3.connect(bare)
+    con.execute("CREATE TABLE unrelated(x)")
+    con.commit()
+    con.close()
+    assert lease.take_lease(str(bare), "run1") == (None, None)
+
+
 def test_reentrant_same_owner_refreshes(db_path):
     lease.acquire_lease(db_path, "run1", owner_token="A", ttl_s=100, now=1000)
     again = lease.acquire_lease(db_path, "run1", owner_token="A", ttl_s=100, now=1050)

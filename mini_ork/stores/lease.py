@@ -26,6 +26,11 @@ Time is injectable (``now=``) so tests are deterministic; production callers
 omit it and get ``int(time.time())``. Nothing here raises for a normal
 "can't acquire / not the holder" outcome — those return ``None``/``False`` so
 callers branch on them; only genuinely broken input (missing db) surfaces.
+
+:func:`take_lease` is the one deliberate exception to "blocked means blocked":
+it wins a lease that is still live, for the operator escaping a recovery whose
+holder died or hung (N4, ``recover --take-lease``). Fencing — not the lease
+check — is what keeps that safe.
 """
 from __future__ import annotations
 
@@ -40,6 +45,7 @@ __all__ = [
     "FenceError",
     "mint_token",
     "acquire_lease",
+    "take_lease",
     "refresh_lease",
     "release_lease",
     "is_lease_holder",
@@ -185,6 +191,76 @@ def acquire_lease(
             except Exception:
                 pass
         return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def take_lease(
+    db: str,
+    run_id: str,
+    *,
+    owner_token: Optional[str] = None,
+    ttl_s: int = DEFAULT_LEASE_TTL_S,
+    now: Optional[int] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Take the run's lease even when a LIVE lease names another owner.
+
+    The escape hatch for a recovery that died or hung while holding the lease
+    (N4): :func:`acquire_lease` refuses for the rest of the 15-minute TTL, so
+    an operator reviving the run has no way in until it lapses.
+
+    Fencing is what makes the steal safe. The displaced token is no longer the
+    current holder, so any checkpoint or publish it presents afterwards is
+    rejected by :func:`is_lease_holder` / :func:`fence_or_reject` instead of
+    landing over the live work — the same rule that already protects an
+    expired-and-re-acquired lease.
+
+    Returns ``(new_token, displaced_owner)``. ``displaced_owner`` is the token
+    that was holding the lease (``None`` when the row was free or already
+    ours), for the caller to report. ``(None, None)`` means the lease could
+    not be written at all (no db/run_id, or the table is missing) — the caller
+    must not assume it owns the run.
+    """
+    if not db or not run_id:
+        _log("take_lease: db and run_id required")
+        return None, None
+    ts = _now(now)
+    token = owner_token or mint_token()
+    exp = ts + max(1, int(ttl_s))
+    con = None
+    try:
+        con = _open(db)
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT owner_token FROM run_leases WHERE run_id=?", (run_id,)
+        ).fetchone()
+        displaced = None if row is None or row[0] == token else str(row[0])
+        if row is None:
+            con.execute(
+                "INSERT INTO run_leases(run_id, owner_token, acquired_at, expires_at, renewed_at) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, token, ts, exp, ts),
+            )
+        else:
+            # Unconditional: the whole point is to win a lease that is still
+            # live. The WHERE names only the run so a concurrent handoff
+            # cannot turn this into a silent no-op.
+            con.execute(
+                "UPDATE run_leases SET owner_token=?, acquired_at=?, expires_at=?, renewed_at=? "
+                "WHERE run_id=?",
+                (token, ts, exp, ts, run_id),
+            )
+        con.execute("COMMIT")
+        return token, displaced
+    except sqlite3.Error as e:  # fallback-guard: allow: (None, None) is the documented "no lease taken" answer — the caller must not dispatch, and the cause is logged
+        _log(f"take_lease: {e}")
+        if con is not None:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # fallback-guard: allow: a failed ROLLBACK means this connection is already unusable; the outer answer is unchanged
+                pass
+        return None, None
     finally:
         if con is not None:
             con.close()

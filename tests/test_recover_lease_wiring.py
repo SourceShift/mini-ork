@@ -158,6 +158,65 @@ def test_recover_acquires_lease_and_is_idempotent(tmp_path, db_path, monkeypatch
     assert reqs2[1] == 1, "the node was not dispatched a second time"
 
 
+def test_take_lease_recovers_a_run_a_dead_worker_still_holds(tmp_path, db_path, monkeypatch, capsys):
+    """N4: a killed recovery keeps the lease for its 15-minute TTL, so the
+    operator has no way in unless ``--take-lease`` can displace the holder."""
+    import time
+
+    run_id = "run-e3-take-1"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    workflow = tmp_path / "wf.yaml"
+    _workflow(workflow)
+    for n in ("A", "B", "C"):
+        _seed_success(db_path, run_id, n, recipe, tc, str(run_dir))
+
+    # A live lease held by the worker that died (or hung) — not expired, so
+    # acquire_lease refuses.
+    now = int(time.time())
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "INSERT INTO run_leases(run_id, owner_token, acquired_at, expires_at, renewed_at) "
+        "VALUES (?,?,?,?,?)", (run_id, "dead-worker-token", now, now + 900, now))
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("MINI_ORK_RECIPE", recipe)
+    for k in ("MINI_ORK_LEASE_TOKEN", "MINI_ORK_LEASE_RUN_ID", "MINI_ORK_RECOVERY_REQUEST"):
+        monkeypatch.delenv(k, raising=False)
+
+    # ── without the flag: refused, and the refusal names the way in ──
+    rc = rp.main([run_id, "--strategy", "resume", "--workflow", str(workflow), "--db", db_path])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "already being recovered" in out
+    assert "--take-lease" in out
+    assert "dispatching closure" not in out
+    con = sqlite3.connect(db_path)
+    assert con.execute("SELECT owner_token FROM run_leases WHERE run_id=?",
+                       (run_id,)).fetchone()[0] == "dead-worker-token"
+    con.close()
+
+    # ── with it: the lease is taken, the run dispatches, the old token is fenced ──
+    rc = rp.main([run_id, "--strategy", "resume", "--workflow", str(workflow),
+                  "--db", db_path, "--take-lease"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "took the run lease from dead-worker" in out
+    assert "dispatching closure" in out
+    con = sqlite3.connect(db_path)
+    owner = con.execute("SELECT owner_token FROM run_leases WHERE run_id=?",
+                        (run_id,)).fetchone()[0]
+    con.close()
+    assert owner != "dead-worker-token"
+    assert os.environ.get("MINI_ORK_LEASE_TOKEN") == owner
+    from mini_ork.stores import lease
+    assert lease.is_lease_holder(db_path, run_id, "dead-worker-token") is False
+
+
 def test_recover_on_legacy_db_without_lease_tables_still_dispatches(tmp_path, monkeypatch, capsys):
     """A pre-0052 DB (no run_leases/recovery_requests) recovers fence-free —
     E3 wiring must not block a legacy consumer."""
