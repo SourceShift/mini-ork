@@ -32,8 +32,15 @@ CREATE TABLE IF NOT EXISTS theme_clusters (
 
 CREATE INDEX IF NOT EXISTS idx_theme_clusters_kind ON theme_clusters(kind);
 
--- Preserve every cluster column on the move. Or IGNORE covers the case where
--- runtime ensure_schema() already created the row before this migration ran.
+-- Preserve every cluster column on the move. EVERY row is copied, authored
+-- ones included: before the split an authored theme was also a live cluster
+-- candidate (``assign_new`` read all of ``lesson_themes``), so leaving it out
+-- would drop that centroid from the clustering space and let its paraphrases
+-- start a duplicate theme — and ``_refresh_theme`` would never update its
+-- stats again. The authored copy stays in ``lesson_themes`` for the readers
+-- that want authored lessons; both copies are kept in step by
+-- ``_refresh_theme``. Or IGNORE covers the case where runtime
+-- ``ensure_schema()`` already created the row before this migration ran.
 INSERT OR IGNORE INTO theme_clusters (
   theme_id, kind, role, task_class, representative, centroid,
   n_gradients, n_runs, n_at_refresh, first_seen, last_seen,
@@ -42,11 +49,10 @@ INSERT OR IGNORE INTO theme_clusters (
 SELECT theme_id, kind, role, task_class, representative, centroid,
        n_gradients, n_runs, n_at_refresh, first_seen, last_seen,
        bug_report_id, updated_at
-  FROM lesson_themes
- WHERE COALESCE(lesson_text, '') = '';
+  FROM lesson_themes;
 
--- Delete only the rows that were moved; authored lessons (and any row that
--- failed the WHERE above) stay in lesson_themes.
+-- Delete only the unauthored rows that were moved; authored lessons stay in
+-- lesson_themes, which is the store the lesson blocks read.
 DELETE FROM lesson_themes WHERE COALESCE(lesson_text, '') = '' AND theme_id IN (SELECT theme_id FROM theme_clusters);
 
 PRAGMA foreign_keys = ON;

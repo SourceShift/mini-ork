@@ -605,6 +605,138 @@ def test_assign_new_works_on_db_without_migration(tmp_path: Path) -> None:
     assert report == {"assigned": 0, "themes_new": 0, "themes_total": 0}
 
 
+# ── migration 0087: the cluster store split ─────────────────────────────────
+
+
+def _seed_pre_split_lessons(db: str) -> None:
+    """A pre-0087 DB: clusters and lessons both live in ``lesson_themes``.
+
+    ``ensure_schema`` runs first because that is what a runtime check does
+    before any migration — it creates an EMPTY ``theme_clusters``, which is
+    also the case ``INSERT OR IGNORE`` has to survive.
+    """
+    th.ensure_schema(db)
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations("
+            " filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT)"
+        )
+        for tid, text, status, n_runs in (
+            ("th-blank", None, "candidate", 4),
+            ("th-authored", "Authored lesson.", "verified", 6),
+        ):
+            con.execute(
+                "INSERT INTO lesson_themes (theme_id, kind, representative,"
+                " centroid, n_gradients, n_runs, lesson_text, status)"
+                " VALUES (?, 'task', 'rep', ?, 3, ?, ?, ?)",
+                (tid, th._centroid_to_blob({}), n_runs, text, status),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_migration_0087_copies_every_cluster_row_and_keeps_authored_lessons(
+        tmp_path: Path) -> None:
+    """Both rows reach ``theme_clusters``; only the unauthored one leaves.
+
+    The authored row must be copied TOO: pre-split it was also a live cluster
+    candidate, so leaving it out of the cluster store would let its paraphrases
+    start a duplicate theme and freeze its stats.
+    """
+    path = str(tmp_path / "pre-split.db")
+    _seed_pre_split_lessons(path)
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            (_REPO / "db" / "migrations" / "0087_theme_clusters.sql")
+            .read_text(encoding="utf-8"))
+        clusters = sorted(r[0] for r in con.execute(
+            "SELECT theme_id FROM theme_clusters"))
+        lessons = sorted(r[0] for r in con.execute(
+            "SELECT theme_id FROM lesson_themes"))
+        copied_runs = con.execute(
+            "SELECT n_runs FROM theme_clusters WHERE theme_id = 'th-authored'"
+        ).fetchone()[0]
+        recorded = con.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+            " WHERE filename = '0087_theme_clusters.sql'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert clusters == ["th-authored", "th-blank"]
+    assert lessons == ["th-authored"]
+    assert copied_runs == 6
+    assert recorded == 1
+
+
+def test_migration_0087_is_idempotent(tmp_path: Path) -> None:
+    """Re-running the SQL changes nothing — the DELETE cannot eat authored rows."""
+    path = str(tmp_path / "pre-split.db")
+    _seed_pre_split_lessons(path)
+    sql = (_REPO / "db" / "migrations" / "0087_theme_clusters.sql").read_text(
+        encoding="utf-8")
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(sql)
+        con.executescript(sql)
+        clusters = sorted(r[0] for r in con.execute(
+            "SELECT theme_id FROM theme_clusters"))
+        lessons = sorted(r[0] for r in con.execute(
+            "SELECT theme_id FROM lesson_themes"))
+    finally:
+        con.close()
+    assert clusters == ["th-authored", "th-blank"]
+    assert lessons == ["th-authored"]
+
+
+def test_unmigrated_db_still_reads_its_clusters(tmp_path: Path) -> None:
+    """Pre-split rows are cluster candidates even before the migration runs.
+
+    Without this the clustering space looks empty on an old home and every
+    gradient re-clusters into a duplicate theme.
+    """
+    path = str(tmp_path / "legacy.db")
+    _seed_pre_split_lessons(path)
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = th._members_of(con, "task")
+        stats = th._stats_con(con)
+    finally:
+        con.close()
+    assert sorted(r["theme_id"] for r in rows) == ["th-authored", "th-blank"]
+    assert stats["themes_per_kind"]["task"] == 2
+
+
+def test_migrated_db_does_not_double_count_a_promoted_lesson(
+        tmp_path: Path) -> None:
+    """A cluster copied into lesson_themes by ``promote`` is one cluster, not two."""
+    path = str(tmp_path / "migrated.db")
+    _seed_pre_split_lessons(path)
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.executescript(
+            (_REPO / "db" / "migrations" / "0087_theme_clusters.sql")
+            .read_text(encoding="utf-8"))
+        # promote's copy: same theme_id in both stores.
+        con.execute(
+            "INSERT INTO lesson_themes (theme_id, kind, representative,"
+            " centroid, n_gradients, n_runs, lesson_text, status)"
+            " SELECT theme_id, kind, representative, centroid, n_gradients,"
+            "        n_runs, 'Authored.', 'verified'"
+            "   FROM theme_clusters WHERE theme_id = 'th-blank'"
+        )
+        rows = th._members_of(con, "task")
+        stats = th._stats_con(con)
+    finally:
+        con.close()
+    assert sorted(r["theme_id"] for r in rows) == ["th-authored", "th-blank"]
+    assert stats["themes_per_kind"]["task"] == 2
+
+
 # ── member-class task_class (LF-R1) ─────────────────────────────────────────
 
 

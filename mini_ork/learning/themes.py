@@ -521,13 +521,35 @@ def _theme_id(kind: str, first_gradient_id: str) -> str:
 # ── Connection-scoped readers ───────────────────────────────────────────────
 
 
+# Every cluster READ goes through this fragment rather than naming
+# ``theme_clusters`` directly. After migration 0087 the cluster store is
+# authoritative, but a home the migration has not touched yet still keeps its
+# clusters in ``lesson_themes`` — pre-split, EVERY row there was a cluster
+# candidate, authored ones included. Reading only the new table on an
+# unmigrated DB would present an empty clustering space, so ``assign_new``
+# would re-cluster every gradient into a fresh duplicate theme and an existing
+# theme's stats would freeze. "In lesson_themes but not in theme_clusters" is
+# exactly the pre-split cluster set; ``NOT IN`` keeps a migrated DB (where
+# ``promote`` copies a cluster into lesson_themes) from double-counting.
+_CLUSTER_SOURCE = (
+    "SELECT theme_id, kind, role, task_class, representative, centroid,"
+    "       n_gradients, n_runs, n_at_refresh, first_seen, last_seen,"
+    "       bug_report_id, updated_at FROM theme_clusters"
+    " UNION ALL"
+    " SELECT theme_id, kind, role, task_class, representative, centroid,"
+    "       n_gradients, n_runs, n_at_refresh, first_seen, last_seen,"
+    "       bug_report_id, updated_at FROM lesson_themes"
+    "  WHERE theme_id NOT IN (SELECT theme_id FROM theme_clusters)"
+)
+
+
 def _members_of(con: sqlite3.Connection, kind: str) -> list[sqlite3.Row]:
     """Existing clusters of one kind, ordered by id for stable iteration."""
     return list(
         con.execute(
             "SELECT theme_id, centroid, n_gradients, n_at_refresh, first_seen,"
             "       last_seen, role, task_class, representative"
-            "  FROM theme_clusters WHERE kind = ? ORDER BY theme_id",
+            f"  FROM ({_CLUSTER_SOURCE}) WHERE kind = ? ORDER BY theme_id",
             (kind,),
         )
     )
@@ -1329,20 +1351,14 @@ def promote(
             existing = con.execute(
                 "SELECT 1 FROM lesson_themes WHERE theme_id = ?", (tid,)
             ).fetchone()
-            if existing is not None:
-                # Legacy candidate already lives in lesson_themes — author it
-                # in place. The cluster row (if any) is left untouched.
-                con.execute(
-                    "UPDATE lesson_themes SET lesson_text = ?,"
-                    " status = 'verified', updated_at = ? WHERE theme_id = ?",
-                    (text, now, tid),
-                )
-            else:
+            if existing is None:
                 # The authored lesson is a copy of the cluster row; the
                 # cluster itself stays in theme_clusters so future gradients
-                # keep joining it.
+                # keep joining it. OR IGNORE: a concurrent promote (or a
+                # legacy row another writer just created) may win the insert,
+                # and losing that race must not abort the whole batch.
                 con.execute(
-                    "INSERT INTO lesson_themes ("
+                    "INSERT OR IGNORE INTO lesson_themes ("
                     "  theme_id, kind, role, task_class, representative,"
                     "  centroid, n_gradients, n_runs, n_at_refresh, first_seen,"
                     "  last_seen, lesson_text, status, bug_report_id, updated_at"
@@ -1352,6 +1368,15 @@ def promote(
                     "  FROM theme_clusters WHERE theme_id = ?",
                     (text, now, tid),
                 )
+            # Author whichever row is there and still blank: the copy just
+            # inserted, a legacy candidate seeded from the cluster, or a
+            # concurrent promote's row. Never overwrite authored text.
+            con.execute(
+                "UPDATE lesson_themes SET lesson_text = ?,"
+                " status = 'verified', updated_at = ?"
+                " WHERE theme_id = ? AND COALESCE(lesson_text, '') = ''",
+                (text, now, tid),
+            )
             con.commit()
             report["promoted"] += 1
         return report
@@ -1431,7 +1456,7 @@ def _sample_member_pairs(con: sqlite3.Connection, limit: int = 5) -> list:
     """``limit`` member-signal pairs from the largest theme (seeded, so the
     proof block is reproducible)."""
     row = con.execute(
-        "SELECT theme_id FROM theme_clusters"
+        f"SELECT theme_id FROM ({_CLUSTER_SOURCE})"
         "  ORDER BY n_gradients DESC, theme_id LIMIT 1"
     ).fetchone()
     if not row:
@@ -1474,12 +1499,12 @@ def stats(db_path: str | None = None) -> dict:
 def _stats_con(con: sqlite3.Connection) -> dict:
     per_kind = dict(
         con.execute(
-            "SELECT kind, COUNT(*) FROM theme_clusters GROUP BY kind"
+            f"SELECT kind, COUNT(*) FROM ({_CLUSTER_SOURCE}) GROUP BY kind"
         ).fetchall() or []
     )
     ge3 = list(
         con.execute(
-            "SELECT theme_id, n_gradients FROM theme_clusters"
+            f"SELECT theme_id, n_gradients FROM ({_CLUSTER_SOURCE})"
             "  WHERE n_gradients >= 3"
         )
     )
@@ -1497,7 +1522,8 @@ def _stats_con(con: sqlite3.Connection) -> dict:
     top10 = list(
         con.execute(
             "SELECT theme_id, kind, n_gradients, representative"
-            "  FROM theme_clusters ORDER BY n_gradients DESC, theme_id LIMIT 10"
+            f"  FROM ({_CLUSTER_SOURCE})"
+            "  ORDER BY n_gradients DESC, theme_id LIMIT 10"
         )
     )
     return {
