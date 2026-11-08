@@ -271,6 +271,11 @@ def learning_governed_lane(
                 route_score=decision.get("route_score"),
                 route_margin=decision.get("route_margin"),
                 predicted_error=decision.get("predicted_error"),
+                # The region decide() derived from the scoped run dir, or None
+                # for node types that route on the default segment. Pass it
+                # through untouched — the trace layer persists the NULL as NULL
+                # rather than substituting an inferred region.
+                code_region=decision.get("code_region"),
             )
         return route or current_lane
     except Exception:

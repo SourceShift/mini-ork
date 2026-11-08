@@ -4804,12 +4804,12 @@ def _make_trace_fn(task_class, db, run_id):
     lane_router_recompute_advantages has real signal to learn from.
     Signature matches dispatch_node's `trace(node_id, status, node_type, output_file,
     verdict, finish_reason, lane, route_source, route_explore, route_score,
-    route_margin, predicted_error)`."""
+    route_margin, predicted_error, code_region)`."""
     from mini_ork import trace_store  # noqa: PLC0415
 
     def _tf(node_id, status, node_type, output_file="", verdict="", finish_reason="",
             lane="", route_source="", route_explore=False, route_score=None,
-            route_margin=None, predicted_error=None):
+            route_margin=None, predicted_error=None, code_region=None):
         extra = {
             "trace_id": f"tr-{node_type}-{node_id}-{uuid.uuid4().hex[:8]}",
             "run_id": run_id,
@@ -4853,6 +4853,12 @@ def _make_trace_fn(task_class, db, run_id):
             # a missing prediction means "uncalibratable row", not a broken write.
             if predicted_error is not None:
                 extra["predicted_error"] = float(predicted_error)
+            # The region decide() routed on. Only written when routing recorded
+            # one: a NULL must stay NULL (never substituted from the run dir),
+            # and the files_written-derived UPDATE below remains the
+            # implementer's override.
+            if code_region is not None:
+                extra["code_region"] = code_region
         # Implementer code_region must reflect the TARGET repo's edited source,
         # not the .mini-ork run-log path. Seed files_written from git-visible
         # target-repo changes FIRST so infer_trace_code_region resolves the

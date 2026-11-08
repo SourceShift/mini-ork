@@ -106,6 +106,7 @@ _TRACE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("route_score", "coalesce"),
     ("route_margin", "coalesce"),
     ("predicted_error", "coalesce"),
+    ("code_region", "coalesce"),
 )
 
 
@@ -157,6 +158,7 @@ def _trace_values(
         "predicted_error": (
             float(p["predicted_error"]) if p.get("predicted_error") is not None else None
         ),
+        "code_region": p.get("code_region"),
     }
 
 
