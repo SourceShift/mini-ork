@@ -10,7 +10,7 @@ runs that must **not** be revived.
 
 | Bucket | Runs | Spend |
 |---|---:|---:|
-| Total failed rows | 730 | $1,931.33 |
+| Total failed rows | 730 | $1,931.58 |
 | No run dir — unrecoverable | 574 | $1,498.74 |
 | Run dir present — evaluable | 156 | $432.59 |
 | … with a reusable checkpoint (`reuse > 0`) | 137 | — |
@@ -251,6 +251,63 @@ left ten of them behind (the two whose tip was already on `main` did get
 deleted). Those ten were removed with `git branch -D` only after the record
 above proved each one landed, superseded or declined — never on the assumption
 that the oracle was merely confused.
+
+## The five cycles that ran while this batch was open
+
+Five `rsi-cycle` runs finished after the twelve worktrees above were settled.
+Each was checked the same way: does its patch — or its effect — exist on `main`?
+
+| Cycle | Outcome | What happened to the work |
+|---|---|---|
+| `rsi-c1793843972-ed0cb372` | merged `50a62ea5` | no verifier rubrics or criteria exist (V2) |
+| `rsi-c1793848872-168266ff` | merged `d97c9ee1` | `defect_attributions` gets no attribution from a real failure (V4) |
+| `rsi-c1793875769-78de48f9` | merged `bd604395` | `reflection_log` is never written — no reflection work is queued (L2) |
+| `rsi-c1793838883-f4ebc6ed` | `error` | the SUGGEST run exited 1 on two panel lanes; its suggestion landed later as `bd604395`, its alternative proposal (`db:V4`) harvest retired as `fixed_externally` |
+| `rsi-c1793879232-5a3f7534` | quarantined `metric_unchanged` | the diff was right and the gate's metric was not; landed by hand as `47033bb5`, re-cut as `25cdec47`, and the rule rebuilt as two structural rules by `31f7e05c` |
+
+`rsi-c1793838883` is the one that looks like salvageable work and is not.
+`verdict.json` says `pass` with `failed_nodes: 0` while `execute.log` ends
+`execute: 2 node(s) failed` and the cycle row records
+`SUGGEST run exited 1 with a failed contract verify: verdict='pass'`: the panel
+lost two lenses, not the run its candidate. Both things it could have produced
+are already accounted for — `bd604395` landed the same suggestion from a later
+cycle, and the `db:V4` proposal it also drafted is on harvest's monitor-only
+list (a writer exists and is called; only a real failure adds a row).
+
+`rsi-c1793879232` is the useful one, because the quarantine was right twice over.
+G8 refused it because `db:R5`'s success metric asked for rows in
+`policy_decisions`, re-read on a copy of the state db that `tests/conftest.py`
+empties before every test on purpose — a correct patch re-asks red. The child's
+body also carried a real defect: it handed `record_decision()`
+`context.db_or_default()`, whose fallback arm resolves `./.mini-ork/state.db`,
+the CWD-relative live-db hazard `MINI_ORK_NO_CWD_DB` exists to close. The wiring
+landed by hand as `47033bb5` and was re-cut as `25cdec47` after the review panel
+blocked it on exactly that finding; the rule was then rebuilt as two structural
+predicates (`31f7e05c`) — `policy_decisions` on a `record_decision` call site
+*inside the router*, `brain_decisions` on any called writer. The old `db:R5`
+ledger row is retired by `ledger.reconcile` on the next non-dry cycle, not by
+hand.
+
+Three other failed runs were never revive candidates, recorded here so the
+inventory is complete. Two of them are counted in the Tier 2 buckets below; both
+landed anyway, so a bucket says which gate stopped the run, never whether its
+work reached `main`.
+
+- `bif-f2-precheck-and-failed-checks-20261027-160624` — failed on
+  `reviewer_escalated`, but `wt/bif-f2`'s tip `e3956bb2` is an ancestor of
+  `main`: the work landed the same day.
+- `rrl-3-benchmarks-20261029-095650` — `spec-test-defect` (two tests no
+  implementation can satisfy) plus `impl_moved_base` from a rebase inside the
+  implementer window; the deliverable, `mini_ork/rsi/benchmarks.py`, landed as
+  `a8ab7d79`.
+- `sdd-smoke-20261031-001808` — a smoke run, not a deliverable: no
+  `verdict.json`, `reaped: dispatcher pid gone`, and its kickoff lived in
+  another session's `/private/tmp` scratchpad and is gone. Parked with `sde-4`:
+  a revive cannot restate a goal nobody recorded.
+
+What the batch leaves open is `db:R5b` — `brain_decisions` has no writer at all
+since the bash brain advisor was removed — and it is now the queue's global-max
+candidate at severity 73. That is the loop's next job, not this batch's.
 
 ## Tier 2 — deferred, cause first
 
