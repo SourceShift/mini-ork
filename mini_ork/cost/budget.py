@@ -250,9 +250,9 @@ def marker_path(run_dir: str | os.PathLike | None) -> str | None:
 def record(run_dir: str | os.PathLike | None, v: Verdict) -> None:
     """Keep ``<run_dir>/.budget-exhausted`` truthful, or remove it.
 
-    The marker is what the attention inbox reads; it must not outlive the
-    condition. Called once per dispatch, so the not-exhausted path
-    is a single ``os.path.exists`` when the marker was never written.
+    The marker is what the IDE run page and the attention inbox read; it must
+    not outlive the condition. Called once per dispatch, so the not-exhausted
+    path is a single ``os.path.exists`` when the marker was never written.
     """
     path = marker_path(run_dir)
     if not path:

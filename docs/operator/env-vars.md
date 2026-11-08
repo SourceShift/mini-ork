@@ -99,8 +99,8 @@ When the ceiling is reached the next node is refused with finish reason
 `budget_exhausted`, the run **parks** with the same rc a review pause uses
 (9) — the plan, the worktree and every finished node survive — and
 `<run_dir>/.budget-exhausted` records `spent_usd` / `budget_usd` / `detail`
-for the attention inbox (`mini-ork board inbox` leads with it, above the
-periodic cost-pause). Raise the ceiling and resume the same run:
+for the IDE run page and the attention inbox (`mini-ork board inbox` leads with
+it, above the periodic cost-pause). Raise the ceiling and resume the same run:
 
 ```bash
 MO_RUN_BUDGET_USD=40 mini-ork resume <run-id>

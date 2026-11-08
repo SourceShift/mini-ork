@@ -1,8 +1,11 @@
 """Runs & live execution — every run, what is in flight, and the event hooks.
 
 Tabs: ``runs`` (All runs, filterable), ``active`` (Active & control),
-``hooks`` (Event hooks). Data: ``acp.fleet.fleet_rows`` for the run table,
-``run_events`` node lifecycle rows for heartbeats and the event tail.
+``scope`` (Scope & claims — every live worktree's declared file scope, with
+the paths two runs both declared), ``hooks`` (Event hooks). Data:
+``acp.fleet.fleet_rows`` for the run table, ``run_events`` node lifecycle rows
+for heartbeats and the event tail, ``workspaces.list_open`` + each run's
+``run_profile.json`` for the scope tab.
 """
 from __future__ import annotations
 
@@ -15,7 +18,8 @@ from typing import Any
 from mini_ork.dispatch.llm_dispatch import error_message_head
 from mini_ork.ide_pages import spec as S
 
-TABS = [("runs", "All runs"), ("active", "Active & control"), ("hooks", "Event hooks")]
+TABS = [("runs", "All runs"), ("active", "Active & control"),
+        ("scope", "Scope & claims"), ("hooks", "Event hooks")]
 FILTERS = ("all", "working", "needs_you", "failed", "done")
 _RUN_LIMIT = 40
 _ACTIVE_LIMIT = 20
@@ -318,6 +322,95 @@ def _hook_sources(home: Path) -> list[tuple[str, str]]:
     return found
 
 
+def _scope_rows(home: Path) -> list[dict[str, Any]]:
+    """Every open workspace with the file scope its run declared (p2-16).
+
+    The cross-run view exists for one question: two live runs editing the same
+    files. Claims (the worktree driver's ``.ownership``) are keyed by worktree
+    slug, but a *run* declares its scope in ``run_profile.json``, so the rows
+    come from the run's own record and the overlap check is on the normalized
+    path set ``preferences.scope_paths`` builds — the same set the injection
+    path uses, not a second parse.
+    """
+    from mini_ork.ide_pages import run as run_page
+
+    try:
+        from mini_ork import workspaces
+
+        open_ws = workspaces.list_open(home)
+    except Exception:  # noqa: BLE001 — no workspaces is a valid, empty answer
+        return []
+    rows: list[dict[str, Any]] = []
+    for ws in open_ws:
+        run_dir = home / "runs" / ws.run_id
+        try:
+            scope = run_page.declared_scope(run_dir)
+        except Exception:  # noqa: BLE001 — one unreadable profile costs its row, not the tab
+            scope = {"target": "", "paths": []}
+        paths = list(scope["paths"])
+        rows.append({
+            "run_id": ws.run_id,
+            "branch": ws.branch,
+            "base_branch": ws.base_branch,
+            "path": str(ws.path),
+            "paths": paths,
+            "target": scope["target"],
+        })
+    return rows
+
+
+def _overlaps(rows: list[dict[str, Any]]) -> list[tuple[str, list[str]]]:
+    """``(path, run ids that declared it)`` for every path claimed by 2+ live runs."""
+    by_path: dict[str, list[str]] = {}
+    for row in rows:
+        for p in row["paths"]:
+            by_path.setdefault(p, []).append(row["run_id"])
+    return sorted((p, ids) for p, ids in by_path.items() if len(ids) > 1)
+
+
+def _scope(home: Path) -> list[dict[str, Any]]:
+    rows = _scope_rows(home)
+    if not rows:
+        return [S.callout(
+            "No open worktrees",
+            "Every run that declared a file scope has finished or been discarded. "
+            "The cross-run view lists live worktrees only — a finished run's scope "
+            "is on its own Run tab.",
+            tone="green", icon="✓", full=True)]
+    overlaps = _overlaps(rows)
+    head: list[dict[str, Any]] = []
+    if overlaps:
+        head.append(S.callout(
+            f"{len(overlaps)} path{'s' if len(overlaps) != 1 else ''} claimed by more "
+            f"than one live run",
+            "Two runs editing the same file will conflict at merge time. Declared "
+            "scope is advisory — check the branches before merging either.",
+            tone="yellow", icon="!", full=True))
+        head.append(S.lst("Overlapping paths", [
+            S.item(p, " · ".join(ids), m="!", mc="yellow", is_mono=True)
+            for p, ids in overlaps[:20]], full=True))
+    overlapping = {p for p, _ids in overlaps}
+    table_rows = []
+    for row in rows:
+        declared = (f"{len(row['paths'])} file{'s' if len(row['paths']) != 1 else ''}"
+                    if row["paths"] else "none declared")
+        hit = any(p in overlapping for p in row["paths"])
+        table_rows.append({
+            "cells": [S.mono(row["run_id"]), S.mono(row["branch"], "sub"),
+                      S.cell(declared, "yellow" if hit else "body"),
+                      S.mono(" · ".join(row["paths"][:3]) or "—", "sub")],
+            "do": S.page_link("run", "overview", run=row["run_id"]),
+        })
+    return head + [S.table(
+        "Live worktrees & declared scope",
+        [S.col(fr=1.4), S.col(fr=1.2), S.col(120), S.col(fr=2.4)],
+        ["run", "branch", "scope", "files"],
+        table_rows, full=True,
+        note="Declared in each run's kickoff (run_profile.json scope_allow). It selects "
+             "which path-scoped preferences are injected; it is not a write sandbox. "
+             "Click a row for that run's Scope section.")]
+
+
 def _hooks(home: Path, now: int) -> list[dict[str, Any]]:
     sources = _hook_sources(home)
     docs = Path(__file__).resolve().parents[2] / "docs" / "EVENT-HOOKS.md"
@@ -377,6 +470,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     errors: dict[str, str] = {}
     if tab == "active":
         sections = S.guarded(errors, "Active dispatches", lambda: _active(home, now))
+    elif tab == "scope":
+        sections = S.guarded(errors, "Scope", lambda: _scope(home))
     elif tab == "hooks":
         sections = S.guarded(errors, "Event hooks", lambda: _hooks(home, now))
     else:

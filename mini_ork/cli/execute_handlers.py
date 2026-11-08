@@ -686,7 +686,8 @@ def _budget_gate(db, run_id, run_dir, node_id):
 
     The durable ``<run_dir>/.budget-exhausted`` marker is kept truthful here —
     written on a refusal, removed once the run fits under the ceiling again —
-    because the attention inbox reads the marker, not this gate.
+    because the IDE run page and the attention inbox read the marker, not this
+    gate.
     """
     from mini_ork.cost import budget as cost_budget  # noqa: PLC0415
 

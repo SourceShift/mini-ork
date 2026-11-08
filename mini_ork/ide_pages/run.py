@@ -546,14 +546,32 @@ def _has_cost_data(run: Run) -> bool:
     return run.card.get("cost_total") is not None or run.row.get("cost_usd") is not None
 
 
-def _per_run_cap() -> float | None:
-    """The run's spend cap, from ``watch.cost_cap_usd`` — never re-derived here.
+def _per_run_cap(run: "Run | None" = None) -> float | None:
+    """The run's spend cap — never re-derived here.
 
-    Imported lazily and looked up on the module at call time: the fallback
-    chain (``MO_WATCH_COST_USD`` → ``MO_ORCH_BUDGET_USD`` → 1.0) lives in one
-    place, and a broken read returns ``None`` so the caller can show the spent
-    number without inventing a cap.
+    Two sources, in order, because they are not the same promise:
+
+    * a ceiling the operator **declared** for this run
+      (``mini_ork.cost.budget``: ``MO_RUN_BUDGET_USD`` then
+      ``run_profile.json`` → ``budget_usd``) is what the dispatch gate
+      actually enforces, so the page must show that number and not a
+      different one;
+    * otherwise the watcher's own resolver (``watch.cost_cap_usd``), kept for
+      the cases with no declared ceiling at all.
+
+    Both are read lazily and through their one source of truth; a broken read
+    returns ``None`` so the caller can show the spent number without inventing
+    a cap.
     """
+    if run is not None:
+        try:
+            from mini_ork.cost import budget
+
+            declared = budget.declared(run.run_dir)
+        except Exception:  # noqa: BLE001 — a broken declaration costs the cap, not the page
+            declared = None
+        if declared is not None and declared > 0:
+            return declared
     try:
         from mini_ork.acp_orchestrator import watch
 
@@ -561,6 +579,20 @@ def _per_run_cap() -> float | None:
     except Exception:  # noqa: BLE001 — a broken cap source costs the cap, not the page
         return None
     return cap if cap > 0 else None
+
+
+def _budget_marker(run: Run) -> dict[str, Any] | None:
+    """The run's ``.budget-exhausted`` payload, or ``None`` when it is not parked.
+
+    Read through ``mini_ork.cost.budget`` so the page and the attention inbox
+    cannot disagree about whether the run is stopped on its ceiling.
+    """
+    try:
+        from mini_ork.cost import budget
+
+        return budget.read_marker(run.run_dir)
+    except Exception:  # noqa: BLE001 — a broken marker costs the line, not the page
+        return None
 
 
 def _daily_cap() -> float:
@@ -653,7 +685,7 @@ def _spend_numbers(run: Run) -> dict[str, float] | None:
         return None
     spent = _cost(run)
     out: dict[str, float] = {"spent": round(spent, 2)}
-    cap = _per_run_cap()
+    cap = _per_run_cap(run)
     if cap is not None:
         out["cap"] = round(cap, 2)
         out["remaining"] = round(max(cap - spent, 0.0), 2)
@@ -672,8 +704,16 @@ def _spend_section(run: Run) -> dict[str, Any]:
     leaves the spent sentence, never an exception and never a made-up number.
     """
     spent = _cost(run)
-    cap = _per_run_cap()
+    cap = _per_run_cap(run)
     items: list[dict[str, Any]] = []
+    # The gate parks a run that spent its declared ceiling; the same fact the
+    # inbox leads with belongs on the page that shows the number, or the run
+    # reads as merely expensive instead of stopped.
+    parked = _budget_marker(run)
+    if parked is not None:
+        items.append(S.bad(
+            "Parked — this run spent its declared per-run budget. "
+            "Raise MO_RUN_BUDGET_USD (or run_profile.json budget_usd), then resume."))
     if cap is None:
         items.append(S.dot(f"{S.money(spent)} spent",
                            "per-run cap unavailable — the watcher could not be read"))
@@ -1943,9 +1983,10 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
         # but the operator action is to lift the cost cap (resume), not to ack
         # a code change. Treat it as the dedicated branch it is.
         if hint.get("retryable") and strategy == "resume-cost":
-            # Name the cap that was hit, from the same watcher source the pause
-            # uses; the button and its confirmation stay byte-identical.
-            cap = _per_run_cap()
+            # Name the cap that was hit, from the same source the gate reads
+            # (declared ceiling first, then the watcher); the button and its
+            # confirmation stay byte-identical.
+            cap = _per_run_cap(run)
             cap_text = f" (the {S.money(cap)} per-run cap)" if cap is not None else ""
             return S.lst("Retry", [S.ok(
                 f"Resume this cost-paused run with `mini-ork resume {run.id}`{cap_text}.")],
@@ -2088,6 +2129,7 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
 
     return ((S.guarded(errors, "Retry", retry_section) if include_retry else [])
             + S.guarded(errors, "Run inputs", inputs)
+            + S.guarded(errors, "Scope", lambda: _scope_section(run))
             + S.guarded(errors, "Why? — evidence",
                         lambda: why_section(run, title="Why? — evidence"))
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
@@ -3263,6 +3305,83 @@ def _human(n: int) -> str:
     if n < 1_048_576:
         return f"{n / 1024:.1f} KB"
     return f"{n / 1_048_576:.1f} MB"
+
+
+# ── declared scope (p2-16) ──────────────────────────────────────────────────
+#
+# A kickoff's "Files in scope" section becomes ``run_profile.json``'s
+# ``scope_allow`` / ``scope_deny`` (one parser: ``mini_ork.kickoff_scope``).
+# It is a DECLARATION, not a sandbox: the only thing it gates today is which
+# path-scoped operator preferences and memories are injected
+# (``memory.preferences``), while the worktree branch and the verifier's own
+# diff are what actually bound the edit. The page says both, because a scope
+# line that reads like enforcement is worse than no line at all.
+_SCOPE_SHOWN = 8
+
+
+def declared_scope(run_dir: Path) -> dict[str, Any]:
+    """What a run's profile declares it may touch: ``roots`` + allow/deny.
+
+    ``paths`` is the normalized set ``preferences.scope_paths`` builds (the one
+    the injection path uses), so what the page shows is what the engine acts on
+    — not a second parse of the same bullets.
+    """
+    from mini_ork.memory import preferences
+
+    profile = _run_profile_for(run_dir)
+    roots = profile.get("roots") if isinstance(profile.get("roots"), dict) else {}
+    raw_allow = [str(e) for e in profile.get("scope_allow") or [] if str(e).strip()]
+    raw_deny = [str(e) for e in profile.get("scope_deny") or [] if str(e).strip()]
+    return {
+        "target": str(roots.get("target") or profile.get("target_repo") or ""),
+        "cwd": str(roots.get("exec_cwd") or ""),
+        "paths": preferences.scope_paths(str(run_dir)),
+        "allow": raw_allow,
+        "deny": raw_deny,
+    }
+
+
+def _run_profile_for(run_dir: Path) -> dict[str, Any]:
+    try:
+        data = json.loads((run_dir / "run_profile.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _scope_section(run: Run) -> dict[str, Any]:
+    """This run's declared scope, the branch its edit lands on, and the caveat."""
+    scope = declared_scope(run.run_dir)
+    items: list[dict[str, Any]] = []
+    if scope["target"]:
+        items.append(S.item("target", scope["target"], is_mono=True, m="▸", mc="sub"))
+    if scope["cwd"] and scope["cwd"] != scope["target"]:
+        items.append(S.item("exec cwd", scope["cwd"], is_mono=True, m="▸", mc="sub"))
+    paths = scope["paths"]
+    if paths:
+        head = f"Files in scope · {len(paths)}"
+        shown = [S.item(p, "", is_mono=True) for p in paths[:_SCOPE_SHOWN]]
+        if len(paths) > _SCOPE_SHOWN:
+            shown.append(S.dot(f"…and {len(paths) - _SCOPE_SHOWN} more", mc="muted"))
+        items.append(S.lst(head, shown, full=True))
+    denies = scope["deny"]
+    if denies:
+        items.append(S.lst(f"Out of scope · {len(denies)}",
+                           [S.dot(d[:160], mc="muted") for d in denies[:5]], full=True))
+    ws = run.workspace
+    if ws is not None:
+        items.append(S.item("worktree", f"{ws.branch} → {ws.base_branch}",
+                            is_mono=True, m="▸", mc="blue"))
+    if not paths and not denies:
+        items.append(S.dot(
+            "No scope declared",
+            "The kickoff named no files in scope; nothing bounds this run's edit "
+            "but its branch and the verifier's diff.", mc="muted"))
+    return S.lst(
+        "Scope", items, full=True,
+        note="Declared in the kickoff (run_profile.json scope_allow/scope_deny). "
+             "It selects which path-scoped preferences are injected — it is not a "
+             "write sandbox; the worktree branch and the verifier's diff are.")
 
 
 def _size(p: Path) -> str:
@@ -4784,10 +4903,10 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     # The Overview tab's tail is not this page's tail. Correlation and recent
     # events are diagnostics, the file list lives on Artifacts, and the memory
     # sections are already above. What is genuinely outcome-only is the retry
-    # decision and what the run knew going in; the attempt ledger explains a
-    # failure the retry hint is about.
+    # decision and what the run knew going in — its inputs and the scope it
+    # declared; the attempt ledger explains a failure the retry hint is about.
     already = {str(section.get("title") or "") for section in sections}
-    keep = {"Retry", "Run inputs"}
+    keep = {"Retry", "Run inputs", "Scope"}
     sections.extend(section for section in _overview_tab(run)
                     if str(section.get("title") or "") in keep
                     and str(section.get("title") or "") not in already)

@@ -113,7 +113,7 @@ def test_all_runs_lists_every_run_with_a_filter(home: Path) -> None:
     _run(home, "run-1791000002-cccccc", "executing")
     p = build_page(home, "runs")
     assert p["ok"] and p["title"] == "Runs & live execution"
-    assert [t["key"] for t in p["tabs"]] == ["runs", "active", "hooks"] and p["tab"] == "runs"
+    assert [t["key"] for t in p["tabs"]] == ["runs", "active", "scope", "hooks"] and p["tab"] == "runs"
     assert p["chips"][0]["t"] == "3 runs"
     chips = _section(p, "chips")
     assert [c["t"] for c in chips["items"]][0] == "All 3"
