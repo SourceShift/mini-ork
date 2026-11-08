@@ -340,16 +340,21 @@ def test_audit_that_raises_is_reported_as_error_and_never_blocks(tmp_path, monke
     assert "judge could not be imported" in result["oracle_integrity"]["error"]
 
 
-def test_knob_off_ignores_record_and_keeps_legacy_keys(tmp_path, monkeypatch):
+def test_knob_off_skips_the_producer_and_ignores_the_record(tmp_path, monkeypatch):
     db = _seed_db(tmp_path)
     _quiet_gate_env(monkeypatch, oracle_knob="0")
     oi.write_latest(db, _failing_record())
+
+    def must_not_audit(**_kwargs):
+        raise AssertionError("the knob is off: the gate must not run the audit")
+
+    monkeypatch.setattr(oi, "run_default_audit", must_not_audit)
     result = promotion_gate.promotion_evaluate(db, CANDIDATE)
     assert result["decision"] == "promoted"
     assert "oracle_integrity" not in result
     assert set(result) == LEGACY_RESULT_KEYS
     # The knob turns the producer off too, not just the reader: a disabled guard
-    # must not spend (or record) a measurement it will then ignore.
+    # must not spend a measurement it will then ignore.
     assert not oi.enabled()
 
 

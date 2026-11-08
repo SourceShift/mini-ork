@@ -82,15 +82,16 @@ flowchart TB
 ④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
 at promotion, or when a recipe opts in, or their producer is a manual command.
 
-One instrument has a consumer but no automatic producer; `mini-ork instruments`
-is that producer. ⑩: `mini-ork instruments verifier-mutation --observable
-<observable.json> --card <card.json>` writes `<card>.mutation.json`, the sidecar
-the verify catalog reads; without `--card` it prints the score and writes
-nothing. ⑦ used to be the second: the promotion gate read a record nothing in
-production wrote, so every promotion reported `unmeasured` and the guard could
-never fire. The gate now runs the audit itself (`oracle_integrity.promotion_check`)
-and `mini-ork instruments oracle-integrity` is the out-of-band producer. ⑧ has
-no separate producer — `MO_JUDGE_VALIDITY=shadow` runs the audit from the
+Two instruments still have a consumer but no automatic producer. ⑤: records
+come only from a manual `mini-ork gate-fuzz --hackability`. ⑩: `mini-ork
+instruments verifier-mutation --observable <observable.json> --card <card.json>`
+writes `<card>.mutation.json`, the sidecar the verify catalog reads; without
+`--card` it prints the score and writes nothing. ⑦ *was* the third: the
+promotion gate read a record nothing in production wrote, so every promotion
+reported `unmeasured` and the guard could never fire. The gate now runs the
+audit itself (`oracle_integrity.promotion_check`) and `mini-ork instruments
+oracle-integrity` is the out-of-band producer, not a prerequisite. ⑧ has no
+separate producer — `MO_JUDGE_VALIDITY=shadow` runs the audit from the
 promotion path, records the per-lane envelopes, and never quarantines, so an
 operator can see a lane's agreement before switching to enforcement.
 

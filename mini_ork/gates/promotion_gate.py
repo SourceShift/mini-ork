@@ -86,16 +86,18 @@ caching):
                                         ``MO_GATE_HACKABILITY_BUDGET_USD`` and
                                         ``MO_GATE_HACKABILITY_MAX`` configure
                                         the measurement, not this consumer.)
-    MO_ORACLE_INTEGRITY              → oracle-integrity consumer: default ON
-                                        ("1"); opt-out with "0". When ON, a
-                                        would-be promote is refused
+    MO_ORACLE_INTEGRITY              → oracle-integrity producer *and* consumer:
+                                        default ON; opt out with "0", "off",
+                                        "false" or "no". When ON, this gate
+                                        audits the verdict judge itself (the
+                                        hermetic ~0.06 s audit), records the
+                                        result, and refuses a would-be promote
                                         ("quarantined", reason
-                                        ``oracle_integrity_failed``) when the
-                                        latest recorded audit of the verdict
-                                        judge failed. A missing record is
-                                        reported as ``unmeasured`` and never
-                                        blocks; the key is absent entirely
-                                        when the knob is off.
+                                        ``oracle_integrity_failed``) when that
+                                        audit fails. An audit that raises is
+                                        reported as ``status: error`` and never
+                                        blocks. The key is absent entirely when
+                                        the knob is off.
     MINI_ORK_ROOT                    → legacy: where to find ``lib/cw_por.sh``
                                         (WS4: CW-POR is computed natively via
                                         ``mini_ork.gates.cw_por``; the env var
