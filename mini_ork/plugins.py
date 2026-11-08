@@ -161,6 +161,18 @@ class PluginContext:
 
         register_shared_drive_backend(name, factory)
 
+    def budget_policy(self, name: str, policy: Callable) -> None:
+        """Register a per-run budget policy selectable with ``MO_BUDGET_POLICY``.
+
+        Without this method the secure tier of :mod:`mini_ork.cost.budget` was
+        unreachable for an out-of-tree deployment: the registry existed but the
+        plugin seam — the only supported way to run code in the host — could not
+        reach it, so ``MO_BUDGET_POLICY=acme`` could only ever fail closed.
+        """
+        from mini_ork.cost.budget import register_budget_policy
+
+        register_budget_policy(name, policy)
+
 
 # ---- discovery ------------------------------------------------------------
 

@@ -118,6 +118,23 @@ def test_a_broken_profile_ceiling_refuses(tmp_path, monkeypatch):
     assert "budget_usd='a lot'" in v.detail
 
 
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_a_non_finite_profile_ceiling_refuses(bad, tmp_path, monkeypatch):
+    """``inf``/``nan`` pass every ``<=`` test, so they must refuse, not become unlimited.
+
+    ``json.dumps(float('inf'))`` emits ``Infinity`` and ``json.load`` reads it
+    back, so a hand-written or machine-generated profile can carry it.
+    """
+    monkeypatch.delenv("MO_RUN_BUDGET_USD", raising=False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run_profile.json").write_text(json.dumps({"budget_usd": float(bad)}))
+    db = _db(tmp_path)
+    v = _cost_budget().verdict(db, "r1", run_dir)
+    assert v.exhausted is True
+    assert "not a finite number" in v.detail
+
+
 def test_an_unreadable_ledger_reads_as_zero(tmp_path, monkeypatch):
     """No DB yet is a fresh home, not a refusal — same choice the daily cap makes."""
     monkeypatch.setenv("MO_RUN_BUDGET_USD", "1")
@@ -279,3 +296,22 @@ def test_the_package_is_importable_from_the_runtime_root():
     from mini_ork.cost import budget
 
     assert budget.BUDGET_ENV == "MO_RUN_BUDGET_USD"
+
+
+def test_a_plugin_can_register_the_secure_tier_policy(tmp_path, monkeypatch):
+    """``PluginContext`` is the only supported in-host seam; it must reach the registry.
+
+    Otherwise ``MO_BUDGET_POLICY=acme`` could only ever fail closed for an
+    out-of-tree deployment, and the documented secure tier would be unreachable.
+    """
+    from mini_ork.plugins import PluginContext
+
+    def acme(db, run_id, run_dir):
+        return _cost_budget().Verdict(spent=0.0, budget=99.0, exhausted=False,
+                                      detail="acme quota headroom")
+
+    PluginContext().budget_policy("acme-test", acme)
+    monkeypatch.setenv("MO_BUDGET_POLICY", "acme-test")
+    v = _cost_budget().verdict(None, "r1", None)
+    assert (v.budget, v.exhausted) == (99.0, False)
+    assert v.detail == "acme quota headroom"

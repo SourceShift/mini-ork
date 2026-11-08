@@ -54,7 +54,10 @@ def _py_resume(args, tmp_run_dir, env_overrides=None, user=None):
         env.pop("USER", None)
     elif user is not None:
         env["USER"] = user
-    cmd = ["python3", "-m", PY_MOD] + list(args)
+    # ``sys.executable``, not a bare ``python3``: the project floor is 3.11 and
+    # a shell ``python3`` can be older (3.9 here), which fails on dataclass
+    # ``slots=`` before the case under test even runs.
+    cmd = [sys.executable, "-m", PY_MOD] + list(args)
     r = subprocess.run(cmd, env=env, capture_output=True, text=True,
                        cwd=str(REPO))
     run_id = args[0] if args else "unused"
@@ -148,3 +151,92 @@ def test_sentinel_present_with_user(tmp_path):
     py_approvals = (py_dir / "runs" / "run-x" /
                     ".cost-pause-approvals.jsonl").read_bytes()
     assert py_approvals.endswith(b"\n") and not py_approvals.endswith(b"\n\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-run budget parks (``.budget-exhausted``)
+#
+# The dispatch gate refuses the next node and prints ``mini-ork resume <run>``
+# as the unblock, so these pin the contract that command makes: resume parks
+# nothing, it re-asks the budget policy and clears the marker only when the run
+# fits — and a run never becomes unlimited because the ceiling was removed.
+# ─────────────────────────────────────────────────────────────────────────────
+import sqlite3  # noqa: E402 — grouped with the cases that need a ledger
+
+
+def _seed_budget_park(tmp_path, run_id, *, spent, budget=None):
+    """A run dir parked by its ceiling + the ledger those dollars came from."""
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    marker = {"spent_usd": spent, "budget_usd": budget,
+              "detail": f"spent ${spent:.2f} of a ${budget or 0:.2f} budget",
+              "recorded_at": 1790000000}
+    (run_dir / ".budget-exhausted").write_text(json.dumps(marker) + "\n")
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE IF NOT EXISTS llm_calls "
+                "(run_id TEXT, cost_usd REAL)")
+    con.execute("INSERT INTO llm_calls VALUES (?, ?)", (run_id, spent))
+    con.commit()
+    con.close()
+    return run_dir
+
+
+def _budget_env(ceiling):
+    return {"MINI_ORK_DB": "", "MO_BUDGET_POLICY": "",
+            "MO_RUN_BUDGET_USD": ceiling}
+
+
+def test_budget_park_resumes_once_the_ceiling_is_raised(tmp_path):
+    run_dir = _seed_budget_park(tmp_path, "run-b", spent=0.84, budget=0.5)
+    rc, out, err, lines, _sent = _py_resume(
+        ["run-b", "--no-restart"], tmp_path,
+        env_overrides=_budget_env("12"), user="alice")
+
+    assert rc == 0, err
+    assert "resumed run-b (approver=alice" in out
+    assert "$0.84 of a $12.00 budget" in out
+    assert err == ""
+    assert not (run_dir / ".budget-exhausted").exists()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["sentinel_payload"]["marker"] == ".budget-exhausted"
+    assert row["sentinel_payload"]["payload"]["spent_usd"] == 0.84
+
+
+def test_budget_park_refuses_while_still_over_the_ceiling(tmp_path):
+    run_dir = _seed_budget_park(tmp_path, "run-c", spent=0.84, budget=0.5)
+    rc, out, err, lines, _sent = _py_resume(
+        ["run-c", "--no-restart"], tmp_path,
+        env_overrides=_budget_env("0.5"))
+
+    assert rc == 1
+    assert out == ""
+    assert "still parked" in err and "$0.50" in err
+    assert lines == []
+    assert (run_dir / ".budget-exhausted").is_file()
+
+
+def test_budget_park_refuses_when_the_ceiling_was_removed(tmp_path):
+    """Unsetting the knob is not a way to un-park a run."""
+    run_dir = _seed_budget_park(tmp_path, "run-d", spent=0.84, budget=0.5)
+    rc, _out, err, _lines, _sent = _py_resume(
+        ["run-d", "--no-restart"], tmp_path,
+        env_overrides=_budget_env(""))
+
+    assert rc == 1
+    assert "no per-run budget is declared" in err
+    assert "does not make a parked run unlimited" in err
+    assert (run_dir / ".budget-exhausted").is_file()
+
+
+def test_a_run_with_neither_sentinel_nor_marker_still_warns(tmp_path):
+    """The budget branch must not swallow the pre-existing no-sentinel path."""
+    _seed_run_dir(tmp_path, "run-plain", with_sentinel=False)
+    rc, out, err, _lines, _sent = _py_resume(
+        ["run-plain", "--no-restart"], tmp_path,
+        env_overrides=_budget_env("12"))
+
+    assert rc == 0
+    assert out == ""
+    assert "no cost-pause sentinel for run-plain" in err

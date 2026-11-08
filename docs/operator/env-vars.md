@@ -99,8 +99,8 @@ When the ceiling is reached the next node is refused with finish reason
 `budget_exhausted`, the run **parks** with the same rc a review pause uses
 (9) — the plan, the worktree and every finished node survive — and
 `<run_dir>/.budget-exhausted` records `spent_usd` / `budget_usd` / `detail`
-for the IDE and the attention inbox (`mini-ork board inbox` leads with it,
-above the periodic cost-pause). Raise the ceiling and resume the same run:
+for the attention inbox (`mini-ork board inbox` leads with it, above the
+periodic cost-pause). Raise the ceiling and resume the same run:
 
 ```bash
 MO_RUN_BUDGET_USD=40 mini-ork resume <run-id>
@@ -108,13 +108,20 @@ MO_RUN_BUDGET_USD=40 mini-ork resume <run-id>
 
 Refusals are the interesting half of the contract:
 
-- A declared value that does not parse (`twelve`, `-5`, `nan`) **refuses** —
-  a typo must not buy a run more spending room.
+- A declared value that does not parse (`twelve`, `-5`, `nan`, `Infinity`) **refuses** —
+  a typo must not buy a run more spending room. The same strictness applies to
+  `run_profile.json` → `budget_usd`; `nan`/`inf` are refused there too, because
+  they parse as floats and pass every `spent >= budget` comparison.
 - A named policy that is not registered, or one that raises, **refuses** —
   never "unlimited".
 - A missing or unreadable ledger reads as `$0.00` spent, the same fail-open
   choice the daily cap makes, so a fresh home is never blocked by a database
   that does not exist yet.
+- `mini-ork resume` re-asks the policy before un-parking: a run still over its
+  ceiling gets rc 1 and the number to exceed, and a run whose ceiling was
+  **removed** is refused too — unsetting `MO_RUN_BUDGET_USD` does not make a
+  parked run unlimited. Only when the run fits is `.budget-exhausted` cleared
+  (and the approval audited to `.cost-pause-approvals.jsonl`).
 - The marker is removed as soon as the run fits under the ceiling again, so a
   raised ceiling does not leave a stale "needs you" row behind.
 
@@ -132,6 +139,11 @@ def _quota(db, run_id, run_dir) -> Verdict:
 
 register_budget_policy("myorg", _quota)
 ```
+
+Out of tree, register it through the plugin seam instead of patching core — an
+entry point in the `mini_ork.plugins` group whose target calls
+`context.budget_policy("myorg", _quota)` (see `mini_ork/plugins.py`; the host
+must call `load_plugins()` at startup).
 
 ```bash
 MO_BUDGET_POLICY=myorg mini-ork run code-fix kickoff.md

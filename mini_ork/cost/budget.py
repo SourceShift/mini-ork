@@ -35,6 +35,10 @@ service, and select it by name::
 
     MO_BUDGET_POLICY=myorg
 
+An out-of-tree deployment reaches the same registry through the plugin seam
+(``PluginContext.budget_policy`` in :mod:`mini_ork.plugins`) rather than
+patching core.
+
 The policy owns where the number comes from (a quota API, a billing export);
 this module owns when it is asked and what a refusal looks like. An unknown
 policy name fails closed.
@@ -59,7 +63,8 @@ BUDGET_ENV = "MO_RUN_BUDGET_USD"
 #: Env var selecting a registered policy (default: the built-in declared one).
 POLICY_ENV = "MO_BUDGET_POLICY"
 
-#: Durable per-run marker the IDE and ``mini-ork status`` read.
+#: Durable per-run marker: :mod:`mini_ork.attention` reads it to put the run
+#: in front of a person.
 MARKER_NAME = ".budget-exhausted"
 
 #: The name of the built-in policy that reads ``BUDGET_ENV`` / the run profile.
@@ -125,6 +130,12 @@ def _budget_from_profile(run_dir: str | os.PathLike | None) -> float | None:
         value = float(raw)
     except (TypeError, ValueError):
         raise ValueError(f"run_profile.json budget_usd={raw!r} is not a number") from None
+    # ``nan`` and ``inf`` parse as floats and pass every ``<=`` comparison as
+    # False, so ``spent >= budget`` would never fire: a profile carrying
+    # ``Infinity`` would be a ceiling that silently never applies. Same
+    # strictness as the env path, or the fail-closed rule is only half true.
+    if not (value == value) or value in (float("inf"), float("-inf")):
+        raise ValueError(f"run_profile.json budget_usd={raw!r} is not a finite number")
     if value <= 0:
         raise ValueError(f"run_profile.json budget_usd={raw!r} must be > 0")
     return value
@@ -218,8 +229,8 @@ def marker_path(run_dir: str | os.PathLike | None) -> str | None:
 def record(run_dir: str | os.PathLike | None, v: Verdict) -> None:
     """Keep ``<run_dir>/.budget-exhausted`` truthful, or remove it.
 
-    The marker is what the IDE and the attention inbox read; it must not
-    outlive the condition. Called once per dispatch, so the not-exhausted path
+    The marker is what the attention inbox reads; it must not outlive the
+    condition. Called once per dispatch, so the not-exhausted path
     is a single ``os.path.exists`` when the marker was never written.
     """
     path = marker_path(run_dir)

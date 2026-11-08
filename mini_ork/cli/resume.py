@@ -25,7 +25,8 @@ from pathlib import Path
 _USAGE = """\
 Usage: mini-ork resume <run_id> [--no-restart] [--answer ask-N=<text>]...
 
-Clear the cost-pause sentinel for <run_id> + record an audit row, or
+Clear the cost-pause sentinel for <run_id> + record an audit row, resume a
+run parked by its per-run budget (.budget-exhausted) once it fits again, or
 record answers to the run's open profile questions and continue the run.
 
 Arguments:
@@ -79,6 +80,96 @@ def _format_audit_row(
     )
 
 
+def _restart_run(run_id: str, run_dir: str) -> str:
+    """Spawn ``recover --strategy resume`` detached; return the message tail.
+
+    The run never stopped (a sentinel or a marker was written but the dispatch
+    path is what refuses), so clearing the file alone would leave it dead.
+    ``_spawn_recover`` raises only when the launcher is unusable; the file is
+    already gone, so degrade to the manual command instead of tracing back.
+    Imported here, not at module scope: the clear-and-audit path (and the
+    parity tests that drive it) must not pay for the approvals/ledger import.
+    """
+    from mini_ork.cli import approvals_cmd  # noqa: PLC0415
+
+    log_path = Path(run_dir) / "cost-resume.log"
+    try:
+        _pid, spawned_log = approvals_cmd._spawn_recover(
+            Path(run_dir).parent.parent,
+            run_id,
+            ["--strategy", "resume"],
+            log_path=log_path,
+        )
+    except (approvals_cmd._LauncherMissingError, OSError):
+        return f"\nresume with: mini-ork recover {run_id} --strategy resume"
+    return f"; restarting (log: {spawned_log})"
+
+
+def _budget_db(run_dir: str) -> str:
+    """The ledger the dispatch gate reads: ``MINI_ORK_DB``, else ``<home>/state.db``."""
+    return (os.environ.get("MINI_ORK_DB")
+            or os.path.join(os.path.dirname(os.path.dirname(run_dir)), "state.db"))
+
+
+def _resume_budget_park(
+    run_id: str,
+    run_dir: str,
+    *,
+    approver: str | None,
+    now: datetime.datetime | None,
+    restart: bool,
+) -> tuple[int, str, str | None, bool] | None:
+    """Resume a run parked by its per-run ceiling; ``None`` when no such park.
+
+    The dispatch gate refuses the next node and prints ``mini-ork resume
+    <run>`` as the unblock, so this is where that promise is kept: re-ask the
+    budget policy, and only clear ``.budget-exhausted`` when the run now fits.
+
+    Fail closed, in two directions:
+
+    * the run is still over its ceiling → refuse (rc 1) and name the number the
+      ceiling has to exceed;
+    * the operator removed the declared ceiling instead of raising it → refuse
+      too. A parked run must not become unlimited because a variable was
+      unset; the message says so and names the spend it has to cover.
+    """
+    from mini_ork.cost import budget  # noqa: PLC0415
+
+    marker = budget.read_marker(run_dir)
+    if marker is None:
+        return None
+    db = _budget_db(run_dir)
+    verdict = budget.verdict(db, run_id, run_dir)
+    if verdict.exhausted or verdict.budget is None:
+        ceiling = ("no per-run budget is declared for this run"
+                   if verdict.budget is None else verdict.detail)
+        sys.stderr.write(
+            f"[mini-ork-resume] {run_id} is still parked: {ceiling}. "
+            f"Set {budget.BUDGET_ENV} (or run_profile.json budget_usd) above "
+            f"${verdict.spent:.2f}, then resume again — removing the ceiling "
+            f"does not make a parked run unlimited.\n"
+        )
+        return 1, "", None, False
+
+    approvals = os.path.join(run_dir, ".cost-pause-approvals.jsonl")
+    if approver is None:
+        approver = os.environ.get("USER") or "unknown"
+    ts = _now_iso(now)
+    row = _format_audit_row(run_id, approver, ts,
+                            json.dumps({"marker": budget.MARKER_NAME,
+                                        "payload": marker}))
+    with open(approvals, "a") as fh:
+        fh.write(row)
+    budget.record(run_dir, verdict)  # not exhausted → removes the marker
+
+    stdout_msg = (f"[mini-ork-resume] resumed {run_id} (approver={approver}, "
+                  f"{verdict.detail}, audit={approvals})")
+    if restart:
+        stdout_msg += _restart_run(run_id, run_dir)
+    stdout_msg += "\n"
+    return 0, stdout_msg, approvals, True
+
+
 def resume(
     run_id: str,
     *,
@@ -93,8 +184,11 @@ def resume(
 
     rc semantics match bash exactly:
       * 1 — ``run_dir`` does not exist (stderr is written by this fn).
-      * 0 — no sentinel present (stderr warning is written by this fn,
-             ``audit_path`` is ``None``, ``sentinel_removed`` is ``False``).
+      * 1 — the run is parked by its per-run budget and still does not fit
+             (see :func:`_resume_budget_park`); nothing is cleared.
+      * 0 — no sentinel and no budget marker present (stderr warning is
+             written by this fn, ``audit_path`` is ``None``,
+             ``sentinel_removed`` is ``False``).
       * 0 — success (no stderr; ``audit_path`` is the jsonl path;
              ``sentinel_removed`` is ``True``; ``stdout_msg`` is the
              "[mini-ork-resume] resumed ..." line).
@@ -120,6 +214,16 @@ def resume(
 
     sentinel = os.path.join(run_dir, ".cost-pause")
     if not os.path.isfile(sentinel):
+        # A run parked by its per-run ceiling has no cost-pause sentinel — the
+        # gate refuses the *next* node and leaves ``.budget-exhausted``. The
+        # dispatch gate prints ``mini-ork resume <run>`` as the unblock, so this
+        # entrypoint must be the one that honours it; falling through to the
+        # cost-pause warning would tell the operator "already running?" and
+        # leave the run dead.
+        parked = _resume_budget_park(run_id, run_dir, approver=approver,
+                                     now=now, restart=restart)
+        if parked is not None:
+            return parked
         sys.stderr.write(
             f"[mini-ork-resume] no cost-pause sentinel for {run_id} "
             "(already running?)\n"
@@ -142,31 +246,7 @@ def resume(
         f"audit={approvals})"
     )
     if restart:
-        # The run never stopped (the old sentinel was written but not read by
-        # the dispatch path), so a resume that only deletes the file would
-        # leave it dead. Restart it exactly the way an approvals resume does:
-        # a detached ``recover --strategy resume`` with its own log in the
-        # run dir. ``_spawn_recover`` raises only when the launcher is
-        # unusable; the sentinel is already gone, so degrade to the manual
-        # command instead of tracing back. Imported here, not at module scope:
-        # the clear-and-audit path (and the parity tests that drive it) must not
-        # pay for the approvals/ledger import.
-        from mini_ork.cli import approvals_cmd  # noqa: PLC0415
-
-        log_path = Path(run_dir) / "cost-resume.log"
-        try:
-            _pid, spawned_log = approvals_cmd._spawn_recover(
-                Path(run_dir).parent.parent,
-                run_id,
-                ["--strategy", "resume"],
-                log_path=log_path,
-            )
-        except (approvals_cmd._LauncherMissingError, OSError):
-            stdout_msg += (
-                f"\nresume with: mini-ork recover {run_id} --strategy resume"
-            )
-        else:
-            stdout_msg += f"; restarting (log: {spawned_log})"
+        stdout_msg += _restart_run(run_id, run_dir)
     stdout_msg += "\n"
 
     return 0, stdout_msg, approvals, True
