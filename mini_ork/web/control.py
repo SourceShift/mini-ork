@@ -49,6 +49,22 @@ def _resolve_run_dir(home: Path, task_run_id: str) -> Path:
     return home / "runs" / task_run_id
 
 
+def _budget_park_state(home: Path, run_id: str, run_dir: Path):
+    """``(marker, verdict)`` when a run carries a per-run budget park.
+
+    ``(None, None)`` when there is no marker. The ledger path follows the same
+    ladder the CLI and the dispatch gate use, so all three answer from one
+    database.
+    """
+    from mini_ork.cost import budget  # noqa: PLC0415 — light, but keep import cost local
+
+    marker = budget.read_marker(run_dir)
+    if marker is None:
+        return None, None
+    db_path = os.environ.get("MINI_ORK_DB") or str(home / "state.db")
+    return marker, budget.verdict(db_path, run_id, run_dir)
+
+
 def pause_cost_run(
     home: Path, task_run_id: str, threshold_usd: float = 25.0
 ) -> dict[str, Any]:
@@ -109,6 +125,24 @@ def resume_cost_run(
     if not run_dir.is_dir():
         return {"ok": False, "error": "run_dir not found", "task_run_id": task_run_id}
 
+    # A budget park is a second hold on the same run. Reporting ok:true after
+    # clearing only the sentinel would be a false success: the run restarts,
+    # meets the budget gate on its first dispatch and parks again. Ask before
+    # touching either file — the CLI resume (mini_ork/cli/resume.py) refuses
+    # the same way, and the two surfaces must agree.
+    marker, verdict = _budget_park_state(home, task_run_id, run_dir)
+    if verdict is not None and (verdict.exhausted or verdict.budget is None):
+        detail = (verdict.detail if verdict.exhausted
+                  else "no per-run budget is declared for this run")
+        return {
+            "ok": False,
+            "error": "budget_exhausted",
+            "detail": (f"run is still parked: {detail}; raise the ceiling "
+                       f"(MO_RUN_BUDGET_USD or run_profile.json budget_usd) "
+                       f"above ${verdict.spent:.2f} and retry"),
+            "task_run_id": task_run_id,
+        }
+
     sentinel = run_dir / ".cost-pause"
     if not sentinel.is_file():
         return {
@@ -130,6 +164,19 @@ def resume_cost_run(
         f.write(json.dumps(audit) + "\n")
 
     sentinel.unlink()
+
+    # The park fits (the pre-check only let it through in that case): clear the
+    # marker and give it its own audit row, mirroring the CLI — one resume, one
+    # audit row per hold, nothing left for the next dispatch to re-park on.
+    if verdict is not None:
+        from mini_ork.cost import budget  # noqa: PLC0415
+
+        budget.record(run_dir, verdict)
+        marker_audit = dict(audit)
+        marker_audit["sentinel_payload"] = {"marker": budget.MARKER_NAME,
+                                            "payload": marker}
+        with approvals.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(marker_audit) + "\n")
 
     # The sentinel alone never stopped the run, so clearing it is not a
     # resume: restart the run through the same seam the approvals path uses.

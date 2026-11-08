@@ -157,11 +157,15 @@ register_budget_policy("myorg", _quota)
 Out of tree, register it through the plugin seam instead of patching core — an
 entry point in the `mini_ork.plugins` group whose target calls
 `context.budget_policy("myorg", _quota)` (see `mini_ork/plugins.py`). The CLI
-now runs that discovery once per process before dispatch, so
-`MO_BUDGET_POLICY=myorg` resolves in a normal `mini-ork …` invocation; a
-plugin that fails to load is reported on stderr and skipped. Set
-`MINI_ORK_NO_PLUGINS=1` to skip discovery in a process that must not execute
-third-party code.
+runs that discovery once per process **at `mini_ork.cli` import**, so every
+native subcommand sees it — including the `mini-ork resume` / `mini-ork
+recover` that a budget refusal tells you to run, which are separate
+`python -m mini_ork.cli.<sub>` processes. A plugin that fails to load is
+reported on stderr and skipped. Set `MINI_ORK_NO_PLUGINS=1` in the process
+environment to skip discovery where third-party code must not execute; because
+discovery happens at import, this must be in the environment before the process
+starts — a profile value set later is too late, and the opt-out does not undo a
+plugin that already registered.
 
 ```bash
 MO_BUDGET_POLICY=myorg mini-ork run code-fix kickoff.md

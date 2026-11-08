@@ -7,6 +7,7 @@ recording :class:`PluginContext` subclass instead of the real one.
 from __future__ import annotations
 
 import types
+from pathlib import Path
 
 import pytest
 
@@ -153,15 +154,19 @@ def test_scan_requests_the_plugin_group(monkeypatch):
     assert seen["group"] == ENTRY_POINT_GROUP == "mini_ork.plugins"
 
 
-def test_the_cli_runs_discovery_once_before_dispatch(monkeypatch):
+def _reset_bootstrap(monkeypatch) -> None:
+    """Force the next ``bootstrap()`` to discover (it is once-per-process)."""
+    monkeypatch.setattr(plugins_mod, "_BOOTSTRAPPED", False)
+    monkeypatch.delenv(plugins_mod.BOOTSTRAP_ENV, raising=False)
+
+
+def test_bootstrap_runs_discovery_once(monkeypatch):
     """The documented host seam must actually be wired.
 
-    ``mini_ork/plugins.py`` says the host calls ``load_plugins`` at startup.
-    While the CLI never did, ``MO_BUDGET_POLICY=acme`` could only fail closed in
-    every real deployment, so the budget's secure tier was unreachable.
+    ``mini_ork/plugins.py`` says the host calls discovery at startup. While the
+    CLI never did, ``MO_BUDGET_POLICY=acme`` could only fail closed in every
+    real deployment, so the budget's secure tier was unreachable.
     """
-    from mini_ork.cli import main as cli_main
-
     calls: list[str] = []
 
     def register(context):
@@ -169,37 +174,87 @@ def test_the_cli_runs_discovery_once_before_dispatch(monkeypatch):
 
     monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
                         lambda: _EPs([_EP("acme", register)]))
-    monkeypatch.delenv("MINI_ORK_NO_PLUGINS", raising=False)
-    monkeypatch.setattr(cli_main, "_PLUGINS_LOADED", False)
+    _reset_bootstrap(monkeypatch)
 
-    cli_main._load_plugins_once()
-    cli_main._load_plugins_once()  # idempotent: one scan per process
+    report = plugins_mod.bootstrap()
+    again = plugins_mod.bootstrap()  # idempotent: one scan per process
 
     assert calls == ["PluginContext"]
+    assert [p.name for p in report.loaded] == ["acme"]
+    assert again is None
 
 
 def test_a_broken_plugin_warns_instead_of_killing_the_cli(monkeypatch, capsys):
-    from mini_ork.cli import main as cli_main
-
     monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
                         lambda: _EPs([_EP("bad", ImportError("nope"))]))
-    monkeypatch.delenv("MINI_ORK_NO_PLUGINS", raising=False)
-    monkeypatch.setattr(cli_main, "_PLUGINS_LOADED", False)
+    _reset_bootstrap(monkeypatch)
 
-    cli_main._load_plugins_once()
+    report = plugins_mod.bootstrap()
 
+    assert report is not None
+    assert [f.name for f in report.failed] == ["bad"]
     assert "warning: plugin bad" in capsys.readouterr().err
 
 
-def test_the_cli_plugin_scan_can_be_opted_out(monkeypatch):
-    from mini_ork.cli import main as cli_main
+def test_a_failing_scan_never_breaks_the_cli(monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("metadata index is unreadable")
 
+    monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points", boom)
+    _reset_bootstrap(monkeypatch)
+
+    assert plugins_mod.bootstrap() is None
+    assert "plugin discovery failed" in capsys.readouterr().err
+
+
+def test_bootstrap_can_be_opted_out(monkeypatch):
     scanned: list[bool] = []
     monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
                         lambda: scanned.append(True) or _EPs())
-    monkeypatch.setenv("MINI_ORK_NO_PLUGINS", "1")
-    monkeypatch.setattr(cli_main, "_PLUGINS_LOADED", False)
+    _reset_bootstrap(monkeypatch)
+    monkeypatch.setenv(plugins_mod.BOOTSTRAP_ENV, "1")
 
-    cli_main._load_plugins_once()
-
+    assert plugins_mod.bootstrap() is None
     assert scanned == []
+
+
+def _write_fake_dist(root) -> object:
+    """A minimal installed distribution declaring one ``mini_ork.plugins`` entry."""
+    dist = root / "acme-1.0.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: acme\nVersion: 1.0\n")
+    (dist / "entry_points.txt").write_text(
+        "[mini_ork.plugins]\nacme = acme_plugin:register\n")
+    (root / "acme_plugin.py").write_text(
+        "def register(context):\n"
+        "    from mini_ork.cost.budget import Verdict, register_budget_policy\n"
+        "    register_budget_policy('acme', lambda db, run_id, run_dir:"
+        " Verdict(0.0, 9.0, False, 'acme quota'))\n")
+    return root
+
+
+def test_a_native_subcommand_child_process_sees_plugins(tmp_path):
+    """``python -m mini_ork.cli.<sub>`` is a fresh interpreter.
+
+    That is exactly what ``mini-ork resume`` execs, and the budget gate's own
+    refusal tells the operator to run it. Discovery in ``main()`` alone would
+    never reach that child, so a plugin-provided policy could never un-park a
+    run. Bootstrap runs at ``mini_ork.cli`` import, which every child does.
+    """
+    import os
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[2]
+    _write_fake_dist(tmp_path)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(repo)])
+    env.pop(plugins_mod.BOOTSTRAP_ENV, None)
+    code = ("import mini_ork.cli; from mini_ork.cost import budget;"
+            " print(sorted(budget.BUDGET_POLICIES))")
+
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(repo), env=env,
+                         capture_output=True, text=True, timeout=120)
+
+    assert out.returncode == 0, out.stderr
+    assert "acme" in out.stdout

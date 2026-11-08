@@ -2488,36 +2488,19 @@ def _load_feature_defaults() -> None:
         sys.stderr.write(f"warning: feature defaults not loaded: {exc}\n")
 
 
-_PLUGINS_LOADED = False
-
-
 def _load_plugins_once() -> None:
     """Discover out-of-tree plugins, once per process.
 
-    :mod:`mini_ork.plugins` has always documented that the host — "the CLI, a
-    service, or an embedding application" — calls ``load_plugins`` at startup,
-    but the CLI never did. The consequence was concrete: the per-run budget's
-    secure tier says ``MO_BUDGET_POLICY=acme`` selects a policy the deployment
-    registered, and no CLI process could ever register one, so that tier could
-    only fail closed. The same was true of node handlers, routing policies and
-    subcommands offered by a plugin.
-
-    Discovery stays explicit and cheap: importing ``mini_ork`` never scans, the
-    scan here is one entry-point metadata read, and a plugin that raises is
-    reported on stderr and skipped rather than turning every command into a
-    traceback. ``MINI_ORK_NO_PLUGINS=1`` opts a process out.
+    Delegates to :func:`mini_ork.plugins.bootstrap`, which owns the idempotence
+    and the failure policy. The real chokepoint is
+    :mod:`mini_ork.cli`'s import — every native subcommand is its own
+    ``python -m mini_ork.cli.<sub>`` process and does not pass through here —
+    so this call only covers a host that imported ``mini_ork.cli.main`` before
+    the bootstrap ran (an embedder setting the environment late).
     """
-    global _PLUGINS_LOADED
-    if _PLUGINS_LOADED:
-        return
-    _PLUGINS_LOADED = True
-    if os.environ.get("MINI_ORK_NO_PLUGINS", "").strip() not in ("", "0"):
-        return
-    from mini_ork.plugins import load_plugins
+    from mini_ork import plugins  # noqa: PLC0415 — keep import-time cost off module load
 
-    report = load_plugins()
-    for failure in report.failed:
-        sys.stderr.write(f"warning: plugin {failure.name}: {failure.error}\n")
+    plugins.bootstrap()
 
 
 def main(argv=None, *, root=None) -> int:

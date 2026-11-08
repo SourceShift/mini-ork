@@ -23,12 +23,18 @@ Each target is either:
 
 Discovery is **explicit**: importing :mod:`mini_ork` never scans the
 environment or executes third-party code. The host (the CLI, a service, or an
-embedding application) calls :func:`load_plugins` once at startup::
+embedding application) calls :func:`bootstrap` once at startup — it is the
+idempotent, never-raising wrapper the CLI itself uses::
 
-    from mini_ork.plugins import load_plugins
-    report = load_plugins()
-    if not report.ok:
+    from mini_ork.plugins import bootstrap
+    report = bootstrap()
+    if report is not None and not report.ok:
         log.warning("plugin failures: %s", report.failed)
+
+:mod:`mini_ork.cli` calls it at *import*, not from ``main()``: every native
+subcommand is a fresh ``python -m mini_ork.cli.<sub>`` process, so a bootstrap
+reached only through the top-level dispatcher would leave children such as
+``resume`` and ``recover`` with no plugin registered at all.
 
 Everything a plugin can reach goes through :class:`PluginContext`, which
 delegates to the public registries. That keeps the OSS core free of private
@@ -38,6 +44,8 @@ of a fork. See ``docs/OPENCORE.md`` for the boundary rationale.
 from __future__ import annotations
 
 import importlib.metadata
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Protocol
 
@@ -46,11 +54,13 @@ ENTRY_POINT_GROUP = "mini_ork.plugins"
 
 __all__ = [
     "ENTRY_POINT_GROUP",
+    "BOOTSTRAP_ENV",
     "LoadedPlugin",
     "PluginContext",
     "PluginError",
     "PluginFailure",
     "PluginReport",
+    "bootstrap",
     "load_plugins",
     "load_entry_point",
     "enabled_plugins",
@@ -272,3 +282,53 @@ def enabled_plugins() -> Mapping[str, LoadedPlugin]:
     ``mini-ork doctor``-style reporting without re-running discovery.
     """
     return dict(_LOADED)
+
+
+#: Env var that opts a process out of discovery (``MINI_ORK_NO_PLUGINS=1``).
+BOOTSTRAP_ENV = "MINI_ORK_NO_PLUGINS"
+
+#: Whether :func:`bootstrap` has run in this process.
+_BOOTSTRAPPED = False
+
+
+def bootstrap(
+    *,
+    group: str = ENTRY_POINT_GROUP,
+    context: PluginContext | None = None,
+    entry_points: Iterable[_EntryPoint] | None = None,
+) -> PluginReport | None:
+    """Discover plugins once per process — the startup seam every host runs.
+
+    Called at import of :mod:`mini_ork.cli`, because a native subcommand is a
+    *fresh interpreter*: ``mini-ork resume`` execs
+    ``python -m mini_ork.cli.resume``, whose ``main()`` never passes through
+    :func:`mini_ork.cli.main.main`. Discovery therefore belongs somewhere every
+    child shares, or a run whose budget policy comes from a plugin could be
+    given a refusal whose own remedy names a command that cannot see the
+    plugin.
+
+    Never raises: a broken plugin is reported and skipped, and a metadata scan
+    that fails outright is reported the same way. Executing optional
+    third-party code must never turn ``mini-ork help`` into a traceback.
+    ``MINI_ORK_NO_PLUGINS=1`` opts a process out; being an environment knob it
+    must be set before the process starts (a value a profile writes into the
+    environment is too late for a bootstrap that runs at import).
+
+    Returns the report, or ``None`` when discovery was skipped (already done,
+    or opted out).
+    """
+    global _BOOTSTRAPPED
+    if _BOOTSTRAPPED:
+        return None
+    _BOOTSTRAPPED = True
+    if os.environ.get(BOOTSTRAP_ENV, "").strip() not in ("", "0"):
+        return None
+    try:
+        report = load_plugins(group=group, context=context,
+                              entry_points=entry_points)
+    except Exception as exc:  # noqa: BLE001 — discovery must not break the CLI
+        sys.stderr.write(f"warning: plugin discovery failed: {exc}\n")
+        return None
+    for failure in report.failed:
+        sys.stderr.write(f"warning: plugin {failure.name}: {failure.error}\n")
+    return report
