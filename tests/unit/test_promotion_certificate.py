@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from mini_ork.cli import apply as ap
 from mini_ork.learning import promotion_certificate as pc
 from mini_ork.learning import probe_scorer
+
+REPO = Path(__file__).resolve().parents[2]
 
 _ENV_KEYS = (
     "MO_APPLY_CERTIFICATE", "MO_APPLY_CERT_ALPHA", "MO_APPLY_CERT_BET",
@@ -165,11 +168,40 @@ def test_resolve_config_empty_values_take_defaults():
     assert cfg["errors"] == []
 
 
+def _migration_statements() -> list[str]:
+    """The CREATE statements of db/migrations/0089, comments stripped.
+
+    The module and the migration each carry the schema because the module must
+    be able to create the table on a DB that predates the migration. Two hand-
+    maintained copies drift; one test that compares them statement by
+    statement is what makes the drift impossible."""
+    text = (REPO / "db" / "migrations"
+            / "0089_promotion_certificates.sql").read_text()
+    body = "\n".join(
+        line for line in text.splitlines()
+        if not line.strip().startswith("--"))
+    out, buf, in_trigger = [], [], False
+    for line in body.splitlines():
+        buf.append(line)
+        s = line.strip().upper()
+        if s.startswith("CREATE TRIGGER"):
+            in_trigger = True
+        if in_trigger:
+            if s == "END;":
+                out.append("\n".join(buf).strip())
+                buf, in_trigger = [], False
+        elif s.endswith(";"):
+            out.append("\n".join(buf).strip())
+            buf = []
+    return [s for s in out if s and not s.upper().startswith("INSERT")]
+
+
 def test_ddl_matches_migration():
-    """The module DDL is the migration's CREATE statements; no insert."""
-    assert "CREATE TABLE IF NOT EXISTS promotion_certificates" in pc.DDL
-    assert "CREATE INDEX IF NOT EXISTS idx_promotion_certificates_class" in pc.DDL
+    """The module DDL is the migration's CREATE statements, byte for byte."""
     assert "schema_migrations" not in pc.DDL
+    want = [" ".join(s.split()) for s in _migration_statements()]
+    got = [" ".join(s.split()) for s in pc.DDL_STATEMENTS]
+    assert got == want
 
 
 def test_ensure_table_on_pre_migration_db(tmp_path):
@@ -177,9 +209,11 @@ def test_ensure_table_on_pre_migration_db(tmp_path):
     try:
         pc.ensure_table(con)
         names = {r[0] for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type IN ('table','index')")}
+            "SELECT name FROM sqlite_master "
+            "WHERE type IN ('table','index','trigger')")}
         assert "promotion_certificates" in names
-        assert "idx_promotion_certificates_class" in names
+        assert "promotion_certificates_no_update" in names
+        assert "promotion_certificates_no_delete" in names
         pc.ensure_table(con)  # idempotent
         assert con.execute(
             "SELECT COUNT(*) FROM promotion_certificates").fetchone()[0] == 0
@@ -203,9 +237,11 @@ def test_certify_slot1_certified(tmp_path):
     try:
         cert = _certify(con, "code_fix")
         assert set(cert) == {
-            "task_class", "candidate_id", "gains", "losses", "n", "bet",
-            "ledger", "alpha_total", "e_value", "consumed", "slot",
-            "alpha_k", "threshold", "certified"}
+            "task_class", "task_class_raw", "candidate_id", "gains", "losses",
+            "n", "bet", "ledger", "alpha_total", "e_value", "run_id",
+            "scorer", "dry_run", "probe_set_hash", "probe_ids", "consumed",
+            "status", "slot", "alpha_k", "threshold", "required_gains",
+            "certified"}
         assert cert["task_class"] == "code_fix"
         assert cert["candidate_id"] == "cand-1"
         assert cert["gains"] == 7 and cert["losses"] == 0 and cert["n"] == 12
@@ -217,7 +253,7 @@ def test_certify_slot1_certified(tmp_path):
         assert cert["certified"] is True
         rows = con.execute(
             "SELECT task_class, slot, candidate_id, gains, losses, n, bet, "
-            "e_value, ledger, alpha_total, alpha_k, threshold, certified, "
+            "e_value, ledger, alpha_total, alpha_k, threshold, status, "
             "created_at FROM promotion_certificates").fetchall()
         assert len(rows) == 1
         row = rows[0]
@@ -225,7 +261,7 @@ def test_certify_slot1_certified(tmp_path):
         assert row[3] == 7 and row[4] == 0 and row[5] == 12
         assert row[7] == pytest.approx(50.26507568359375, rel=1e-12)
         assert row[8] == "spend"
-        assert row[12] == 1
+        assert row[12] == "certified"
         assert row[13] == 1  # created_at = now
     finally:
         con.close()
@@ -324,9 +360,9 @@ def test_certify_unique_task_class_slot(tmp_path):
                 "INSERT INTO promotion_certificates "
                 "(task_class, slot, candidate_id, gains, losses, n, bet, "
                 "e_value, ledger, alpha_total, alpha_k, threshold, "
-                "certified, created_at) "
+                "status, created_at) "
                 "VALUES ('code_fix', 1, 'dup', 0, 0, 0, 0.75, 1.0, 'spend', "
-                "0.05, 0.025, 40.0, 0, 1)")
+                "0.05, 0.025, 40.0, 'certified', 1)")
     finally:
         con.close()
 
@@ -363,10 +399,13 @@ def test_flag_on_under_certified_quarantines(tmp_path, monkeypatch):
     out = _gate(monkeypatch, 0.0, 0.5, _V(6, 0), db=p)
     assert out["decision"] == "quarantined"
     assert out["rationale"].startswith(
-        "no anytime-valid certificate: e=28.7229 < threshold=40.0000 "
-        "(gains=6, losses=0, slot=1, alpha_k=0.025, bet=0.75); "
+        "certificate unreachable at this probe count: need >= 7 clean gains, "
+        "only 6 discordant pair(s) and max e=28.7229 < threshold=40.0000 "
+        "(slot=1, alpha_k=0.025, bet=0.75); "
         "point-estimate gate said: non-regression cleared")
     assert out["cert"]["certified"] is False
+    assert out["cert"]["status"] == "unreachable"
+    assert out["cert"]["required_gains"] == 7
 
 
 def test_flag_on_certified_promotes(tmp_path, monkeypatch):
@@ -638,7 +677,7 @@ def test_apply_run_certified_candidate_promotes(db, tmp_path, capsys,
     assert len(rows) == 1
     assert rows[0]["task_class"] == "reviewer"
     assert rows[0]["candidate_id"] == summary["candidate_id"]
-    assert rows[0]["certified"] == 1
+    assert rows[0]["status"] == "certified"
 
 
 def test_apply_run_under_certified_quarantines(db, tmp_path, capsys,
@@ -652,4 +691,178 @@ def test_apply_run_under_certified_quarantines(db, tmp_path, capsys,
     assert summary["decision"] == "quarantined"
     assert target.read_text() == "ORIGINAL PROMPT\n"
     rationale = _rows(db, "apply_attempts")[0]["rationale"]
-    assert "no anytime-valid certificate" in rationale
+    assert "certificate unreachable at this probe count" in rationale
+    assert "need >= 7 clean gains" in rationale
+
+
+# ── legibility: how far away is the bar? ────────────────────────────────────
+# The review's finding A-1: at the shipped config the bar was 40 and the
+# achievable e-value was 3.06, so the feature could only ever quarantine and
+# said so without saying why. required_gains/max_e are the inverse of the
+# threshold, and certify reports them.
+
+@pytest.mark.parametrize("slot,want", [(1, 7), (2, 9), (10, 14),
+                                       (100, 22), (1000, 31)])
+def test_required_gains_grows_logarithmically(slot, want):
+    assert pc.required_gains(slot, 0.05, 0.75, "spend") == want
+
+
+def test_required_gains_is_exactly_enough():
+    for slot in (1, 2, 10, 100):
+        g = pc.required_gains(slot, 0.05, 0.75, "spend")
+        alpha_k = pc.slot_alpha(0.05, slot, "spend")
+        assert pc.betting_e_value(g, 0, 0.75) >= 1.0 / alpha_k
+        if g > 1:
+            assert pc.betting_e_value(g - 1, 0, 0.75) < 1.0 / alpha_k
+
+
+def test_required_gains_ledger_none_does_not_tighten():
+    """ledger='none' gives every test the whole alpha, so the bar is flat."""
+    assert (pc.required_gains(1, 0.05, 0.75, "none")
+            == pc.required_gains(1000, 0.05, 0.75, "none"))
+
+
+def test_max_e_is_the_best_possible_split():
+    assert pc.max_e(2, 0.75) == pytest.approx(3.0625)
+    assert pc.max_e(0, 0.75) == 1.0
+    assert pc.max_e(7, 0.75) == pytest.approx(pc.betting_e_value(7, 0, 0.75))
+
+
+def test_certify_reports_unreachable_at_two_discordant_pairs(tmp_path):
+    con = sqlite3.connect(tmp_path / "c.db")
+    try:
+        cert = _certify(con, "code_fix", gains=2, losses=0, n=12)
+        assert cert["certified"] is False
+        assert cert["status"] == "unreachable"
+        assert cert["required_gains"] == 7
+        assert pc.max_e(2, 0.75) < cert["threshold"]
+    finally:
+        con.close()
+
+
+def test_certify_reports_uncertified_when_more_data_could_get_there(tmp_path):
+    """8 discordant pairs could reach 1.75^8 = 88 > 40; 5 won, 3 lost, e < 1."""
+    con = sqlite3.connect(tmp_path / "c.db")
+    try:
+        before = [0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0]
+        after = [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+        cert = pc.certify(con, task_class="code_fix", candidate_id="c",
+                          before=before, after=after, alpha_total=0.05,
+                          bet=0.75, ledger="spend", now=1)
+        assert cert["gains"] == 5 and cert["losses"] == 3
+        assert cert["status"] == "uncertified"
+        assert pc.max_e(8, 0.75) >= cert["threshold"]
+    finally:
+        con.close()
+
+
+# ── the ledger is append-only and carries provenance ────────────────────────
+
+def test_the_ledger_refuses_update_and_delete(tmp_path):
+    con = sqlite3.connect(tmp_path / "c.db")
+    try:
+        _certify(con, "code_fix")
+        con.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("UPDATE promotion_certificates SET gains=99")
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("DELETE FROM promotion_certificates")
+        con.rollback()
+        assert con.execute(
+            "SELECT gains FROM promotion_certificates").fetchone()[0] == 7
+    finally:
+        con.close()
+
+
+def test_certify_records_provenance(tmp_path):
+    con = sqlite3.connect(tmp_path / "c.db")
+    try:
+        before = [0] * 12
+        after = [1] * 7 + [0] * 5
+        pc.certify(con, task_class="Code-Fix", candidate_id="cand-9",
+                   before=before, after=after, alpha_total=0.05, bet=0.75,
+                   ledger="spend", now=7, run_id="run-1", scorer="probe",
+                   dry_run=True, probe_set_hash="abcd1234",
+                   probe_ids=["p1", "p2"])
+        con.commit()
+        row = con.execute(
+            "SELECT task_class, task_class_raw, run_id, scorer, dry_run, "
+            "probe_set_hash, probe_ids, status FROM promotion_certificates"
+        ).fetchone()
+        assert row == ("Code_Fix", "Code-Fix", "run-1", "probe", 1,
+                       "abcd1234", '["p1", "p2"]', "certified")
+    finally:
+        con.close()
+
+
+# ── infra failures are not edit memory ─────────────────────────────────────
+
+def _migrated_attempts_db(tmp_path) -> str:
+    """The fixture schema plus the migration-0090 column."""
+    path = str(tmp_path / "migrated.db")
+    con = sqlite3.connect(path)
+    con.executescript(FIXTURE_DDL)
+    con.execute("ALTER TABLE apply_attempts ADD COLUMN reason_class TEXT")
+    con.commit()
+    con.close()
+    return path
+
+
+def _record(db_path, decision, reason_class):
+    return ap.attempt_record(
+        "reviewer", "prompt_file", "prompts/reviewer.md", "gradient_records",
+        "gr-1", "", "", "", "", "", "", decision, "why", "0", "1",
+        db=db_path, reason_class=reason_class)
+
+
+def test_infra_failure_does_not_block_a_reproposal(tmp_path):
+    p = _migrated_attempts_db(tmp_path)
+    _record(p, "quarantined", "infra")
+    assert ap._previously_failed(
+        "reviewer", "prompts/reviewer.md", "gr-1", db=p) is False
+
+
+def test_evidence_failure_still_blocks_a_reproposal(tmp_path):
+    p = _migrated_attempts_db(tmp_path)
+    _record(p, "quarantined", "evidence")
+    assert ap._previously_failed(
+        "reviewer", "prompts/reviewer.md", "gr-1", db=p) is True
+
+
+def test_an_unclassified_row_still_blocks(tmp_path):
+    """Pre-0090 rows (and anything not classified) keep today's semantics."""
+    p = _migrated_attempts_db(tmp_path)
+    _record(p, "rejected", None)
+    assert ap._previously_failed(
+        "reviewer", "prompts/reviewer.md", "gr-1", db=p) is True
+
+
+def test_a_dead_harness_records_infra(db, tmp_path, capsys, monkeypatch):
+    """Nothing measured → quarantined with reason_class='infra', so the sweep
+    is not permanently silenced by one broken probe launch."""
+    target = tmp_path / "prompts" / "reviewer.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("ORIGINAL PROMPT\n")
+    monkeypatch.setenv("MO_APPLY_ENABLED", "1")
+    monkeypatch.setenv("MO_APPLY_SCORER", "probe")
+    monkeypatch.setenv("MO_APPLY_PERTASK_JSON", "")
+    monkeypatch.setattr(ap, "_previously_failed", ap._previously_failed)
+    # No probe set under the recipe dir → the scorer reports n=0.
+    monkeypatch.setattr(probe_scorer, "probe_score",
+                        lambda *a, **k: {"before": 0.0, "after": 0.0,
+                                         "n": 0, "pertask_json": "",
+                                         "runs": [], "cost_usd": 0.0,
+                                         "control_n": 1})
+    con = sqlite3.connect(db)
+    con.execute("ALTER TABLE apply_attempts ADD COLUMN reason_class TEXT")
+    con.commit()
+    con.close()
+    _seed_gradient(db, target="prompts/reviewer.md")
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    rows = _rows(db, "apply_attempts")
+    assert rows[0]["decision"] == "quarantined"
+    assert rows[0]["reason_class"] == "infra"
+    assert ap._previously_failed(
+        "reviewer", "prompts/reviewer.md", "gr-1", db=db) is False

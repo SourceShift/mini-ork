@@ -19,8 +19,13 @@ The module is pure math plus one table. The only env reads are inside
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+import json
+import math
 import os
 import sqlite3
+import time
 
 FLAG = "MO_APPLY_CERTIFICATE"
 ALPHA_ENV = "MO_APPLY_CERT_ALPHA"
@@ -31,39 +36,65 @@ DEFAULT_ALPHA = 0.05
 DEFAULT_BET = 0.75
 LEDGER_MODES = ("spend", "none")
 
-# The CREATE TABLE / CREATE INDEX statements from db/migrations/
-# 0086_promotion_certificates.sql, byte-for-byte. The migration's
-# schema_migrations insert is intentionally not included: it belongs to the
-# migration, not to a table the runtime may need to create on a DB that
-# predates it.
-DDL = """CREATE TABLE IF NOT EXISTS promotion_certificates (
-  id            INTEGER PRIMARY KEY,
-  task_class    TEXT    NOT NULL,
-  slot          INTEGER NOT NULL CHECK (slot >= 1),
-  candidate_id  TEXT    NOT NULL,
-  gains         INTEGER NOT NULL CHECK (gains >= 0),
-  losses        INTEGER NOT NULL CHECK (losses >= 0),
-  n             INTEGER NOT NULL CHECK (n >= 0),
-  bet           REAL    NOT NULL,
-  e_value       REAL    NOT NULL,
-  ledger        TEXT    NOT NULL CHECK (ledger IN ('spend','none')),
-  alpha_total   REAL    NOT NULL,
-  alpha_k       REAL    NOT NULL,
-  threshold     REAL    NOT NULL,
-  certified     INTEGER NOT NULL CHECK (certified IN (0,1)),
-  created_at    INTEGER NOT NULL,
+# The CREATE statements from db/migrations/0089_promotion_certificates.sql,
+# byte-for-byte in substance (a test compares them statement by statement).
+# The migration's schema_migrations insert is intentionally not included: it
+# belongs to the migration, not to a table the runtime may need to create on a
+# DB that predates it.
+_TABLE_SQL = """CREATE TABLE IF NOT EXISTS promotion_certificates (
+  id              INTEGER PRIMARY KEY,
+  task_class      TEXT    NOT NULL,
+  task_class_raw  TEXT    NOT NULL DEFAULT '',
+  slot            INTEGER NOT NULL CHECK (slot >= 1),
+  candidate_id    TEXT    NOT NULL,
+  run_id          TEXT,
+  scorer          TEXT,
+  dry_run         INTEGER NOT NULL DEFAULT 0 CHECK (dry_run IN (0,1)),
+  probe_set_hash  TEXT,
+  probe_ids       TEXT,
+  gains           INTEGER NOT NULL CHECK (gains >= 0),
+  losses          INTEGER NOT NULL CHECK (losses >= 0),
+  n               INTEGER NOT NULL CHECK (n >= 0),
+  bet             REAL    NOT NULL,
+  e_value         REAL    NOT NULL,
+  ledger          TEXT    NOT NULL CHECK (ledger IN ('spend','none')),
+  alpha_total     REAL    NOT NULL,
+  alpha_k         REAL    NOT NULL,
+  threshold       REAL    NOT NULL,
+  status          TEXT    NOT NULL CHECK (status IN
+                                  ('certified','uncertified','unreachable')),
+  created_at      INTEGER NOT NULL,
   UNIQUE (task_class, slot)
-);
-CREATE INDEX IF NOT EXISTS idx_promotion_certificates_class ON promotion_certificates(task_class, slot);
-"""
+);"""
+
+_NO_UPDATE_SQL = """CREATE TRIGGER IF NOT EXISTS promotion_certificates_no_update
+BEFORE UPDATE ON promotion_certificates
+BEGIN
+  SELECT RAISE(ABORT, 'promotion_certificates is append-only');
+END;"""
+
+_NO_DELETE_SQL = """CREATE TRIGGER IF NOT EXISTS promotion_certificates_no_delete
+BEFORE DELETE ON promotion_certificates
+BEGIN
+  SELECT RAISE(ABORT, 'promotion_certificates is append-only');
+END;"""
+
+DDL_STATEMENTS = (_TABLE_SQL, _NO_UPDATE_SQL, _NO_DELETE_SQL)
+
+DDL = "\n".join(DDL_STATEMENTS)
 
 
 def ensure_table(con: sqlite3.Connection) -> None:
-    """Create the certificate table/index if they are missing.
+    """Create the certificate table, triggers and indexes if they are missing.
 
-    Idempotent, so it also covers a DB that predates migration 0086.
+    Executed one statement at a time instead of via ``executescript``: that
+    convenience issues an implicit COMMIT, which would end the caller's
+    explicit transaction mid-``certify`` and let a lock error land as a
+    half-applied test. Each statement is ``IF NOT EXISTS``, so re-running is a
+    no-op and the helper covers a DB that predates migration 0089.
     """
-    con.executescript(DDL)
+    for stmt in DDL_STATEMENTS:
+        con.execute(stmt)
 
 
 def normalize_task_class(task_class: str) -> str:
@@ -114,7 +145,66 @@ def slot_alpha(alpha_total: float, k: int, ledger: str) -> float:
     raise ValueError(f"unknown ledger {ledger!r}")
 
 
-def _parse_unit_interval(environ: dict, key: str, default: float,
+def required_gains(slot: int, alpha_total: float, bet: float,
+                   ledger: str) -> int:
+    """Clean gains (all wins, no losses) needed to certify at ``slot``.
+
+    The bar at slot k is ``1 / alpha_k``; each clean gain multiplies the
+    e-value by ``1 + bet``. Returned exactly (candidates are verified against
+    ``betting_e_value`` rather than trusting a log/ceil rounding).
+
+    This is the number a pre-flight check needs: if a class's probe set can
+    never produce that many discordant pairs, no amount of a second look will
+    certify it, and the run should say so BEFORE it spends probe dollars.
+    """
+    if not 0.0 < bet < 1.0:
+        raise ValueError("bet must be in (0, 1)")
+    threshold = 1.0 / slot_alpha(alpha_total, slot, ledger)
+    g = max(1, math.ceil(math.log(threshold) / math.log(1.0 + bet)))
+    while betting_e_value(g, 0, bet) < threshold:
+        g += 1
+    while g > 1 and betting_e_value(g - 1, 0, bet) >= threshold:
+        g -= 1
+    return g
+
+
+def max_e(n: int, bet: float) -> float:
+    """The largest e-value ``n`` discordant pairs can ever produce.
+
+    Under this bet every gain multiplies more than every loss divides, so the
+    best split is all gains: ``(1 + bet) ** n``. A threshold above this is
+    **unreachable** at size n, whatever the next probes do.
+    """
+    if n < 0:
+        raise ValueError("n must be >= 0")
+    if not 0.0 < bet < 1.0:
+        raise ValueError("bet must be in (0, 1)")
+    return (1.0 + bet) ** n
+
+
+def _begin_immediate(con: sqlite3.Connection, attempts: int = 4,
+                     base_sleep: float = 0.05) -> None:
+    """``BEGIN IMMEDIATE`` with a bounded retry on SQLite's lock contention.
+
+    A busy database is an infrastructure event, not evidence about the
+    candidate: the caller distinguishes the two so a one-second lock never
+    becomes a permanent "this directive already failed" memory.
+    """
+    for i in range(attempts):
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            name = getattr(exc, "sqlite_errorname", "") or ""
+            if "SQLITE_BUSY" not in name and "SQLITE_LOCKED" not in name \
+                    and "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            if i == attempts - 1:
+                raise
+            time.sleep(base_sleep * (2 ** i))
+
+
+def _parse_unit_interval(environ: Mapping[str, str], key: str, default: float,
                          errors: list[str]) -> float:
     raw = environ.get(key)
     if not raw:
@@ -136,14 +226,13 @@ def resolve_config(environ: dict | None = None) -> dict:
     empty value takes its default. An invalid value takes its default AND
     appends one error string prefixed with the offending env var's name.
     """
-    if environ is None:
-        environ = os.environ
+    env = os.environ if environ is None else environ
     errors: list[str] = []
-    alpha = _parse_unit_interval(environ, ALPHA_ENV, DEFAULT_ALPHA, errors)
-    bet = _parse_unit_interval(environ, BET_ENV, DEFAULT_BET, errors)
+    alpha = _parse_unit_interval(env, ALPHA_ENV, DEFAULT_ALPHA, errors)
+    bet = _parse_unit_interval(env, BET_ENV, DEFAULT_BET, errors)
 
     ledger = "spend"
-    raw_ledger = environ.get(LEDGER_ENV)
+    raw_ledger = env.get(LEDGER_ENV)
     if raw_ledger:
         if raw_ledger in LEDGER_MODES:
             ledger = raw_ledger
@@ -153,7 +242,7 @@ def resolve_config(environ: dict | None = None) -> dict:
                 f"{', '.join(LEDGER_MODES)}")
 
     return {
-        "enabled": environ.get(FLAG) == "1",
+        "enabled": env.get(FLAG) == "1",
         "alpha": alpha,
         "bet": bet,
         "ledger": ledger,
@@ -163,7 +252,10 @@ def resolve_config(environ: dict | None = None) -> dict:
 
 def certify(con: sqlite3.Connection, *, task_class: str, candidate_id: str,
             before: list, after: list, alpha_total: float, bet: float,
-            ledger: str, now: int) -> dict:
+            ledger: str, now: int, run_id: str | None = None,
+            scorer: str | None = None, dry_run: bool = False,
+            probe_set_hash: str | None = None,
+            probe_ids: list[str] | None = None) -> dict:
     """Score one gate test against the class's alpha ledger.
 
     A test with no discordant pair consumes no slot and writes no row: its
@@ -178,6 +270,7 @@ def certify(con: sqlite3.Connection, *, task_class: str, candidate_id: str,
 
     base = {
         "task_class": tc,
+        "task_class_raw": task_class,
         "candidate_id": candidate_id,
         "gains": gains,
         "losses": losses,
@@ -186,36 +279,56 @@ def certify(con: sqlite3.Connection, *, task_class: str, candidate_id: str,
         "ledger": ledger,
         "alpha_total": alpha_total,
         "e_value": e_value,
+        "run_id": run_id,
+        "scorer": scorer,
+        "dry_run": bool(dry_run),
+        "probe_set_hash": probe_set_hash,
+        "probe_ids": probe_ids,
     }
 
     if gains + losses == 0:
         return {
             **base,
             "consumed": False,
+            "status": "no_vectors",
             "slot": None,
             "alpha_k": None,
             "threshold": None,
+            "required_gains": None,
             "certified": False,
         }
 
     ensure_table(con)
     try:
-        con.execute("BEGIN IMMEDIATE")
+        _begin_immediate(con)
         row = con.execute(
             "SELECT COALESCE(MAX(slot), 0) + 1 FROM promotion_certificates "
             "WHERE task_class = ?", (tc,)).fetchone()
         slot = int(row[0])
         alpha_k = slot_alpha(alpha_total, slot, ledger)
         threshold = 1.0 / alpha_k
+        need = required_gains(slot, alpha_total, bet, ledger)
         certified = e_value >= threshold
+        if certified:
+            status = "certified"
+        elif max_e(gains + losses, bet) < threshold:
+            # No split of this many discordant pairs could clear the bar.
+            # A faithful "unreachable" beats an "uncertified" that invites
+            # another identical run.
+            status = "unreachable"
+        else:
+            status = "uncertified"
         con.execute(
-            "INSERT INTO promotion_certificates (task_class, slot, "
-            "candidate_id, gains, losses, n, bet, e_value, ledger, "
-            "alpha_total, alpha_k, threshold, certified, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (tc, slot, candidate_id, gains, losses, len(before), bet,
-             e_value, ledger, alpha_total, alpha_k, threshold,
-             1 if certified else 0, now))
+            "INSERT INTO promotion_certificates (task_class, task_class_raw, "
+            "slot, candidate_id, run_id, scorer, dry_run, probe_set_hash, "
+            "probe_ids, gains, losses, n, bet, e_value, ledger, alpha_total, "
+            "alpha_k, threshold, status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tc, task_class, slot, candidate_id, run_id, scorer,
+             1 if dry_run else 0, probe_set_hash,
+             json.dumps(probe_ids) if probe_ids is not None else None,
+             gains, losses, len(before), bet, e_value, ledger, alpha_total,
+             alpha_k, threshold, status, now))
         con.commit()
     except Exception:
         con.rollback()
@@ -224,8 +337,10 @@ def certify(con: sqlite3.Connection, *, task_class: str, candidate_id: str,
     return {
         **base,
         "consumed": True,
+        "status": status,
         "slot": slot,
         "alpha_k": alpha_k,
         "threshold": threshold,
+        "required_gains": need,
         "certified": certified,
     }

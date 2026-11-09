@@ -186,6 +186,7 @@ _APPLY_ATTEMPTS_DDL = """
         rationale               TEXT NOT NULL DEFAULT '',
         dry_run                 INTEGER NOT NULL DEFAULT 0 CHECK (dry_run IN (0,1)),
         apply_enabled           INTEGER NOT NULL DEFAULT 0 CHECK (apply_enabled IN (0,1)),
+        reason_class            TEXT,
         created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 """
@@ -215,6 +216,20 @@ def ensure_tables(db: str | None = None) -> None:
     con.commit()
     con.close()
     _SCHEMA_INIT = True
+
+
+def _has_reason_class(con: sqlite3.Connection) -> bool:
+    """Whether this database's ``apply_attempts`` carries ``reason_class``.
+
+    The column arrives with migration 0090, so a DB migrated before it (or one
+    created by this module's own fallback DDL) may not have it. Both the writer
+    and ``_previously_failed`` ask here instead of assuming, so an unmigrated
+    state.db keeps working exactly as it does today."""
+    try:
+        return any(row[1] == "reason_class"
+                   for row in con.execute("PRAGMA table_info(apply_attempts)"))
+    except sqlite3.Error:
+        return False
 
 
 def _now() -> str:
@@ -493,12 +508,14 @@ def evaluate_gate(candidate_id: str, utility_before: float,
     regressed_ids = []
     before: list[int] = []
     after: list[int] = []
+    probe_ids: list[str] = []
     if pertask_json:
         try:
             pt = json.loads(pertask_json)
             before = [int(v) for v in (pt.get("before", []) or [])]
             after = [int(v) for v in (pt.get("after", []) or [])]
             ids = pt.get("ids", list(range(min(len(before), len(after)))))
+            probe_ids = [str(i) for i in ids]
             regressed = 0
             for i in range(min(len(before), len(after))):
                 if before[i] and not after[i]:      # pass → fail == a regression
@@ -643,7 +660,10 @@ def evaluate_gate(candidate_id: str, utility_before: float,
         cert_enabled = True
         if cfg["errors"]:
             cert_payload = {
-                "error": "misconfigured: " + "; ".join(cfg["errors"])}
+                "error": "misconfigured: " + "; ".join(cfg["errors"]),
+                "status": "misconfigured",
+                "reason_class": "infra",
+            }
             if decision == "promoted":
                 decision = "quarantined"
                 rationale = (
@@ -657,19 +677,35 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                     "no anytime-valid certificate: no per-task vectors to "
                     f"certify; point-estimate gate said: {rationale}")
         else:
+            probe_hash = (
+                hashlib.sha256("\x1f".join(probe_ids).encode()).hexdigest()[:16]
+                if probe_ids else None)
+            cert_dry_run = os.environ.get("MO_APPLY_DRY_RUN", "0") == "1"
             try:
-                con = sqlite3.connect(_db_path(db))
+                # timeout=30 matches the scheduler's writers: the default 5s
+                # turns ordinary write contention into a lock error, and a
+                # lock error here would be misread as a failed measurement.
+                con = sqlite3.connect(_db_path(db), timeout=30)
                 try:
                     cert = _pc.certify(
                         con, task_class=task_class,
                         candidate_id=str(candidate_id), before=before,
                         after=after, alpha_total=cfg["alpha"],
                         bet=cfg["bet"], ledger=cfg["ledger"],
-                        now=int(time.time()))
+                        now=int(time.time()),
+                        run_id=os.environ.get("MO_RUN_ID") or None,
+                        scorer=os.environ.get("MO_APPLY_SCORER"),
+                        dry_run=cert_dry_run,
+                        probe_set_hash=probe_hash,
+                        probe_ids=probe_ids or None)
                 finally:
                     con.close()
             except Exception as exc:
-                cert_payload = {"error": f"{type(exc).__name__}: {exc}"}
+                cert_payload = {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "status": "unavailable",
+                    "reason_class": "infra",
+                }
                 if decision == "promoted":
                     decision = "quarantined"
                     rationale = (
@@ -688,6 +724,21 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                             "no anytime-valid certificate: no discordant "
                             "probe pairs (gains=0, losses=0); point-estimate "
                             f"gate said: {rationale}")
+                    elif cert["status"] == "unreachable":
+                        # Legibility first: say why another identical run
+                        # cannot change the answer, so the operator fixes the
+                        # probe set instead of re-running the sweep.
+                        decision = "quarantined"
+                        rationale = (
+                            "certificate unreachable at this probe count: "
+                            f"need >= {cert['required_gains']} clean gains, "
+                            f"only {cert['gains'] + cert['losses']} discordant "
+                            f"pair(s) and max e={_pc.max_e(cert['gains'] + cert['losses'], cert['bet']):.4f}"
+                            f" < threshold={cert['threshold']:.4f} "
+                            f"(slot={cert['slot']}, "
+                            f"alpha_k={cert['alpha_k']:.6g}, "
+                            f"bet={cert['bet']:g}); point-estimate gate "
+                            f"said: {rationale}")
                     else:
                         decision = "quarantined"
                         rationale = (
@@ -697,8 +748,9 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                             f"(gains={cert['gains']}, losses={cert['losses']}, "
                             f"slot={cert['slot']}, "
                             f"alpha_k={cert['alpha_k']:.6g}, "
-                            f"bet={cert['bet']:g}); point-estimate gate "
-                            f"said: {rationale}")
+                            f"bet={cert['bet']:g}, "
+                            f"need>={cert['required_gains']} clean gains); "
+                            f"point-estimate gate said: {rationale}")
 
     result = {
         "decision": decision,
@@ -1025,7 +1077,8 @@ def attempt_record(task_class: str, target_kind: str, target_name: str,
                    candidate_id: str, promotion_id: str, base_wf_version: str,
                    utility_before, utility_after, utility_delta,
                    decision: str, rationale: str,
-                   dry_run, apply_enabled, db: str | None = None) -> str:
+                   dry_run, apply_enabled, db: str | None = None,
+                   reason_class: str | None = None) -> str:
     """Persist an apply_attempts row. Returns the attempt_id (bash prints it
     on stdout; apply_run suppresses it in the normal path but not in the
     no_candidate path)."""
@@ -1034,21 +1087,26 @@ def attempt_record(task_class: str, target_kind: str, target_name: str,
     now = _now()
     con = sqlite3.connect(_db_path(db))
     try:
-        con.execute("""
-            INSERT INTO apply_attempts
-                (attempt_id, task_class, target_kind, target_name,
-                 source_kind, source_id, candidate_id, promotion_id,
-                 base_workflow_version_id,
-                 utility_before, utility_after, utility_delta,
-                 decision, rationale, dry_run, apply_enabled, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (aid, task_class, target_kind, target_name,
-              source_kind, source_id or None,
-              candidate_id or None, promotion_id or None, base_wf_version or None,
-              float(utility_before) if utility_before not in (None, "") else None,
-              float(utility_after) if utility_after not in (None, "") else None,
-              float(utility_delta) if utility_delta not in (None, "") else None,
-              decision, rationale, int(dry_run), int(apply_enabled), now))
+        has_rc = _has_reason_class(con)
+        cols = ("attempt_id, task_class, target_kind, target_name, "
+                "source_kind, source_id, candidate_id, promotion_id, "
+                "base_workflow_version_id, utility_before, utility_after, "
+                "utility_delta, decision, rationale, dry_run, apply_enabled")
+        vals = (aid, task_class, target_kind, target_name,
+                source_kind, source_id or None,
+                candidate_id or None, promotion_id or None,
+                base_wf_version or None,
+                float(utility_before) if utility_before not in (None, "") else None,
+                float(utility_after) if utility_after not in (None, "") else None,
+                float(utility_delta) if utility_delta not in (None, "") else None,
+                decision, rationale, int(dry_run), int(apply_enabled))
+        if has_rc:
+            cols += ", reason_class"
+            vals += (reason_class,)
+        con.execute(
+            f"INSERT INTO apply_attempts ({cols}, created_at) "
+            f"VALUES ({','.join('?' * (len(vals) + 1))})",
+            (*vals, now))
         con.commit()
     finally:
         con.close()
@@ -1180,9 +1238,16 @@ def _previously_failed(task_class: str, target_name: str, source_id: str,
     except sqlite3.Error:
         return False
     try:
+        # An INFRA failure is not an edit-memory: the run never measured the
+        # directive, so a busy DB or an unreadable certificate must not
+        # permanently blacklist something that may in fact be an improvement.
+        skip_infra = (
+            " AND COALESCE(reason_class,'') <> 'infra'"
+            if _has_reason_class(con) else "")
         row = con.execute(
             "SELECT 1 FROM apply_attempts WHERE task_class=? AND target_name=? "
-            "AND source_id=? AND decision IN ('quarantined','rejected') LIMIT 1",
+            "AND source_id=? AND decision IN ('quarantined','rejected')"
+            + skip_infra + " LIMIT 1",
             (task_class, target_name, source_id)).fetchone()
         return row is not None
     except sqlite3.Error:
@@ -1350,6 +1415,7 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     # 4. Gate. Pass the optional per-task held-out vector so the in-loop
     #    no-regression gate can block a candidate that regresses a
     #    previously-solved task even when the aggregate improved (2607.14004).
+    gate = None
     if probe_unmeasured:
         # quarantine, not pending_human_approval: there is no human in this loop
         # (see the module docstring on the RSI posture). An unmeasured candidate is
@@ -1557,12 +1623,25 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
             version_id = ""
 
     # 7. Apply-attempt audit row (stdout suppressed in bash via > /dev/null).
+    #    ``reason_class`` separates "the gate measured and refused" from "the
+    #    run could not measure"; only the former feeds edit memory.
+    _cert_blob = gate.get("cert") if isinstance(gate, dict) else None
+    if isinstance(_cert_blob, dict) and _cert_blob.get("reason_class"):
+        _reason_class = _cert_blob["reason_class"]
+    elif probe_unmeasured:
+        # Nothing was measured: a dead harness, a missing frozen probe set or an
+        # exhausted budget. Infra, not evidence — this row must never become the
+        # edit memory that stops the directive from ever being re-proposed.
+        _reason_class = "infra"
+    else:
+        _reason_class = None
     attempt_record(
         task_class, target_kind, target_name,
         source_kind, source_id, candidate_id, promotion_id, "",
         utility_before, utility_after, utility_delta,
         gate_decision, gate_rationale,
-        dry_flag, apply_enabled, db=db)
+        dry_flag, apply_enabled, db=db,
+        reason_class=_reason_class)
 
     sys.stdout.write(
         f'{{"decision":"{gate_decision}","candidate_id":"{candidate_id}",'
