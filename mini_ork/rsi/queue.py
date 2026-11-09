@@ -53,7 +53,22 @@ REJECT_CODES: tuple[str, ...] = (
 #: implementer that cannot win. Closing one for real is a data or behaviour
 #: change (author the missing values, or change what produces them), not a code
 #: patch, so it belongs in the operator's hands.
+#:
+#: A second, structurally different case carries the same value: a candidate
+#: whose WHOLE fix surface is on the frozen kernel list. Such a patch is refused
+#: at publish, so dispatching it spends the implementer for nothing. Harvest sets
+#: ``evidence["monitor_reason"] = "frozen_files"`` there, and the rejection below
+#: says so instead of blaming a ratio the rule never had.
 MONITOR_ONLY: str = "monitor_only"
+
+_MONITOR_ONLY_DEFAULT_REASON = (
+    "the success predicate is a ratio over rows already written; "
+    "no patch can move it — fix the producer or the data instead")
+_MONITOR_ONLY_REASONS: dict[str, str] = {
+    "frozen_files": "every file this gap names is on the frozen kernel list; "
+                    "a self-driving patch to it is refused at publish — "
+                    "the change needs the operator (MO_ALLOW_FROZEN_EDIT)",
+}
 
 DEFAULT_MAX_CANDIDATES = 3
 DEFAULT_PER_DOMAIN_MAX = 5
@@ -382,10 +397,11 @@ def build_queue(
         # seeded order hands the top of the queue to a candidate that can only
         # be quarantined. See MONITOR_ONLY.
         if cand.evidence.get("fixability") == MONITOR_ONLY:
+            why = _MONITOR_ONLY_REASONS.get(
+                str(cand.evidence.get("monitor_reason") or ""),
+                _MONITOR_ONLY_DEFAULT_REASON)
             rejected.append(Rejection(
-                cand.candidate_id, cand.signature, "monitor_only",
-                "the success predicate is a ratio over rows already written; "
-                "no patch can move it — fix the producer or the data instead"))
+                cand.candidate_id, cand.signature, "monitor_only", why))
             continue
         avoid = avoidance(cand, view, cfg, now=now)
         if avoid is not None:

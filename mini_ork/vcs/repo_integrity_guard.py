@@ -78,6 +78,13 @@ FROZEN_PATHS_DEFAULT: list[str] = [
     "mini_ork/stores/diagnosis_ledger.py",
     "mini_ork/cli/publisher_authored_patch.py",
     "mini_ork/gates/merge_risk.py",
+    # escalation.py imports ``file_diagnosis`` / ``diagnosis_fingerprint`` from
+    # here, so this module is a policy input too: editing it steers what the
+    # frozen escalation policy decides without touching the policy itself (the
+    # 2026-10-29 t1-kernel-hole-3 review's first required fix). Appended after
+    # the eight rather than inserted among them, so the kickoff-order pin on
+    # that block stays meaningful.
+    "mini_ork/triage/failures.py",
 ]
 
 

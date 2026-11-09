@@ -40,8 +40,105 @@ from mini_ork.verify.pm import classify_suite_spawn, run_argv, run_logged  # noq
 
 # The frozen-kernel guard logic + its built-in default list live in the engine
 # (mini_ork/vcs/repo_integrity_guard.py) so the verifier and the apply boundary
-# share one definition. If the engine predates it, fall back to an inline copy of
-# the floor — a stale engine must still refuse, never silently pass.
+# share one definition. If the engine predates it, fall back to the inline copy
+# below — a stale engine must still refuse, never silently pass.
+#
+# The inline copy is the WHOLE floor plus a real reader of
+# ``config/kernel-frozen.yaml``. It used to be 14 entries with
+# ``parse_frozen_paths`` returning ``[]``, so a stale engine checked 14 paths
+# and silently ignored every config entry — including the eight self-driving
+# policy inputs the 2026-10-27 kernel freeze added. The import keeps the engine
+# list authoritative when the engine has the module; only a stale/failed import
+# reaches the copy. ``tests/unit/test_static_check_frozen_fallback.py`` holds
+# the copy and the engine floor byte-equal, so they cannot drift apart again.
+_INLINE_FROZEN_PATHS = [
+    "config/kernel-frozen.yaml",
+    "recipes/framework-edit/verifiers/static-check.py",
+    "mini_ork/vcs/repo_integrity_guard.py",
+    "mini_ork/runtime/sandbox.py",
+    "mini_ork/gates/gate_bootstrap.py",
+    "mini_ork/gates/abstain_gate.py",
+    "mini_ork/recovery/circuit_breaker.py",
+    "mini_ork/recovery/escalation_policy.py",
+    "mini_ork/dispatch/calibration.py",
+    "mini_ork/recovery/auto_repair.py",
+    "mini_ork/policies/engine.py",
+    "mini_ork/dispatch/cost_pause.py",
+    "mini_ork/stores/safety_events.py",
+    "mini_ork/observability/bug_report.py",
+    # The self-driving policy's inputs (RSI Tier-1 #4).
+    "mini_ork/recovery/escalation.py",
+    "mini_ork/recovery/diagnose.py",
+    "mini_ork/recovery/diagnoser_llm.py",
+    "mini_ork/recovery/supervisor.py",
+    "mini_ork/recovery/graph_patch.py",
+    "mini_ork/stores/diagnosis_ledger.py",
+    "mini_ork/cli/publisher_authored_patch.py",
+    "mini_ork/gates/merge_risk.py",
+    # escalation.py imports file_diagnosis / diagnosis_fingerprint from here.
+    "mini_ork/triage/failures.py",
+]
+
+
+def _inline_extract_paths(data):
+    if not isinstance(data, dict):
+        return []
+    paths = data.get("paths")
+    if not isinstance(paths, list):
+        return []
+    return [p for p in paths if isinstance(p, str) and p.strip()]
+
+
+def _inline_minimal_parse(text):
+    """Last-resort ``paths:`` reader for when PyYAML is unavailable."""
+    out = []
+    in_paths = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("- "):
+            in_paths = line == "paths:"
+            continue
+        if in_paths:
+            item = line[2:].strip().strip("'\"")
+            if item:
+                out.append(item)
+    return out
+
+
+def _inline_parse_frozen_paths(text):
+    if not text or not text.strip():
+        return []
+    try:
+        import yaml  # type: ignore
+    except Exception:  # noqa: BLE001
+        return _inline_minimal_parse(text)
+    try:
+        data = yaml.safe_load(text)
+    except Exception:  # noqa: BLE001
+        return _inline_minimal_parse(text)
+    return _inline_extract_paths(data)
+
+
+def _inline_load_frozen_paths(root):
+    """Config entries when readable, else the built-in copy — never ``[]``."""
+    path = os.path.join(str(root), "config", "kernel-frozen.yaml")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return list(_INLINE_FROZEN_PATHS)
+    parsed = _inline_parse_frozen_paths(text)
+    return parsed or list(_INLINE_FROZEN_PATHS)
+
+
+def _inline_frozen_hits(changed, patterns):
+    import fnmatch as _fnmatch  # noqa: PLC0415
+
+    return [c for c in changed if any(_fnmatch.fnmatch(c, p) for p in patterns)]
+
+
 try:  # noqa: E402
     from mini_ork.vcs.repo_integrity_guard import (  # noqa: E402
         FROZEN_CONFIG_RELPATH,
@@ -51,34 +148,11 @@ try:  # noqa: E402
         parse_frozen_paths,
     )
 except Exception:  # noqa: BLE001
-    import fnmatch as _fnmatch  # noqa: E402
-
     FROZEN_CONFIG_RELPATH = os.path.join("config", "kernel-frozen.yaml")
-    FROZEN_PATHS_DEFAULT = [
-        "config/kernel-frozen.yaml",
-        "recipes/framework-edit/verifiers/static-check.py",
-        "mini_ork/vcs/repo_integrity_guard.py",
-        "mini_ork/runtime/sandbox.py",
-        "mini_ork/gates/gate_bootstrap.py",
-        "mini_ork/gates/abstain_gate.py",
-        "mini_ork/recovery/circuit_breaker.py",
-        "mini_ork/recovery/escalation_policy.py",
-        "mini_ork/dispatch/calibration.py",
-        "mini_ork/recovery/auto_repair.py",
-        "mini_ork/policies/engine.py",
-        "mini_ork/dispatch/cost_pause.py",
-        "mini_ork/stores/safety_events.py",
-        "mini_ork/observability/bug_report.py",
-    ]
-
-    def parse_frozen_paths(text):  # type: ignore[misc]
-        return []
-
-    def load_frozen_paths(root):  # type: ignore[misc]
-        return list(FROZEN_PATHS_DEFAULT)
-
-    def frozen_hits(changed, patterns):  # type: ignore[misc]
-        return [c for c in changed if any(_fnmatch.fnmatch(c, p) for p in patterns)]
+    FROZEN_PATHS_DEFAULT = list(_INLINE_FROZEN_PATHS)
+    parse_frozen_paths = _inline_parse_frozen_paths  # type: ignore[misc]
+    load_frozen_paths = _inline_load_frozen_paths  # type: ignore[misc]
+    frozen_hits = _inline_frozen_hits  # type: ignore[misc]
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 

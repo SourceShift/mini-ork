@@ -74,7 +74,15 @@ def test_both_lists_carry_every_new_entry(p):
 
 
 def test_floor_last_eight_in_kickoff_order():
-    assert repo_integrity_guard.FROZEN_PATHS_DEFAULT[-8:] == NEW
+    """The eight inputs stay one contiguous block in the kickoff's order.
+
+    Pinned positionally as "the last eight" until triage/failures.py was
+    appended after them (the 2026-10-29 review's freeze of escalation.py's
+    import). Contiguity + order is the property the pin was for; the tail
+    position was an accident of it."""
+    floor = repo_integrity_guard.FROZEN_PATHS_DEFAULT
+    idx = [floor.index(p) for p in NEW]
+    assert idx == list(range(idx[0], idx[0] + len(NEW)))
 
 
 def test_nothing_dropped_from_floor_or_file():

@@ -1247,6 +1247,33 @@ def test_a_broken_rule_is_still_dispatchable(tmp_path, con):
     ctx = harvest_mod._Ctx(root=tmp_path, con=con, now=NOW, cfg={})
     cand = harvest_mod._broken(ctx, "L3", "learning", "column held_out is missing")
     assert cand.kind == "probe_broken"
+
+
+def test_a_frozen_fix_surface_marks_the_candidate_monitor_only(tmp_path, con):
+    """A rule whose ONLY file is on the frozen kernel list can never be closed
+    by a self-driving patch — publish refuses the edit. It still emits (the
+    symptom is real) but must not take a queue slot.
+
+    L11 is the case this was found on: diagnosis_ledger.py joined the frozen
+    kernel with the 2026-10-27 policy-input freeze."""
+    ctx = harvest_mod._Ctx(root=tmp_path, con=con, now=NOW, cfg={})
+    cand = harvest_mod._cand(
+        ctx, "learning", "L11", kind="stale_signal", title="t", evidence_key="k",
+        files=("mini_ork/stores/diagnosis_ledger.py",))
+    assert cand.evidence["fixability"] == MONITOR_ONLY
+    assert cand.evidence["monitor_reason"] == "frozen_files"
+    assert cand.evidence["frozen_files"] == ["mini_ork/stores/diagnosis_ledger.py"]
+
+
+def test_an_editable_file_keeps_the_candidate_queueable(tmp_path, con):
+    """One editable file is still a real remedy — only a WHOLLY frozen list is
+    unpatchable."""
+    ctx = harvest_mod._Ctx(root=tmp_path, con=con, now=NOW, cfg={})
+    cand = harvest_mod._cand(
+        ctx, "learning", "L1", kind="producer_missing", title="t", evidence_key="k",
+        files=("mini_ork/learning/ledger.py", "mini_ork/stores/diagnosis_ledger.py"))
+    assert "fixability" not in cand.evidence
+    assert "monitor_reason" not in cand.evidence
     assert "fixability" not in cand.evidence
 
 

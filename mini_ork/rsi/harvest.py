@@ -658,6 +658,33 @@ _G8_INVISIBLE: Mapping[str, str] = {
 }
 
 
+def _frozen_fix_surface(ctx: _Ctx, files: Sequence[str]) -> list[str]:
+    """The candidate's files a self-driving patch may not edit.
+
+    Every enforcing boundary reads the built-in floor ∪ the checkout's
+    ``config/kernel-frozen.yaml`` (publish, the framework-edit verifier, merge
+    risk); reading the same union here means "the loop cannot fix this" is
+    decided the same way everywhere. Only a candidate whose WHOLE file list is
+    frozen is unpatchable — one editable file is still a real remedy. A missing
+    guard module yields ``[]`` (the loop keeps its old behaviour) rather than
+    guessing.
+    """
+    if not files:
+        return []
+    try:
+        from mini_ork.vcs.repo_integrity_guard import (  # noqa: PLC0415
+            FROZEN_PATHS_DEFAULT,
+            frozen_hits,
+            load_frozen_paths,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    patterns = set(load_frozen_paths(str(ctx.root))) | set(FROZEN_PATHS_DEFAULT)
+    rel = [str(f) for f in files]
+    hits = frozen_hits(rel, sorted(patterns))
+    return hits if len(hits) == len(rel) else []
+
+
 def _cand(
     ctx: _Ctx,
     domain: str,
@@ -676,8 +703,23 @@ def _cand(
     source: str | None = None,
     success_command: str | None = None,
 ) -> Candidate:
-    if kind != "probe_broken" and rule_id in _G8_INVISIBLE:
-        evidence = {**dict(evidence or {}), "fixability": MONITOR_ONLY}
+    if kind != "probe_broken":
+        # Two ways a candidate can be real and still unqueueable: its success
+        # predicate is a ratio over rows already written, or its whole fix
+        # surface is frozen. The frozen fact is checked first because it is the
+        # more specific, more actionable one — L11 is both (its only file,
+        # diagnosis_ledger.py, is a policy input since the 2026-10-27 freeze),
+        # and a reader told "ratio over rows" would miss that the file is shut.
+        frozen = _frozen_fix_surface(ctx, files)
+        if frozen:
+            evidence = {
+                **dict(evidence or {}),
+                "fixability": MONITOR_ONLY,
+                "monitor_reason": "frozen_files",
+                "frozen_files": frozen,
+            }
+        elif rule_id in _G8_INVISIBLE:
+            evidence = {**dict(evidence or {}), "fixability": MONITOR_ONLY}
     return Candidate.build(
         domain=domain,
         source=source or f"{SYNTHETIC_PREFIX}{rule_id}",

@@ -378,7 +378,7 @@ def test_load_frozen_paths_missing_file_returns_nonempty_default(tmp_path: Path)
     from mini_ork.vcs.repo_integrity_guard import FROZEN_PATHS_DEFAULT, load_frozen_paths
     got = load_frozen_paths(str(tmp_path / "does-not-exist"))
     assert got == FROZEN_PATHS_DEFAULT
-    assert len(got) == 22
+    assert len(got) == 23
 
 
 def test_load_frozen_paths_garbage_file_returns_default(tmp_path: Path) -> None:
@@ -472,6 +472,17 @@ def test_escalation_policy_frozen_in_default_and_yaml() -> None:
     assert "mini_ork/recovery/escalation_policy.py" in yaml
     assert "mini_ork/recovery/auto_repair.py" in floor
     assert "mini_ork/recovery/auto_repair.py" in yaml
+
+
+def test_triage_failures_frozen_in_default_and_yaml() -> None:
+    """``recovery/escalation.py`` imports ``file_diagnosis`` and
+    ``diagnosis_fingerprint`` from ``triage/failures.py``, so that module is a
+    policy input: editing it steers the frozen escalation policy without
+    touching the policy. Both lists must carry it (the 2026-10-29
+    t1-kernel-hole-3 review's first required fix)."""
+    from mini_ork.vcs.repo_integrity_guard import FROZEN_PATHS_DEFAULT, load_frozen_paths
+    for paths in (set(FROZEN_PATHS_DEFAULT), set(load_frozen_paths(str(REPO)))):
+        assert "mini_ork/triage/failures.py" in paths
 
 
 def test_frozen_list_yaml_matches_builtin_floor() -> None:

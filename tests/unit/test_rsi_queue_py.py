@@ -174,6 +174,22 @@ def test_a_monitor_only_gap_is_still_examined():
     assert plan.selected == ()
 
 
+def test_a_frozen_surface_gap_is_rejected_with_its_own_reason():
+    """A candidate whose whole fix surface is frozen is monitor-only for a
+    different reason than a ratio rule; the rejection must say which, or the
+    operator is told to fix a producer the rule never had."""
+    frozen = replace(_cand("learning", key="frozen", severity=99),
+                     evidence={"fixability": MONITOR_ONLY,
+                               "monitor_reason": "frozen_files"})
+    plan = build_queue([frozen], now=NOW)
+
+    assert plan.selected == ()
+    (rej,) = plan.rejected
+    assert rej.code == MONITOR_ONLY
+    assert "frozen kernel" in rej.detail
+    assert "ratio over rows" not in rej.detail
+
+
 # ── avoidance ───────────────────────────────────────────────────────────────
 
 

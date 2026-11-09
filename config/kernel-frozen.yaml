@@ -48,6 +48,10 @@ paths:
   - mini_ork/stores/diagnosis_ledger.py
   - mini_ork/cli/publisher_authored_patch.py
   - mini_ork/gates/merge_risk.py
+  # escalation.py imports file_diagnosis / diagnosis_fingerprint from here, so
+  # this module is a policy input too — frozen since the 2026-10-29
+  # t1-kernel-hole-3 review.
+  - mini_ork/triage/failures.py
   # The code-fix probe fixtures are the measurement floor the code-fix probes
   # score against: a run that edits them moves its own goalposts. The glob
   # covers all three fixture subtrees (and any future one) — never a file list,
