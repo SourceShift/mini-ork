@@ -29,6 +29,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from mini_ork.verify_commands import fallback_commands
+
 REPO = Path(__file__).resolve().parents[2]
 VERIFIER = REPO / "recipes" / "framework-edit" / "verifiers" / "static-check.py"
 
@@ -55,14 +57,21 @@ paths:
 # Captured from the pre-change default (non-framework-edit) renderer. The origin
 # marker + redaction live strictly on the framework-edit branch, so the default
 # body must stay byte-identical; this golden fails if that ever drifts.
+#
+# The verification pair is interpolated from ``mini_ork.verify_commands`` rather
+# than pinned as a literal: it must name ``sys.executable`` (a bare ``python3``
+# is 3.9 on this host and cannot import the package), so a literal would be a
+# golden that only passes on one machine. Everything else in the body is still
+# a frozen string.
+_VERIFY_CMDS = "".join(
+    f"- `{cmd}`\n" for cmd in fallback_commands()).rstrip("\n")
 GOLDEN_DEFAULT = (
     "# Bug-promoted epic: T\n\n## Goal\n\nFix the bug noticed by `reviewer` agent "
     "during a prior run:\n\n> T\n\n## Context\n\n- Severity: **high** (confidence "
     "0.90, observed 2x)\n- First noticed by: `reviewer` agent\n- Observed in: "
     "`lib/p`\n- Originating task_class: `code_fix`\n\n## Description\n\nD\n\n"
     "## Suggested fix (from the noticing agent)\n\nF\n\n## Verification commands\n\n"
-    "- `python3 -m compileall -q mini_ork`\n- `python3 -m pytest -q "
-    "tests/unit/test_mini_ork_epics_py.py tests/unit/test_scheduler_py.py`\n\n"
+    f"{_VERIFY_CMDS}\n\n"
     "## Done When\n\n- `${MINI_ORK_RUN_DIR}/verdict.json` contains `{ \"pass\": "
     "true }`.\n- The originating noticed_bug fingerprint stops recurring in new "
     "runs.\n\n_Auto-promoted from bug_reports id=7 (fingerprint=abcdef012345)._\n"

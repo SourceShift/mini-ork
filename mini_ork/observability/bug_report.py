@@ -57,6 +57,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from mini_ork.context import context_env
+from mini_ork.verify_commands import fallback_commands
 
 __all__ = [
     "bug_report_emit",
@@ -624,13 +625,11 @@ def _render_promoted_kickoff(
         body.extend([
             "## Verification commands",
             "",
-            # Must reference paths that EXIST and terminate on their own. The
-            # previous pair cited tests/integration/test_autonomous_epic_pipeline.sh
-            # (deleted by the 2026-07 bash-removal, Phase 4) and a `shellcheck
-            # $(...)` whose substitution is EMPTY when no .sh changed — shellcheck
-            # then reads stdin and hangs the verifier.
-            "- `python3 -m compileall -q mini_ork`",
-            "- `python3 -m pytest -q tests/unit/test_mini_ork_epics_py.py tests/unit/test_scheduler_py.py`",
+            # One definition, shared with the epics door (``_synth_verify``'s
+            # no-hint fallback) so the two kickoff shapes cannot drift: the
+            # commands must reference paths that EXIST, terminate on their own,
+            # and name the interpreter that can actually import the package.
+            *[f"- `{cmd}`" for cmd in fallback_commands()],
             "",
             "## Done When",
             "",

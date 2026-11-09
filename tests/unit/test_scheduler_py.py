@@ -147,6 +147,23 @@ def test_generated_verification_classifies_launcher_as_python() -> None:
     assert commands == [f"{sys.executable} -m py_compile bin/mini-ork-scheduler"]
 
 
+def test_no_hint_fallback_uses_the_running_interpreter() -> None:
+    """A roadmap body that names no files still gets a check that can pass.
+
+    The no-hint pair lagged the file-hint path: it kept a bare ``python3``,
+    which is 3.9 here and cannot import ``mini_ork``, so every no-hint epic
+    inherited a verification command that failed on the interpreter alone.
+    Both kickoff emitters now read one definition
+    (``mini_ork.verify_commands``), so this asserts the shared list too.
+    """
+    from mini_ork.verify_commands import fallback_commands
+
+    commands = epics._synth_verify([])
+    assert commands == fallback_commands()
+    for command in commands:
+        assert command.split()[0] == sys.executable, command
+
+
 def test_effective_priority_and_ready_order_golden(graph_world: dict[str, str]) -> None:
     db = graph_world["db"]
     assert scheduler.effective_priority("A", db=db) == 10

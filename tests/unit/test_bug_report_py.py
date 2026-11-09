@@ -388,6 +388,15 @@ def test_promote_happy_path(temp_db, tmp_path):
     assert "## Verification commands" in text
     assert "## Done When" in text
 
+    # The commands a promoted kickoff carries are the shared fallback pair —
+    # the same list the no-hint epic path emits — and they name the running
+    # interpreter, not a bare ``python3`` (3.9 here: cannot import the package).
+    from mini_ork.verify_commands import fallback_commands
+
+    for command in fallback_commands():
+        assert f"- `{command}`" in text, command
+        assert command.split()[0] == sys.executable
+
     # Re-promote is idempotent: the epic already exists → 0.
     assert py.bug_report_promote("--top", "3", repo_root=sandbox) == 0
 

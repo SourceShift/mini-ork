@@ -557,13 +557,12 @@ def _synth_verify(paths):
     if sqls:
         cmds.append("# Apply: sqlite3 .mini-ork/state.db < " + sqls[0])
     if not cmds:
-        # Fallback for a body that named no files. It must reference paths that
-        # EXIST: the previous pair pointed at
-        # tests/integration/test_autonomous_epic_pipeline.sh, deleted by the
-        # 2026-07 bash-removal (Phase 4, 72040279), so every no-hint epic
-        # inherited a verification command that could never pass.
-        cmds = ["python3 -m compileall -q mini_ork",
-                "python3 -m pytest -q tests/unit/test_mini_ork_epics_py.py tests/unit/test_scheduler_py.py"]
+        # Fallback for a body that named no files — the same pair the
+        # bug-promoted kickoff carries, so it lives in one place
+        # (``mini_ork.verify_commands``) and the two cannot drift apart again.
+        from mini_ork.verify_commands import fallback_commands  # noqa: PLC0415
+
+        cmds = fallback_commands()
     return cmds
 
 
