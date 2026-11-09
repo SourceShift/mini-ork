@@ -695,13 +695,16 @@ def main(argv: list[str] | None = None) -> int:
             # other — two of them can contradict and nothing notices. One
             # capped audit pass judges the live corpus through that same
             # detector, so every relation it records is the detector's own
-            # evidence rather than a hand-written row. The import sits
-            # INSIDE this try: an ImportError must degrade to a stderr line,
-            # never crash reflect.
+            # evidence rather than a hand-written row. It is OPT-IN
+            # (MO_LESSON_CONFLICT_AUDIT=1) because it is a one-shot backfill:
+            # recording is idempotent, so a default-on pass would re-bill a
+            # full judge limit on every reflect and add nothing after the
+            # first. The import sits INSIDE this try: an ImportError must
+            # degrade to a stderr line, never crash reflect.
             try:
                 from mini_ork.learning import lesson_conflict
 
-                if lesson_conflict.enabled():
+                if lesson_conflict.enabled() and lesson_conflict.audit_enabled():
                     audit_report = lesson_conflict.audit_live_corpus(
                         db_path,
                         limit=lesson_conflict.audit_limit(),

@@ -32,7 +32,10 @@ The detector is wired onto the *authoring* path, so it only ever saw lessons
 written after it landed. ``audit_live_corpus`` is the missing half: one capped
 pass that walks the lessons already live and judges them against each other
 through the same ``check``. Every row it lands is written by this module's own
-writer, so the evidence and the detector can never drift apart.
+writer, so the evidence and the detector can never drift apart. It is a
+backfill, not a duty: ``reflect`` runs it only under
+``MO_LESSON_CONFLICT_AUDIT=1``, because the authoring path already covers
+everything written after the wiring and a repeat pass records nothing new.
 """
 from __future__ import annotations
 
@@ -52,6 +55,7 @@ __all__ = [
     "check",
     "skip_reason",
     "audit_live_corpus",
+    "audit_enabled",
     "audit_limit",
     "DEFAULT_AUDIT_LIMIT",
 ]
@@ -110,6 +114,27 @@ _RELATIONS = ("duplicate", "contradicts", "refines", "independent")
 # ``MO_LESSON_CONFLICT_AUDIT_LIMIT`` overrides it; ``0`` disables the pass.
 DEFAULT_AUDIT_LIMIT = 20
 AUDIT_LIMIT_ENV = "MO_LESSON_CONFLICT_AUDIT_LIMIT"
+AUDIT_ENV = "MO_LESSON_CONFLICT_AUDIT"
+
+
+def audit_enabled(environ=None) -> bool:
+    """Whether ``reflect`` runs the live-corpus backfill pass (default OFF).
+
+    The authoring path already checks every new lesson at write time, so this
+    pass exists for the corpus that *predates* that wiring — a one-shot
+    backfill, not a per-reflect duty. Recording is idempotent, so a second pass
+    re-judges the same head of the order and adds no row; leaving it on by
+    default would bill a full ``DEFAULT_AUDIT_LIMIT`` of judge calls on every
+    reflect and buy nothing after the first. Set ``MO_LESSON_CONFLICT_AUDIT=1``
+    for that pass, capped by ``MO_LESSON_CONFLICT_AUDIT_LIMIT``.
+
+    Opt-in here is deliberate and does not contradict ``enabled()``'s
+    default-on: the *check* must guard every write, while the *audit* is an
+    operator-initiated sweep over history.
+    """
+    env = os.environ if environ is None else environ
+    return (env.get(AUDIT_ENV) or "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def enabled() -> bool:

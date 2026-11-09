@@ -711,3 +711,38 @@ def test_audit_survives_a_judge_outage(monkeypatch, tmp_path):
     assert _count(con, "SELECT COUNT(*) FROM lesson_themes WHERE"
                        " lesson_text IS NOT NULL") == 2   # nothing withdrawn
     con.close()
+
+
+# ── the backfill is opt-in (default-off) ──────────────────────────────────
+
+def test_audit_is_off_by_default():
+    assert lc.audit_enabled({}) is False
+    assert lc.audit_enabled({"MO_LESSON_CONFLICT_AUDIT": ""}) is False
+    assert lc.audit_enabled({"MO_LESSON_CONFLICT_AUDIT": "0"}) is False
+
+
+def test_audit_takes_the_usual_truthy_spellings():
+    for raw in ("1", "true", "YES", " on "):
+        assert lc.audit_enabled({"MO_LESSON_CONFLICT_AUDIT": raw}) is True
+
+
+def test_the_check_stays_default_on_while_the_audit_does_not():
+    """The guard and the backfill answer different questions.
+
+    ``enabled()`` must default ON — it protects every authored lesson. The
+    audit defaults OFF because the authoring path already covers new lessons
+    and a repeat pass records nothing. Collapsing the two into one switch
+    would either stop guarding new lessons or re-bill a judge limit on every
+    reflect.
+    """
+    import mini_ork.learning.lesson_conflict as m
+    saved = m.os.environ.pop("MO_LESSON_CONFLICT_CHECK", None)
+    saved_audit = m.os.environ.pop(m.AUDIT_ENV, None)
+    try:
+        assert m.enabled() is True
+        assert m.audit_enabled() is False
+    finally:
+        if saved is not None:
+            m.os.environ["MO_LESSON_CONFLICT_CHECK"] = saved
+        if saved_audit is not None:
+            m.os.environ[m.AUDIT_ENV] = saved_audit

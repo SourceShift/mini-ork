@@ -453,6 +453,23 @@ site changes.
   does not write lessons. A lesson drawn from one cycle teaches the loop its own
   noise — authoring waits for a repeated failure signature and the
   `lesson_conflict` judge.
+
+### Backfilling contradictions among lessons already live
+
+The conflict check runs on the *authoring* path, so lessons written before it
+landed were never compared to each other. `audit_live_corpus` walks that older
+corpus and judges it through the same checker. It is opt-in because it is a
+one-shot backfill — recording is idempotent, so a second pass adds no row and
+only re-bills the judge:
+
+```bash
+MO_LESSON_CONFLICT_AUDIT=1 MO_LESSON_CONFLICT_AUDIT_LIMIT=20 mini-ork reflect
+```
+
+`MO_LESSON_CONFLICT_AUDIT_LIMIT=0` is a no-op equivalent to leaving the flag
+off. Relations land in `lesson_conflicts` and a contradiction also enqueues one
+`lesson-conflict` oversight item; nothing is un-authored or withheld, because
+these lessons are already live.
 - **Un-gameable gates.** G7/G9 are differential and G10 is out-of-family, which
   raises the cost of gaming them; it does not make them impossible. The
   implementer never sees the gate implementation it is measured against, and
