@@ -266,6 +266,19 @@ Two common extension selectors are:
 | `MO_ROUTING_POLICY` | Chooses a registered native routing policy. |
 | `MO_EMBED_PROVIDER` | Chooses a registered semantic-memory embedder. |
 
+### Delegation ledger
+
+Every dispatched run records who asked for it, a copy of the kickoff bytes it
+saw, and the absolute path of the `state.db` holding its row. `mini-ork runs`
+reads those rows — the current home by default, or `--all-homes` across every
+registered home.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MO_INITIATOR` | unset | Explicit initiator string recorded on `task_runs.initiator` for this dispatch. Control characters are stripped and the value is capped at 120 chars. When unset, the runtime falls back to `MO_SCHEDULER_DISPATCH`, `MO_RECOVER_OF`, `MO_RSI_CYCLE_ID`, a process-ancestry `claude-session:<id>`, then `manual[:<uid>]`. |
+| `MO_SCHEDULER_DISPATCH` | unset | Set to `1` by the scheduler to record the initiator as `scheduler` rather than `manual`. |
+| `MO_HOMES_REGISTRY` | `~/.mini-ork/homes.json` | Points the homes registry at another file. The default is the laptop (simple) tier; point this at a shared location when several homes should be unioned by `mini-ork runs --all-homes`. An unreadable registry is reported as `incomplete`, never presented as a complete empty union. |
+
 `MO_REVISE_ROUNDS` (default `2`) caps the revise-loop rounds a failed
 `retries`-edge node may spend re-dispatching its target before the
 `escalates_to` rollback edges fire. Set it to `0` to restore the pre-revise

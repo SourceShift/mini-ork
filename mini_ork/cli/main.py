@@ -2668,6 +2668,16 @@ def _inbox_handler(rest, root):
     return attention.main(rest, root=root)
 
 
+def _runs_handler(rest, root):
+    # Cross-home delegation ledger. Registered here, not in `_NATIVE_SUBS` or
+    # `_NATIVE_MODULE_SUBS`, because those name importable
+    # `mini_ork.cli.<name>` modules (and `_NATIVE_MODULE_SUBS` is pinned by
+    # tests/unit/test_native_dispatch_py.py). The command lives in runs_cmd.
+    from mini_ork.cli import runs_cmd
+
+    return runs_cmd.main(rest, root=root)
+
+
 def _build_default_registry() -> dict:
     registry = {sub: _native_module_handler(f"mini_ork.cli.{sub}") for sub in _NATIVE_SUBS}
     # "recipe-eval" is native too, but the dash is not importable in a module
@@ -2696,6 +2706,9 @@ def _build_default_registry() -> dict:
     # board. Registered here and not in `_NATIVE_MODULE_SUBS`, whose exact
     # mapping is pinned by tests/unit/test_native_dispatch_py.py.
     registry["inbox"] = _inbox_handler
+    # `runs` answers "what has been delegated to mini-ork" across every home.
+    # In-process beside board/inbox; the module is imported lazily.
+    registry["runs"] = _runs_handler
     registry["run"] = _run_handler
     registry["doctor"] = _doctor_handler
     registry["install"] = _install_handler

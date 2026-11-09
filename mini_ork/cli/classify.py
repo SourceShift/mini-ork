@@ -221,6 +221,12 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             sys.stderr.write(f"[warn] task_runs table not yet created ({e}); DB write skipped\n")
         finally:
             con.close()
+        # The row is committed: record who asked, the kickoff bytes, and the
+        # absolute DB path. Fail-soft and silent on a pre-0091 schema, so this
+        # never disturbs the upsert above or the caller's stderr contract.
+        from mini_ork.orchestration.delegation import record_dispatch
+        record_dispatch(os.path.abspath(db), run_id, kickoff_path=kickoff,
+                        run_dir=run_dir)
     _safe_trace_write(trace_store.enrich_stage_trace({
         "trace_id": trace_id,
         "run_id": run_id,

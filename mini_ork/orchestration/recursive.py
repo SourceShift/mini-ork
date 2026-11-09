@@ -372,6 +372,18 @@ def mo_recursive_approve_spawn(
             raise
     finally:
         con.close()
+    # The child's task_runs row is committed. Record the dispatch on it (never
+    # a second INSERT): who asked, the kickoff bytes, and the absolute DB path.
+    # A child run dir that does not exist yet stores NULL copy/digest.
+    from mini_ork.orchestration.delegation import record_dispatch
+
+    child_home = os.environ.get("MINI_ORK_HOME") or os.path.dirname(os.path.abspath(db))
+    record_dispatch(
+        os.path.abspath(db),
+        child_run_id,
+        kickoff_path=kickoff_path,
+        run_dir=os.path.join(child_home, "runs", child_run_id),
+    )
     return spawn_id
 
 

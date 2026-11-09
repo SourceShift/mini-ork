@@ -915,6 +915,21 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     print(f"  [ok] publisher: {published_count} artifact(s) published")
     _archive_stale_attempt_markers(run_dir, db, run_id)
     _mark_published(db, run_id)
+    # Record the DELIVERED artifact on the run's row. A run that took the
+    # no-commit early return above delivered nothing and is deliberately not
+    # stamped here. Bookkeeping only: a failure must never turn a published
+    # run into a failed one (mirror _note).
+    try:
+        from mini_ork.orchestration.delegation import set_artifact_path  # noqa: PLC0415
+        delivered = os.path.join(run_dir, "framework-edit.diff")
+        if not os.path.isfile(delivered):
+            delivered = os.path.join(run_dir, "review-diff.patch")
+        if not os.path.isfile(delivered):
+            delivered = review_file or ""
+        if delivered:
+            set_artifact_path(db, run_id, delivered)
+    except Exception as exc:  # fallback-guard: allow: the run is already published
+        print(f"  [warn] publisher: could not record artifact: {exc}", file=sys.stderr)
     return 0, "done"
 
 
