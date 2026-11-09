@@ -100,7 +100,9 @@ Top to bottom on every run tab (`page.rs:2062-2104`):
    - Clicking a node opens a **separate node tab** (`page.rs:1784-1798`).
 2. **Header** (`page.rs:584-654`):
    - title (kickoff heading);
-   - chips: state, cost, elapsed, plus ✋ questions and `remote · <env>` when present;
+   - chips: state, cost, elapsed, plus ✋ questions, `remote · <env>` and — on a
+     `published` run — how it landed (`committed <sha>`, `proposed diff`, or
+     `worktree to merge`) when present;
    - the run id with a Copy button, then desc (up to N lines), then sub (`recipe · branch · id`).
    - Under v2 the header **actions are empty** (`run.py:2701`).
 3. **Tab bar.** Seven tabs, no counts, no badges (`page.rs:656-685`).

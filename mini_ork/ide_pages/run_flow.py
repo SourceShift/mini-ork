@@ -612,6 +612,45 @@ def _workspace_waiting(run: Run) -> bool:
     return bool(status.get("uncommitted"))
 
 
+def _delivery(run: Run) -> tuple[str | None, list[str], bool]:
+    """The publisher's evidence — ``(commit sha, run-local artifacts, worktree waiting)``.
+
+    One read of the run dir, shared by the delivery bar (:func:`_merge`) and the
+    header chip (:func:`delivery`), so the two can never disagree about whether
+    a run delivered something. A sha makes the artifact list irrelevant (a
+    committing run has nothing "proposed"); artifacts with no sha are the
+    patch-delivery case, not an error.
+    """
+    sha = _publish_sha(run)
+    artifacts = _published_artifacts(run) if sha is None else []
+    waiting = str(run.card.get("status") or "").strip().lower() == "published" \
+        and _workspace_waiting(run)
+    return sha, artifacts, waiting
+
+
+def delivery(run: Run) -> tuple[str, str] | None:
+    """``(kind, detail)`` — how the run delivered, or ``None`` when it delivered nothing.
+
+    ``kind`` is ``"commit"`` (detail = the short sha), ``"diff"`` (a recipe
+    whose contract says deliver a patch and do not commit) or ``"worktree"``
+    (the run is published and its branch still holds work for a person to
+    merge). The absent case is the signal: a run that delivered nothing grows
+    no label, on the bar or in the header.
+
+    The caller decides *when* to ask, because :func:`_publish_sha` may fall
+    back to ``git log`` in the run's target repo — a page should ask only where
+    delivery is the run's outcome, not on every render of an in-flight run.
+    """
+    sha, artifacts, waiting = _delivery(run)
+    if sha:
+        return "commit", sha
+    if artifacts:
+        return "diff", ""
+    if waiting:
+        return "worktree", ""
+    return None
+
+
 def _merge(run: Run, hub: dict[str, Any] | None, integrate_state: str) -> dict[str, Any] | None:
     """The delivery bar — present when the run committed, published a patch, or a
     published worktree waits.
@@ -625,13 +664,8 @@ def _merge(run: Run, hub: dict[str, Any] | None, integrate_state: str) -> dict[s
     run with a kept empty worktree never grows a delivery stage. A run that
     delivered nothing has no bar: the absence is the signal.
     """
-    sha = _publish_sha(run)
-    # A committed run has a sha; only then is the artifact list irrelevant. The
-    # reverse — artifacts with no sha — is the patch-delivery case, not an error.
-    artifacts = _published_artifacts(run) if sha is None else []
+    sha, artifacts, waiting = _delivery(run)
     published = sha is not None or bool(artifacts)
-    waiting = str(run.card.get("status") or "").strip().lower() == "published" \
-        and _workspace_waiting(run)
     if not (published or waiting):
         return None
     review_passed = bool(hub) and hub.get("state") == "approved"

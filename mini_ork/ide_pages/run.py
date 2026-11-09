@@ -517,6 +517,40 @@ def _placement_chip(run: Run) -> dict[str, Any] | None:
     return S.chip(f"remote · {env}" if env else "remote", "blue")
 
 
+_DELIVERY_CHIP = {
+    "commit": ("green", lambda detail: f"committed {detail[:7]}"),
+    "diff": ("blue", lambda detail: "proposed diff"),
+    "worktree": ("yellow", lambda detail: "worktree to merge"),
+}
+
+
+def _delivery_chip(run: Run) -> dict[str, Any] | None:
+    """How a finished run landed, in the header: committed / proposed diff / worktree.
+
+    The delivery bar (:func:`run_flow._merge`) says this too, but only on the tab
+    that draws it — a reader on the Graph or Kickoff tab sees a ``published`` run
+    and cannot tell whether it committed, handed over a patch, or left a branch
+    for a person to merge. The chip carries that fact on every tab.
+
+    Asked only for a ``published`` run: a delivery is the outcome, and finding it
+    may fall back to ``git log`` in the target repo, which no in-flight run's
+    page should pay for. The kind itself comes from ``run_flow.delivery`` — one
+    read of the evidence, shared with the bar, so the two cannot disagree.
+    """
+    if str(run.card.get("status") or "").strip().lower() != "published":
+        return None
+    try:
+        from mini_ork.ide_pages import run_flow  # noqa: PLC0415 — run_flow imports run
+
+        found = run_flow.delivery(run)
+    except Exception:  # noqa: BLE001 — a broken evidence read costs the chip, not the page
+        return None
+    if found is None:
+        return None
+    tone, label = _DELIVERY_CHIP[found[0]]
+    return S.chip(label(found[1]), tone)
+
+
 def _elapsed(run: Run) -> str:
     start = _epoch(run.row.get("created_at"))
     end = _epoch(run.row.get("ended_at")) if not _running(run) else None
@@ -5286,6 +5320,9 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     if waiting:
         chips.append(S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
     chips.append(S.chip(O.chip_word(run, outcome["state"]), outcome["tone"]))
+    delivered = _delivery_chip(run)
+    if delivered:
+        chips.append(delivered)
     done = sum(1 for n in run.nodes if n.state == "done")
     if run.nodes:
         chips.append(S.chip(f"{done}/{len(run.nodes)} nodes"))
@@ -5397,6 +5434,9 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     placement = _placement_chip(run)
     if placement:
         chips.insert(1, placement)
+    delivered = _delivery_chip(run)
+    if delivered:
+        chips.insert(1, delivered)
     sections = {
         "dag": lambda: _dag_tab(run, args.get("node")),
         "kickoff": lambda: _kickoff_tab(run),
