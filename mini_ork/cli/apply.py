@@ -445,6 +445,22 @@ def mcnemar_exact_p(gains: int, losses: int) -> float:
     return successes / (2 ** n)
 
 
+def _cert_infra_reason_class(pre_flip_decision: str) -> str | None:
+    """``'infra'`` only when the certificate's own failure decided the run.
+
+    On top of a promote, a certificate that cannot run is the whole reason the
+    run refuses, so ``infra`` is right: it keeps a broken config from becoming
+    edit memory that blacklists a directive forever.
+
+    On top of an *evidence* quarantine (a measured regression, an ambiguous
+    tie) the refusal already has a real cause. Stamping that row ``infra``
+    would drop it from ``_previously_failed`` and let the sweep re-propose a
+    directive the gate has already measured as bad — the certificate merely
+    failed to add its own verdict on top.
+    """
+    return "infra" if pre_flip_decision == "promoted" else None
+
+
 def evaluate_gate(candidate_id: str, utility_before: float,
                   utility_after: float, pertask_json: str = "",
                   control_n: int = 1, *, task_class: str = "",
@@ -668,7 +684,7 @@ def evaluate_gate(candidate_id: str, utility_before: float,
             cert_payload = {
                 "error": "misconfigured: " + "; ".join(cfg["errors"]),
                 "status": "misconfigured",
-                "reason_class": "infra",
+                "reason_class": _cert_infra_reason_class(decision),
             }
             if decision == "promoted":
                 decision = "quarantined"
@@ -715,7 +731,7 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                 cert_payload = {
                     "error": f"{type(exc).__name__}: {exc}",
                     "status": "unavailable",
-                    "reason_class": "infra",
+                    "reason_class": _cert_infra_reason_class(decision),
                 }
                 if decision == "promoted":
                     decision = "quarantined"
@@ -1313,7 +1329,11 @@ def _certificate_preflight(task_class: str, scorer: str,
     # and no file is created (sqlite3.connect would create an empty one).
     if os.path.exists(db_file):
         try:
-            con = sqlite3.connect(db_file, timeout=5)
+            # timeout=30, like every other writer in this module: at the
+            # default 5 s ordinary write contention surfaces as a lock error,
+            # and the pre-flight would then refuse a perfectly good arm for a
+            # reason that has nothing to do with its evidence.
+            con = sqlite3.connect(db_file, timeout=30)
             try:
                 slot = _pc.next_slot(con, task_class)
             finally:
@@ -1726,7 +1746,10 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
 
     # 7. Apply-attempt audit row (stdout suppressed in bash via > /dev/null).
     #    ``reason_class`` separates "the gate measured and refused" from "the
-    #    run could not measure"; only the former feeds edit memory.
+    #    run could not measure"; only the former feeds edit memory. A
+    #    certificate blob only carries ``infra`` when its own failure decided
+    #    the verdict (see ``_cert_infra_reason_class``) — a measured refusal
+    #    keeps its evidence.
     _cert_blob = gate.get("cert") if isinstance(gate, dict) else None
     if isinstance(_cert_blob, dict) and _cert_blob.get("reason_class"):
         _reason_class = _cert_blob["reason_class"]

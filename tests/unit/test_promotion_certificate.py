@@ -501,6 +501,70 @@ def test_misconfigured_fails_closed(tmp_path, monkeypatch):
     assert not __import__("os").path.exists(p)
 
 
+def test_a_measured_quarantine_is_not_relabelled_infra(tmp_path, monkeypatch):
+    """A broken certificate on top of evidence must not erase edit memory.
+
+    Review b2d09c95: the overlay stamped ``reason_class='infra'`` on every
+    certificate failure, so a run whose per-task gate had *measured* a
+    regression became an infrastructure row — invisible to
+    ``_previously_failed``, which would then re-propose the same bad directive
+    forever. The certificate did not decide this verdict; the measurement did.
+    """
+    p = str(tmp_path / "g.db")
+    regressed = json.dumps({"before": [1, 0] + [0] * 10,
+                            "after": [0, 1] + [0] * 10})
+    out = _gate(monkeypatch, 1 / 12, 1 / 12, regressed, db=p,
+                MO_APPLY_CERT_ALPHA="2")
+    assert out["decision"] == "quarantined"
+    assert out["rationale"].startswith("per-task no-regression gate")
+    assert out["cert"]["reason_class"] is None
+
+
+def test_a_broken_certificate_over_a_promote_is_infra(tmp_path, monkeypatch):
+    """Here the certificate's failure IS the reason the run refuses."""
+    p = str(tmp_path / "g.db")
+    out = _gate(monkeypatch, 0.0, 7 / 12, _V(7, 0), db=p,
+                MO_APPLY_CERT_ALPHA="2")
+    assert out["decision"] == "quarantined"
+    assert out["cert"]["reason_class"] == "infra"
+
+
+def test_a_measured_quarantine_stays_in_edit_memory(
+        db, tmp_path, capsys, monkeypatch):
+    """The end-to-end consequence: the row is evidence, so the sweep sees it."""
+    target = tmp_path / "prompts" / "reviewer.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("ORIGINAL PROMPT\n")
+    monkeypatch.setenv("MO_APPLY_ENABLED", "1")
+    monkeypatch.setenv("MO_APPLY_CERTIFICATE", "1")
+    monkeypatch.setenv("MO_APPLY_CERT_ALPHA", "2")      # misconfigured on purpose
+    # The pre-flight is covered by its own tests; this one is about where the
+    # reason_class lands once the gate has run.
+    monkeypatch.setenv("MO_APPLY_CERT_PREFLIGHT", "0")
+    monkeypatch.setenv("MO_APPLY_SCORER", "probe")
+    # A measured per-task regression against the control arm.
+    regressed = json.dumps({"before": [1, 0] + [0] * 10,
+                            "after": [0, 1] + [0] * 10})
+    monkeypatch.setattr(
+        probe_scorer, "probe_score",
+        lambda *a, **k: {"before": 1 / 12, "after": 1 / 12, "n": 12,
+                         "pertask_json": regressed, "runs": [],
+                         "cost_usd": 0.0, "control_n": 1})
+    con = sqlite3.connect(db)
+    con.execute("ALTER TABLE apply_attempts ADD COLUMN reason_class TEXT")
+    con.commit()
+    con.close()
+    _seed_gradient(db, target="prompts/reviewer.md")
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    rows = _rows(db, "apply_attempts")
+    assert rows[0]["decision"] == "quarantined"
+    assert rows[0]["reason_class"] is None
+    assert ap._previously_failed(
+        "reviewer", "prompts/reviewer.md", "gr-1", db=db) is True
+
+
 def test_composes_with_mcnemar(tmp_path, monkeypatch):
     p = str(tmp_path / "g.db")
     out = _gate(monkeypatch, 0.0, 7 / 12, _V(7, 0), db=p,
