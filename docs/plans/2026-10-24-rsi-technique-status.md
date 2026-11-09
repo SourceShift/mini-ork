@@ -427,7 +427,7 @@ Commits are on `origin/main`.
 | Provenance + independent support | S12 #9, S17 #7 | 1d25b092 | LIVE | 51 patterns gated | raw gradients ≥0.6 still reach prompts via context |
 | Cross-epic gradient | comp A7 | `cross_epic_gradient.py` 4be49575 | PARTIAL | 185 rows written | reading needs `MO_INJECT_UNVERIFIED=1` |
 | Pattern mining | RMEL §3 | `pattern_store.py` | REPORT | 71 rows, all `observed` | the promotion gate never reads it |
-| Trace2Skill conflict check | S17 #9, RSIG | `lesson_conflict.py` bef6e2e5 | DORMANT | 0 conflicts | no lesson verified since merge |
+| Trace2Skill conflict check | S17 #9, RSIG | `lesson_conflict.py` bef6e2e5 + `12e85c3f` | LIVE | authoring check default ON; backfill opt-in | `audit_live_corpus` sweeps the lessons written before the wiring — run once with `MO_LESSON_CONFLICT_AUDIT=1`; it is not a per-reflect duty (recording is idempotent) |
 | Context v2 item-UCB rerank | RSIG | `item_utility.py` 2d3b55a8 | DORMANT | 0 rows | oldest-first tally (④) |
 | Reversible memory retirement (G4) | R2K | 6b9fd368 | DORMANT | 0 of 1,159 retired | no automatic policy |
 | Prefs / path rules | LMP E2, LLF R4 | 4d21a384 | DORMANT | 0 rules | none authored |
