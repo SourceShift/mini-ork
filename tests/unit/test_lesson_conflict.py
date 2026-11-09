@@ -606,3 +606,108 @@ def test_flag_off_both_writers_behave_exactly_as_before(monkeypatch, tmp_path):
             " WHERE pattern_id=?", (PAT_ID,)).fetchone()[0] == CAND_TEXT
     finally:
         con.close()
+
+
+# ── audit_live_corpus: the backfill pass over already-live lessons ─────────
+
+AUDIT_A = "When the verifier reports vacuous: always rerun the gate on the diff itself"
+AUDIT_B = "When the verifier reports vacuous: never rerun the gate on the diff itself"
+
+
+def _corpus_db(tmp_path):
+    """Two verified themes whose lessons are near-identical — the corpus the
+    authoring-time detector never saw."""
+    db = str(tmp_path / "state.db")
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE lesson_themes (
+          theme_id TEXT PRIMARY KEY, kind TEXT NOT NULL, role TEXT, task_class TEXT,
+          representative TEXT NOT NULL, centroid BLOB NOT NULL,
+          n_gradients INTEGER NOT NULL DEFAULT 0, n_runs INTEGER NOT NULL DEFAULT 0,
+          n_at_refresh INTEGER NOT NULL DEFAULT 0, first_seen INTEGER, last_seen INTEGER,
+          lesson_text TEXT, status TEXT NOT NULL DEFAULT 'candidate',
+          bug_report_id INTEGER, updated_at INTEGER);
+        CREATE TABLE emergent_patterns (
+          pattern_id TEXT PRIMARY KEY, cluster_label TEXT NOT NULL,
+          member_item_ids_json TEXT NOT NULL, feature_set_json TEXT NOT NULL,
+          strength_score REAL NOT NULL, suggested_meta_adr TEXT,
+          status TEXT NOT NULL DEFAULT 'proposed', detected_at INTEGER NOT NULL,
+          resolved_at INTEGER, lesson_text TEXT, task_class TEXT);
+        CREATE TABLE mo_inbox_gates (
+          inbox_id INTEGER PRIMARY KEY AUTOINCREMENT, gate_id TEXT NOT NULL,
+          feature TEXT NOT NULL, phase TEXT, context_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending', review_note TEXT,
+          enqueued_at INTEGER NOT NULL, resolved_at INTEGER, blocks_dispatch_for TEXT);
+        """
+    )
+    _theme(con, "th-a", "code_fix", AUDIT_A)
+    _theme(con, "th-b", "code_fix", AUDIT_B)
+    con.close()
+    return db
+
+
+def _audit_reply(against_id):
+    return json.dumps(
+        [{"id": against_id, "relation": "contradicts", "why": "opposite verb"}])
+
+
+def test_audit_missing_database_reports_and_records_nothing(tmp_path):
+    report = lc.audit_live_corpus(tmp_path / "nope.db")
+    assert report["error"] == "database not found"
+    assert report["recorded"] == 0 and report["audited"] == 0
+
+
+def test_audit_limit_zero_never_dispatches(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    db = _corpus_db(tmp_path)
+    calls = []
+    report = lc.audit_live_corpus(db, limit=0, dispatch_fn=_dispatch("[]", calls))
+    assert report["audited"] == 0 and report["recorded"] == 0
+    assert calls == []
+
+
+def test_audit_records_the_detectors_own_relations_and_reruns_add_none(
+        monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    db = _corpus_db(tmp_path)
+    calls = []
+    # Each source is judged against the other; the fake always says the two
+    # contradict. The pair is recorded by check(), not by the pass itself.
+    report = lc.audit_live_corpus(
+        db, limit=5, dispatch_fn=_dispatch(_audit_reply("th-a"), calls),
+        model="spec-lane-x")
+    assert report["audited"] == 2
+    assert report["judged"] == 2
+    # th-a's judge reply names th-a itself. The source is excluded from its
+    # own neighbour set, so the citation resolves to nothing and the call is
+    # unchecked — not a conflict against itself. th-b's reply lands.
+    assert report["verdicts"] == {"ok": 0, "duplicate": 0, "conflict": 1,
+                                  "unchecked": 1}
+    assert report["relations"] == 1
+    assert report["recorded"] == 1
+    assert calls == ["spec-lane-x", "spec-lane-x"]
+
+    con = sqlite3.connect(db)
+    assert _count(con, "SELECT COUNT(*) FROM lesson_conflicts") == 1
+    again = lc.audit_live_corpus(
+        db, limit=5, dispatch_fn=_dispatch(_audit_reply("th-a")))
+    assert again["recorded"] == 0            # idempotent through the unique pair
+    assert _count(con, "SELECT COUNT(*) FROM lesson_conflicts") == 1
+    con.close()
+
+
+def test_audit_survives_a_judge_outage(monkeypatch, tmp_path):
+    """An unchecked verdict withholds no lesson and does not stop the pass."""
+    _env(monkeypatch, tmp_path)
+    db = _corpus_db(tmp_path)
+    report = lc.audit_live_corpus(
+        db, limit=5, dispatch_fn=_dispatch(RuntimeError("lane down")))
+    assert report["audited"] == 2
+    assert report["verdicts"]["unchecked"] == 2
+    assert report["recorded"] == 0
+    con = sqlite3.connect(db)
+    assert _count(con, "SELECT COUNT(*) FROM lesson_conflicts") == 0
+    assert _count(con, "SELECT COUNT(*) FROM lesson_themes WHERE"
+                       " lesson_text IS NOT NULL") == 2   # nothing withdrawn
+    con.close()
