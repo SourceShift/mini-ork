@@ -4,8 +4,8 @@
 `<z-insight>` blocks. Which of them are actually still open?
 
 **Answer.** Of 851 tasks whose last self-report was `pending` / `in_progress` / `failed` /
-`blocked`, **521 (61%) had already shipped**, **60 (7%) are superseded**, **117 (14%) left no
-trace either way**, and **153 (18%) are genuinely still open**.
+`blocked`, **554 (65%) had already shipped**, **61 (7%) are superseded**, **118 (14%) left no
+trace either way**, and **118 (14%) are genuinely still open**.
 
 The failure mode is not false completion claims. It is **stale re-emission**: a session
 finishes work, stops mentioning the task, and ContextNest keeps the last thing it said.
@@ -31,19 +31,19 @@ Every verdict carries a receipt. The vocabulary is `DONE` (commit / file / branc
 
 | group | rows | DONE | OPEN | STALE | UNKNOWN |
 |---|---:|---:|---:|---:|---:|
-| A git mechanics (mini-ork + worktrees) | 126 | 82 | 14 | 5 | 25 |
-| B git + run triage (zed fork) | 121 | 72 | 19 | 27 | 3 |
-| C run triage (mini-ork) | 106 | 76 | 9 | 6 | 15 |
-| D lane / framework-edit | 97 | 51 | 20 | 2 | 24 |
-| E engine core + RSI | 75 | 48 | 17 | 6 | 4 |
-| F zed IDE frontend | 133 | 73 | 35 | 10 | 15 |
-| G1 IDE surface, 10-14→11-04 | 96 | 55 | 21 | 3 | 17 |
-| G2 IDE surface, 10-07→10-13 | 97 | 67 | 15 | 1 | 14 |
-| **total** | **851** | **524** | **150** | **60** | **117** |
+| A git mechanics (mini-ork + worktrees) | 126 | 90 | 6 | 5 | 25 |
+| B git + run triage (zed fork) | 121 | 73 | 18 | 27 | 3 |
+| C run triage (mini-ork) | 106 | 82 | 3 | 6 | 15 |
+| D lane / framework-edit | 97 | 54 | 17 | 2 | 24 |
+| E engine core + RSI | 75 | 51 | 13 | 7 | 4 |
+| F zed IDE frontend | 133 | 76 | 32 | 10 | 15 |
+| G1 IDE surface, 10-14→11-04 | 96 | 58 | 18 | 3 | 17 |
+| G2 IDE surface, 10-07→10-13 | 97 | 70 | 11 | 1 | 15 |
+| **total** | **851** | **554** | **118** | **61** | **118** |
 
 Per-row evidence for all 851 lives in the sibling files (`A-git-mo.md` … `G2-ide-mo-old.md`).
 
-## The 150 open tasks
+## The 118 open tasks
 
 The raw count overstates the work: agents found several rows collapsing onto one item.
 
@@ -85,8 +85,8 @@ The raw count overstates the work: agents found several rows collapsing onto one
 - `benchmark-results-no-producer` — `record_benchmark_delta` (the L9 patch, `785963d0`)
   averages `benchmark_results` joined to `benchmark_tasks`, and the only writers of those
   two tables — `benchmark_suite.add()` / `.run()` — are called by nothing anywhere in the
-  tree. The writeback is on `main` and computes nothing: the AVG is NULL, the UPDATE
-  matches no row. Declined twice (`docs/audits/2026-11-06-revive-batch.md` and the
+  tree. The writeback (`785963d0`) is unmerged *and* computes nothing: its AVG is NULL, its
+  UPDATE matches no row. Declined twice (`docs/audits/2026-11-06-revive-batch.md` and the
   2026-11-08 pre-push review); L9 now refuses that hollow closure (`8a6cc25e`) by
   requiring the delta writer **and** both benchmark producers to be wired.
 - ~~`on-event-hook` / `bif-e1`~~ — **DONE**: `d322c5ab`/`d10a34a2` wired
@@ -183,15 +183,16 @@ alone exempted every credential under `tests/`.
 
 ## Cross-cutting findings
 
-1. **Stale emission, not dishonesty.** 61% of "open" work had landed. A session that
+1. **Stale emission, not dishonesty.** 65% of "open" work had landed. A session that
    finishes a task usually stops naming it, so its last record freezes at `in_progress`.
    A todo queue fed by such blocks decays toward optimism-in-reverse: it accumulates tasks
    that are already done.
 2. **Task ids multiply; work items do not.** 6 sandbox rows → 3 providers, 3 emitter rows →
    1 sweep, 5 SDD rows → 1 chain. Deduping by `task_id` counts emissions, not work.
-3. **A rewritten file hides an unfixed defect.** G2 nearly marked `flow.rs` done because the
-   file changed; the `score` branch still renders `-1`. Verify the branch, not the diff.
-4. **`UNKNOWN` (117 rows) is honest, and concentrated.** It is user-facing observation,
+3. **A rewritten file hides an unfixed defect.** G2 first read the `flow.rs` diff as proof the
+   rubric-score defect was fixed; the `score` branch still rendered `-1` until 2026-11-09
+   (`mini-ork-ui` `2480d71`). Verify the branch, not the diff.
+4. **`UNKNOWN` (118 rows) is honest, and concentrated.** It is user-facing observation,
    external credentials, operator acts, or subjects outside the three audited repos. Guessing
    those `DONE` would have inflated the pass rate by ~14 points.
 
@@ -219,7 +220,8 @@ Two did not:
   concluded no node was accepted, without following the construction path that computes it.
 
 Both errors are the same species: **a verdict drawn from a signature or a count rather than
-from the behaviour**. Corrected totals would move 1 row from OPEN to DONE (152 open).
+from the behaviour**. The table above already counts B's row as DONE, so the totals reflect
+both corrections.
 
 ### Post-audit re-probe, 2026-11-09
 

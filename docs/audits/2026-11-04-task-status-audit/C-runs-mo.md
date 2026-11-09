@@ -8,7 +8,7 @@ fixes, the repo's own disposition docs (`docs/todos/2026-10-09..10-15`,
 `docs/audits/2026-10-19-session-goals/SESSION-GOALS.md`), the run dirs under
 `.mini-ork/runs/` (810), and read-only SQLite against `.mini-ork/state.db`.
 
-**Counts: 76 DONE / 9 OPEN / 6 STALE / 15 UNKNOWN**
+**Counts: 82 DONE / 3 OPEN / 6 STALE / 15 UNKNOWN**
 (out of 106).
 
 Read as a whole, the run-triage backlog is mostly *closed*: the 2026-10-20 RB

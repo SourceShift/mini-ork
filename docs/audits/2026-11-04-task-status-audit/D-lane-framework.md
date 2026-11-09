@@ -6,7 +6,7 @@ Window: 2026-10-07 → 2026-11-04. Repos read: `/Volumes/docker-ssd/ps/mini-ork`
 
 ## Summary
 
-Of the 97 rows, **51 are DONE**, **20 are OPEN**, **2 are STALE**, and **24 are
+Of the 97 rows, **54 are DONE**, **17 are OPEN**, **2 are STALE**, and **24 are
 UNKNOWN** (`panel-health-hackability` moved OPEN → DONE on 2026-11-09; see
 `SUMMARY.md`'s post-audit re-probe). The framework/lane half of this backlog is in much better shape than
 its self-reported status implies: lane affinity, the mock provider, the RBF
@@ -34,7 +34,7 @@ no in-repo trace.
 
 | task_id | ts | claimed | verdict | evidence |
 |---|---|---|---|---|
-| verifiers-pin-fix | 2026-11-04T15:19 | in_progress | STALE | `.github/workflows/ci.yml:132-146` records the decision *against* `==0.4.0` ("The ceiling entry is a *range*, not `==0.4.0`"); `pyproject.toml:43` still `verifiers>=0.2.0,<0.5`; `87669c33` 2026-10-28 |
+| verifiers-pin-fix | 2026-11-04T15:19 | in_progress | STALE | superseded: `pyproject.toml:43` declares `verifiers>=0.2.0,<0.4.1`, and `.github/workflows/ci.yml:211-235` (job `verifiers-pin`) tests **both** ends as exact pins (`verifiers==0.2.0` on py3.11, `verifiers==0.4.0` on py3.12) with the reason in a comment: a range re-resolves, so `>=0.4,<0.5` silently became 0.4.1 while `THIRD_PARTY.md` recorded a check against 0.4.0 |
 | verif-wiring-run | 2026-11-02T13:47 | in_progress | DONE | `24e5bb8c` "feat(instruments): producers for oracle integrity and verifier mutation, shadow for judge validity" |
 | readme-certify-ship | 2026-10-29T11:45 | pending | OPEN | last translation regen `e5406b67` (2026-10-25); English README modified later by `594eab86` (2026-11-02) → translations stale |
 | rrl-design | 2026-10-29T08:46 | pending | DONE | `docs/research/2026-10-29-agentic-language-design-v0.md` (Attest v0 design) + `recipes/agentic-language-pains/kickoff.md` exist (both untracked on disk) |
