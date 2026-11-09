@@ -31,6 +31,26 @@ pd() { python3.11 -c 'import json,sys; t=sys.stdin.read(); print(json.dumps(json
 
 If `oracle-coalition` has been fixed upstream before this smoke runs, use `oracle-liveness` or `oracle-stability` instead; both measured 0.8 pre-merge.
 
+### Update 2026-11-09 — the positive control moved into the harness
+
+The expectations above are the 2026-10-05 baseline and are kept as written. Two
+things changed since, and a re-run must not read them as regressions:
+
+- `oracle-coalition`, `oracle-liveness` and `oracle-stability` now all measure
+  **0.0** (re-measured on this tree: 5 trials each, no exploit), so the
+  "use another gate" fallback above no longer applies.
+- `oracle-panel-health` no longer passes `indeterminate`; it defers, the answer
+  an unmeasurable panel deserves. That was the last gullible registered gate,
+  so the audit's positive control no longer comes from production at all:
+  `mini_ork.gates.hackability.control()` runs the same operators against an
+  evaluator that always answers `pass` and requires **1.0**. Every
+  `gate-fuzz --hackability` run now reports it — `control.ok=false` means the
+  measured zeros say nothing about the gates under test.
+
+**Expected on a re-run:** every audited gate at 0.0, and `control.hackability`
+1.0 with `control.ok=true`. A clean registry plus a clean control is the pass
+condition now; a floor of 1/5 on a real gate is the failure.
+
 ## Step 0: pre-state
 
 ```bash

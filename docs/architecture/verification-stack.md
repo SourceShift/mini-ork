@@ -307,10 +307,19 @@ Run the audit with:
 mini-ork gate-fuzz --hackability --gate <gate_id> [--proposer-lane glm] --json
 ```
 
+**The instrument's own control.** A ratio is only evidence about a gate if the operators still work, and every
+registered gate now measures 0.0 — a broken operator set would look identical to a clean registry. So `control()`
+runs the same trials against an evaluator that always answers `pass` and requires **1.0**; every
+`gate-fuzz --hackability` run reports it as `control`. `control.ok=false` means the zeros above prove nothing. The
+control lives in the harness, not in the registry, so no gate has to stay deliberately gullible for the audit to
+keep working.
+
 **Live result.** The first audit found `oracle-coalition`, `oracle-liveness` and `oracle-stability` at **0.8**. An
 unknown panel or run fell into each backend's fail-open default, and the evaluator mapped that default to "pass". A
 fix made those evaluators defer on absent evidence (b53b6c0d), and the re-audit measured **0.0**.
-`oracle-panel-health` stays at 0.2, under the threshold.
+`oracle-panel-health` held **0.2** under the threshold because it mapped `cw_por`'s `indeterminate` to pass on
+purpose — it was the audit's positive control. As of 2026-11-09 it **defers** on `indeterminate` too, and the
+control above took over that role; all four gates then measured 0.0 with the control at 1.0.
 
 ## ⑥ Declared equivalence operator (G10-T07): `mini_ork/verify/equivalence.py`
 

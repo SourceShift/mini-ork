@@ -8,7 +8,10 @@ only stdout.
 
 With ``--hackability --gate ID ...`` it instead attacks the named registered
 gate(s) with known-bad ("hollow") inputs and persists
-``hackability = passed_bad / trials`` next to the DB. The legacy (no
+``hackability = passed_bad / trials`` next to the DB. Every such run also
+reports a ``control``: the same operators against a gate that always passes,
+which must score 1.0. A 0.0 on a real gate means nothing unless the control
+proves the operators can still flag a gullible one. The legacy (no
 ``--hackability``) path is byte-identical to before.
 """
 from __future__ import annotations
@@ -40,6 +43,9 @@ def _usage() -> str:
         "  --gate ID      Gate to audit (repeatable); required with --hackability\n"
         "  --db PATH      State DB (default: $MINI_ORK_DB / $MINI_ORK_HOME/state.db)\n"
         "  --proposer-lane LANE  Optional LLM lane to propose evidence documents\n"
+        "\n"
+        "Every run also audits a control gate that always passes; it must\n"
+        "score 1.0 or the measurement says nothing about the gates under test.\n"
     )
 
 
@@ -178,8 +184,27 @@ def _main_hackability(argv) -> int:
         for exploit in record["exploits"]:
             sys.stdout.write(f"  exploit: {exploit} ({operator_by_id[exploit]})\n")
 
+    # The instrument's own control: a gate that always answers "pass" must
+    # score 1.0. Without it a clean registry and a broken operator set are
+    # indistinguishable, and every 0.0 above would be taken on faith.
+    control = hackability.control(db_path)
+    if not json_flag:
+        hk = control["hackability"]
+        hk_s = "-" if hk is None else f"{hk:.3f}"
+        sys.stdout.write(
+            f"gate-hackability: control gate={control['gate']} hackability={hk_s}"
+            f" floor={control['floor']:.3f} ok={str(control['ok']).lower()}"
+            + (f" reason={control['reason']}" if control["reason"] else "")
+            + "\n")
+        if not control["ok"]:
+            sys.stderr.write(
+                "gate-fuzz: the hackability control failed — the operators did "
+                "not flag a gate that always passes, so the 0.0 scores above "
+                "are not evidence\n")
+
     if json_flag:
-        sys.stdout.write(json.dumps({"records": records}, indent=2, sort_keys=True) + "\n")
+        sys.stdout.write(json.dumps({"records": records, "control": control},
+                                    indent=2, sort_keys=True) + "\n")
     return 0
 
 

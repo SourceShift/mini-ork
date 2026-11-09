@@ -386,6 +386,65 @@ def test_production_e2e(db, monkeypatch, capsys):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# (9b) the instrument's control: an always-pass gate must score 1.0
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_control_flags_a_gate_that_always_passes(db):
+    """The control is structural: no registry gate has to stay gullible.
+
+    Before this existed the audit's positive control was
+    ``oracle-panel-health`` mapping ``indeterminate`` to ``pass``. Every other
+    measured gate already reads 0.0, so flipping that gate would have left the
+    audit unable to tell a clean registry from a broken operator set.
+    """
+    _register(db, "scope_gate", '["code_fix"]')   # any active row will do
+    ctrl = hackability.control(str(db))
+    assert ctrl["ok"] is True
+    assert ctrl["hackability"] == 1.0
+    assert ctrl["floor"] == 1.0
+    assert ctrl["reason"] is None
+    # The borrowed row is never consulted: the evaluator ignores the context,
+    # so even a sound gate's identity still yields the bad-input passes. The
+    # id is the registry's generated one, not the type name.
+    assert ctrl["gate"] and ctrl["gate"] != "control"
+
+
+def test_control_fails_closed_without_a_registered_gate(db, monkeypatch):
+    ctrl = hackability.control(str(db))
+    assert ctrl["ok"] is False
+    assert ctrl["hackability"] is None
+    assert "no active gate" in ctrl["reason"]
+
+
+def test_control_catches_a_broken_operator_set(db, monkeypatch):
+    """If the operators stop producing hollow documents, the control says so
+    instead of every real gate quietly measuring 0.0."""
+    _register(db, "scope_gate", '["code_fix"]')
+    monkeypatch.setattr(hackability, "is_hollow_document", lambda _d: False)
+    ctrl = hackability.control(str(db))
+    assert ctrl["ok"] is False
+    assert "did not flag" in ctrl["reason"]
+
+
+def test_cli_reports_the_control_and_warns_when_it_fails(db, capsys,
+                                                         monkeypatch):
+    gid = _register(db, "scope_gate", '["code_fix"]')
+    rc = gate_fuzz.main(["--hackability", "--gate", gid, "--db", str(db),
+                         "--json"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["control"]["ok"] is True
+
+    monkeypatch.setattr(hackability, "is_hollow_document", lambda _d: False)
+    rc = gate_fuzz.main(["--hackability", "--gate", gid, "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 0                       # a measurement always exits 0
+    assert "control" in captured.out and "ok=false" in captured.out
+    assert "are not evidence" in captured.err
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # (10) below threshold → promoted, gate in within_threshold
 # ─────────────────────────────────────────────────────────────────────────────
 

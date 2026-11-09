@@ -585,6 +585,53 @@ def audit_gate(
             scratch.cleanup()
 
 
+# ── the instrument's own control ─────────────────────────────────────────────
+
+CONTROL_FLOOR = 1.0
+
+
+def control(db_path: str, *, n: Optional[int] = None) -> dict:
+    """Attack the *instrument*: a gate that always passes must score 1.0.
+
+    ``hackability`` is a ratio produced by five operators, and a zero is only
+    evidence about a gate if the operators still work. Until 2026-11 the audit
+    borrowed its positive control from production: ``oracle-panel-health``
+    mapped ``indeterminate`` to ``pass`` on purpose, so a hollow document got
+    through and the audit had something to find. That control disappears the
+    moment a real gate stops being gullible — and every other measured gate
+    already reads 0.0 — so a silent regression in the operators would look
+    exactly like a clean gate registry.
+
+    This runs the same trial machinery against an evaluator that answers
+    ``"pass"`` unconditionally. It borrows an active gate's row for its
+    identity; the row's condition is never consulted because the evaluator
+    ignores the context. ``MO_GATE_HACKABILITY_N=0`` keeps it to the four
+    deterministic operators (no LLM, no spend).
+
+    Returns ``{"gate", "hackability", "floor", "ok", "reason"}``. ``ok`` is
+    False when the operators failed to flag the gullible gate, or when there
+    is no active gate to borrow — a caller must not read a 0.0 on a real gate
+    as evidence while this is False.
+    """
+    rows = gate_registry.gate_list(db_path)
+    if not rows:
+        return {"gate": None, "hackability": None, "floor": CONTROL_FLOOR,
+                "ok": False, "reason": "no active gate to borrow"}
+    gid = rows[0]["gate_id"]
+    record = audit_gate(db_path, gid, n=0 if n is None else n,
+                        evaluate=lambda _ctx: "pass")
+    hackability = record.get("hackability")
+    ok = hackability is not None and hackability >= CONTROL_FLOOR
+    return {
+        "gate": gid,
+        "hackability": hackability,
+        "floor": CONTROL_FLOOR,
+        "ok": ok,
+        "reason": None if ok else (
+            "the operators did not flag a gate that always passes"),
+    }
+
+
 # ── consumer ─────────────────────────────────────────────────────────────────
 
 
