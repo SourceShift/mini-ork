@@ -2705,6 +2705,19 @@ def _injection_ledger(run: Run) -> list[dict[str, Any]]:
         sub_bits = [f"{len(srcs)} source(s)"]
         if kinds:
             sub_bits.append("/".join(k for k in kinds if k))
+        # What KIND each injected pack item was. The ledger has recorded it
+        # since the source entry gained ``item_kind``; a count is what a reader
+        # can act on ("3 constraint · 2 finding"), and an id the pack could not
+        # classify is counted as unclassified rather than dropped.
+        item_bits: dict[str, int] = {}
+        for s in srcs:
+            if not (isinstance(s, dict) and s.get("item_kind")):
+                continue
+            key = str(s["item_kind"])
+            item_bits[key] = item_bits.get(key, 0) + 1
+        if item_bits:
+            sub_bits.append(" · ".join(f"{n} {kind}" for kind, n
+                                       in sorted(item_bits.items())))
         if skipped:
             sub_bits.append("skipped: " + ", ".join(sorted(skipped)))
         if d.get("reason"):

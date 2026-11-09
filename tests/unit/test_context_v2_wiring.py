@@ -135,7 +135,7 @@ def test_on_replaces_only_the_task_class_blocks(setup, monkeypatch):
     rec = json.loads((run_dir / "learned" / "planner.json").read_text())
     assert rec["context_v2"]["arm"] == "v2" and rec["context_v2"]["injected"] is True
     assert "c:0" in rec["context_v2"]["item_ids"]
-    assert {"kind": "context_v2", "id": "c:0"} in rec["sources"]
+    assert {"kind": "context_v2", "id": "c:0", "item_kind": "constraint"} in rec["sources"]
     assert "[c:0]" in (run_dir / "learned" / "planner.md").read_text()
 
 
@@ -185,7 +185,7 @@ def test_node_block_is_injected_in_the_v2_arm_with_sources(node_env, monkeypatch
     text = _learned("implementer", sources)
     assert "[c:0] Do NOT modify any other file." in text
     assert "re-check your change" in text
-    assert {"kind": "context_v2", "id": "c:0"} in sources
+    assert {"kind": "context_v2", "id": "c:0", "item_kind": "constraint"} in sources
     assert _learned("implementer") == text  # byte-identical with sources=None
     assert "name the id" in _learned("reviewer")
     # the node built and wrote the pack itself (no planner pack existed)

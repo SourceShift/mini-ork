@@ -1060,16 +1060,64 @@ def rendered_ids(text: str, pack: dict) -> list[str]:
     return [i for i in (pack.get("item_ids") or []) if f"[{i}]" in text]
 
 
+#: The pack list each source kind comes from. A source id already carries a
+#: prefix (``c:``/``f:``/``p:``/``t:``), but that is a rendering convention; the
+#: pack's own lists are the authority for what an id IS.
+_ITEM_KINDS = (
+    ("constraints", "constraint"),
+    ("file_findings", "finding"),
+    ("prior_attempts", "prior_attempt"),
+    ("themes", "theme"),
+)
+
+
+def item_kinds(pack: dict) -> dict[str, str]:
+    """id → ``constraint`` | ``finding`` | ``prior_attempt`` | ``theme``.
+
+    Built from the pack's own lists rather than the id prefix, so an id that
+    was renamed or hand-edited in a pack file is described by the list it is
+    actually in. An id in no list is simply absent from the map.
+    """
+    kinds: dict[str, str] = {}
+    for key, kind in _ITEM_KINDS:
+        for item in pack.get(key) or []:
+            if isinstance(item, dict) and item.get("id"):
+                kinds[str(item["id"])] = kind
+    return kinds
+
+
+def source_entries(pack: dict, ids: list[str], *, held_out: bool = False) -> list[dict]:
+    """The ledger sources for the pack items a block actually injected.
+
+    One shape for every emitter (the per-node block below and the planner in
+    :mod:`mini_ork.cli.plan`), so the injection ledger says *what kind* each id
+    was instead of leaving a reader to decode the ``f:``/``c:`` prefix. An id
+    whose kind the pack cannot name keeps the entry with ``item_kind: ""`` —
+    "injected, unclassified" is a fact, and dropping it would make the ledger
+    disagree with the count of sources.
+    """
+    kinds = item_kinds(pack)
+    out = []
+    for item_id in ids:
+        entry: dict = {"kind": "context_v2", "id": item_id,
+                       "item_kind": kinds.get(str(item_id), "")}
+        if held_out:
+            entry["held_out"] = True
+        out.append(entry)
+    return out
+
+
 def node_block(run_dir: str, node_type: str, run_id: str, *, task_class: str = "",
                sources: list[dict] | None = None) -> str:
     """The v2 block for one LLM node, or ``""`` unless this run's arm is ``v2``.
-    Appends one ``kind: "context_v2"`` source per injected item id."""
+    Appends one ``kind: "context_v2"`` source per injected item id, carrying
+    the item's own kind (:func:`source_entries`)."""
     if not run_dir or arm(run_id) != "v2":
         return ""
     pack = pack_for_run(run_dir, task_class=task_class, run_id=run_id)
     text = render(pack, node_type) if pack else ""
     if text and sources is not None:
-        sources.extend({"kind": "context_v2", "id": i} for i in rendered_ids(text, pack))
+        sources.extend(source_entries(pack, rendered_ids(text, pack)))
     return text
 
 

@@ -123,14 +123,22 @@ def _v2_pack(run: Run) -> None:
     }), encoding="utf-8")
 
 
-def _ledger(run: Run, node: str, ids: list[str]) -> None:
+def _ledger(run: Run, node: str, ids: list[str],
+            item_kinds: dict[str, str] | None = None) -> None:
     """``learned/<node>.json`` in the shape ``context_v2.write_injection_record``
-    writes: each source carries the pack item id the node was given."""
+    writes: each source carries the pack item id the node was given (and, since
+    ``item_kind`` landed, the kind of pack item it was when known)."""
     learned = run.run_dir / "learned"
     learned.mkdir(exist_ok=True)
+    sources = []
+    for i in ids:
+        entry: dict[str, Any] = {"kind": "context_v2", "id": i}
+        if item_kinds and i in item_kinds:
+            entry["item_kind"] = item_kinds[i]
+        sources.append(entry)
     (learned / f"{node}.json").write_text(json.dumps({
         "node_id": node, "injected": bool(ids), "reason": "",
-        "sources": [{"kind": "context_v2", "id": i} for i in ids], "written_at": 1,
+        "sources": sources, "written_at": 1,
     }), encoding="utf-8")
 
 
@@ -347,6 +355,30 @@ def test_learnings_tab_absorbs_a_ledger_failure(tmp_path: Path, monkeypatch: pyt
     tab = _learnings_tab(run)
     # The broken ledger costs the usage facts, not the injected lesson rows.
     assert _lesson_row_for(tab, LESSONS[0][1])
+
+
+def test_ledger_row_breaks_injected_items_down_by_kind(tmp_path: Path) -> None:
+    """A reader should see "2 constraint · 1 theme", not have to decode ids."""
+    run = _run(tmp_path)
+    _v2_pack(run)
+    _ledger(run, "implementer",
+            [LESSONS[0][0], LESSONS[1][0], LESSONS[2][0], "?:unclassified"],
+            item_kinds={LESSONS[0][0]: "constraint", LESSONS[1][0]: "constraint",
+                        LESSONS[2][0]: "theme"})
+
+    row = run_page._injection_ledger(run)[0]
+    assert row["t"] == "● implementer"
+    assert "4 source(s)" in row["sub"]          # the unclassified id still counts
+    assert "2 constraint · 1 theme" in row["sub"]
+
+
+def test_ledger_row_without_item_kinds_keeps_todays_sub_line(tmp_path: Path) -> None:
+    """An older ``learned/*.json`` (no ``item_kind``) renders exactly as before."""
+    run = _run(tmp_path)
+    _ledger(run, "planner", ["c:0"])
+
+    row = run_page._injection_ledger(run)[0]
+    assert row["sub"] == "1 source(s) · context_v2"
 
 
 def test_level_one_lesson_rows_keep_todays_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

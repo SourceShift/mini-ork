@@ -362,6 +362,71 @@ def test_render_keeps_constraints_and_drops_prior_first_under_budget(tmp_path):
     assert cv.render({"constraints": [], "file_findings": [], "prior_attempts": []}) == ""
 
 
+# ── source entries carry the item's kind ────────────────────────────────────
+
+def test_item_kinds_names_each_id_by_the_pack_list_it_is_in():
+    """The pack's lists are the authority, not the id prefix: the ledger should
+    say "this was a finding", not leave a reader decoding ``f:``."""
+    pack = {
+        "constraints": [{"id": "c:0", "text": "x"}, {"id": "c:1", "text": "y"}],
+        "file_findings": [{"id": "f:aaaaaaaaaa", "n": 2}],
+        "prior_attempts": [{"id": "p:r1", "status": "failed"}],
+        "themes": [{"id": "t:4", "text": "z"}],
+        "item_ids": ["c:0", "f:aaaaaaaaaa", "p:r1", "t:4", "?:unlisted"],
+    }
+    assert cv.item_kinds(pack) == {
+        "c:0": "constraint", "c:1": "constraint", "f:aaaaaaaaaa": "finding",
+        "p:r1": "prior_attempt", "t:4": "theme"}
+
+
+def test_item_kinds_tolerates_malformed_lists():
+    pack = {"constraints": [{"text": "no id"}, "not-a-dict", None],
+            "file_findings": "not-a-list", "themes": [{"id": "t:1"}]}
+    assert cv.item_kinds(pack) == {"t:1": "theme"}
+    assert cv.item_kinds({}) == {}
+
+
+def test_source_entries_keep_an_unclassified_id_instead_of_dropping_it():
+    """An injected id the pack cannot classify is "injected, unclassified" —
+    a fact worth keeping; dropping it would make the ledger's source count
+    disagree with what the node was actually shown."""
+    pack = {"constraints": [{"id": "c:0"}], "file_findings": [{"id": "f:aaaaaaaaaa"}]}
+    got = cv.source_entries(pack, ["c:0", "f:aaaaaaaaaa", "?:x"])
+    assert [s["id"] for s in got] == ["c:0", "f:aaaaaaaaaa", "?:x"]
+    assert [s["item_kind"] for s in got] == ["constraint", "finding", ""]
+    assert all(s["kind"] == "context_v2" for s in got)
+    assert all("held_out" not in s for s in got)
+    assert [s.get("held_out") for s in cv.source_entries(pack, ["c:0"], held_out=True)] == [True]
+
+
+def test_node_block_records_the_kind_of_every_injected_item(monkeypatch):
+    pack = {
+        "constraints": [{"id": "c:0", "text": "Do NOT modify any other file."}],
+        "file_findings": [{"id": "f:aaaaaaaaaa", "n": 2, "n_runs": 2, "files": ["a.py"],
+                           "worst_severity": "high", "representative": "x" * 50}],
+        "item_ids": ["c:0", "f:aaaaaaaaaa"],
+    }
+    monkeypatch.setattr(cv, "arm", lambda run_id: "v2")
+    monkeypatch.setattr(cv, "pack_for_run",
+                        lambda run_dir, **kw: pack)
+
+    sources: list[dict] = []
+    text = cv.node_block("/tmp/run", "planner", "run-1", sources=sources)
+
+    assert "[c:0]" in text and "[f:aaaaaaaaaa]" in text
+    assert sources == [
+        {"kind": "context_v2", "id": "c:0", "item_kind": "constraint"},
+        {"kind": "context_v2", "id": "f:aaaaaaaaaa", "item_kind": "finding"},
+    ]
+
+
+def test_node_block_records_nothing_outside_the_v2_arm(monkeypatch):
+    monkeypatch.setattr(cv, "arm", lambda run_id: "shadow")
+    sources: list[dict] = []
+    assert cv.node_block("/tmp/run", "planner", "run-1", sources=sources) == ""
+    assert sources == []
+
+
 # ── modes / holdout ─────────────────────────────────────────────────────────
 
 def test_mode_defaults_to_shadow_and_rejects_unknown_values(monkeypatch):
