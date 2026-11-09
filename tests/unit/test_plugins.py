@@ -196,6 +196,31 @@ def test_a_broken_plugin_warns_instead_of_killing_the_cli(monkeypatch, capsys):
     assert "warning: plugin bad" in capsys.readouterr().err
 
 
+def test_a_plugin_that_exits_cannot_kill_the_cli(monkeypatch, capsys):
+    """``sys.exit()`` during registration must be a warning, not the process.
+
+    Discovery runs at import now, so an escaping ``SystemExit`` would terminate
+    the interpreter while ``mini-ork`` is still importing — every command, not
+    just the one that touches the plugin.
+    """
+    class _Exiting:
+        name = "quitter"
+        value = "quitter:register"
+
+        def load(self):
+            raise SystemExit(3)
+
+    monkeypatch.setattr(plugins_mod.importlib.metadata, "entry_points",
+                        lambda: _EPs([_Exiting()]))
+    _reset_bootstrap(monkeypatch)
+
+    report = plugins_mod.bootstrap()
+
+    assert report is not None
+    assert [f.name for f in report.failed] == ["quitter"]
+    assert "warning: plugin quitter" in capsys.readouterr().err
+
+
 def test_a_failing_scan_never_breaks_the_cli(monkeypatch, capsys):
     def boom():
         raise RuntimeError("metadata index is unreadable")

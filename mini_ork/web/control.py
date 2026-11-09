@@ -113,8 +113,13 @@ def resume_cost_run(
     Mirrors bin/mini-ork-resume's audit shape: appends
     {resumed_at, approver, source, run_id} to
     .cost-pause-approvals.jsonl so the resume is traceable. Returns
-    ok=False when no sentinel was present (treat as a successful
-    no-op on the client side).
+    ok=False when neither hold is present (treat as a successful no-op on the
+    client side), and ok=False / error="budget_exhausted" while a per-run budget
+    park still blocks.
+
+    A run may be held by the cost-pause sentinel, by a ``.budget-exhausted``
+    marker (the gate's park), or by both; one call answers whatever is there and
+    writes one audit row per hold.
 
     After the clear + audit, the run is restarted with
     ``mini-ork recover <id> --strategy resume`` — the same helper and log
@@ -144,30 +149,31 @@ def resume_cost_run(
         }
 
     sentinel = run_dir / ".cost-pause"
-    if not sentinel.is_file():
+    if not sentinel.is_file() and verdict is None:
         return {
             "ok": False,
             "error": "no cost-pause sentinel present",
             "task_run_id": task_run_id,
         }
 
-    sentinel_payload = sentinel.read_text(encoding="utf-8").strip()
     approvals = run_dir / ".cost-pause-approvals.jsonl"
     audit = {
         "resumed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "approver": approver,
         "source": "http-api",
         "run_id": task_run_id,
-        "sentinel_payload": sentinel_payload,
     }
-    with approvals.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(audit) + "\n")
+    if sentinel.is_file():
+        audit["sentinel_payload"] = sentinel.read_text(encoding="utf-8").strip()
+        with approvals.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(audit) + "\n")
+        sentinel.unlink()
 
-    sentinel.unlink()
-
-    # The park fits (the pre-check only let it through in that case): clear the
-    # marker and give it its own audit row, mirroring the CLI — one resume, one
-    # audit row per hold, nothing left for the next dispatch to re-park on.
+    # A budget park that fits (the pre-check only let it through in that case)
+    # gets its own audit row and is cleared — one resume, one audit row per
+    # hold. A marker-only park reaches here with no sentinel at all, which is
+    # exactly the state a budget gate leaves behind; the CLI resume accepts it
+    # too, so this surface must not answer "no sentinel present" instead.
     if verdict is not None:
         from mini_ork.cost import budget  # noqa: PLC0415
 

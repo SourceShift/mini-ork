@@ -268,7 +268,9 @@ def load_plugins(
             loaded = load_entry_point(ep, context=context)
             report.loaded.append(loaded)
             _LOADED[loaded.name] = loaded
-        except PluginError as exc:
+        except (PluginError, SystemExit) as exc:
+            # ``SystemExit`` from a plugin's own ``sys.exit()`` is contained to
+            # that plugin: aborting here would skip every entry point after it.
             if strict:
                 raise
             report.failed.append(PluginFailure(name=ep.name, error=str(exc)))
@@ -326,7 +328,11 @@ def bootstrap(
     try:
         report = load_plugins(group=group, context=context,
                               entry_points=entry_points)
-    except Exception as exc:  # noqa: BLE001 — discovery must not break the CLI
+    except (SystemExit, Exception) as exc:  # noqa: BLE001 — must not break the CLI
+        # ``SystemExit`` included: a plugin that calls ``sys.exit()`` while
+        # registering would otherwise terminate the interpreter mid-import,
+        # i.e. break every command instead of warning about that one package.
+        # ``KeyboardInterrupt`` is deliberately NOT caught — Ctrl-C is the user.
         sys.stderr.write(f"warning: plugin discovery failed: {exc}\n")
         return None
     for failure in report.failed:

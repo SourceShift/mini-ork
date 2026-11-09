@@ -128,8 +128,12 @@ def resume_cost(
     result = control.resume_cost_run(home, task_run_id, approver=operator)
     if not result.get("ok"):
         # 409 because the sentinel might already be absent — "nothing to resume"
-        # is a different error class than "run doesn't exist".
-        raise HTTPException(status_code=409, detail=result.get("error", "resume failed"))
+        # is a different error class than "run doesn't exist". Carry `detail`
+        # too: a budget refusal is only actionable with the number to exceed.
+        message = result.get("error", "resume failed")
+        if result.get("detail"):
+            message = f"{message}: {result['detail']}"
+        raise HTTPException(status_code=409, detail=message)
     return result
 
 

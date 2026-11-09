@@ -115,6 +115,31 @@ def test_resume_clears_both_holds_once_the_run_fits(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_resume_clears_a_marker_only_park(tmp_path, monkeypatch):
+    """A budget gate leaves the marker with no sentinel — the CLI accepts that."""
+    run_id = "run-web-park-5"
+    home = tmp_path / "home"
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / ".budget-exhausted").write_text("{}\n", encoding="utf-8")
+    con = sqlite3.connect(home / "state.db")
+    con.execute("CREATE TABLE IF NOT EXISTS llm_calls (run_id TEXT, cost_usd REAL)")
+    con.execute("INSERT INTO llm_calls VALUES (?, ?)", (run_id, 0.84))
+    con.commit()
+    con.close()
+    monkeypatch.setenv("MO_RUN_BUDGET_USD", "12")
+    calls = _spawn_noop(monkeypatch)
+
+    result = control.resume_cost_run(home, run_id, "op")
+
+    assert result["ok"] is True
+    assert not (run_dir / ".budget-exhausted").exists()
+    rows = _audit_rows(run_dir)
+    assert len(rows) == 1
+    assert rows[0]["sentinel_payload"]["marker"] == ".budget-exhausted"
+    assert len(calls) == 1
+
+
 def test_resume_without_a_marker_is_unchanged(tmp_path, monkeypatch):
     """The pre-existing single-hold path keeps its exact shape."""
     run_id = "run-web-park-4"

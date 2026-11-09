@@ -158,9 +158,10 @@ Out of tree, register it through the plugin seam instead of patching core — an
 entry point in the `mini_ork.plugins` group whose target calls
 `context.budget_policy("myorg", _quota)` (see `mini_ork/plugins.py`). The CLI
 runs that discovery once per process **at `mini_ork.cli` import**, so every
-native subcommand sees it — including the `mini-ork resume` / `mini-ork
-recover` that a budget refusal tells you to run, which are separate
-`python -m mini_ork.cli.<sub>` processes. A plugin that fails to load is
+subcommand sees it — including the `mini-ork resume` / `mini-ork recover` that
+a budget refusal tells you to run, which the dispatcher spawns as separate
+`python -m mini_ork.cli.<sub>` processes (`execute` runs in-process, and sees
+the same import). A plugin that fails to load is
 reported on stderr and skipped. Set `MINI_ORK_NO_PLUGINS=1` in the process
 environment to skip discovery where third-party code must not execute; because
 discovery happens at import, this must be in the environment before the process
