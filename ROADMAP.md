@@ -200,7 +200,7 @@ All four calibration-list items shipped 2026-06-13. The list is closed.
   Pre-push hook treats INDETERMINATE as fail-open by default,
   block-on `MO_README_PANEL_INDETERMINATE=block`.
 - providers-doctor pre-flight (closed 2026-06-05):
-  `scripts/readme-drift-providers-doctor.sh` probes each lens provider
+  `scripts/readme_drift.py doctor` probes each lens provider
   with a 1-token prompt before the panel fires. If <
   `MO_DRIFT_MIN_RESPONSIVE_LENSES` (default 2) respond within
   `MO_DRIFT_PROBE_TIMEOUT_SEC` (default 20s), panel is skipped with

@@ -85,7 +85,7 @@ python3 scripts/readme_claim_check.py --verbose
 python3 scripts/readme_claim_check.py --json
 ```
 
-### Layer 2a — gatekeeper (`scripts/readme-drift-gatekeeper.sh`)
+### Layer 2a — gatekeeper (`scripts/readme_drift.py gatekeeper`)
 
 A single MiniMax-M3 call (~$0.005, ~5-10 sec) that decides whether the
 expensive 4-lens panel should fire at all. Most pushes touch typos /
@@ -107,10 +107,10 @@ provider outage doesn't block your push.
 
 Run ad-hoc:
 ```bash
-bash scripts/readme-drift-gatekeeper.sh | jq .
+python3 scripts/readme_drift.py gatekeeper | jq .
 ```
 
-### Layer 2b — 4-lens panel (`scripts/readme-drift-panel.sh`)
+### Layer 2b — 4-lens panel (`scripts/readme_drift.py panel`)
 
 Heterogeneous-family panel (Rajan 2025 submodularity precondition met by
 construction — see [docs/positioning/why-mini-ork.md](../positioning/why-mini-ork.md)):
@@ -139,7 +139,8 @@ review.
 
 Run ad-hoc (any time, not just from the hook):
 ```bash
-bash scripts/readme-drift-panel.sh | jq .
+python3 scripts/readme_drift.py panel | jq .
+python3 scripts/readme_drift.py doctor | jq .   # pre-flight liveness probe
 ```
 
 ## Cost budgeting
@@ -151,9 +152,8 @@ bash scripts/readme-drift-panel.sh | jq .
 | Heavy on main: 20 to main, all touch lib/ or README | $1-3 / day (panel fires ~20-30% of the time after gatekeeper filter) |
 
 The gatekeeper is the load-bearing cost-control. If you find the panel
-firing too often on benign diffs, tune the gatekeeper prompt at
-`scripts/readme-drift-gatekeeper.sh` (the system prompt is inline +
-versioned).
+firing too often on benign diffs, tune the gatekeeper prompt in
+`scripts/readme_drift.py` (`gatekeeper()`; the prompt is inline + versioned).
 
 ## When Layer 1 disagrees with Layer 2b
 
@@ -170,15 +170,20 @@ catches qualitative drift. A push where:
 
 1. **MiniMax provider outage**: gatekeeper fails open, push proceeds
    without the panel check. If you want a hard block on outage instead,
-   patch `scripts/readme-drift-gatekeeper.sh` exit code 2 → exit 1.
+   change `gatekeeper()` in `scripts/readme_drift.py` to return 1 instead
+   of 2 on an unreachable provider.
 
-2. **Opus provider outage during panel arbitration**: arbiter emits
-   `{"verdict": "NO_DRIFT", "notes": "arbiter output unparseable — fail-open"}`.
-   The push proceeds. Lens outputs are preserved in the run dir for
-   manual review.
+2. **Opus provider outage during panel arbitration**: the arbiter output
+   is unparseable, so the panel reports
+   `{"verdict": "INDETERMINATE", "notes": "arbiter output unparseable — …"}`,
+   and a separate honesty net forces INDETERMINATE whenever every lens
+   failed — absence of evidence is never reported as evidence of absence.
+   The hook's `MO_README_PANEL_INDETERMINATE` decides block vs fail-open
+   (block is the default for a push to main). Lens outputs are preserved in
+   the run dir for manual review.
 
 3. **False-positive panel verdict on a clean README**: tune the lens
-   prompts in `scripts/readme-drift-panel.sh` (the prompts are inline +
+   prompts in `scripts/readme_drift.py` (`LENS_PROMPTS`; inline +
    versioned, so prompt edits are reviewable in commit history).
 
 4. **Pre-push hook silent disable**: someone runs `git config

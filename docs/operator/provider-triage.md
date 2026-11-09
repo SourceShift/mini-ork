@@ -1,9 +1,9 @@
-# Provider triage — when `readme-drift-providers-doctor.sh` flags providers down
+# Provider triage — when `readme_drift.py doctor` flags providers down
 
 The 4-lens panel (Layer 2b of README drift detection) requires at least
 `MO_DRIFT_MIN_RESPONSIVE_LENSES` (default 2) of its 4 providers to respond
 within `MO_DRIFT_PROBE_TIMEOUT_SEC` (default 20 sec). The
-`scripts/readme-drift-providers-doctor.sh` pre-flight probe surfaces
+`scripts/readme_drift.py doctor` pre-flight probe surfaces
 non-responsive providers in <30 sec before the panel burns 4 × 90 sec
 on guaranteed-empty calls.
 
@@ -13,12 +13,12 @@ This guide documents the triage path when the doctor returns
 ## Step 0 — Diagnose
 
 ```bash
-bash scripts/readme-drift-providers-doctor.sh | jq .
+python3 scripts/readme_drift.py doctor | jq .
 ```
 
 Read the per-provider JSON. Each provider has:
 
-- `rc=124` → timeout (gateway unreachable OR network slow)
+- `note: "timeout after Ns"` → timeout (gateway unreachable OR network slow)
 - `rc=0 but empty stdout` → silent fail (key likely expired)
 - `rc=0 but stdout contains error string` → wrapper-side mismatch (stdin
   handling, model name, etc — typically codex)
@@ -134,7 +134,7 @@ Rotate the key in the provider's web console:
 Update `.mini-ork/config/secrets.local.sh` with the new value. Re-run
 doctor.
 
-### Gateway URL changed (rc=124 timeout)
+### Gateway URL changed (timeout note)
 
 DNS resolves but the endpoint moved. Check the provider's current docs
 (table above) and update `ANTHROPIC_BASE_URL` in

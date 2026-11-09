@@ -156,8 +156,6 @@ parity tests already prove equivalence.
   a pytest or a ruff-style check); keep `readme-claim-check` (port to
   Python or keep as the one sanctioned script). **Done 2026-11-08:** the port
   is `scripts/readme_claim_check.py`; CI now calls it, and the shell twin was
-  deleted once the pre-push hook, the Makefile and CI all pointed at the port. **Done 2026-11-08:** the port
-  is `scripts/readme_claim_check.py`; CI now calls it, and the shell twin was
   deleted once the pre-push hook, the Makefile and CI all pointed at the port.
 - **Makefile**: retarget `serve/dev/test-obs/worktree*` to Python entry
   points (port `scripts/mini-ork-worktree.sh` — it is the worktree-first
@@ -169,7 +167,13 @@ parity tests already prove equivalence.
   `mini-ork-worktree.sh` + `readme-*.sh` → port). **Done for the worktree
   driver:** `scripts/mini_ork_worktree.py` is the port; the shell original was
   repointed-away (`c7a84dc5`) and then deleted on 2026-10-17, once it had zero
-  call sites and zero live prose references.
+  call sites and zero live prose references. **Done for `readme-*.sh`
+  2026-11-09:** `scripts/readme_drift.py` carries all three layers
+  (`gatekeeper` / `doctor` / `panel`); the pre-push hook, the Makefile target
+  and the operator docs point at it, and the three shell twins were deleted
+  the same day. The LLM calls are now in-process `dispatch_model` calls
+  instead of `python3 -m mini_ork.dispatch` subprocesses, so no prompt
+  crosses an argv or a shell word.
 - **hooks/*.sh** (Claude Code integration): port to Python entry points or
   document as the one external bash surface (decision; they are
   Claude-side glue, not mini-ork runtime).

@@ -48,8 +48,7 @@ install-hooks:
 	@chmod +x .githooks/pre-push 2>/dev/null || true
 	@chmod +x scripts/readme_claim_check.py \
 	          scripts/mini_ork_worktree.py \
-	          scripts/readme-drift-gatekeeper.sh \
-	          scripts/readme-drift-panel.sh 2>/dev/null || true
+	          scripts/readme_drift.py 2>/dev/null || true
 	@echo "✓ hooks installed: core.hooksPath = .githooks"
 	@echo "  pre-push will run Layer 1 (mechanical) on every push,"
 	@echo "  Layer 2a (gatekeeper) + 2b (panel) on push-to-main with structural diff."
@@ -115,10 +114,9 @@ worktree-list:
 readme-claim-check:
 	@$(PYTHON) scripts/readme_claim_check.py
 
-# TODO(bash-removal): the drift panel/gatekeeper stay bash for now (LLM panel
-# tools; the ported pre-push hook still calls them). Port + retarget later.
+# Layers 2a/2b are Python; scripts/readme_drift.py carries all three commands.
 readme-drift-panel:
-	@bash scripts/readme-drift-panel.sh
+	@$(PYTHON) scripts/readme_drift.py panel
 
 # ── observability API ────────────────────────────────────────────────────────
 

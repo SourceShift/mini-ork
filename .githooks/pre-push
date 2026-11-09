@@ -10,13 +10,13 @@
 #   Catches numerical drift (counts, paths, regression strings).
 #   HARD BLOCK on mismatch.
 #
-#   ── Layer 2a — gatekeeper (scripts/readme-drift-gatekeeper.sh) ──
+#   ── Layer 2a — gatekeeper (scripts/readme_drift.py gatekeeper) ──
 #   Fires ONLY on push to main AND only if README.md / ROADMAP.md /
 #   any structural path appeared in the push diff. ~$0.005 / 5-10s.
 #   Single MiniMax-M3 call decides: PANEL_NEEDED or PANEL_SKIP.
 #   Fail-open: any error here → PANEL_SKIP, push proceeds.
 #
-#   ── Layer 2b — 4-lens panel (scripts/readme-drift-panel.sh) ────
+#   ── Layer 2b — 4-lens panel (scripts/readme_drift.py panel) ────
 #   Fires ONLY if Layer 2a returns PANEL_NEEDED. ~$0.25-0.30 / 30-60s.
 #   Heterogeneous-family panel (codex + kimi + minimax + glm) +
 #   opus arbiter. HARD BLOCK on DRIFT verdict when target is main;
@@ -278,11 +278,9 @@ def main() -> int:
         return 0
 
     # ── Layer 2a — gatekeeper ────────────────────────────────────────────
-    # TODO-port: scripts/readme-drift-gatekeeper.sh is an operator-LLM tool
-    # still in bash; invoke via subprocess with identical args for now.
     print("pre-push: running Layer 2a (MiniMax gatekeeper)…")
     r = subprocess.run(
-        ["bash", str(REPO_ROOT / "scripts" / "readme-drift-gatekeeper.sh")],
+        [sys.executable, str(REPO_ROOT / "scripts" / "readme_drift.py"), "gatekeeper"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -299,14 +297,13 @@ def main() -> int:
 
     # ── Layer 2a.5 — providers-doctor (cheap pre-flight liveness probe) ──
     # Avoids burning 4 × 90s timeouts when the lens providers are all down.
-    doctor = REPO_ROOT / "scripts" / "readme-drift-providers-doctor.sh"
-    if os.access(doctor, os.X_OK) and os.environ.get(
+    doctor = REPO_ROOT / "scripts" / "readme_drift.py"
+    if os.access(doctor, os.R_OK) and os.environ.get(
         "MO_README_DOCTOR_SKIP", "0"
     ) != "1":
-        # TODO-port: still bash (operator-LLM tool); subprocess, identical args.
         print("pre-push: running Layer 2a.5 (providers-doctor pre-flight)…")
         r = subprocess.run(
-            ["bash", str(doctor)],
+            [sys.executable, str(doctor), "doctor"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -349,14 +346,12 @@ def main() -> int:
             return 0
 
     # ── Layer 2b — 4-lens panel + opus arbiter ───────────────────────────
-    # TODO-port: scripts/readme-drift-panel.sh is an operator-LLM tool still
-    # in bash; invoke via subprocess with identical args for now.
     print(
         "pre-push: running Layer 2b (4-lens panel + opus arbiter —"
         " wall ~30-60s)…"
     )
     r = subprocess.run(
-        ["bash", str(REPO_ROOT / "scripts" / "readme-drift-panel.sh")],
+        [sys.executable, str(REPO_ROOT / "scripts" / "readme_drift.py"), "panel"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
