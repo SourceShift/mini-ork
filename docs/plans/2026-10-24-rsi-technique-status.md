@@ -273,9 +273,9 @@ Defaults, so nobody assumes a merged item is inert:
 | # | Item | State | Commits |
 |---|---|---|---|
 | 1 | Artifact-grounded node reward (`artifact@v1`, `MO_ARTIFACT_REWARD`) | merged | aae3dd7f |
-| 2 | Anytime-valid certificate + per-class α ledger (migration 0086, `MO_APPLY_CERTIFICATE`) | **awaiting a person's merge approval** (high risk tier: migration) | `wt/t1-certificate` |
+| 2 | Anytime-valid certificate + per-class α ledger (migrations 0089/0090, `MO_APPLY_CERTIFICATE`) | merged (default OFF); arm-time pre-flight added | 56c6dacf + 79c24ff7 |
 | 3 | Probe harvest: git-oracle probe kind (a), harvester with salted holdout (b), failed framework-edit runs re-validated against git (c) | merged; operator steps in `docs/operator/probe-harvest-runbook.md` | a: a6ad7d34, grader hardening 89553eeb 8e9eaa85 1eb1842e · b: c17c05d6 c462c898 93d9443d · c: 3ec35d97 becd702d |
-| 4 | Frozen kernel: refusals logged to `safety_events` (4a); the apply loop refuses frozen targets, also by inode (4b); the self-driving policy's 8 input modules join the floor, 14 → 22 entries (4c) | 4a, 4b merged; **4c awaiting approval** (edits the frozen list) | 4de04f43 · 899adc26 d9596390 · `wt/t1-kernel-hole-3` |
+| 4 | Frozen kernel: refusals logged to `safety_events` (4a); the apply loop refuses frozen targets, also by inode (4b); the self-driving policy's 8 input modules join the floor, 14 → 22 → 23 entries (4c) | 4a, 4b, 4c merged | 4de04f43 · 899adc26 d9596390 · bcc98e10 1c018305 |
 | 5 | Layer routing: reflection records directives aimed at the wrong layer (shadow) | authoring merged; apply-side wiring queued behind #2 | efacad66 744fa61c |
 | 6 | MGM contrastive lane mining (infra = the engine's non-learnable exits) | merged | 09e53e69 21b10b4f |
 | 7 | Harness evolution: typed, reversible `workflow.yaml` edits (H1, library) | H1 merged; apply wiring (H2) queued behind #2 | 704dec2d |

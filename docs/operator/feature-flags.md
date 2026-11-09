@@ -150,6 +150,17 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_BUG_REPORT_SWEEP` | `"1"` | Bug-report sweep in reflect |
 | `MO_BUG_REPORT_AUTO_PROMOTE` | `"0"` | Auto-promote swept bug reports |
 
+### Apply gate / promotion certificate
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MO_APPLY_CERTIFICATE` | `"0"` | Anytime-valid promotion certificate (test-by-betting e-value) + per-class alpha ledger on the measured apply path |
+| `MO_APPLY_CERT_ALPHA` | `"0.05"` | Per-class error budget; values above `0.2` are refused unless the loose override below is set |
+| `MO_APPLY_CERT_ALPHA_ALLOW_LOOSE` | `"0"` | Accept an alpha above the `0.2` guardrail (the pre-flight refuses otherwise) |
+| `MO_APPLY_CERT_PREFLIGHT` | `"1"` | Run the arm-time pre-flight (refuse before any probe spend when the probe set cannot reach the slot's bar). `0` disables it for harnesses that inject per-task vectors out of band |
+| `MO_APPLY_CERT_BET` | `"0.75"` | Bet fraction λ of the e-value |
+| `MO_APPLY_CERT_LEDGER` | `"spend"` | `spend` gives the k-th test `alpha/(k(k+1))` (class-wide union bound); `none` gives every test the whole alpha and emits a warning |
+
 ## Orchestration / conductor / scheduler
 
 | Variable | Default | Effect |

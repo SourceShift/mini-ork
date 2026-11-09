@@ -461,6 +461,17 @@ def _load_builtins() -> None:
             cost_multiplier=1.2,
         ),
         Feature(
+            id="promotion_certificate",
+            label="Promotion certificate",
+            description=(
+                "Anytime-valid certificate (test-by-betting e-value) plus a "
+                "per-class alpha ledger on the measured apply path. Adds no "
+                "model calls: it only refuses or records a promotion."),
+            knobs={"MO_APPLY_CERTIFICATE": "1"},
+            default="0",
+            cost_multiplier=1.0,
+        ),
+        Feature(
             id="assay_relations",
             label="Metamorphic relations",
             description="Relations term in the certify oracle; vetoes a would-be PROVEN on a broken relation.",

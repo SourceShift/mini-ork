@@ -22,7 +22,8 @@ REPO = Path(__file__).resolve().parents[2]
 
 _ENV_KEYS = (
     "MO_APPLY_CERTIFICATE", "MO_APPLY_CERT_ALPHA", "MO_APPLY_CERT_BET",
-    "MO_APPLY_CERT_LEDGER", "MO_APPLY_SIG_ALPHA", "MINI_ORK_DB",
+    "MO_APPLY_CERT_LEDGER", "MO_APPLY_CERT_PREFLIGHT",
+    "MO_APPLY_CERT_ALPHA_ALLOW_LOOSE", "MO_APPLY_SIG_ALPHA", "MINI_ORK_DB",
     "MO_APPLY_REGRESSION_TOLERANCE",
 )
 
@@ -241,7 +242,7 @@ def test_certify_slot1_certified(tmp_path):
             "n", "bet", "ledger", "alpha_total", "e_value", "run_id",
             "scorer", "dry_run", "probe_set_hash", "probe_ids", "consumed",
             "status", "slot", "alpha_k", "threshold", "required_gains",
-            "certified"}
+            "ledger_warning", "certified"}
         assert cert["task_class"] == "code_fix"
         assert cert["candidate_id"] == "cand-1"
         assert cert["gains"] == 7 and cert["losses"] == 0 and cert["n"] == 12
@@ -384,14 +385,37 @@ def _gate(monkeypatch, ub, ua, pertask, task_class="code_fix",
         "c1", ub, ua, pertask, task_class=task_class, **kwargs))
 
 
-def test_flag_off_is_byte_identical(tmp_path):
+# Captured from the pre-certificate gate (the commit before the certificate
+# landed), not from a second run of today's code: the review's B-9 finding was
+# that comparing new-vs-new cannot detect a behaviour change on the off path.
+_GOLDEN_FLAG_OFF = {
+    "decision": "promoted",
+    "rationale": (
+        "non-regression cleared: utility_after=0.5833 >= utility_before=0.0000 "
+        "(delta=+0.5833 >= threshold=+0.0000); 0 per-task regressions; "
+        "McNemar p=0.0078"),
+    "utility_before": 0.0,
+    "utility_after": 0.583333,
+    "utility_delta": 0.583333,
+    "threshold": 0.0,
+    "min_examples": 1,
+    "regressed_tasks": 0,
+    "regression_tolerance": 0,
+    "control_n": 1,
+    "sig_p": 0.007812,
+    "sig_gains": 7,
+    "sig_losses": 0,
+}
+
+
+def test_flag_off_matches_the_golden_output(tmp_path):
     p = str(tmp_path / "off.db")
     with_args = ap.evaluate_gate(
         "c1", 0.0, 7 / 12, _V(7, 0), task_class="code_fix", db=p)
     without = ap.evaluate_gate("c1", 0.0, 7 / 12, _V(7, 0))
-    assert with_args == without
+    assert json.loads(with_args) == _GOLDEN_FLAG_OFF
+    assert json.loads(without) == _GOLDEN_FLAG_OFF
     assert not __import__("os").path.exists(p)
-    assert "cert" not in json.loads(with_args)
 
 
 def test_flag_on_under_certified_quarantines(tmp_path, monkeypatch):
@@ -655,6 +679,9 @@ def _run(monkeypatch, db, tmp_path, *, after, pertask_json):
     monkeypatch.setenv("MO_APPLY_SCORER", "probe")
     monkeypatch.setenv("MO_APPLY_ENABLED", "1")
     monkeypatch.setenv("MO_APPLY_CERTIFICATE", "1")
+    # The probe scorer is stubbed, so the probe-set ceiling the pre-flight
+    # checks is not the source of this test's vectors.
+    monkeypatch.setenv("MO_APPLY_CERT_PREFLIGHT", "0")
     return target
 
 
@@ -866,3 +893,121 @@ def test_a_dead_harness_records_infra(db, tmp_path, capsys, monkeypatch):
     assert rows[0]["reason_class"] == "infra"
     assert ap._previously_failed(
         "reviewer", "prompts/reviewer.md", "gr-1", db=db) is False
+
+
+# ── the evidence survives the verdict (Win 5c) ─────────────────────────────
+
+def test_a_precert_quarantine_still_records_the_certificate(tmp_path,
+                                                            monkeypatch):
+    """A slot-consuming test must be visible even when it changed nothing.
+
+    ``apply_attempts`` stores the rationale, not the cert blob (A-15/E-2), so
+    the numbers have to travel in the rationale or the alpha spend is invisible
+    to every later reader.
+    """
+    p = str(tmp_path / "q.db")
+    out = _gate(monkeypatch, 0.5, 0.5, _V(6, 0), db=p)
+    assert out["decision"] == "quarantined"
+    assert "no measured improvement" in out["rationale"]
+    assert "certificate e=" in out["rationale"]
+    assert "verdict unchanged: quarantined" in out["rationale"]
+    assert out["cert"]["gains"] == 6
+    assert _rows(p, "promotion_certificates")[0]["slot"] == 1
+
+
+def test_apply_attempts_carries_the_certificate_line(db, tmp_path, monkeypatch):
+    """The end-to-end version: the audit row, not just the JSON result."""
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    monkeypatch.setenv("MO_APPLY_SCORER", "probe")
+    monkeypatch.setenv("MO_APPLY_ENABLED", "1")
+    monkeypatch.setenv("MO_APPLY_CERTIFICATE", "1")
+    monkeypatch.setenv("MO_APPLY_CERT_PREFLIGHT", "0")
+    # Equal arms: the point-estimate gate quarantines BEFORE the certificate
+    # runs, which is exactly the path whose alpha spend used to vanish.
+    monkeypatch.setattr(probe_scorer, "probe_score", lambda *a, **k: {
+        "before": 0.5, "after": 0.5, "n": 12, "pertask_json": _V(6, 0),
+        "ids": list(range(12)), "runs": [], "cost_usd": 0.0})
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    rationale = _rows(db, "apply_attempts")[0]["rationale"]
+    assert "certificate e=" in rationale
+    assert "verdict unchanged: quarantined" in rationale
+
+
+def test_preflight_refuses_before_any_probe_launch(db, tmp_path, monkeypatch):
+    """Exit 2, zero probe calls, zero apply_attempts rows (Win 2)."""
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    monkeypatch.setenv("MO_APPLY_SCORER", "probe")
+    monkeypatch.setenv("MO_APPLY_ENABLED", "1")
+    monkeypatch.setenv("MO_APPLY_CERTIFICATE", "1")
+    # A root with no recipes/ → no probe set at all → 0 gate probes.
+    monkeypatch.setattr(probe_scorer, "_ROOT", str(tmp_path / "no-recipes"),
+                        raising=False)
+    launches = []
+    monkeypatch.setattr(probe_scorer, "probe_score",
+                        lambda *a, **k: launches.append(1) or {})
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 2
+    assert launches == []
+    assert _rows(db, "apply_attempts") == []
+
+
+def test_a_dry_run_reports_the_preflight_but_does_not_refuse(
+        db, tmp_path, monkeypatch):
+    """A dry run spends nothing, so it stays a diagnostic (rc 0)."""
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="reviewer")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    monkeypatch.setenv("MO_APPLY_SCORER", "mock")
+    monkeypatch.setenv("MO_APPLY_ENABLED", "1")
+    monkeypatch.setenv("MO_APPLY_DRY_RUN", "1")
+    monkeypatch.setenv("MO_APPLY_CERTIFICATE", "1")
+    # The mock scorer never probes, so the pre-flight is not even consulted.
+    rc = ap.apply_run("reviewer", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+
+
+# ── slot allocation under real concurrency (Win 5d) ────────────────────────
+
+def test_two_connections_never_share_a_slot(tmp_path):
+    """IMMEDIATE + retry must make slot allocation safe off one thread."""
+    import threading
+
+    path = str(tmp_path / "race.db")
+    con = sqlite3.connect(path, timeout=30)
+    pc.ensure_table(con)
+    con.close()
+
+    barrier = threading.Barrier(2)
+    slots: list[int] = []
+    errors: list[BaseException] = []
+
+    def work(candidate: str) -> None:
+        c = sqlite3.connect(path, timeout=30)
+        try:
+            barrier.wait(timeout=10)
+            out = pc.certify(c, task_class="code_fix", candidate_id=candidate,
+                             before=[0] * 12, after=[1] * 7 + [0] * 5,
+                             alpha_total=0.05, bet=0.75, ledger="spend", now=1)
+            slots.append(out["slot"])
+        except BaseException as exc:  # noqa: BLE001 — reported below
+            errors.append(exc)
+        finally:
+            c.close()
+
+    threads = [threading.Thread(target=work, args=(f"c{i}",)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors == []
+    assert sorted(slots) == [1, 2]
+    assert [r["slot"] for r in _rows(path, "promotion_certificates")] == [1, 2]

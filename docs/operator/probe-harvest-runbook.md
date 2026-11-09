@@ -67,4 +67,12 @@ it, consider the cost:
    `MO_APPLY_REGRESSION_TOLERANCE`.
 2. **Then pair it with the certificate.** Set `MO_APPLY_CERTIFICATE=1`
    (`rsi-t1-certificate`). At n=14, slot 1 needs at least 7 gains with no
-   losses.
+   losses. **The arm-time pre-flight refuses (exit 2, no `apply_attempts`
+   row) when the class's non-anchor gate-probe count is below that bar** —
+   `MO_APPLY_PROBE_MAX_TASKS` caps the count, so raising it past the number of
+   probes the recipe ships changes nothing. Check the ceiling first:
+   `python3 -c "from mini_ork.learning import probe_scorer as ps; print(ps.gate_probe_count('code-fix'))"`.
+   The bar is `required_gains(slot, alpha, bet, ledger)`; lower
+   `MO_APPLY_CERT_ALPHA` or set `MO_APPLY_CERT_LEDGER=none` only if you accept
+   the weaker guarantee. `MO_APPLY_CERT_PREFLIGHT=0` skips the check for
+   harnesses that inject per-task vectors out of band.

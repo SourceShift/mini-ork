@@ -108,6 +108,7 @@ a tweak, go back to step 2 — the previous selection is the new starting point.
 | Oracle gates (auto) | `oracle_gates` | `MO_ORACLE_GATES_AUTO` | ×1.2 | 1 | all recipes |
 | Plan Q&A gate | `plan_qa_gate` | `MINI_ORK_EXECUTE_GATE` | ×1 | 1 | all recipes |
 | PRM scoring | `prm_score` | `MO_PRM_SCORE` | ×1.05 | 1 | all recipes |
+| Promotion certificate | `promotion_certificate` | `MO_APPLY_CERTIFICATE` | ×1 | 0 | all recipes |
 | Reward stamp | `reward_stamp` | `MO_REWARD_STAMP` | ×1 | 1 | all recipes |
 
 **Premium — opt-in (>1.5×)**

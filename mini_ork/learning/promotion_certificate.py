@@ -182,6 +182,125 @@ def max_e(n: int, bet: float) -> float:
     return (1.0 + bet) ** n
 
 
+ALPHA_GUARDRAIL = 0.2
+ALPHA_LOOSE_ENV = "MO_APPLY_CERT_ALPHA_ALLOW_LOOSE"
+# Escape hatch for harnesses that supply the per-task vectors out of band
+# (stubbed scorers, MO_APPLY_PERTASK_JSON replays): the probe-set ceiling they
+# are checked against is not the ceiling their vectors came from.
+PREFLIGHT_ENV = "MO_APPLY_CERT_PREFLIGHT"
+_PREFLIGHT_OFF = frozenset({"0", "off", "false", "no"})
+
+
+def preflight_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the arm-time pre-flight runs (on unless explicitly off)."""
+    env = os.environ if environ is None else environ
+    return (env.get(PREFLIGHT_ENV) or "").strip().lower() not in _PREFLIGHT_OFF
+
+
+def ledger_warning(ledger: str) -> str | None:
+    """Why a non-default ledger is a weaker guarantee (None for ``spend``).
+
+    ``spend`` is the shipped mode because its ``1/(k(k+1))`` schedule is what
+    makes the union bound hold across a class's whole test history. ``none``
+    exists for operators who accept that cost, and every consumer that reports
+    a certificate should say so rather than silently using it.
+    """
+    if ledger == "spend":
+        return None
+    return (
+        f"certificate ledger={ledger!r}: every test gets the whole alpha, so "
+        "the class-wide union bound no longer holds (each new test re-spends "
+        "the same budget)")
+
+
+def next_slot(con: sqlite3.Connection, task_class: str) -> int:
+    """The slot this class's next test will consume.
+
+    Reads ``MAX(slot) + 1`` without creating anything: a DB that predates
+    migration 0089 has no table and its first test is slot 1. Shared by
+    :func:`certify` (inside its IMMEDIATE transaction) and the pre-flight
+    (outside one), so the two can never disagree about which slot they mean.
+    """
+    tc = normalize_task_class(task_class)
+    try:
+        row = con.execute(
+            "SELECT COALESCE(MAX(slot), 0) + 1 FROM promotion_certificates "
+            "WHERE task_class = ?", (tc,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return 1
+        raise
+    return int(row[0])
+
+
+def preflight(*, task_class: str, cfg: Mapping, gate_probes: int, slot: int,
+              db_error: str | None = None,
+              allow_loose_alpha: bool = False) -> dict:
+    """Decide whether a certificate run is worth starting at all.
+
+    Called BEFORE any probe dollar is spent (apply_run, next to the
+    frozen-kernel check). Every error here is one the run could not have
+    recovered from later, and none of them should create an
+    ``apply_attempts`` row: a config mistake must not become edit memory.
+
+    ``gate_probes`` is the number of NON-ANCHOR probes the gate actually
+    scores — the maximum number of discordant pairs a perfectly discriminating
+    candidate could produce, and so ``max_e``'s n. Anchors are excluded
+    because the gate's before/after vectors exclude them.
+
+    Returns ``{"ok", "errors", "warnings", "slot", "required_gains",
+    "gate_probes"}``.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for err in cfg.get("errors") or ():
+        errors.append(f"certificate misconfigured: {err}")
+    if db_error:
+        errors.append(f"certificate ledger unreachable: {db_error}")
+
+    alpha = float(cfg["alpha"])
+    bet = float(cfg["bet"])
+    ledger = str(cfg["ledger"])
+
+    if alpha > ALPHA_GUARDRAIL and not allow_loose_alpha:
+        errors.append(
+            f"certificate alpha={alpha:g} is looser than the {ALPHA_GUARDRAIL:g} "
+            f"guardrail; set {ALPHA_LOOSE_ENV}=1 to accept the added false-"
+            "promotion risk")
+    warn = ledger_warning(ledger)
+    if warn:
+        warnings.append(warn)
+
+    try:
+        required = required_gains(int(slot), alpha, bet, ledger)
+    except (TypeError, ValueError) as exc:
+        errors.append(f"certificate configuration is unusable: {exc}")
+        required = None
+
+    if required is not None and int(gate_probes) < required:
+        # Note what NOT to suggest: MO_APPLY_PROBE_MAX_TASKS is a cap, not a
+        # supply. Raising it past the number of non-anchor probes the recipe
+        # ships changes nothing, so the fix is more probes or a lower bar.
+        errors.append(
+            f"certificate pre-flight: slot {slot} needs {required} clean "
+            f"gains to certify, but the frozen probe set yields only "
+            f"{gate_probes} non-anchor gate probe(s) (MO_APPLY_PROBE_MAX_TASKS "
+            "caps that number, it cannot add probes); ship more non-anchor "
+            "probes, or lower MO_APPLY_CERT_ALPHA / set "
+            "MO_APPLY_CERT_LEDGER=none. Refusing before any probe spend.")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "task_class": task_class,
+        "slot": int(slot),
+        "required_gains": required,
+        "gate_probes": int(gate_probes),
+    }
+
+
 def _begin_immediate(con: sqlite3.Connection, attempts: int = 4,
                      base_sleep: float = 0.05) -> None:
     """``BEGIN IMMEDIATE`` with a bounded retry on SQLite's lock contention.
@@ -284,6 +403,7 @@ def certify(con: sqlite3.Connection, *, task_class: str, candidate_id: str,
         "dry_run": bool(dry_run),
         "probe_set_hash": probe_set_hash,
         "probe_ids": probe_ids,
+        "ledger_warning": ledger_warning(ledger),
     }
 
     if gains + losses == 0:
@@ -301,10 +421,7 @@ def certify(con: sqlite3.Connection, *, task_class: str, candidate_id: str,
     ensure_table(con)
     try:
         _begin_immediate(con)
-        row = con.execute(
-            "SELECT COALESCE(MAX(slot), 0) + 1 FROM promotion_certificates "
-            "WHERE task_class = ?", (tc,)).fetchone()
-        slot = int(row[0])
+        slot = next_slot(con, tc)
         alpha_k = slot_alpha(alpha_total, slot, ledger)
         threshold = 1.0 / alpha_k
         need = required_gains(slot, alpha_total, bet, ledger)

@@ -332,6 +332,19 @@ def _load_probes(task_class: str) -> list[tuple[str, bool]]:
     return gate + anchors
 
 
+def gate_probe_count(task_class: str) -> int:
+    """How many NON-ANCHOR probes the apply gate will actually score.
+
+    This is the ceiling on discordant pairs a run can produce, so it is the
+    n in ``promotion_certificate.max_e`` and the number the certificate
+    pre-flight compares against ``required_gains``. Anchors are excluded
+    because the gate's before/after vectors exclude them: an anchor-only gain
+    can never move the certificate. Reads the same frontmatter and env knobs
+    as :func:`_load_probes`, so the pre-flight and the run cannot disagree.
+    """
+    return sum(1 for _, is_anchor in _load_probes(task_class) if not is_anchor)
+
+
 def _probe_fixture(probe_path: str) -> str | None:
     """The probe's target project, or None when it declares none.
 

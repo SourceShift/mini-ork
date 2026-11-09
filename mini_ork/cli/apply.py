@@ -60,8 +60,14 @@ Env contract (identical to bash):
                                   scorer's temp-copy path so scoring never
                                   writes the live file.
     MO_APPLY_CERTIFICATE=1  anytime-valid certificate + alpha ledger on the measured path (default OFF)
-    MO_APPLY_CERT_ALPHA  per-class error budget (default 0.05)
+    MO_APPLY_CERT_ALPHA  per-class error budget (default 0.05; > 0.2 is refused unless
+                         MO_APPLY_CERT_ALPHA_ALLOW_LOOSE=1)
     MO_APPLY_CERT_BET / MO_APPLY_CERT_LEDGER  bet λ (default 0.75) / spend|none (default spend)
+    MO_APPLY_CERT_ALPHA_ALLOW_LOOSE=1  accept an alpha above the 0.2 guardrail
+    MO_APPLY_CERT_PREFLIGHT=0  skip the pre-flight (harnesses that inject per-task vectors out of band)
+    Pre-flight: with the certificate on, a run refuses (exit 2, no apply_attempts
+    row) when the class's non-anchor gate-probe count cannot reach the slot's
+    bar. Fix by raising MO_APPLY_PROBE_MAX_TASKS or lowering the bar.
 
 Exit code mapping (mirrors bash exactly):
     0  success (promote, quarantine, and no_candidate all exit 0 — a
@@ -669,6 +675,9 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                 rationale = (
                     f"certificate misconfigured: {'; '.join(cfg['errors'])}; "
                     f"point-estimate gate said: {rationale}")
+            else:
+                rationale += (
+                    f"; certificate misconfigured: {'; '.join(cfg['errors'])}")
         elif not (measured and len(before) == len(after)):
             cert_payload = {"error": "no per-task vectors"}
             if decision == "promoted":
@@ -676,6 +685,8 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                 rationale = (
                     "no anytime-valid certificate: no per-task vectors to "
                     f"certify; point-estimate gate said: {rationale}")
+            else:
+                rationale += "; certificate skipped: no per-task vectors"
         else:
             probe_hash = (
                 hashlib.sha256("\x1f".join(probe_ids).encode()).hexdigest()[:16]
@@ -711,6 +722,10 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                     rationale = (
                         f"certificate unavailable: {type(exc).__name__}: "
                         f"{exc}; point-estimate gate said: {rationale}")
+                else:
+                    rationale += (
+                        f"; certificate unavailable: {type(exc).__name__}: "
+                        f"{exc}")
             else:
                 cert_payload = cert
                 if decision == "promoted":
@@ -751,6 +766,18 @@ def evaluate_gate(candidate_id: str, utility_before: float,
                             f"bet={cert['bet']:g}, "
                             f"need>={cert['required_gains']} clean gains); "
                             f"point-estimate gate said: {rationale}")
+                elif cert["threshold"] is not None:
+                    # The verdict was already a quarantine, but the test still
+                    # consumed an alpha slot. Carry its numbers into the audit
+                    # row: `apply_attempts` stores the rationale, not the cert
+                    # blob, so this is the only place the spend is visible.
+                    rationale += (
+                        f"; certificate e={cert['e_value']:.4f} vs "
+                        f"threshold={cert['threshold']:.4f} "
+                        f"(status={cert['status']}, slot={cert['slot']}, "
+                        f"alpha_k={cert['alpha_k']:.6g}, bet={cert['bet']:g}, "
+                        f"gains={cert['gains']}, losses={cert['losses']}) — "
+                        f"verdict unchanged: {decision}")
 
     result = {
         "decision": decision,
@@ -1256,6 +1283,57 @@ def _previously_failed(task_class: str, target_name: str, source_id: str,
         con.close()
 
 
+def _certificate_preflight(task_class: str, scorer: str,
+                           db: str | None) -> dict | None:
+    """The arm-time certificate pre-flight (synthesis Win 2).
+
+    Called BEFORE any probe dollar is spent. Returns ``None`` when the
+    certificate is off or the scorer never probes, otherwise the
+    :func:`promotion_certificate.preflight` verdict.
+
+    Writes nothing: a refusal here must not create an ``apply_attempts`` row,
+    because ``_previously_failed`` reads those as edit memory and a config
+    mistake would then permanently blacklist a directive.
+    """
+    if scorer not in ("probe", "code"):
+        return None
+    from mini_ork.learning import promotion_certificate as _pc
+    from mini_ork.learning import probe_scorer as _ps
+
+    cfg = _pc.resolve_config()
+    if not cfg["enabled"]:
+        return None
+    if not _pc.preflight_enabled():
+        return None
+
+    slot = 1
+    db_error = None
+    db_file = _db_path(db)
+    # A path that does not exist yet means no class has spent a slot: slot 1,
+    # and no file is created (sqlite3.connect would create an empty one).
+    if os.path.exists(db_file):
+        try:
+            con = sqlite3.connect(db_file, timeout=5)
+            try:
+                slot = _pc.next_slot(con, task_class)
+            finally:
+                con.close()
+        except sqlite3.Error as exc:
+            db_error = f"{type(exc).__name__}: {exc}"
+
+    try:
+        gate_probes = _ps.gate_probe_count(task_class)
+    except (OSError, ValueError) as exc:
+        # An unreadable probe set is also why the run would measure nothing.
+        gate_probes = 0
+        db_error = db_error or f"probe set unreadable: {exc}"
+
+    return _pc.preflight(
+        task_class=task_class, cfg=cfg, gate_probes=gate_probes, slot=slot,
+        db_error=db_error,
+        allow_loose_alpha=os.environ.get(_pc.ALPHA_LOOSE_ENV, "") == "1")
+
+
 def apply_run(task_class: str, target_kind: str, target_name: str,
               target_file: str = "", db: str | None = None) -> int:
     """Run pick → materialize → score → gate → write (or quarantine).
@@ -1342,6 +1420,30 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
             f'"target":"{target_name}","source_id":"{source_id}"}}\n'
         )
         return 0
+
+    # 1c. Certificate pre-flight (Win 2): refuse BEFORE any probe dollar. At
+    #     the shipped probe cap a class cannot produce enough discordant pairs
+    #     for the certificate's bar, so the run would spend a full probe sweep
+    #     just to learn it cannot certify. No apply_attempts row is written:
+    #     a config error must never become edit memory.
+    scorer = os.environ.get("MO_APPLY_SCORER", "probe")
+    pre = _certificate_preflight(task_class, scorer, db)
+    if pre is not None:
+        for warn in pre["warnings"]:
+            sys.stderr.write(f"[apply-preflight] warning: {warn}\n")
+        if not pre["ok"]:
+            for err in pre["errors"]:
+                sys.stderr.write(f"[apply-preflight] {err}\n")
+            # A dry run is a diagnostic, not a spend: report and continue so
+            # `apply --dry-run` still shows the rest of the plan.
+            if os.environ.get("MO_APPLY_DRY_RUN", "0") != "1":
+                sys.stdout.write(
+                    f'{{"decision":"preflight_refused",'
+                    f'"task_class":"{task_class}",'
+                    f'"target":"{target_name}",'
+                    f'"required_gains":{pre["required_gains"]},'
+                    f'"gate_probes":{pre["gate_probes"]}}}\n')
+                return 2
 
     # 2. Materialize the candidate.
     candidate_id = materialize_candidate(
