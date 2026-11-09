@@ -215,6 +215,34 @@ That is deliberate: a loop that panics on its first measurement is a loop
 nobody can trust. Deleting the file resumes; read `rsi-cycle list --limit 10`
 first.
 
+#### The diversity floor (a second, independent signal)
+
+`mini_ork/learning/collapse_floor.py` watches a different collapse: pass@k
+falling while the implementer-lane set narrows to one lane. It is evaluated
+by the same liveness breaker (`circuit_breaker.check_liveness_breaker`) and
+trips *independently* of the score-vs-anchor collapse above, at most once per
+breach episode.
+
+`MO_CB_COLLAPSE_FLOOR` selects one of three modes:
+
+| value | mode | behaviour |
+|---|---|---|
+| unset / empty (**default**) | `shadow` | evaluated and reported on every run under `collapse["floor_*"]`; never trips, never latches |
+| `1`, `on`, `true`, `armed`, `enforce` | `armed` | a breach trips the breaker once, then latches until a healthy evaluation clears it |
+| `0`, `off`, `false`, `no` | `off` | not evaluated at all |
+
+Any unrecognised value stays in `shadow`: a typo must never arm a halting
+signal. `MO_CB_COLLAPSE=0` turns the floor off as well.
+
+Ship in `shadow` for at least one cycle and read the run pages' `floor`
+block before setting `MO_CB_COLLAPSE_FLOOR=1`. The latch lives in
+`collapse_floor_latch`, keyed on `task_class` (the floor's own unit of
+evaluation, so one recipe's breach does not leave the same class's other
+recipes tripping). Only an evaluation that *ran* and came back healthy
+clears it — a disabled floor, a failed import, or a detector that raised
+leaves the latch standing, because "the detector did not answer" is not
+evidence that the collapse ended.
+
 ## Quarantine, release, revert
 
 A quarantined cycle keeps its worktree, branch and claims by default

@@ -21,8 +21,15 @@ same values it exports to the bash subprocess):
   MO_CB_DISABLE           → disable           (default False; "1" enables)
   MO_CB_COLLAPSE          → collapse_history injection + opt-out
                               (default ON; "0" disables the collapse signal)
-  MO_CB_COLLAPSE_FLOOR    → diversity / pass@k floor (default ON; "0" disables;
-                              also off when MO_CB_COLLAPSE=0)
+  MO_CB_COLLAPSE_FLOOR    → diversity / pass@k floor trip. Three modes:
+                              unset/empty → "shadow" (DEFAULT: the floor is
+                              evaluated and reported on every run, never trips
+                              or latches); "1"/"on"/"true"/"armed"/"enforce"
+                              → "armed" (an edge-triggered trip); "0"/"off"/
+                              "false"/"no" → "off" (not even evaluated). Any
+                              other value stays in shadow — an unrecognised
+                              value must never arm a halting signal. Also off
+                              when MO_CB_COLLAPSE=0.
   MO_CB_FLOOR_WINDOW      → floor window in terminal runs (default 20; read by
                               collapse_floor.resolve_window)
 
@@ -123,6 +130,21 @@ def _ensure_state_table(db: str) -> None:
             last_reason   TEXT,
             trip_count    INTEGER NOT NULL DEFAULT 0,
             updated_at    INTEGER NOT NULL
+        )
+        """
+    )
+    # The collapse-floor latch. Keyed on ``task_class`` ALONE because that is
+    # the floor's own unit of evaluation (``collapse_floor.evaluate`` reads
+    # one class's terminal runs); a ``task_class::recipe`` key would latch one
+    # recipe's breach and leave the same class's other recipes tripping on
+    # the same underlying collapse. Kept OUT of ``circuit_breaker_state`` so a
+    # floor latch can never be mistaken for a stagnation verdict there, and so
+    # switching the breaker's policy cannot lose it.
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collapse_floor_latch (
+            task_class  TEXT PRIMARY KEY,
+            latched_at  INTEGER NOT NULL
         )
         """
     )
@@ -380,13 +402,44 @@ def _eval_collapse_signal(
     return fired, n, rationale, report
 
 
+FLOOR_OFF = "off"
+FLOOR_SHADOW = "shadow"
+FLOOR_ARMED = "armed"
+
+_FLOOR_ARM_VALUES = frozenset({"1", "on", "true", "yes", "armed", "enforce"})
+_FLOOR_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+
+
+def _floor_mode() -> str:
+    """How the diversity / pass@k floor participates: ``off``, ``shadow``, ``armed``.
+
+    **shadow is the default** and the mode the feature ships in: the floor is
+    evaluated and reported on every run so an operator can watch it against
+    live traffic for a cycle, but it never trips the breaker and never writes
+    the latch. Arming is one explicit value.
+
+    Fail-safe in both directions: an unrecognised value stays in ``shadow``
+    (a typo must never arm a halting signal), and ``MO_CB_COLLAPSE=0`` turns
+    the floor off entirely, like the score-vs-anchor collapse signal."""
+    if os.environ.get("MO_CB_COLLAPSE", "1") == "0":
+        return FLOOR_OFF
+    raw = os.environ.get("MO_CB_COLLAPSE_FLOOR", "").strip().lower()
+    if not raw:
+        return FLOOR_SHADOW
+    if raw in _FLOOR_OFF_VALUES:
+        return FLOOR_OFF
+    if raw in _FLOOR_ARM_VALUES:
+        return FLOOR_ARMED
+    return FLOOR_SHADOW
+
+
 def _eval_floor_signal(
-    con: sqlite3.Connection | None,
-    tr: sqlite3.Row | None,
+    con: sqlite3.Connection,
+    tr: sqlite3.Row,
     floor_runs: Sequence[dict] | None,
     enabled: bool,
-) -> tuple[bool, dict]:
-    """Signal 5: the diversity / pass@k floor recommends ``halt``.
+) -> tuple[str, dict]:
+    """Signal 5: the diversity / pass@k floor — a TRI-STATE report.
 
     RSI Tier-1 #12b. ``collapse_detector.floor`` compares the most recent
     ``window`` terminal runs of a task class against the ``window`` before
@@ -394,11 +447,20 @@ def _eval_floor_signal(
     That is a diversity collapse, independent of the score-vs-anchor
     divergence signal above.
 
-    The floor is **edge-triggered by the caller**, not here: this helper
-    only reports whether the floor currently recommends ``halt``. The
-    breaker latches on ``collapse_floor`` in ``last_reason`` so a persistent
-    breach trips once and then lets subsequent runs proceed; latching here
-    would make the helper stateful and untestable in isolation.
+    Returns ``(state, report)`` with ``state`` one of:
+
+    * ``"breach"``  — the floor ran and recommends ``halt``.
+    * ``"clear"``   — the floor ran and recommends something else.
+    * ``"unknown"`` — the floor did not run (disabled), could not be imported,
+      or raised. A detector that never answered is NOT evidence of health.
+
+    The caller uses exactly this distinction: only ``"clear"`` clears the
+    latch. A fail-open ``"unknown"`` must leave the latch standing, or one
+    transient import error would re-arm the trip on the next run and let a
+    persistent collapse trip repeatedly (the 2026-10-29 review's W1).
+
+    The floor is **edge-triggered by the caller**, not here: this helper is
+    stateless so it can be tested in isolation.
 
     ``floor_runs`` is a TEST SEAM: when not ``None`` the DB read is skipped
     and the injected ``{"run_id", "passed", "task_key", "lanes"}`` rows are
@@ -406,13 +468,13 @@ def _eval_floor_signal(
     runs for the run's ``task_class`` via ``collapse_floor.evaluate``.
 
     Fail-open is load-bearing: a broken import or a detector that raises
-    must never halt a healthy run, so both return ``fired=False`` with the
-    failure surfaced in the report's ``reason``.
+    must never halt a healthy run.
     """
     if not enabled:
-        return False, {
+        return "unknown", {
             "recommendation": "none",
             "breach": False,
+            "state": "unknown",
             "reason": "collapse floor disabled "
                       "(MO_CB_COLLAPSE_FLOOR=0 or MO_CB_COLLAPSE=0)",
         }
@@ -428,9 +490,10 @@ def _eval_floor_signal(
         collapse_floor = getattr(learning, "collapse_floor")
     except Exception as exc:
         _log_collapse_once(f"floor import failed: {type(exc).__name__}: {exc}")
-        return False, {
+        return "unknown", {
             "recommendation": "none",
             "breach": False,
+            "state": "unknown",
             "reason": f"floor import failed: {exc}",
         }
 
@@ -441,15 +504,31 @@ def _eval_floor_signal(
             )
         else:
             report = collapse_floor.evaluate(con, tr["task_class"])
+        # Read the recommendation INSIDE the try: a detector that returns a
+        # non-mapping (or None) must fail open like one that raises, not
+        # blow up the breaker with AttributeError outside the handler (W2).
+        breach = (
+            isinstance(report, dict)
+            and report.get("recommendation") == "halt"
+        )
     except Exception as exc:
         _log_collapse_once(f"floor raised {type(exc).__name__}: {exc}")
-        return False, {
+        return "unknown", {
             "recommendation": "none",
             "breach": False,
+            "state": "unknown",
             "reason": f"floor raised {type(exc).__name__}: {exc}",
         }
 
-    return report.get("recommendation") == "halt", report
+    if not isinstance(report, dict):
+        return "unknown", {
+            "recommendation": "none",
+            "breach": False,
+            "state": "unknown",
+            "reason": f"floor returned {type(report).__name__}, not a mapping",
+        }
+    report = {**report, "state": "breach" if breach else "clear"}
+    return ("breach" if breach else "clear"), report
 
 
 def check_liveness_breaker(
@@ -484,9 +563,8 @@ def check_liveness_breaker(
     # but reports fired=False with a stable rationale so audit rows stay
     # honest about why the signal did not participate.
     collapse_enabled = os.environ.get("MO_CB_COLLAPSE", "1") != "0"
-    floor_enabled = collapse_enabled and os.environ.get(
-        "MO_CB_COLLAPSE_FLOOR", "1"
-    ) != "0"
+    # The floor's own mode (off / shadow / armed) is resolved next to its
+    # evaluation below, because the latch and trip logic depend on it.
 
     db = _resolve_db(db)
     artifact_window = int(artifact_window)
@@ -555,18 +633,29 @@ def check_liveness_breaker(
     )
 
     # Diversity / pass@k floor (RSI Tier-1 #12b). Unlike the score-vs-anchor
-    # signal above, the floor is edge-triggered: it trips once per breach
-    # episode and then latches on ``collapse_floor`` in ``last_reason``.
-    # Every run of a breached scope must not trip — each tripped run ends
-    # failed, which keeps pass@k down and would make the breach permanent.
-    floor_fired, floor_report = _eval_floor_signal(
+    # signal above, the floor is edge-triggered: in "armed" mode it trips once
+    # per breach episode and then latches in ``collapse_floor_latch`` (keyed on
+    # task_class — the floor's own unit of evaluation). Every run of a breached
+    # class must not trip — each tripped run ends failed, which keeps pass@k
+    # down and would make the breach permanent. In the default "shadow" mode
+    # the floor is evaluated and reported but neither trips nor latches.
+    floor_mode = _floor_mode()
+    floor_enabled = floor_mode != FLOOR_OFF
+    floor_state, floor_report = _eval_floor_signal(
         con, tr, floor_runs, floor_enabled
     )
-    floor_latched = (
-        st is not None
-        and "collapse_floor" in str(st["last_reason"] or "").split(",")
+    floor_fired = floor_state == "breach"
+    floor_latched = con.execute(
+        "SELECT 1 FROM collapse_floor_latch WHERE task_class=?",
+        (tr["task_class"],),
+    ).fetchone() is not None
+    floor_trip = (
+        floor_mode == FLOOR_ARMED and floor_fired and not floor_latched
     )
-    floor_trip = floor_fired and not floor_latched
+    # Only an evaluation that actually RAN and came back healthy clears the
+    # latch. ``unknown`` (disabled, import failure, detector raise) says
+    # nothing about the collapse and must not re-arm a trip.
+    floor_clear = floor_enabled and floor_state == "clear"
 
     # Collapse is an INDEPENDENT trip, not a vote. The original three
     # stagnation signals drive `signals_fired` (so fired_count /
@@ -668,12 +757,31 @@ def check_liveness_breaker(
         )
         last_reason_tokens = list(fired_names) if fired_names else []
 
-    # Persist the floor latch on EVERY verdict (PROCEED and PROBE included):
-    # while the breach persists the token stays set so subsequent runs do
-    # not re-trip. The first evaluation without a breach clears it because
-    # ``last_reason_tokens`` no longer contains it.
-    if floor_fired and "collapse_floor" not in last_reason_tokens:
+    # A trip where BOTH the stagnation vote and the floor fired keeps both
+    # tokens in the audit row: whichever branch picked the rationale, the
+    # floor's own trip is a fact of this run.
+    if floor_trip and "collapse_floor" not in last_reason_tokens:
         last_reason_tokens.append("collapse_floor")
+
+    # Persist the floor latch on EVERY verdict (PROCEED and PROBE included):
+    # while an ARMED breach persists the latch stays set so subsequent runs do
+    # not re-trip. Only an evaluation that ran and came back healthy clears it
+    # — a disabled or failed-open floor leaves the latch standing, because
+    # "the detector did not answer" is not evidence that the collapse ended.
+    # Shadow mode never writes or clears the latch: it must be a pure report,
+    # so arming later still trips once on an ongoing breach.
+    if floor_mode == FLOOR_ARMED:
+        if floor_trip:
+            con.execute(
+                "INSERT INTO collapse_floor_latch (task_class, latched_at) "
+                "VALUES (?, ?) ON CONFLICT(task_class) DO NOTHING",
+                (tr["task_class"], now),
+            )
+        elif floor_clear:
+            con.execute(
+                "DELETE FROM collapse_floor_latch WHERE task_class=?",
+                (tr["task_class"],),
+            )
 
     con.execute(
         """
@@ -740,6 +848,8 @@ def check_liveness_breaker(
             "history_rows": collapse_n,
             "enabled": collapse_enabled,
             "rationale": collapse_rationale,
+            "floor_mode": floor_mode,
+            "floor_state": floor_state,
             "floor_enabled": floor_enabled,
             "floor_fired": floor_fired,
             "floor_latched": floor_latched,
