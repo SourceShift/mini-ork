@@ -8,6 +8,9 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RECIPE_DIR = os.path.dirname(SCRIPT_DIR)
+# Import the sibling helper by path: a launcher that runs with -P or
+# PYTHONSAFEPATH=1 drops the script's own directory from sys.path.
+sys.path.insert(0, SCRIPT_DIR)
 from _inputs import input_dir
 
 INPUT_DIR = input_dir()

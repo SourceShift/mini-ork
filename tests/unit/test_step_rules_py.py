@@ -255,6 +255,29 @@ def test_a_recipe_verifier_resolves_the_way_the_dispatcher_resolves_it(ws, tmp_p
     assert sr.rule_named_test_path_exists(plan, str(ws), str(REPO))[0] == "pass"
 
 
+def test_the_runs_own_profile_resolves_the_recipe_without_an_ambient_one(
+        ws, tmp_path, monkeypatch):
+    """`mini-ork verify` re-run by hand carries no ``MINI_ORK_RECIPE``.
+
+    The run's ``run_profile.json`` names the recipe and the checkout it was
+    dispatched from, and the dispatcher now resolves the verifier from those —
+    so the rule has to pass the same ``run_dir`` or it vetoes a plan the
+    dispatcher would happily run.
+    """
+    monkeypatch.delenv("MINI_ORK_RECIPE", raising=False)
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "run_profile.json").write_text(
+        json.dumps({"recipe": "code-fix", "roots": {"engine": str(REPO)}}),
+        encoding="utf-8")
+    plan = _plan(tmp_path, verifiers=["verifiers/typecheck.py"])
+
+    verdict, detail = sr.rule_named_test_path_exists(
+        plan, str(ws), str(tmp_path / "not-a-checkout"), run_dir=str(run))
+
+    assert verdict == "pass", detail
+
+
 def test_a_recipe_verifier_that_is_genuinely_absent_still_fails(ws, tmp_path,
                                                                monkeypatch):
     plan = _plan(tmp_path, verifiers=["verifiers/not-a-real-verifier.py"])

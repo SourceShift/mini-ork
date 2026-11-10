@@ -141,6 +141,132 @@ def test_the_helper_returns_the_value_when_published(tmp_path):
     assert proc.stdout.strip() == str(tmp_path / "inputs")
 
 
+# ── what the verifier actually sees in its environment ──────────────────────
+
+
+def test_an_inherited_boundary_is_cleared(monkeypatch):
+    """Re-run from inside a node: the parent's inputs are not this verifier's."""
+    monkeypatch.setenv("MINI_ORK_NODE_INPUT_DIR", "/parent/node/inputs")
+    monkeypatch.setenv("MINI_ORK_NODE_INPUT_MANIFEST", "/parent/node/inputs.json")
+
+    env = ver._script_env("/art.md", {})
+
+    assert env["ARTIFACT_PATH"] == "/art.md"
+    assert "MINI_ORK_NODE_INPUT_DIR" not in env
+    assert "MINI_ORK_NODE_INPUT_MANIFEST" not in env
+
+
+def test_the_recovered_boundary_replaces_an_inherited_one(monkeypatch):
+    monkeypatch.setenv("MINI_ORK_NODE_INPUT_DIR", "/parent/node/inputs")
+
+    env = ver._script_env("/art.md", {
+        "MINI_ORK_NODE_INPUT_DIR": "/run/workspace/inputs/research_completeness",
+        "MINI_ORK_NODE_INPUT_MANIFEST": "/run/workspace/manifests/research_completeness.inputs.json",
+    })
+
+    assert env["MINI_ORK_NODE_INPUT_DIR"].endswith("inputs/research_completeness")
+
+
+# ── the run's own record outranks the caller's environment ──────────────────
+
+
+def test_the_profiles_recipe_beats_an_ambient_one(tmp_path, monkeypatch):
+    run = _run_dir(tmp_path)
+    _materialize(run, "research_completeness")
+    monkeypatch.setenv("MINI_ORK_RECIPE", "some-other-recipe")
+
+    env = ver._node_input_env(str(REPO), str(run), str(VERIFIERS / "verify-aggregation.py"))
+
+    assert env["MINI_ORK_NODE_INPUT_DIR"].endswith("research_completeness")
+
+
+def test_the_recipe_root_is_used_when_the_engine_lacks_the_recipe(tmp_path, monkeypatch):
+    """A run dispatched by a worktree is verified against the worktree's copy."""
+    run = _run_dir(tmp_path)
+    (run / "run_profile.json").write_text(
+        json.dumps({"recipe": "frontier-llm-research", "roots": {"engine": str(tmp_path / "gone")}}),
+        encoding="utf-8")
+    _materialize(run, "research_completeness")
+    monkeypatch.setenv("MINI_ORK_RECIPE_ROOT", str(REPO))
+
+    env = ver._node_input_env(str(tmp_path / "also-gone"), str(run),
+                              str(VERIFIERS / "verify-aggregation.py"))
+
+    assert env["MINI_ORK_NODE_INPUT_DIR"].endswith("research_completeness")
+
+
+# ── the verifier script itself is found the same way ────────────────────────
+
+
+def test_the_profiles_recipe_finds_the_script_without_an_ambient_one(tmp_path, monkeypatch):
+    """`mini-ork verify` re-run by hand has no MINI_ORK_RECIPE in its env."""
+    monkeypatch.delenv("MINI_ORK_RECIPE", raising=False)
+    run = _run_dir(tmp_path)
+
+    found = ver._find_verifier_script(
+        "verifiers/verify-aggregation.py", str(tmp_path / "root"),
+        str(tmp_path / "home"), str(run))
+
+    assert found == str(VERIFIERS / "verify-aggregation.py")
+
+
+def test_a_gone_engine_root_falls_back_to_the_callers(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINI_ORK_RECIPE", raising=False)
+    run = _run_dir(tmp_path)
+    (run / "run_profile.json").write_text(
+        json.dumps({"recipe": "frontier-llm-research",
+                    "roots": {"engine": str(tmp_path / "gone")}}), encoding="utf-8")
+
+    found = ver._find_verifier_script(
+        "verifiers/verify-aggregation.py", str(REPO), str(tmp_path / "home"), str(run))
+
+    assert found == str(VERIFIERS / "verify-aggregation.py")
+
+
+def test_the_ambient_recipe_still_resolves_a_run_with_no_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINI_ORK_RECIPE", "frontier-llm-research")
+
+    found = ver._find_verifier_script(
+        "verifiers/verify-aggregation.py", str(tmp_path), str(REPO), str(tmp_path / "no-run"))
+
+    assert found == str(VERIFIERS / "verify-aggregation.py")
+
+
+# ── the warning follows the script, not the run ─────────────────────────────
+
+
+def test_the_gap_warning_only_applies_to_a_script_that_reads_the_variable(tmp_path):
+    reader = tmp_path / "reader.py"
+    reader.write_text("import os\nprint(os.environ['MINI_ORK_NODE_INPUT_DIR'])\n",
+                      encoding="utf-8")
+    helper_reader = tmp_path / "helper_reader.py"
+    helper_reader.write_text("from _inputs import input_dir\nprint(input_dir())\n",
+                             encoding="utf-8")
+    silent = tmp_path / "silent.py"
+    silent.write_text("print('ok')\n", encoding="utf-8")
+
+    assert ver._reads_input_dir(str(reader)) is True
+    assert ver._reads_input_dir(str(helper_reader)) is True
+    assert ver._reads_input_dir(str(silent)) is False
+    assert ver._reads_input_dir(str(tmp_path / "missing.py")) is False
+
+
+# ── a launcher that sets -P must not break the sibling import ───────────────
+
+
+def test_the_helper_import_survives_pythonsafepath(tmp_path):
+    proc = subprocess.run(
+        [sys.executable, str(VERIFIERS / "verify-aggregation.py")],
+        env={**os.environ, "PYTHONSAFEPATH": "1",
+             "MINI_ORK_NODE_INPUT_DIR": str(tmp_path / "empty"),
+             "MINI_ORK_RUN_DIR": str(tmp_path)},
+        capture_output=True, text=True, check=False,
+    )
+
+    assert "_inputs" not in proc.stderr, proc.stderr
+    assert "No module named" not in proc.stderr, proc.stderr
+
+
 # ── no shell twin comes back ────────────────────────────────────────────────
 
 

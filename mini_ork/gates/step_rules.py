@@ -278,10 +278,10 @@ def _resolve(token: str, workspace: str, root: str, run_dir: str = "") -> bool:
     for base in (workspace, root, run_dir):
         if base and os.path.exists(os.path.join(base, token)):
             return True
-    return _resolves_via_the_verifier_dispatcher(token, root)
+    return _resolves_via_the_verifier_dispatcher(token, root, run_dir)
 
 
-def _resolves_via_the_verifier_dispatcher(token: str, root: str) -> bool:
+def _resolves_via_the_verifier_dispatcher(token: str, root: str, run_dir: str = "") -> bool:
     """Ask ``verify.py``'s own resolver, so this rule cannot disagree with it.
 
     A recipe's verifiers do not live at ``<root>/verifiers`` — they live at
@@ -299,7 +299,11 @@ def _resolves_via_the_verifier_dispatcher(token: str, root: str) -> bool:
         return False
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
     try:
-        return bool(verify._find_verifier_script(token, root, home))
+        # Same arguments the dispatcher itself will use, ``run_dir`` included:
+        # the run's profile names the recipe when the caller's environment
+        # does not, and a rule that omits it fails a plan the dispatcher would
+        # have resolved.
+        return bool(verify._find_verifier_script(token, root, home, run_dir))
     except Exception:
         return False
 

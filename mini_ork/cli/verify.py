@@ -133,15 +133,37 @@ def _dag_result(run_dir, name):
     return payload
 
 
-def _find_verifier_script(raw, root, home):
+def _read_run_profile(run_dir):
+    """The run's own ``run_profile.json``, or {} when it has none."""
+    if not run_dir:
+        return {}
+    try:
+        with open(os.path.join(run_dir, "run_profile.json"), encoding="utf-8") as handle:
+            profile = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return profile if isinstance(profile, dict) else {}
+
+
+def _find_verifier_script(raw, root, home, run_dir=""):
     stem = _verifier_stem(raw)
     # Prefer the extension the contract named; fall back to the sibling so a
     # .sh reference still resolves after a recipe ports its verifier to .py
     # (and vice versa for not-yet-repointed contracts).
     exts = [".py", ".sh"] if raw.endswith(".py") else [".sh", ".py"]
-    recipe = os.environ.get("MINI_ORK_RECIPE")
-    # A project recipe (home overlay) first, as runs resolve recipes, then the engine's.
+    profile = _read_run_profile(run_dir)
+    # The run's own record names the recipe. An ambient MINI_ORK_RECIPE belongs
+    # to whatever launched this process and is absent when a verifier is
+    # re-run by hand against a finished run — which is exactly when the recipe
+    # scripts have to be found without it.
+    recipe = str(profile.get("recipe") or os.environ.get("MINI_ORK_RECIPE") or "").strip()
+    roots = profile.get("roots")
+    engine = str(roots.get("engine") or "") if isinstance(roots, dict) else ""
+    # A project recipe (home overlay) first, as runs resolve recipes, then the
+    # engine that dispatched the run (a worktree or the primary checkout), then
+    # the caller's root.
     bases = ([os.path.join(home, "recipes", recipe, "verifiers"),
+              os.path.join(engine, "recipes", recipe, "verifiers"),
               os.path.join(root, "recipes", recipe, "verifiers")] if recipe else []) + [
         os.path.join(home, "verifiers"),
         os.path.join(root, "verifiers")]
@@ -159,8 +181,8 @@ def _node_id_for_script(workflow_path, script, run_dir):
     ``workflow.nodes`` is authoritative only when it names one node. Several
     nodes may share one script (``author-style-imitation-review`` runs
     ``verifiers/search_batch.py`` in five), so an ambiguous match is narrowed
-    by the run's evidence: exactly one of the candidates has a materialized
-    ``workspace/inputs/<node>/``. If two did, the answer is still unknown and
+    by the run's evidence: exactly one of the candidates has the input manifest
+    this function's caller requires. If two did, the answer is still unknown and
     this returns "" instead of guessing whose inputs a verifier should read.
     """
     try:
@@ -192,7 +214,8 @@ def _node_id_for_script(workflow_path, script, run_dir):
         return matches[0]
     materialized = [
         name for name in matches
-        if os.path.isdir(os.path.join(run_dir, "workspace", "inputs", name))
+        if os.path.isfile(os.path.join(
+            run_dir, "workspace", "manifests", f"{name}.inputs.json"))
     ]
     return materialized[0] if len(materialized) == 1 else ""
 
@@ -222,21 +245,29 @@ def _node_input_env(root, run_dir, script):
     """
     if not run_dir or not script:
         return {}
-    try:
-        with open(os.path.join(run_dir, "run_profile.json"), encoding="utf-8") as handle:
-            profile = json.load(handle)
-    except (OSError, ValueError):
+    profile = _read_run_profile(run_dir)
+    if not profile:
         return {}
-    if not isinstance(profile, dict):
-        return {}
-    recipe = os.environ.get("MINI_ORK_RECIPE") or profile.get("recipe") or ""
-    recipe = str(recipe).strip()
+    # The profile is the run's own record; an ambient MINI_ORK_RECIPE belongs
+    # to whatever launched this process and must not rename the run's recipe.
+    recipe = str(profile.get("recipe") or os.environ.get("MINI_ORK_RECIPE") or "").strip()
     if not recipe:
         return {}
     roots = profile.get("roots")
     engine = str(roots.get("engine") or "") if isinstance(roots, dict) else ""
-    workflow_path = os.path.join(engine or root or "", "recipes", recipe, "workflow.yaml")
-    if not os.path.isfile(workflow_path):
+    # A recipe can live in the engine checkout, in a worktree's recipe root
+    # (MINI_ORK_RECIPE_ROOT), or under the caller's root — the winning base is
+    # whichever one actually holds this recipe's workflow.
+    bases = [engine, os.environ.get("MINI_ORK_RECIPE_ROOT", ""), root or ""]
+    workflow_path = ""
+    for base in bases:
+        if not base:
+            continue
+        candidate = os.path.join(base, "recipes", recipe, "workflow.yaml")
+        if os.path.isfile(candidate):
+            workflow_path = candidate
+            break
+    if not workflow_path:
         return {}
     node_id = _node_id_for_script(workflow_path, script, run_dir)
     if not node_id:
@@ -248,6 +279,42 @@ def _node_input_env(root, run_dir, script):
         "MINI_ORK_NODE_INPUT_DIR": os.path.join(run_dir, "workspace", "inputs", node_id),
         "MINI_ORK_NODE_INPUT_MANIFEST": manifest,
     }
+
+
+def _script_env(artifact_path, boundary):
+    """The environment for a script-branch verifier.
+
+    ``ARTIFACT_PATH`` is the legacy contract every verifier may read. The
+    node-input pair is carried only when this run's boundary was recovered: a
+    value already in the environment belongs to the node that invoked
+    ``verify`` (a verifier re-run from inside a node inherits that node's
+    inputs), so an unrecovered boundary must CLEAR it rather than let the
+    verifier judge someone else's artifacts.
+    """
+    env = {**os.environ, "ARTIFACT_PATH": artifact_path}
+    for key in ("MINI_ORK_NODE_INPUT_DIR", "MINI_ORK_NODE_INPUT_MANIFEST"):
+        value = boundary.get(key)
+        if value:
+            env[key] = value
+        else:
+            env.pop(key, None)
+    return env
+
+
+def _reads_input_dir(script) -> bool:
+    """Whether the verifier's own text reads the node-input boundary.
+
+    The recovery warning is only honest for a script that would have used the
+    variable; most non-recipe verifiers never mention it (or import the
+    recipe's ``_inputs`` helper), and an empty boundary is their correct state.
+    """
+    try:
+        with open(script, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(65536)
+    except OSError:
+        return False
+    return any(marker in text for marker in
+               ("MINI_ORK_NODE_INPUT_DIR", "_inputs import", "input_dir("))
 
 
 def _verifier_argv(script):
@@ -641,7 +708,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
     for name in verifier_names:
         if not name:
             continue
-        script = _find_verifier_script(name, root, home)
+        script = _find_verifier_script(name, root, home, run_dir or "")
         # Second-resolution names collided: two `mini-ork verify` calls in the same
         # second shared one log, so the earlier result's evidence_path pointed at the
         # later run's verdict. Keep the `<stem>-<epoch>` prefix, add a unique suffix.
@@ -741,19 +808,20 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             # ``subprocess.run(stdout=PIPE, stderr=STDOUT)`` shape on the
             # local branch byte-for-byte.
             boundary = _node_input_env(root, run_dir or "", script)
-            # Warn only where the gap is real: this run materialized node
-            # inputs (so the recipe uses the boundary), yet none could be
-            # mapped to this script. A verifier that never reads
-            # $MINI_ORK_NODE_INPUT_DIR (most non-recipe verifiers) stays quiet.
-            if not boundary and run_dir and os.path.isdir(
-                    os.path.join(run_dir, "workspace", "manifests")):
+            # Warn only where the gap is real: the verifier reads
+            # $MINI_ORK_NODE_INPUT_DIR, the run materialized node inputs (so
+            # the recipe uses the boundary), yet none could be mapped to this
+            # script. Every other verifier stays quiet.
+            if (not boundary and run_dir and _reads_input_dir(script)
+                    and os.path.isdir(
+                        os.path.join(run_dir, "workspace", "manifests"))):
                 sys.stderr.write(
                     f"[verify] {name}: no node-input boundary recovered; "
                     "the verifier reads $MINI_ORK_NODE_INPUT_DIR\n")
             rc, out = run_check(
                 _verifier_argv(script),
                 cwd=pinned_target,
-                env={**os.environ, "ARTIFACT_PATH": artifact_path, **boundary},
+                env=_script_env(artifact_path, boundary),
                 evidence_path=ev,
                 timeout=0,
             )
