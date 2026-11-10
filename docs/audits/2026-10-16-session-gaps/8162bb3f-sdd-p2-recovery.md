@@ -18,7 +18,7 @@ mostly *other* work this session measured, not work it owns.
 | `sdd-p2-artifact-transport` | Deliver `docs/architecture/artifact-transport.md` + kickoff + roadmap epic | done | **DONE, verified** | commit `0792dc43` is an ancestor of `origin/main`; doc gate PASS; kickoff sha `9656f151…` matches guard; run `run-1791751582-29808` verdict `pass` |
 | `sdd-ide-page` | Add an SDD page so mechanisms render in the Zed UI | pending | NOT STARTED | `grep -n '"sdd"' mini_ork/ide_pages/__init__.py` → no match; no `mini_ork/ide_pages/sdd.py` |
 | `sdd-missing-epics` | Build I2/I4/I6/I7/I8/I9 | pending | NOT STARTED | 6 candidate files MISSING (see §b) |
-| `guard-primary-stash-u` | Stop a `git stash -u` in the primary from stranding untracked deliverables | pending | **DONE 2026-11-10** | `ca7e0f25` — `.githooks/reference-transaction` refuses a three-parent `refs/stash` (the `-u`/`--include-untracked`/`-a` signature) at `prepared`, which aborts the stash before any file moves; `tests/unit/test_githooks_py.py` covers block / plain-stash pass / escape hatch / pre-existing untracked stash still pops |
+| `guard-primary-stash-u` | Stop a `git stash -u` in the primary from stranding untracked deliverables | pending | **DONE 2026-11-10** | `7cc64b63` (authored as `ca7e0f25`, rebased at merge — cite the former) — `.githooks/reference-transaction` refuses a three-parent `refs/stash` (the `-u`/`--include-untracked`/`-a` signature) at `prepared`, which aborts the stash before any file moves; `tests/unit/test_githooks_py.py` covers block / plain-stash pass / escape hatch / pre-existing untracked stash still pops |
 
 Commands actually run:
 
@@ -57,7 +57,7 @@ are `on`. No n≥30 A/B has flipped them — so "implemented" ≠ "live".
 ("preserve-main-changes-before-p1-2-checkpointer-worktree") held the P2 tracked
 files AND, in its `^3` tree, the two untracked ones — i.e. an agent ran
 `git stash -u` in the primary. Any in-flight run's untracked output could be
-stranded the same way. **Closed 2026-11-10 (`ca7e0f25`):** the
+stranded the same way. **Closed 2026-11-10 (`7cc64b63`):** the
 `reference-transaction` hook now refuses a `refs/stash` commit with three
 parents — the exact `-u`/`--include-untracked`/`-a` signature — at `prepared`,
 so the stash is aborted before any file leaves the working tree. Plain stashes
@@ -69,6 +69,6 @@ are unaffected; `MO_ALLOW_UNTRACKED_STASH=1` is the deliberate-sweep escape.
 - **User decision, not a technical block.** Both remaining open items
   (`sdd-ide-page`, `sdd-missing-epics`) need the user to pick priority; no
   credentials, infra, or dependency is blocking them. (`guard-primary-stash-u`
-  left this list on 2026-11-10 — `ca7e0f25` shipped the guard.)
+  left this list on 2026-11-10 — `7cc64b63` shipped the guard.)
 - **This session owns no uncommitted work** — its one deliverable is committed
   and pushed (`0792dc43` → `origin/main`).
