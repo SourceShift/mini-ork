@@ -12,6 +12,10 @@ Contracts pinned here:
   (d) the classifier's ranking is exposed as `top3`, best first
   (e) a missing kickoff is a usage error (stage `usage`, exit 2)
   (f) the verb is reachable through the shared parser, from either positional
+  (g) a kickoff that matches no class reports `generic` — the value `classify`
+      itself prints — not whichever zero-scoring class sorts first
+  (h) the size ceiling `classify` enforces (`MO_MAX_KICKOFF_BYTES`) is applied
+  (i) a non-UTF-8 kickoff still yields a JSON verdict instead of a traceback
 """
 from __future__ import annotations
 
@@ -147,6 +151,48 @@ def test_a_missing_kickoff_is_a_usage_error(home: Path, tmp_path: Path):
     assert "kickoff not found" in got["error"]
 
 
+def test_a_kickoff_that_matches_nothing_is_generic_like_classify(
+        home: Path, tmp_path: Path, monkeypatch, capsys):
+    """`classify` starts at "generic" and only replaces it on a positive score.
+    A field of zeros must therefore report `generic`, not the alphabetically
+    first class — the low-severity finding this test pins."""
+    from mini_ork.cli import classify
+
+    path = _write(tmp_path, "k.md", "# Unrelated\n\nnothing in here matches\n")
+    got = _preflight(home, path)
+
+    assert got["marker"] == "generic", got
+    assert got["marker_score"] == 0
+    assert got["top3"][0]["score"] == 0
+
+    # And it agrees with the real classifier, not just with itself.
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
+    assert classify.main([path, "--dry-run"]) == 0
+    assert capsys.readouterr().out.startswith("task_class=generic\n")
+
+
+def test_an_oversized_kickoff_is_a_usage_error(home: Path, tmp_path: Path,
+                                               monkeypatch):
+    monkeypatch.setenv("MO_MAX_KICKOFF_BYTES", "16")
+    got = _preflight(home, _write(tmp_path, "k.md", KICKOFF_WITH_RECIPE))
+
+    assert got["ok"] is False
+    assert got["stage"] == "usage"
+    assert "MO_MAX_KICKOFF_BYTES" in got["error"]
+
+
+def test_a_non_utf8_kickoff_still_produces_a_verdict(home: Path, tmp_path: Path):
+    path = tmp_path / "k.md"
+    path.write_bytes(b"---\nrecipe: tiny-recipe\n---\n\n# caf\xe9\n")
+
+    got = _preflight(home, str(path))
+
+    assert got["recipe"] == "tiny-recipe"
+    assert got["resolved"] is True
+    assert got["ok"] is True
+
+
 def test_the_verb_parses_from_either_positional_slot():
     for argv in (["preflight", "k.md"], ["preflight", "--kickoff", "k.md"]):
         args = board_cmd.build_parser().parse_args(argv)
@@ -175,3 +221,16 @@ def test_the_cli_exits_0_on_a_resolved_kickoff(home: Path, tmp_path: Path, capsy
     out = capsys.readouterr()
     assert rc == 0
     assert json.loads(out.out)["recipe"] == "tiny-recipe"
+
+
+def test_the_cli_exits_1_when_the_recipe_does_not_resolve(
+        home: Path, tmp_path: Path, capsys):
+    """The documented exit-1 path, exercised through `main` rather than the
+    payload builder — that is where the code split (`1` vs usage `2`) lives."""
+    rc = board_cmd.main(["preflight", _write(tmp_path, "k.md", KICKOFF_WITH_RECIPE),
+                         "--recipe", "no-such-recipe", "--home", str(home)], "")
+
+    out = capsys.readouterr()
+    assert rc == 1
+    assert "does not resolve" in out.err
+    assert json.loads(out.out)["resolved"] is False

@@ -113,6 +113,11 @@ def rank_candidates(kickoff_text: str, *, root: str, home: str) -> list[tuple[st
     caller can show *why* a kickoff resolves to a class instead of only the
     winner. The sort is stable, so equal scores keep filename order — the exact
     "lex-first on ties" order ``main``'s strictly-greater comparison produces.
+
+    A score of ``0`` means "no signal", and row 0 is then NOT the class
+    ``main`` picks: ``main`` starts from ``"generic"`` and only replaces it on
+    a strictly positive score, so every-zero input classifies as ``generic``.
+    A caller mirroring ``main`` must apply that fallback itself.
     """
     task_classes_dir = os.path.join(home, "config", "task_classes")
     if not os.path.isdir(task_classes_dir):

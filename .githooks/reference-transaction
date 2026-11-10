@@ -18,15 +18,22 @@
 # Legitimate work (new commits, merges, fast-forwards, branch switches) all share
 # mini-ork history and pass untouched.
 #
-# Escape hatch: MO_ALLOW_FOREIGN_REF=1 (for a deliberate cross-graft).
+# Escape hatch: MO_ALLOW_FOREIGN_REF=1 (for a deliberate cross-graft). It is a
+# whole-hook bypass — it returns before either guard runs, so it also lets a
+# `stash -u` through. That is the cost of one switch that disables this hook.
 #
 # Second guard, same phase: `git stash -u` (or --include-untracked / -a) writes a
 # three-parent stash commit — HEAD, index, and the untracked tree. The third
 # parent is the harm: a fresh deliverable, an uncommitted report or a kickoff
 # leaves the working tree for a ref nothing else in the workflow reads, which is
 # how a finished artefact "vanishes" between two `git status` calls. A plain
-# stash has two parents and passes. Only creation is checked; `pop`/`drop` do not
-# route through this hook at all, so existing stash stacks still apply.
+# stash has two parents and passes. Only creation is refused: probed on this git
+# (2026-11-10), `pop`/`drop` never route through `reference-transaction` at all,
+# so existing stash stacks apply and drop normally, including stacks made before
+# this guard existed. Should a future git start routing them, popping an
+# untracked stash inside a multi-entry stack would move `refs/stash` onto the
+# NEXT entry — a three-parent commit — and be refused exactly as a `-u` stash
+# is; `MO_ALLOW_UNTRACKED_STASH=1` unblocks that case too.
 # Escape hatch: MO_ALLOW_UNTRACKED_STASH=1.
 #
 # Ported from bash (bash-removal Phase 4) — semantics preserved line-for-line.

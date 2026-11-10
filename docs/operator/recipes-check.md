@@ -122,15 +122,21 @@ It reports the four things a launch decision needs:
   kickoff that declares no recipe and a preflight that invented one would bless
   a launch that fails.
 - **`marker`** / **`marker_score`** — the task class the keyword classifier
-  picks, and its score (the same scorer `mini-ork classify` uses).
+  picks, and its score (the same scorer `mini-ork classify` uses). When nothing
+  matches, this is `generic` with score `0` — the value `classify` itself
+  prints — not whichever class happens to sort first among zeros.
 - **`top3`** — the three best-scoring classes, best first. Ties keep filename
   order, which is the order `classify` itself resolves them in.
 - **`resolved`** — whether that recipe is a real tree on disk (both
   `workflow.yaml` and `task_class.yaml`).
 
-Exit `0` when the kickoff would launch, `1` when it would not (no declared
+Exit `0` when the kickoff's recipe resolves, `1` when it does not (no declared
 recipe, or a recipe that does not resolve — the reason is printed), `2` for a
-usage error (no kickoff, or a path that does not exist). Like `recipes check`
+usage error (no kickoff, a path that does not exist, or a kickoff over
+`MO_MAX_KICKOFF_BYTES`). Exit `0` is *not* a promise that `board start` accepts
+the run: `start` additionally validates `--lane` against the recipe's workflow,
+applies `--set` overrides, and resolves the workspace — preflight answers only
+"is the recipe declared and present". Like `recipes check`
 this is repo-local and static: it reads files, opens no sockets, reads no
 credentials, and writes nothing, so the simple and secure tiers are the same
 command with nothing to configure.

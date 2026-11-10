@@ -24,6 +24,10 @@ truth.
   board start --kickoff <path> [--recipe R] [--workspace worktree|in-place]
               [--set K=V ...] [--run-id ID] [--init] [--dry-run]
                                       launch a run from a kickoff file, detached
+  board preflight <kickoff.md> [--recipe R] [--json]
+                                      what a start would resolve — recipe,
+                                      recipe source, classifier marker, top3 —
+                                      without spending a run
 
 Every section is computed independently: a section that fails comes back
 empty with its error in ``errors`` instead of failing the whole board.
@@ -1502,7 +1506,9 @@ def _act_preflight(home: Path, args) -> dict[str, Any]:
     `_act_start` uses, so the two cannot disagree about which recipe a kickoff
     means. The classifier is reported as ``marker`` and never as ``recipe``: a
     real start refuses a kickoff with no declared recipe, and a preflight that
-    silently invented one would bless a launch that will fail.
+    silently invented one would bless a launch that will fail. ``marker`` is
+    ``generic`` when no class scores — the value `classify` would print — never
+    whichever class happens to sort first in a field of zeros.
     """
     raw = (getattr(args, "kickoff", None) or args.run_id or "").strip()
     if not raw:
@@ -1512,8 +1518,23 @@ def _act_preflight(home: Path, args) -> dict[str, Any]:
     if not kickoff.is_file():
         return {"ok": False, "stage": "usage",
                 "error": f"kickoff not found: {kickoff}"}
+    # The same ceiling `classify` enforces before it reads anything: a preflight
+    # that scanned a multi-hundred-MB file would be the expensive failure it
+    # exists to prevent.
+    max_bytes = int(os.environ.get("MO_MAX_KICKOFF_BYTES", "1048576"))
     try:
-        text = kickoff.read_text(encoding="utf-8")
+        size = kickoff.stat().st_size
+    except OSError as exc:
+        return {"ok": False, "stage": "usage",
+                "error": f"could not stat kickoff: {exc}"}
+    if size > max_bytes:
+        return {"ok": False, "stage": "usage",
+                "error": f"kickoff exceeds MO_MAX_KICKOFF_BYTES "
+                         f"({size} > {max_bytes} bytes)"}
+    try:
+        # `errors="replace"` mirrors `classify`: a kickoff with one stray byte
+        # should still produce a JSON verdict, not a decode traceback.
+        text = kickoff.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return {"ok": False, "stage": "usage",
                 "error": f"could not read kickoff: {exc}"}
@@ -1525,6 +1546,12 @@ def _act_preflight(home: Path, args) -> dict[str, Any]:
             or str(Path(__file__).resolve().parents[2]))
     ranked = rank_candidates(text, root=root, home=str(home))
     marker, marker_score = ranked[0] if ranked else ("", 0)
+    # `classify` starts from "generic" and only replaces it on a strictly
+    # positive score, so a kickoff that matches nothing is classified
+    # "generic" — NOT as row 0, which would be whichever class is alphabetically
+    # first among a field of zeros. Report the class `classify` would print.
+    if marker_score <= 0:
+        marker = "generic"
 
     recipe = (getattr(args, "recipe", None) or "").strip()
     recipe_source = "--recipe"

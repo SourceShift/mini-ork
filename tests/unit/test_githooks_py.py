@@ -353,6 +353,31 @@ def test_ref_tx_allows_popping_an_existing_untracked_stash(tx_repo: Path):
     assert _git(tx_repo, "stash", "list").stdout.strip() == ""
 
 
+def test_ref_tx_allows_popping_from_a_multi_entry_stack(tx_repo: Path):
+    """The harder shape: popping a `-u` stash that is NOT the only entry moves
+    `refs/stash` onto the next entry, which is itself a stash commit. Both pushes
+    run with the hooks off (creation is what the guard covers), then the hooks
+    are enabled for the pop — which must still succeed and leave the older entry
+    in place."""
+    (tx_repo / "a.txt").write_text("first\n")
+    assert _git(tx_repo, "stash", "push", "-m", "tracked-only").returncode == 0
+    (tx_repo / "a.txt").write_text("second\n")
+    (tx_repo / "deliverable.md").write_text("precious\n")
+    assert _git(tx_repo, "stash", "push", "-u", "-m", "with-untracked").returncode == 0
+    assert len(_git(tx_repo, "stash", "list").stdout.strip().splitlines()) == 2
+
+    _git(tx_repo, "config", "core.hooksPath", str(HOOKS))
+    r = _git(tx_repo, "stash", "pop")
+
+    assert r.returncode == 0, r.stderr
+    assert "stash-guard" not in r.stderr
+    assert (tx_repo / "deliverable.md").is_file()
+    assert (tx_repo / "a.txt").read_text() == "second\n"
+    remaining = _git(tx_repo, "stash", "list").stdout.strip().splitlines()
+    assert len(remaining) == 1
+    assert "tracked-only" in remaining[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # pre-push
 # ─────────────────────────────────────────────────────────────────────────────
