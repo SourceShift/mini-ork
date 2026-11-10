@@ -485,7 +485,8 @@ Commits are on `origin/main`.
 | Conformal abstain + LTT saturation (I6/I6b) | S17 #17, R2K #6 | f3d933c4, 66d84582 | DORMANT | 0 confidence values | no writer; node `gates:` never read |
 | Oracle integrity · verifier mutation | VS ⑦⑩ | 48fab622, 0537d16b | DORMANT | — | no producer |
 | Judge validity / reliability harness | VS ⑧, S17 #13 | `judge_validity.py` 4893c602 | OPT-IN | 0 | — |
-| Relations · differential · discrimination · hidden checks | VS ①②⑫⑭ | b976ca71, 0e41c887 | OPT-IN | `certify` CLI only | Tier 1 #8 |
+| Relations · differential | VS ①② | b976ca71, 0e41c887 · `certify/codefix_terms.py` | SHADOW in code-fix, ON in `certify` | verifier runs both veto terms on every green replay with a Python PoC; `MO_CODEFIX_CERTIFY=gate` turns shadow into a level downgrade | 0 `certify_terms.json` reports written yet — no shadow evidence to justify flipping the default |
+| Discrimination · hidden checks | VS ⑫⑭ | b976ca71, 0e41c887 | OPT-IN | `certify` CLI only | Tier 1 #8 |
 | Equivalence · recompute | VS ⑥⑬ | 98145717, ffc3f18e | OPT-IN | post-mvp-delivery only | no recipe declares an operator |
 | Gate hackability (vt2) | VS ⑤ | cf5c4acf | PARTIAL | 5 records (10-06) · 0 refusals | producer is manual |
 | SWE-ABS hardening | S17 #2 | adequacy only | PARTIAL | — | Tier 1 #9 |
