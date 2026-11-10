@@ -12,6 +12,9 @@ outputs:
   - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
     mime: application/json
     description: LibWit source manifest of the top 2026 verification papers with retrieval metadata, per-paper body-text evidence, and evidence coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/papers"
+    mime: text/markdown
+    description: One markdown evidence file per paper with body text (abstract plus ordered LibWit chunks). Referenced by `evidence_path` in source-corpus.json and read by the extraction nodes.
   - path: "${MINI_ORK_RUN_DIR}/technique-catalog.json"
     mime: application/json
     description: Validated canonical techniques with corpus-checked source ids and coverage accounting.

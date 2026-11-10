@@ -11,7 +11,10 @@ rollback_policy: keep_all_source_and_summary_artifacts
 outputs:
   - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
     mime: application/json
-    description: LibWit source manifest with 200 distinct 2026 paper URLs and retrieval metadata.
+    description: LibWit source manifest with 200 distinct 2026 paper URLs, retrieval metadata, per-paper body-text evidence, and evidence coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/papers"
+    mime: text/markdown
+    description: One markdown evidence file per paper with body text (abstract plus ordered LibWit chunks), referenced by `evidence_path` in source-corpus.json.
   - path: "${MINI_ORK_RUN_DIR}/technique-rollup.json"
     mime: application/json
     description: Schema-validated shard techniques and source index.

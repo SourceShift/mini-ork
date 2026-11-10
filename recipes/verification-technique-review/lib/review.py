@@ -441,10 +441,40 @@ def assemble(report_path: Path, merged_path: Path, corpus_path: Path, out: Path)
     _write_text(out, "\n".join(lines))
 
 
+def _check_evidence(corpus: dict[str, dict[str, Any]], corpus_path: Path) -> None:
+    """The kickoff promises extraction read retrieved body text. Enforce the
+    provenance half of that promise here: the collector's coverage block must be
+    present, every paper must carry an evidence mode, and every body-text paper
+    must point at the excerpt file extraction was told to read."""
+    payload = _read_json(corpus_path)
+    coverage = payload.get("evidence_coverage")
+    if not isinstance(coverage, dict):
+        raise ReviewError(
+            "source corpus has no evidence_coverage block: the collector did not attempt body-text retrieval"
+        )
+    missing_mode = sorted(
+        sid for sid, source in corpus.items() if str(source.get("evidence_mode") or "") not in {"body-text", "abstract-only"}
+    )
+    if missing_mode:
+        raise ReviewError(
+            f"{len(missing_mode)} corpus papers carry no evidence_mode: {', '.join(missing_mode[:5])}"
+        )
+    unbacked = sorted(
+        sid
+        for sid, source in corpus.items()
+        if source.get("evidence_mode") == "body-text" and not str(source.get("evidence_path") or "").strip()
+    )
+    if unbacked:
+        raise ReviewError(
+            f"{len(unbacked)} body-text papers have no evidence_path: {', '.join(unbacked[:5])}"
+        )
+
+
 def verify(final_path: Path, merged_path: Path, corpus_path: Path) -> None:
     text = final_path.read_text(encoding="utf-8")
     merged = _read_json(merged_path)
     corpus = _corpus_sources(corpus_path)
+    _check_evidence(corpus, corpus_path)
     for heading in ("## Executive Summary", "## Implement Now", "## Appendix A", "## Appendix B"):
         if heading not in text:
             raise ReviewError(f"final review is missing section {heading!r}")

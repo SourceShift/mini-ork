@@ -295,6 +295,64 @@ def test_collector_falls_back_to_abstract_only_without_body_text(monkeypatch, tm
     assert corpus["evidence_coverage"]["abstract_only_papers"] == 1
 
 
+def test_evidence_file_name_stays_inside_the_papers_dir():
+    pipeline = _pipeline()
+
+    assert pipeline._evidence_file_name("../../etc/passwd") == "etc-passwd.md"
+    assert pipeline._evidence_file_name("..") == "paper.md"
+    assert pipeline._evidence_file_name("2607.00001") == "2607.00001.md"
+
+
+def test_oversized_first_chunk_is_truncated_to_the_per_paper_budget():
+    pipeline = _pipeline()
+    chunks = [{"index": 0, "section": "Introduction", "content": "word " * 5000}]
+
+    selected = pipeline._ordered_body_chunks(chunks, 100)
+
+    assert len(selected) == 1
+    assert selected[0]["tokens"] == 100
+    assert len(selected[0]["content"]) <= 400
+
+
+def test_review_verify_requires_body_text_provenance(tmp_path: Path):
+    spec = importlib.util.spec_from_file_location(
+        "verification_review", ROOT / "recipes" / "verification-technique-review" / "lib" / "review.py"
+    )
+    assert spec and spec.loader
+    review = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(review)
+    source = {
+        "source_id": "arxiv:2607.00001",
+        "title": "Test paper",
+        "evidence_mode": "body-text",
+        "evidence_path": str(tmp_path / "papers" / "2607.00001.md"),
+    }
+    corpus_path = tmp_path / "source-corpus.json"
+    corpus_path.write_text(
+        json.dumps({"sources": [source], "evidence_coverage": {"body_text_papers": 1}}), encoding="utf-8"
+    )
+    review._check_evidence({"arxiv:2607.00001": source}, corpus_path)
+
+    corpus_path.write_text(json.dumps({"sources": [source]}), encoding="utf-8")
+    try:
+        review._check_evidence({"arxiv:2607.00001": source}, corpus_path)
+    except review.ReviewError as exc:
+        assert "evidence_coverage" in str(exc)
+    else:
+        raise AssertionError("verify accepted a corpus without evidence coverage")
+
+    source["evidence_path"] = ""
+    corpus_path.write_text(
+        json.dumps({"sources": [source], "evidence_coverage": {"body_text_papers": 1}}), encoding="utf-8"
+    )
+    try:
+        review._check_evidence({"arxiv:2607.00001": source}, corpus_path)
+    except review.ReviewError as exc:
+        assert "evidence_path" in str(exc)
+    else:
+        raise AssertionError("verify accepted a body-text paper with no evidence file")
+
+
 def test_shard_carries_body_text_metadata(tmp_path: Path):
     pipeline = _pipeline()
     source = _source(1)

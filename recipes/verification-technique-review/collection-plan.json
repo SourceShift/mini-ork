@@ -60,6 +60,7 @@
     "max_tokens_per_paper": 6000,
     "digest_tokens": 120,
     "workers": 4,
-    "fetch_missing": true
+    "fetch_missing": true,
+    "ingest_budget_seconds": 1800
   }
 }

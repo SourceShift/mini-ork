@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, date
@@ -105,6 +106,13 @@ def _truthy(value: str | None, default: bool) -> bool:
 def _evidence_config(plan: dict[str, Any]) -> dict[str, Any]:
     spec = plan.get("fulltext")
     spec = spec if isinstance(spec, dict) else {}
+    # Body-text retrieval is a per-paper enrichment, so it must not inherit a
+    # batch-search timeout sized for a 32-query request (measured: 900 s in the
+    # 2000-paper profile) — that would make one slow paper stall the collector.
+    search_timeout = float(os.environ.get("MINI_ORK_LIBWIT_REQUEST_TIMEOUT_SEC") or 90)
+    evidence_timeout = float(
+        os.environ.get("MINI_ORK_RESEARCH_FULLTEXT_TIMEOUT_SEC") or min(search_timeout, 90)
+    )
     return {
         "enabled": _truthy(os.environ.get("MINI_ORK_RESEARCH_FULLTEXT"), bool(spec.get("enabled", True))),
         "max_tokens_per_paper": int(
@@ -119,7 +127,12 @@ def _evidence_config(plan: dict[str, Any]) -> dict[str, Any]:
         "fetch_missing": _truthy(
             os.environ.get("MINI_ORK_RESEARCH_FULLTEXT_FETCH"), bool(spec.get("fetch_missing", True))
         ),
-        "timeout_seconds": float(os.environ.get("MINI_ORK_LIBWIT_REQUEST_TIMEOUT_SEC") or 90),
+        "ingest_budget_seconds": float(
+            os.environ.get("MINI_ORK_RESEARCH_FULLTEXT_FETCH_BUDGET_SEC")
+            or spec.get("ingest_budget_seconds")
+            or 1800
+        ),
+        "timeout_seconds": evidence_timeout,
     }
 
 
@@ -129,6 +142,15 @@ def _arxiv_key(source_id: str, url: str) -> str:
     return str(url or "").rstrip("/").rsplit("/", 1)[-1].split("v", 1)[0]
 
 
+def _evidence_file_name(arxiv_id: str) -> str:
+    """A remote-supplied id becomes a local filename, so it is sanitized to a
+    flat, dot-safe stem: no separators, no traversal, no hidden files."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(arxiv_id or "")).strip("-.")
+    if not cleaned:
+        cleaned = "paper"
+    return f"{cleaned[:96]}.md"
+
+
 def _libwit_call(
     api_base: str,
     token: str,
@@ -136,6 +158,7 @@ def _libwit_call(
     path: str,
     body: dict[str, Any] | None,
     timeout: float,
+    attempts: int = 3,
 ) -> tuple[int, Any]:
     """One LibWit call with bounded retries. Returns (status, payload); status 0
     means every attempt failed at the transport level."""
@@ -149,7 +172,7 @@ def _libwit_call(
         },
         method=method,
     )
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             with urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
@@ -159,12 +182,15 @@ def _libwit_call(
                 return exc.code, None
         except (URLError, TimeoutError, json.JSONDecodeError):
             pass
-        time.sleep(1.5 * (attempt + 1))
+        if attempt + 1 < attempts:
+            time.sleep(1.5 * (attempt + 1))
     return 0, None
 
 
 def _body_chunks(api_base: str, token: str, arxiv_id: str, timeout: float) -> list[dict[str, Any]]:
-    code, payload = _libwit_call(api_base, token, "GET", f"/paper/{quote(arxiv_id)}/chunks", None, timeout)
+    code, payload = _libwit_call(
+        api_base, token, "GET", f"/paper/{quote(arxiv_id)}/chunks", None, timeout, attempts=2
+    )
     if code != 200 or not isinstance(payload, dict):
         return []
     chunks = payload.get("chunks") or payload.get("results") or []
@@ -183,6 +209,7 @@ def _ingest_body(api_base: str, token: str, arxiv_id: str, timeout: float) -> bo
         "/fetch",
         {"arxiv_id": arxiv_id, "force": False},
         max(timeout, 240),
+        attempts=1,
     )
     return code == 200 and isinstance(payload, dict) and bool(payload.get("title") or payload.get("arxiv_id"))
 
@@ -205,6 +232,11 @@ def _ordered_body_chunks(chunks: list[dict[str, Any]], max_tokens: int) -> list[
     used = 0
     for chunk in candidates:
         cost = int(chunk.get("tokens") or 0) or _token_count(str(chunk.get("content") or ""))
+        if cost > max_tokens:
+            # A single oversized chunk still has to fit the per-paper budget.
+            text = str(chunk.get("content") or "")
+            chunk = {**chunk, "content": " ".join(text[: max_tokens * 4].split()), "tokens": max_tokens}
+            cost = max_tokens
         if selected and used + cost > max_tokens:
             continue
         selected.append(chunk)
@@ -297,16 +329,30 @@ def _attach_body_text(
 
     papers_dir.mkdir(parents=True, exist_ok=True)
     failure_reasons: dict[str, int] = {}
+    failure_lock = threading.Lock()
+    started = time.monotonic()
+    ingest_skipped = 0
+
+    def count_failure(reason: str) -> None:
+        with failure_lock:
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
 
     def enrich(source: dict[str, Any]) -> None:
+        nonlocal ingest_skipped
         arxiv_id = _arxiv_key(source["source_id"], source["url"])
         chunks = _body_chunks(api_base, token, arxiv_id, config["timeout_seconds"])
+        # A cold corpus can need an ingest per paper; the budget keeps that
+        # bounded instead of letting one run spend hours warming LibWit.
         if not chunks and config["fetch_missing"]:
-            if _ingest_body(api_base, token, arxiv_id, config["timeout_seconds"]):
-                time.sleep(1.0)
-                chunks = _body_chunks(api_base, token, arxiv_id, config["timeout_seconds"])
+            if time.monotonic() - started < config["ingest_budget_seconds"]:
+                if _ingest_body(api_base, token, arxiv_id, config["timeout_seconds"]):
+                    time.sleep(1.0)
+                    chunks = _body_chunks(api_base, token, arxiv_id, config["timeout_seconds"])
+            else:
+                with failure_lock:
+                    ingest_skipped += 1
         if not chunks:
-            failure_reasons["no_chunks"] = failure_reasons.get("no_chunks", 0) + 1
+            count_failure("no_chunks")
             source["evidence_mode"] = "abstract-only"
             source["evidence_path"] = ""
             source["evidence_chunks"] = 0
@@ -316,7 +362,7 @@ def _attach_body_text(
             return
         selected = _ordered_body_chunks(chunks, config["max_tokens_per_paper"])
         if not selected:
-            failure_reasons["no_selection"] = failure_reasons.get("no_selection", 0) + 1
+            count_failure("no_selection")
             source["evidence_mode"] = "abstract-only"
             source["evidence_path"] = ""
             source["evidence_chunks"] = 0
@@ -324,7 +370,7 @@ def _attach_body_text(
             source["evidence_digest"] = ""
             source["chunk_count"] = len(chunks)
             return
-        path = papers_dir / f"{arxiv_id}.md"
+        path = papers_dir / _evidence_file_name(arxiv_id)
         path.write_text(_evidence_markdown(source, selected) + "\n", encoding="utf-8")
         source["evidence_mode"] = "body-text"
         source["evidence_path"] = str(path)
@@ -350,6 +396,8 @@ def _attach_body_text(
         "max_tokens_per_paper": config["max_tokens_per_paper"],
         "digest_tokens": config["digest_tokens"],
         "fetch_missing": config["fetch_missing"],
+        "ingest_budget_seconds": config["ingest_budget_seconds"],
+        "ingest_skipped_for_budget": ingest_skipped,
         "failure_reasons": failure_reasons,
         "notes": [
             "Body text retrieved from the LibWit chunk API; each paper's excerpts are written under papers/.",
