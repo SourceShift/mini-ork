@@ -106,6 +106,25 @@ def _candidate_class(yaml_file: str) -> str:
     return cc.replace("-", "_")
 
 
+def rank_candidates(kickoff_text: str, *, root: str, home: str) -> list[tuple[str, int]]:
+    """Every candidate task_class with its keyword score, best first.
+
+    The same ``_candidates``/``_score`` pair ``main`` selects from, exposed so a
+    caller can show *why* a kickoff resolves to a class instead of only the
+    winner. The sort is stable, so equal scores keep filename order — the exact
+    "lex-first on ties" order ``main``'s strictly-greater comparison produces.
+    """
+    task_classes_dir = os.path.join(home, "config", "task_classes")
+    if not os.path.isdir(task_classes_dir):
+        task_classes_dir = os.path.join(root, "config", "task_classes")
+    scored = [
+        (name, _score(yf, kickoff_text, name))
+        for yf in _candidates(task_classes_dir, root, home)
+        for name in (_candidate_class(yf),)
+    ]
+    return sorted(scored, key=lambda row: -row[1])
+
+
 def _safe_trace_write(payload: dict, db: str) -> None:
     """Best-effort trace side-channel matching Bash's ``|| true`` contract."""
     try:

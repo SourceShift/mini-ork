@@ -99,3 +99,42 @@ under budget pressure. `recipes check` walks the YAML and the compiler says yes
 or no in under a second, on every push, for free. Same principle as the
 [fallback guard](fallback-guard.md): give the rule a machine before giving it a
 paragraph.
+
+## `mini-ork board preflight` — the same question, asked of a kickoff
+
+`recipes check` asks whether a recipe can still be dispatched. The neighbouring
+failure is a dispatch that goes to the *wrong* recipe: a kickoff declares none,
+or declares one whose tree is not there, and nobody finds out until the run has
+planned and billed. `mini-ork board preflight <kickoff.md>` answers that before
+anything is spent:
+
+```bash
+mini-ork board preflight kickoffs/auto/some-task.md
+mini-ork board preflight kickoffs/auto/some-task.md --recipe code-fix
+mini-ork board preflight kickoffs/auto/some-task.md --json
+```
+
+It reports the four things a launch decision needs:
+
+- **`recipe`** and **`recipe_source`** — the recipe a real `board start` would
+  use, resolved `--recipe` → front matter. This is deliberately *not* a guess:
+  the classifier's opinion is reported separately, because a `start` refuses a
+  kickoff that declares no recipe and a preflight that invented one would bless
+  a launch that fails.
+- **`marker`** / **`marker_score`** — the task class the keyword classifier
+  picks, and its score (the same scorer `mini-ork classify` uses).
+- **`top3`** — the three best-scoring classes, best first. Ties keep filename
+  order, which is the order `classify` itself resolves them in.
+- **`resolved`** — whether that recipe is a real tree on disk (both
+  `workflow.yaml` and `task_class.yaml`).
+
+Exit `0` when the kickoff would launch, `1` when it would not (no declared
+recipe, or a recipe that does not resolve — the reason is printed), `2` for a
+usage error (no kickoff, or a path that does not exist). Like `recipes check`
+this is repo-local and static: it reads files, opens no sockets, reads no
+credentials, and writes nothing, so the simple and secure tiers are the same
+command with nothing to configure.
+
+`board start --dry-run` remains the deeper check — it also validates `--lane`
+against the recipe's workflow and resolves the workspace. Preflight is the one
+that needs no initialised home.

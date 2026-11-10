@@ -1490,6 +1490,78 @@ def _act_start(home: Path, args) -> dict[str, Any]:
     return result
 
 
+def _act_preflight(home: Path, args) -> dict[str, Any]:
+    """What a real `board start` would resolve for this kickoff, unpaid.
+
+    Emits the four things a misclassified launch costs a whole run to discover:
+    the ``recipe`` (and where it came from), the classifier's ``marker`` with
+    its score, the ``top3`` candidate scores, and ``resolved`` — whether that
+    recipe is a real recipe tree on disk.
+
+    The recipe resolves ``--recipe`` → front matter, exactly the precedence
+    `_act_start` uses, so the two cannot disagree about which recipe a kickoff
+    means. The classifier is reported as ``marker`` and never as ``recipe``: a
+    real start refuses a kickoff with no declared recipe, and a preflight that
+    silently invented one would bless a launch that will fail.
+    """
+    raw = (getattr(args, "kickoff", None) or args.run_id or "").strip()
+    if not raw:
+        return {"ok": False, "stage": "usage",
+                "error": "a kickoff path is required"}
+    kickoff = Path(raw).expanduser().absolute()
+    if not kickoff.is_file():
+        return {"ok": False, "stage": "usage",
+                "error": f"kickoff not found: {kickoff}"}
+    try:
+        text = kickoff.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "stage": "usage",
+                "error": f"could not read kickoff: {exc}"}
+
+    from mini_ork import kickoff_lint
+    from mini_ork.cli.classify import rank_candidates
+
+    root = (os.environ.get("MINI_ORK_ROOT")
+            or str(Path(__file__).resolve().parents[2]))
+    ranked = rank_candidates(text, root=root, home=str(home))
+    marker, marker_score = ranked[0] if ranked else ("", 0)
+
+    recipe = (getattr(args, "recipe", None) or "").strip()
+    recipe_source = "--recipe"
+    if not recipe:
+        recipe = kickoff_lint.front_matter_recipe(text) or ""
+        recipe_source = "front matter"
+
+    resolved = False
+    if recipe:
+        from mini_ork.recipes_catalog import find_recipe
+
+        resolved = find_recipe(recipe, home) is not None
+
+    payload: dict[str, Any] = {
+        "ok": resolved,
+        "kickoff": str(kickoff),
+        "recipe": recipe,
+        "recipe_source": recipe_source if recipe else "",
+        "marker": marker,
+        "marker_score": marker_score,
+        "top3": [{"task_class": name, "score": score} for name, score in ranked[:3]],
+        "resolved": resolved,
+    }
+    if not recipe:
+        payload["error"] = (
+            f"no recipe for {kickoff.name}: pass --recipe, or declare a "
+            "`recipe:` line in the front matter — a start would refuse this "
+            "kickoff. The classifier's pick is reported as `marker`."
+        )
+    elif not resolved:
+        payload["error"] = (
+            f"recipe {recipe!r} does not resolve to a recipe tree: no "
+            f"<recipes>/{recipe}/ with both workflow.yaml and task_class.yaml"
+        )
+    return payload
+
+
 def main(rest: list[str], root: str) -> int:
     del root
     parser = build_parser()
@@ -1505,6 +1577,7 @@ def main(rest: list[str], root: str) -> int:
                          "[retry <run_id> [--ack-change] [--force] [--dry-run]] "
                          "[checkpoints <run_id>] "
                          "[restore <run_id> <node> [--force]] "
+                         "[preflight <kickoff.md> [--recipe R]] "
                          "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
         return 2
     home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
@@ -1531,13 +1604,16 @@ def main(rest: list[str], root: str) -> int:
         # keep the pre-kickoff behaviour of exiting 1 silently — touching
         # their stderr output would change behaviour the existing test
         # suite (and other tooling) already expects.
-        if args.verb in ("restore", "checkpoints", "start", "answer", "race-keep"):
+        if args.verb in ("restore", "checkpoints", "start", "answer", "race-keep",
+                         "preflight"):
             reason = payload.get("reason") or payload.get("error")
             if reason:
                 sys.stderr.write(f"{reason}\n")
         # A mistyped `board start` is a usage error (2); a launch the launcher
         # itself rejected is a failure (1). `_act_start` marks which it was.
-        if args.verb == "start" and payload.get("stage") == "usage":
+        # `preflight` shares the split: a missing/unreadable kickoff is usage,
+        # a kickoff that would not launch is a failure.
+        if args.verb in ("start", "preflight") and payload.get("stage") == "usage":
             return 2
         return 1
     return 0
@@ -1584,6 +1660,12 @@ def validate(args) -> str | None:
     elif args.verb == "start":
         if not args.kickoff:
             return "mini-ork board start: --kickoff <path> is required"
+    elif args.verb == "preflight":
+        # `preflight <kickoff.md>` — the path may ride either positional slot or
+        # the flag, so the SESSION-GOALS spelling (`board preflight <kickoff.md>`)
+        # and the `board start` spelling both work.
+        if not (args.kickoff or args.run_id):
+            return "mini-ork board preflight: a kickoff path is required"
     elif args.verb == "race-keep":
         if not args.run_id:
             return "mini-ork board race-keep: a winner run id is required"
@@ -1664,6 +1746,8 @@ def build_payload(home: Path, args) -> dict[str, Any]:
         payload = _act_restore(home, args.run_id, args.target, force=args.force)
     elif args.verb == "start":
         payload = _act_start(home, args)
+    elif args.verb == "preflight":
+        payload = _act_preflight(home, args)
     else:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
@@ -1715,7 +1799,7 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["show", "run", "merge", "discard", "dismiss", "stop", "kill",
                                  "resume", "retry", "gate", "page", "node", "steer", "answer",
                                  "runs", "checkpoints", "restore", "start", "race-keep",
-                                 "not-needed"])
+                                 "not-needed", "preflight"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464

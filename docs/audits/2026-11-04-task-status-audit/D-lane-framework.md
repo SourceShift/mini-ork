@@ -6,9 +6,9 @@ Window: 2026-10-07 → 2026-11-04. Repos read: `/Volumes/docker-ssd/ps/mini-ork`
 
 ## Summary
 
-Of the 97 rows, **54 are DONE**, **17 are OPEN**, **2 are STALE**, and **24 are
+Of the 97 rows, **55 are DONE**, **16 are OPEN**, **2 are STALE**, and **24 are
 UNKNOWN** (`panel-health-hackability` moved OPEN → DONE on 2026-11-09; see
-`SUMMARY.md`'s post-audit re-probe). The framework/lane half of this backlog is in much better shape than
+`SUMMARY.md`'s post-audit re-probe; `b2-preflight` closed 2026-11-10). The framework/lane half of this backlog is in much better shape than
 its self-reported status implies: lane affinity, the mock provider, the RBF
 verifier envelopes (RB-02a/b, RB-12, RB-15, RB-21), the SDD ratification CLI,
 the RSI recipes (`rsi-cycle` / `rsi-critic`), the certify tamper-class fix, the
@@ -62,7 +62,7 @@ no in-repo trace.
 | sdd-epic-launch | 2026-10-16T21:25 | blocked | OPEN | same; SESSION-GOALS:925-935 shows the go/no-go was requested 4× and never given |
 | ci-bbd241d5 | 2026-10-16T14:18 | in_progress | UNKNOWN | commit `bbd241d5` exists (2026-10-16 "spec: the three ACP failures are fae2a7a5's stale arithmetic"); no in-repo CI verdict recorded |
 | sdd-engine-run | 2026-10-16T11:58 | in_progress | OPEN | no `preflight` subcommand in `mini_ork/cli/board_cmd.py`; no specdir kickoff-precedence code in `mini_ork/specdir/`; classifier-coverage artifact absent |
-| b2-preflight | 2026-10-16T09:50 | pending | OPEN | `mini_ork/cli/board_cmd.py` subcommand list has no `preflight`; only `board start … --dry-run` |
+| b2-preflight | 2026-10-16T09:50 | pending | DONE | `mini-ork board preflight <kickoff.md>` (`_act_preflight` in `mini_ork/cli/board_cmd.py`) emits `recipe` + `recipe_source` + `marker`/`marker_score` + `top3` + `resolved`, exactly as SESSION-GOALS:835 asked; the classifier's ranking comes from `rank_candidates` (`mini_ork/cli/classify.py`), the only new export, so `classify`'s selection loop is byte-identical. Exit 0/1/2 like `board start`. 10 tests in `tests/unit/test_board_preflight_py.py`; documented in `docs/operator/recipes-check.md`. Deliberate deviation: the classifier's pick is reported as `marker`, never as `recipe`, because a real start refuses a kickoff that declares no recipe — a preflight that guessed would bless a launch that fails |
 | sdd-ratification-gate | 2026-10-16T09:38 | pending | DONE | `564cf8d1` "feat(specs): `mini-ork specs ratify`, the operator half of the SDD ratification gate"; `mini_ork/cli/specs.py` |
 | lf-r10 | 2026-10-15T20:21 | in_progress | DONE | `kickoffs/auto/lf-r10-recurring.md` (commit `2e8367f7`) |
 | act-e-lock | 2026-10-15T19:24 | pending | UNKNOWN | no node-provider lock or dirty-engine surfacing found in `mini_ork/remote/providers/` or `mini_ork/node_agent/` |
