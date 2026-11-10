@@ -262,6 +262,28 @@ One of the "held exactly" claims has since changed — it was true on audit day,
   in `recipes/bdd-first-delivery/workflow.yaml` no longer declare it.
   `E-engine-rsi.md`'s `sweep-node` row is **DONE**.
 
+### Found while closing, 2026-11-10
+
+The evidence-worktree disposition (`docs/decisions/20261110-evidence-worktree-disposition.md`)
+was written to delete moot trees, and its probe found the opposite of a moot tree:
+
+- **`w2-review-resume-from-waiting` held a real unmerged fix** (`b1afcaa2`, 2026-10-31),
+  merged as **`1317e87f`**: approving a parked node spawned `recover --strategy resume`
+  with no entry point, and because verifier nodes write no `node_checkpoints` the planner
+  restarted at `specdir_ingest` and re-dispatched the node the operator had just
+  approved — a $4.29 loop in the live SDD smoke that produced it. The node-approve path
+  now resumes `--from-node <waiting_node>` from `.review-pause`.
+- **Its pre-push panel found three defects in that fix, fixed in `58f2d119`**: the
+  sentinel read caught only `OSError` while `UnicodeDecodeError` is a `ValueError` (so a
+  stray byte crashed a path whose docstring promises it never raises); the sentinel's
+  `waiting_node` went straight into `recover --from-node <value>` unvalidated; and the
+  "resuming without an entry point" warning printed under `--no-resume` and while other
+  inbox rows were still pending. Tests: 17 in `test_approvals_resume_waiting_node_py.py`.
+
+Neither row existed in this audit. They are recorded here rather than added to A's table,
+because adding rows after the fact would move the 126-row denominator every total in this
+file is quoted against.
+
 ## Caveat on the group tables
 
 Several agents counted their own output rows in `verification[]` rather than citing the

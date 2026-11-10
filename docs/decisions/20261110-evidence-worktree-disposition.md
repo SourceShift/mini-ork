@@ -86,3 +86,9 @@ The general lesson is the reason this ADR probes instead of trusting names: a
   behind, `zed-acp-slice0` 2798 behind); deleting a tree another session is
   using is a different risk from deleting a review snapshot, so that sweep needs
   its own check-and-act pass and its own record.
+- After the seven removals the directory held **92** entries of which **57** are
+  registered worktrees — 44 are unregistered leftovers, the directory half of a
+  checkout whose git registration went away in an earlier clean. They are also
+  out of scope here: a leftover directory can still hold untracked run output,
+  so each needs its own content check before deletion. Recorded so the next
+  sweep does not mistake them for this ADR's unfinished business.
