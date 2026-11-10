@@ -12,6 +12,7 @@ Requirements:
 - Merge semantically duplicate instructions into one stronger instruction with
   all supporting source IDs. Keep distinct instructions distinct.
 - Include a short limitations section explaining that source-level claims are
-  based on the retrieved LibWit metadata and abstracts unless a record states
-  otherwise.
+  based on the retrieved LibWit metadata, abstracts, and body text (where the
+  source record says `evidence_mode: body-text`), and that no reported number was
+  reproduced by this run.
 - Do not introduce claims or sources absent from the rollup.

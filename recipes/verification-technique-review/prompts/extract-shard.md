@@ -1,13 +1,23 @@
 Read only the declared `source_shard` artifact: a bounded, audited set of 2026
-LibWit/arXiv paper records (title, abstract, metadata). You are extracting the
-VERIFICATION TECHNIQUES these papers contribute — the reusable mechanisms by
-which an AI system (especially an agent or a coding agent) decides that a piece
-of work is correct, or proves it is not. Write exactly one JSON object to the
-requested output path — no Markdown fences, no commentary. Work through the
-shard in order and write the file incrementally if it is large; every source
-must appear. Your LAST action must be the file write: never end your turn with a
-message announcing the write — the node's output is whatever the file holds when
-you stop.
+LibWit/arXiv paper records. Each record carries the title, abstract, metadata,
+and — for most papers — `evidence_digest`: a bounded body-text excerpt taken
+from the paper itself and `evidence_path`: the run-local file holding that
+paper's retrieved body text (sections in order, up to the configured budget).
+You are extracting the VERIFICATION TECHNIQUES these papers contribute — the
+reusable mechanisms by which an AI system (especially an agent or a coding
+agent) decides that a piece of work is correct, or proves it is not. Write
+exactly one JSON object to the requested output path — no Markdown fences, no
+commentary. Work through the shard in order and write the file incrementally if
+it is large; every source must appear. Your LAST action must be the file write:
+never end your turn with a message announcing the write — the node's output is
+whatever the file holds when you stop.
+
+Full text is the evidence. Read the abstract AND the body text for every paper:
+start from `evidence_digest`, and when a paper is high- or medium-relevance and
+the digest does not state the mechanism or the result, read its `evidence_path`
+file (in batches — do not read every file blindly). `evidence_mode` tells you
+what is available: `body-text` means the body was retrieved, `abstract-only`
+means it was not.
 
 Verification, for this scan, includes: execution/test-based checking, oracle and
 ground-truth construction, metamorphic and property-based testing, invariant and
@@ -28,10 +38,11 @@ Required shape:
       "title": "...",
       "url": "https://arxiv.org/abs/2601.00001",
       "published_at": "2026-01-01",
-      "summary": "2-4 sentences: the problem, the method, and the headline result exactly as the abstract states it.",
+      "evidence_mode": "body-text | abstract-only",
+      "summary": "2-4 sentences: the problem, the method, and the headline result as the abstract and body text state them.",
       "verification_relevance": "high | medium | low",
       "techniques": [
-        {"name": "Short technique name", "mechanism": "One sentence: what it does and how.", "result": "Number or claim from the abstract, or empty string."}
+        {"name": "Short technique name", "mechanism": "One sentence: what it does and how.", "result": "Number or claim from the abstract or body text, or empty string."}
       ]
     }
   ],
@@ -42,7 +53,7 @@ Required shape:
 
 Rules:
 - Exactly one `papers` entry per source in the shard; copy `source_id`, `rank`,
-  `title`, `url`, `published_at` verbatim from the shard.
+  `title`, `url`, `published_at`, and `evidence_mode` verbatim from the shard.
 - 1 to 5 `techniques` per paper. A technique is a reusable verification MECHANISM
   (e.g. "metamorphic amplification of a reproduction test", "frozen-control
   oracle audit", "conformal calibrated abstention", "mutation-score test-suite
@@ -52,8 +63,11 @@ Rules:
   medium = a component such verification needs (a test generator, an executor, an
   uncertainty estimator, a sandbox); low = tangential or verification is only a
   side experiment.
-- `result` only repeats what the abstract says. Never invent numbers, sources,
-  URLs, or dates. Empty string when the abstract gives no result.
+- `result` only repeats what the retrieved text says — abstract or body text.
+  Never invent numbers, sources, URLs, or dates. Empty string when neither gives
+  a result. For an `abstract-only` paper, do not imply body-text findings.
+- Body text is evidence: prefer the mechanism and the result as the paper
+  states them in the body when the abstract only advertises the contribution.
 - Keep NEGATIVE findings: a technique the paper shows FAILS, is unreliable, or
   causes false confidence (self-verification limits, judge bias, verifier
   blind spots, reward hacking) is a technique too.

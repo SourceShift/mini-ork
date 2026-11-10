@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from email.message import Message
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError
 
 from mini_ork.workflow.compiler import compile_workflow
 
@@ -82,7 +85,7 @@ def test_collector_identifies_the_mini_ork_client_to_libwit(monkeypatch, tmp_pat
         ),
         encoding="utf-8",
     )
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     class Response:
         def __enter__(self):
@@ -90,6 +93,9 @@ def test_collector_identifies_the_mini_ork_client_to_libwit(monkeypatch, tmp_pat
 
         def __exit__(self, *_args):
             return False
+
+        def getcode(self):
+            return 200
 
         def read(self):
             return json.dumps(
@@ -116,6 +122,9 @@ def test_collector_identifies_the_mini_ork_client_to_libwit(monkeypatch, tmp_pat
         return Response()
 
     monkeypatch.setenv("ARXIV_API_TOKEN", "test-token")
+    # Keep this test on the search call alone: body-text enrichment has its own
+    # tests below and uses a different (longer) timeout.
+    monkeypatch.setenv("MINI_ORK_RESEARCH_FULLTEXT", "0")
     monkeypatch.setattr(pipeline, "urlopen", fake_urlopen)
 
     pipeline.collect(plan_path, tmp_path / "source-corpus.json")
@@ -181,3 +190,131 @@ def test_200_source_fixture_survives_sharding_rollup_and_assembly(tmp_path: Path
     aggregation = aggregation_path.read_text(encoding="utf-8")
     assert aggregation.count("\n### ") == 200
     assert aggregation.count("How to write a proper prompt:") == 200
+
+
+def _collect_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    plan_path = tmp_path / "collection-plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "required_source_count": 1,
+                "results_per_query": 1,
+                "max_workers": 1,
+                "queries": [{"topic": "test", "query": "test query"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return plan_path, tmp_path / "source-corpus.json"
+
+
+def _install_libwit(monkeypatch, pipeline, chunk_payload: object) -> None:
+    class Response:
+        def __init__(self, payload: object):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    search_payload = {
+        "data": [
+            {
+                "results": [
+                    {
+                        "paper_uid": "arxiv:2607.00001",
+                        "arxiv_id": "2607.00001",
+                        "title": "Test paper",
+                        "published": "2026-07-01",
+                        "abstract": "Test abstract",
+                    }
+                ]
+            }
+        ]
+    }
+
+    def fake_urlopen(request, timeout):  # noqa: ARG001 - signature matches urlopen
+        if "/search/batch" in request.full_url:
+            return Response(search_payload)
+        if "/chunks" in request.full_url:
+            if chunk_payload is None:
+                raise HTTPError(request.full_url, 404, "not found", Message(), None)
+            return Response(chunk_payload)
+        raise HTTPError(request.full_url, 404, "not found", Message(), None)
+
+    monkeypatch.setenv("ARXIV_API_TOKEN", "test-token")
+    monkeypatch.setenv("MINI_ORK_RESEARCH_FULLTEXT_WORKERS", "1")
+    monkeypatch.setattr(pipeline, "urlopen", fake_urlopen)
+
+
+def test_collector_reads_body_text_and_writes_a_evidence_file(monkeypatch, tmp_path: Path):
+    pipeline = _pipeline()
+    _install_libwit(
+        monkeypatch,
+        pipeline,
+        {
+            "chunks": [
+                {"index": 0, "section": "Introduction", "content": "Body introduction text."},
+                {"index": 1, "section": "Limitations", "content": "The body names one limitation."},
+            ]
+        },
+    )
+    plan_path, corpus_path = _collect_fixture(tmp_path)
+
+    pipeline.collect(plan_path, corpus_path)
+
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    source = corpus["sources"][0]
+    assert source["evidence_mode"] == "body-text"
+    assert source["evidence_digest"]
+    assert Path(source["evidence_path"]).read_text(encoding="utf-8").count("### Introduction") == 1
+    assert corpus["evidence_coverage"]["body_text_papers"] == 1
+    assert corpus["evidence_coverage"]["abstract_only_papers"] == 0
+
+
+def test_collector_falls_back_to_abstract_only_without_body_text(monkeypatch, tmp_path: Path):
+    pipeline = _pipeline()
+    _install_libwit(monkeypatch, pipeline, None)
+    plan_path, corpus_path = _collect_fixture(tmp_path)
+
+    pipeline.collect(plan_path, corpus_path)
+
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    source = corpus["sources"][0]
+    assert source["evidence_mode"] == "abstract-only"
+    assert source["evidence_path"] == ""
+    assert corpus["evidence_coverage"]["body_text_papers"] == 0
+    assert corpus["evidence_coverage"]["abstract_only_papers"] == 1
+
+
+def test_shard_carries_body_text_metadata(tmp_path: Path):
+    pipeline = _pipeline()
+    source = _source(1)
+    source.update(
+        {
+            "evidence_mode": "body-text",
+            "evidence_path": "/run/papers/2607.00001.md",
+            "evidence_chunks": 2,
+            "evidence_tokens": 90,
+            "evidence_digest": "[Introduction] Body introduction text.",
+            "chunk_count": 2,
+        }
+    )
+    corpus_path = tmp_path / "source-corpus.json"
+    corpus_path.write_text(json.dumps({"source_count": 1, "required_source_count": 1, "sources": [source]}), encoding="utf-8")
+    shard_path = tmp_path / "shard.json"
+
+    pipeline.shard(corpus_path, [shard_path])
+
+    sharded = json.loads(shard_path.read_text(encoding="utf-8"))["sources"][0]
+    assert sharded["evidence_mode"] == "body-text"
+    assert sharded["evidence_digest"].startswith("[Introduction]")
+    assert sharded["evidence_path"] == "/run/papers/2607.00001.md"

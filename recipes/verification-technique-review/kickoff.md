@@ -35,7 +35,9 @@ through coverage gaps.
 ## Success Criteria
 
 - `source-corpus.json` holds 2000 distinct unversioned arXiv URLs with dates,
-  titles, and abstracts.
+  titles, abstracts, and retrieved body text (`evidence_mode`, `evidence_path`,
+  `evidence_coverage`); no paper is extracted from its abstract alone when body
+  text was retrievable.
 - Shard extraction covers at least 95% of the corpus
   (`technique-catalog.json` coverage block).
 - `clusters.json` has exactly ten groups covering at least 95% of catalog

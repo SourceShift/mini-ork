@@ -12,11 +12,15 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, date
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -81,6 +85,278 @@ def _source_id(record: dict[str, Any], url: str) -> str:
         return supplied
     arxiv_id = str(record.get("arxiv_id") or record.get("id") or "").strip().split("v", 1)[0]
     return f"arxiv:{arxiv_id}" if arxiv_id else url
+
+
+# ---------------------------------------------------------------- body text
+
+
+def _token_count(text: str) -> int:
+    """Deterministic token estimate: the chunk API reports token counts when it
+    has them, but a chunk without one must still fit the same budget."""
+    return max(1, len(text) // 4)
+
+
+def _truthy(value: str | None, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _evidence_config(plan: dict[str, Any]) -> dict[str, Any]:
+    spec = plan.get("fulltext")
+    spec = spec if isinstance(spec, dict) else {}
+    return {
+        "enabled": _truthy(os.environ.get("MINI_ORK_RESEARCH_FULLTEXT"), bool(spec.get("enabled", True))),
+        "max_tokens_per_paper": int(
+            os.environ.get("MINI_ORK_RESEARCH_FULLTEXT_TOKENS") or spec.get("max_tokens_per_paper") or 6000
+        ),
+        "digest_tokens": int(
+            os.environ.get("MINI_ORK_RESEARCH_FULLTEXT_DIGEST_TOKENS") or spec.get("digest_tokens") or 120
+        ),
+        "workers": max(
+            1, int(os.environ.get("MINI_ORK_RESEARCH_FULLTEXT_WORKERS") or spec.get("workers") or 4)
+        ),
+        "fetch_missing": _truthy(
+            os.environ.get("MINI_ORK_RESEARCH_FULLTEXT_FETCH"), bool(spec.get("fetch_missing", True))
+        ),
+        "timeout_seconds": float(os.environ.get("MINI_ORK_LIBWIT_REQUEST_TIMEOUT_SEC") or 90),
+    }
+
+
+def _arxiv_key(source_id: str, url: str) -> str:
+    if source_id.startswith("arxiv:"):
+        return source_id.split(":", 1)[1]
+    return str(url or "").rstrip("/").rsplit("/", 1)[-1].split("v", 1)[0]
+
+
+def _libwit_call(
+    api_base: str,
+    token: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    timeout: float,
+) -> tuple[int, Any]:
+    """One LibWit call with bounded retries. Returns (status, payload); status 0
+    means every attempt failed at the transport level."""
+    request = Request(
+        f"{api_base}{path}",
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "mini-ork/0.1 (+https://github.com/adelin-d/mini-ork)",
+        },
+        method=method,
+    )
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+                return response.getcode(), json.loads(raw) if raw.strip() else {}
+        except HTTPError as exc:
+            if exc.code in (400, 401, 403, 404, 422):
+                return exc.code, None
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            pass
+        time.sleep(1.5 * (attempt + 1))
+    return 0, None
+
+
+def _body_chunks(api_base: str, token: str, arxiv_id: str, timeout: float) -> list[dict[str, Any]]:
+    code, payload = _libwit_call(api_base, token, "GET", f"/paper/{quote(arxiv_id)}/chunks", None, timeout)
+    if code != 200 or not isinstance(payload, dict):
+        return []
+    chunks = payload.get("chunks") or payload.get("results") or []
+    return [
+        chunk
+        for chunk in chunks
+        if isinstance(chunk, dict) and str(chunk.get("content") or "").strip()
+    ]
+
+
+def _ingest_body(api_base: str, token: str, arxiv_id: str, timeout: float) -> bool:
+    code, payload = _libwit_call(
+        api_base,
+        token,
+        "POST",
+        "/fetch",
+        {"arxiv_id": arxiv_id, "force": False},
+        max(timeout, 240),
+    )
+    return code == 200 and isinstance(payload, dict) and bool(payload.get("title") or payload.get("arxiv_id"))
+
+
+_SKIP_SECTION = re.compile(r"reference|bibliograph|acknowledg|appendix", re.I)
+_PREFERRED_SECTION = re.compile(
+    r"abstract|introduc|motivat|method|approach|experiment|evaluat|result|analysis|limit|discussion|conclusion",
+    re.I,
+)
+
+
+def _ordered_body_chunks(chunks: list[dict[str, Any]], max_tokens: int) -> list[dict[str, Any]]:
+    ordered = sorted(chunks, key=lambda chunk: int(chunk.get("index") or 0))
+    usable = [c for c in ordered if not _SKIP_SECTION.search(str(c.get("section") or ""))]
+    if not usable:
+        usable = ordered
+    preferred = [c for c in usable if _PREFERRED_SECTION.search(str(c.get("section") or ""))]
+    candidates = preferred or usable
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for chunk in candidates:
+        cost = int(chunk.get("tokens") or 0) or _token_count(str(chunk.get("content") or ""))
+        if selected and used + cost > max_tokens:
+            continue
+        selected.append(chunk)
+        used += cost
+        if used >= max_tokens:
+            break
+    return selected
+
+
+def _body_digest(chunks: list[dict[str, Any]], digest_tokens: int) -> str:
+    """A bounded, ordered preview: the paper's opening plus its strongest
+    conclusion/limitation/result chunk. Enough for extraction to see what the
+    body says without inlining the whole paper into the shard artifact."""
+    if not chunks:
+        return ""
+    picks: list[dict[str, Any]] = list(chunks[:2])
+    closing = [
+        chunk
+        for chunk in chunks
+        if re.search(r"limit|conclu|result|discussion", str(chunk.get("section") or ""), re.I)
+    ]
+    if closing and closing[-1] is not picks[-1]:
+        picks.append(closing[-1])
+    lines: list[str] = []
+    used = 0
+    for chunk in picks:
+        text = re.sub(r"\s+", " ", str(chunk.get("content") or "")).strip()
+        cost = int(chunk.get("tokens") or 0) or _token_count(text)
+        budget = digest_tokens - used
+        if budget <= 0:
+            break
+        if cost > budget:
+            text = " ".join(text[: budget * 4].split())
+            cost = budget
+        section = str(chunk.get("section") or "").strip() or "body"
+        lines.append(f"[{section}] {text}")
+        used += cost
+    return "\n".join(lines)
+
+
+def _evidence_markdown(source: dict[str, Any], chunks: list[dict[str, Any]]) -> str:
+    lines = [
+        f"# {source['title']}",
+        "",
+        f"- source_id: {source['source_id']}",
+        f"- url: {source['url']}",
+        f"- published: {source.get('published_at') or 'unknown'}",
+        f"- authors: {', '.join(str(a) for a in (source.get('authors') or []))[:400]}",
+        "",
+        "## Abstract",
+        "",
+        str(source.get("abstract") or "(no abstract available)").strip(),
+        "",
+        "## Body text (LibWit chunks, ordered by position)",
+        "",
+    ]
+    for chunk in chunks:
+        section = str(chunk.get("section") or "").strip() or "(unnamed section)"
+        lines += [f"### {section}", "", str(chunk.get("content") or "").strip(), ""]
+    return "\n".join(lines)
+
+
+def _attach_body_text(
+    sources: list[dict[str, Any]],
+    papers_dir: Path,
+    api_base: str,
+    token: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Fetch each selected paper's body text and bind it to the corpus record.
+
+    Retrieval failure is never fatal: the paper is marked abstract-only and the
+    extraction prompt is told not to claim body-text findings for it."""
+    if not config["enabled"]:
+        for source in sources:
+            source["evidence_mode"] = "abstract-only"
+            source["evidence_path"] = ""
+            source["evidence_chunks"] = 0
+            source["evidence_tokens"] = 0
+            source["evidence_digest"] = ""
+            source["chunk_count"] = 0
+        return {
+            "enabled": False,
+            "papers": len(sources),
+            "body_text_papers": 0,
+            "abstract_only_papers": len(sources),
+            "body_text_ratio": 0.0,
+            "notes": ["Body-text retrieval disabled; all extraction is abstract-only."],
+        }
+
+    papers_dir.mkdir(parents=True, exist_ok=True)
+    failure_reasons: dict[str, int] = {}
+
+    def enrich(source: dict[str, Any]) -> None:
+        arxiv_id = _arxiv_key(source["source_id"], source["url"])
+        chunks = _body_chunks(api_base, token, arxiv_id, config["timeout_seconds"])
+        if not chunks and config["fetch_missing"]:
+            if _ingest_body(api_base, token, arxiv_id, config["timeout_seconds"]):
+                time.sleep(1.0)
+                chunks = _body_chunks(api_base, token, arxiv_id, config["timeout_seconds"])
+        if not chunks:
+            failure_reasons["no_chunks"] = failure_reasons.get("no_chunks", 0) + 1
+            source["evidence_mode"] = "abstract-only"
+            source["evidence_path"] = ""
+            source["evidence_chunks"] = 0
+            source["evidence_tokens"] = 0
+            source["evidence_digest"] = ""
+            source["chunk_count"] = 0
+            return
+        selected = _ordered_body_chunks(chunks, config["max_tokens_per_paper"])
+        if not selected:
+            failure_reasons["no_selection"] = failure_reasons.get("no_selection", 0) + 1
+            source["evidence_mode"] = "abstract-only"
+            source["evidence_path"] = ""
+            source["evidence_chunks"] = 0
+            source["evidence_tokens"] = 0
+            source["evidence_digest"] = ""
+            source["chunk_count"] = len(chunks)
+            return
+        path = papers_dir / f"{arxiv_id}.md"
+        path.write_text(_evidence_markdown(source, selected) + "\n", encoding="utf-8")
+        source["evidence_mode"] = "body-text"
+        source["evidence_path"] = str(path)
+        source["evidence_chunks"] = len(selected)
+        source["evidence_tokens"] = sum(
+            int(chunk.get("tokens") or 0) or _token_count(str(chunk.get("content") or ""))
+            for chunk in selected
+        )
+        source["evidence_digest"] = _body_digest(selected, config["digest_tokens"])
+        source["chunk_count"] = len(chunks)
+
+    workers = min(config["workers"], max(1, len(sources)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(enrich, sources))
+
+    body_text = sum(1 for source in sources if source.get("evidence_mode") == "body-text")
+    coverage = {
+        "enabled": True,
+        "papers": len(sources),
+        "body_text_papers": body_text,
+        "abstract_only_papers": len(sources) - body_text,
+        "body_text_ratio": round(body_text / len(sources), 4) if sources else 0.0,
+        "max_tokens_per_paper": config["max_tokens_per_paper"],
+        "digest_tokens": config["digest_tokens"],
+        "fetch_missing": config["fetch_missing"],
+        "failure_reasons": failure_reasons,
+        "notes": [
+            "Body text retrieved from the LibWit chunk API; each paper's excerpts are written under papers/.",
+            "Abstract-only papers carry no body-text claim into extraction.",
+        ],
+    }
+    return coverage
 
 
 def _records_from_batch(payload: Any, query_specs: list[dict[str, Any]]) -> Iterable[tuple[dict[str, Any], str]]:
@@ -221,6 +497,24 @@ def collect(plan_path: Path, output_path: Path) -> None:
             f"LibWit returned only {len(selected)} distinct 2026 papers; need {required_count}. "
             "Do not run model summaries against an incomplete corpus."
         )
+    evidence_config = _evidence_config(plan)
+    evidence_coverage = _attach_body_text(
+        selected,
+        output_path.parent / "papers",
+        api_base,
+        token,
+        evidence_config,
+    )
+    notes = [
+        "Collected through the LibWit batch-search endpoint.",
+        "Only papers published in 2026 were eligible.",
+        "Ranking combines topical coverage, source relevance, citation signals, and recency.",
+    ]
+    if evidence_config["enabled"]:
+        notes.append(
+            f"Body text retrieved for {evidence_coverage['body_text_papers']}/{evidence_coverage['papers']} papers; "
+            "extraction reads those excerpts, not the abstract alone."
+        )
     _write_json(
         output_path,
         {
@@ -231,11 +525,8 @@ def collect(plan_path: Path, output_path: Path) -> None:
             "ranking_policy": plan.get("ranking_policy"),
             "sources": selected,
             "coverage_gaps": [],
-            "search_notes": [
-                "Collected through the LibWit batch-search endpoint.",
-                "Only papers published in 2026 were eligible.",
-                "Ranking combines topical coverage, source relevance, citation signals, and recency.",
-            ],
+            "evidence_coverage": evidence_coverage,
+            "search_notes": notes,
         },
     )
 
@@ -378,7 +669,9 @@ def assemble(summary_paths: list[Path], techniques_path: Path, output_path: Path
         [
             "## Evidence Limits",
             "",
-            "The deterministic collector records title, abstract, metadata, URLs, and dates. The per-source summaries do not claim full-text findings that are absent from those records.",
+            "The deterministic collector records title, abstract, metadata, URLs, dates, and the retrieved body-text "
+            "excerpts for each paper (`evidence_mode` in `source-corpus.json`). Per-source summaries rest on that "
+            "retrieved text; numbers are as stated in the paper, not reproduced by this run.",
         ]
     )
     _write_text(output_path, "\n".join(lines))

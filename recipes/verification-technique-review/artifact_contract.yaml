@@ -11,7 +11,7 @@ rollback_policy: keep_all_source_and_summary_artifacts
 outputs:
   - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
     mime: application/json
-    description: LibWit source manifest of the top 2026 verification papers with retrieval metadata.
+    description: LibWit source manifest of the top 2026 verification papers with retrieval metadata, per-paper body-text evidence, and evidence coverage accounting.
   - path: "${MINI_ORK_RUN_DIR}/technique-catalog.json"
     mime: application/json
     description: Validated canonical techniques with corpus-checked source ids and coverage accounting.

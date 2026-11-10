@@ -6,8 +6,9 @@ anchoring stack ALREADY ships, what is measurement-only, and what is
 known-broken.
 
 You are an independent reviewer deciding what the verification stack should
-build next. Be skeptical on two axes. First: abstract-level claims are
-unreproduced. Second, and specific to this review — mini-ork's own state notes
+build next. Be skeptical on two axes. First: reported results are claims from the
+papers' abstracts or retrieved body text, not reproductions. Second, and
+specific to this review — mini-ork's own state notes
 record a MEASURED verification gap: on SWE-bench the cheap lane generated 3/6
 correct fixes and the gate rejected all 3, i.e. the loop certifies
 non-regression, not correctness; the oracle has a measured recall hole (~84%,

@@ -398,11 +398,17 @@ the newest review without spending anything.
 
 **Where techniques come from.** The `verification-technique-review` recipe
 collects a domain's papers, clusters the techniques into families and writes a
-ranked `merged-review.json` into its run directory. The research harvest reads
-the newest review for each domain and turns its top ranked rows into
-`technique_unadopted` candidates through the ordinary queue, so they compete for
-a cycle on severity like any other gap. The candidate's identity is the
-technique name, so a re-review that renumbers or regroups the same technique
+ranked `merged-review.json` into its run directory. The shared collector
+(`recipes/frontier-llm-research/lib/research_pipeline.py`) retrieves each paper's
+body text from the LibWit chunk API and writes it under `papers/<arxiv_id>.md`;
+extraction reads those excerpts, not the abstract alone. `source-corpus.json`
+carries `evidence_mode` per paper and an `evidence_coverage` block, so a review
+that fell back to abstracts (no body text was retrievable) is visible rather than
+silent; `MINI_ORK_RESEARCH_FULLTEXT=0` turns the retrieval off entirely. The
+research harvest reads the newest review for each domain and turns its top ranked
+rows into `technique_unadopted` candidates through the ordinary queue, so they
+compete for a cycle on severity like any other gap. The candidate's identity is
+the technique name, so a re-review that renumbers or regroups the same technique
 does not mint a duplicate.
 
 **What G12 checks.** A `bench:<name>` candidate is judged by the sealed, paired

@@ -75,5 +75,12 @@
     {"topic": "agentic-rl-verification", "query": "reinforcement learning agent verifier execution signal model training"},
     {"topic": "trace-based-eval", "query": "execution trace analysis agent behavior specification compliance"},
     {"topic": "agent-state-audit", "query": "agent state audit rollback checkpoint recovery verification"}
-  ]
+  ],
+  "fulltext": {
+    "enabled": true,
+    "max_tokens_per_paper": 6000,
+    "digest_tokens": 120,
+    "workers": 4,
+    "fetch_missing": true
+  }
 }

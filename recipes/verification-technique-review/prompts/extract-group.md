@@ -1,7 +1,9 @@
 Read only the declared `technique_group` artifact. It holds one technique group
 from a 2026 verification-literature scan: the group definition, its catalog
-techniques (each with supporting `source_ids`), and the abstract-level summaries
-of every supporting paper.
+techniques (each with supporting `source_ids`), and the summaries of every
+supporting paper, each generated from the paper's abstract and retrieved body
+text (`evidence_mode: body-text`) or from its abstract alone
+(`evidence_mode: abstract-only`).
 
 Your job: distill the group into its canonical, implementable verification
 techniques for mini-ork — a task OS for coding agents whose verdict is
@@ -23,7 +25,7 @@ Write one JSON object to the requested output path, no fences:
       "id": "G01-T01",
       "technique": "Canonical name",
       "mechanism": "3-5 sentences: how it works concretely — what it verifies, what evidence it consumes, the accept/reject/abstain rule, and what it is anchored on.",
-      "reported_results": "Strongest numbers the abstracts state, each attributed with (arxiv:ID). Empty if none.",
+      "reported_results": "Strongest numbers the retrieved abstract/body text states, each attributed with (arxiv:ID). Empty if none.",
       "evidence_strength": "strong | moderate | weak",
       "evidence": ["arxiv:2601.00001"],
       "miniork_surface": "Which mini-ork verification surface it would change (crucible runtime, assay oracle, behavioral verifier, committee, gate registry, promotion gate, probe scorer, rubric/panel scoring, abstention/oversight inbox, reward writeback, test-env sanitizer, certificate, or the eval node).",

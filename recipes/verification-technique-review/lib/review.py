@@ -107,6 +107,7 @@ def catalog(extraction_paths: list[Path], corpus_path: Path, catalog_out: Path, 
                 "published_at": src.get("published_at") or paper.get("published_at"),
                 "rank": src.get("rank") or paper.get("rank"),
                 "summary": str(paper.get("summary") or "").strip(),
+                "evidence_mode": str(src.get("evidence_mode") or paper.get("evidence_mode") or "abstract-only"),
                 "rsi_relevance": paper.get("rsi_relevance") or paper.get("relevance") or "unknown",
                 "techniques": [
                     {k: t.get(k) for k in ("name", "mechanism", "result")}
@@ -199,6 +200,7 @@ def split(clusters_path: Path, catalog_path: Path, papers_path: Path, out_dir: P
                         # Bounded read for the group extractor: the mechanism
                         # text already lives on the catalog techniques above.
                         "summary": papers[sid]["summary"][:500],
+                        "evidence_mode": papers[sid].get("evidence_mode") or "abstract-only",
                         "techniques": [
                             {"name": t.get("name"), "result": t.get("result") or ""}
                             for t in papers[sid]["techniques"]
@@ -410,16 +412,30 @@ def assemble(report_path: Path, merged_path: Path, corpus_path: Path, out: Path)
                 continue
             lines += [
                 f"- **{tid} {row['technique']}** (priority {row['priority']}, {row['verdict']}) — {row['mechanism']}",
-                f"  - Results reported: {row['reported_results'] or 'not stated in abstracts'}",
+                f"  - Results reported: {row['reported_results'] or 'not stated in the retrieved text'}",
                 f"  - mini-ork surface: {row['miniork_surface'] or 'n/a'}",
                 "  - Evidence: " + ", ".join(f"[{sid}]({corpus[sid].get('url')})" for sid in row["evidence"] if sid in corpus),
             ]
         lines.append("")
+    sources = list(corpus.values())
+    body_text = sum(1 for source in sources if str(source.get("evidence_mode") or "") == "body-text")
+    if body_text:
+        evidence_limits = (
+            f"Per-paper extraction read LibWit metadata, abstracts, and retrieved body text for {body_text} of "
+            f"{len(sources)} papers ({body_text / len(sources):.0%}); the remaining {len(sources) - body_text} "
+            "were abstract-only because no body text could be retrieved. Reported numbers are as stated in the "
+            "retrieved text, not reproduced."
+        )
+    else:
+        evidence_limits = (
+            "Per-paper extraction read LibWit metadata and abstracts only; no body text was available for this "
+            "corpus, so reported numbers are as stated in abstracts and not reproduced."
+        )
     lines += [
         "## Evidence Limits",
         "",
-        "Per-paper extraction read LibWit titles, abstracts, and metadata only; reported numbers are as stated in abstracts, "
-        f"not reproduced. Impact scores are the judgment of {len(merged['reviewers'])} non-Anthropic model reviewers "
+        evidence_limits,
+        f" Impact scores are the judgment of {len(merged['reviewers'])} non-Anthropic model reviewers "
         f"({', '.join(merged['reviewers'])}) against a hand-written snapshot of mini-ork's shipped mechanisms.",
     ]
     _write_text(out, "\n".join(lines))
@@ -447,7 +463,19 @@ def verify(final_path: Path, merged_path: Path, corpus_path: Path) -> None:
     stray = sorted(mentioned - known_ids)
     if stray:
         raise ReviewError(f"report body references unknown technique ids: {', '.join(stray)}")
-    print(json.dumps({"groups": len(groups), "techniques": len(known_ids), "cited_papers": len(cited), "report_ids": len(mentioned)}))
+    body_text_papers = sum(1 for source in corpus.values() if str(source.get("evidence_mode") or "") == "body-text")
+    print(
+        json.dumps(
+            {
+                "groups": len(groups),
+                "techniques": len(known_ids),
+                "cited_papers": len(cited),
+                "report_ids": len(mentioned),
+                "body_text_papers": body_text_papers,
+                "abstract_only_papers": len(corpus) - body_text_papers,
+            }
+        )
+    )
 
 
 def main() -> int:

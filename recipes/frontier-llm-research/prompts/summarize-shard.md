@@ -1,6 +1,9 @@
 Read only the declared `source_shard` artifact. It is a bounded, audited set of
-LibWit paper records. Write exactly one JSON object to the requested output path
-and no Markdown fences.
+LibWit paper records, each carrying its abstract plus body-text evidence:
+`evidence_mode` (`body-text` or `abstract-only`), `evidence_digest` (a short
+ordered excerpt of the paper's body), and `evidence_path` (a markdown file with
+the retrieved body sections, readable with the Read tool). Write exactly one JSON
+object to the requested output path and no Markdown fences.
 
 Required shape:
 {
@@ -30,9 +33,14 @@ Required shape:
 Rules:
 - Produce exactly one summary for every source in the shard; preserve its IDs,
   URLs, dates, rank, and topics exactly.
-- Write one concise factual paragraph per paper using only its supplied title,
-  abstract, and metadata. State a limitation when the abstract does not support
-  a stronger claim.
+- Write one concise factual paragraph per paper from the retrieved text, not the
+  abstract alone: start with the abstract and `evidence_digest`, and read
+  `evidence_path` (in batches, several per Read call) for every paper whose
+  method, experiments, or limits the digest does not settle. Use the body text
+  for methods, numbers, and limitations; state a limitation when neither the
+  abstract nor the retrieved body supports a stronger claim.
+- Never claim a body-text finding for a record whose `evidence_mode` is
+  `abstract-only`; that record was not retrieved.
 - `prompt_instructions` is the second required paragraph in structured form:
   include 1 to 20 directly actionable instructions, each specific to the paper.
 - Do not invent results, benchmark numbers, source URLs, or dates.

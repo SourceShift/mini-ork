@@ -23,8 +23,9 @@ lane routing, learning writeback, memory).
 ## Success Criteria
 
 - The minimum corpus is 2000 distinct unversioned arXiv URLs, each with a
-  publication date, retrieval date, source ID, title, and abstract or metadata
-  evidence.
+  publication date, retrieval date, source ID, title, abstract, and retrieved
+  body text (`evidence_mode`, `evidence_path`, `evidence_coverage`); a paper is
+  summarized from its abstract alone only when no body text was retrievable.
 - The required artifacts are `source-corpus.json`, ten `source-shard-*.json`
   files, ten `summary-shard-*.json` files, `technique-rollup.json`,
   `unified-techniques.md`, and `aggregation.md`.
