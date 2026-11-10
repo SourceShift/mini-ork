@@ -55,7 +55,7 @@ re-running it.
 
 ## Expected Edit
 
-Touch six files:
+Touch seven files:
 
 1. **`mini_ork/stores/checkpoints.py`** — the vocabulary and the decision:
 
@@ -114,8 +114,11 @@ Touch six files:
 
    ```python
    def mark_effect_pending(run_dir: str, node_id: str, effect: str) -> int:
-       """Record the effect as started, fsync it, return 0. Non-zero when
-       ``run_dir`` is missing or unwritable (never raises)."""
+       """Record the effect as started, return 0. Non-zero when ``run_dir`` is
+       missing or unwritable (never raises). The write is fsync'd and so is the
+       ``.effects`` directory, because a rename/create that is not directory-
+       synced can be lost by a crash — which is the case this record exists to
+       survive."""
 
    def mark_effect_done(run_dir: str, node_id: str) -> int:
        """Flip an existing record to ``done`` with ``ended_at`` and fsync.
@@ -169,7 +172,10 @@ Touch six files:
      `row_status is None` branch, because the publisher has no row;
    - `REUSE` → `reuse.add(nid)`, reason `""` (or `"effect_done"` when the node
      is irreversible; either is fine as long as it is stable);
-   - `RECONCILE` → `reconcile.add(nid)`, reason `"effect_may_have_landed"`;
+   - `RECONCILE` → with `force=False`, `reconcile.add(nid)`, reason
+     `"effect_may_have_landed"`; with `force=True`, treat it as `RERUN` so the
+     node lands in the closure. `--force` has to actually re-dispatch the node:
+     a refusal the operator can override but not act on is a dead end;
    - `RERUN` → fall through to today's handling: the `plan_json` / `no_row`
      branch, then the `status=<s>` branch, then
      `hash_mismatch_or_artifact_corrupt`.
@@ -184,10 +190,12 @@ Touch six files:
    keeps returning a `RecoveryPlan` and carries `parked_nodes` through
    unchanged; it writes nothing either.
 
-6. **`mini_ork/recovery/planner.py`** — the `recover` CLI. Where it already
-   refuses with `sys.stderr.write("Pass --force to override.\n")` (line 1345),
-   add the parked case: when `plan.parked_nodes` is non-empty and `--force` is
-   **not** set, print one line per parked node
+6. **`mini_ork/recovery/planner.py`** — the `recover` CLI. `--force` is already
+   parsed at line 1149. Add the parked case in `main` (line 1065) on the path
+   that turns a plan into a dispatch — not inside the retry-hint refusal block
+   at 1345, which runs only for a `retryable: false` hint. When
+   `plan.parked_nodes` is non-empty and `--force` is **not** set, pass
+   `force=False` to the planner, print one line per parked node
    (`refusing: <node_id> is an irreversible effect that may already have
    landed; inspect <run_dir>/.effects/<node_id>.json`) and return the existing
    refusal code. With `--force`, dispatch the closure as today — the operator
@@ -200,7 +208,7 @@ Touch six files:
 
 ## Requirements
 
-- One diff, six files. Do not touch `.mini-ork/`, `db/migrations/`,
+- One diff, seven files (six existing, one new test file). Do not touch `.mini-ork/`, `db/migrations/`,
   `config/risk-tiers.yaml`, or any frozen path.
 - No new third-party dependency.
 - Do not change `is_node_reusable`'s signature or its fail-closed default.
@@ -229,10 +237,11 @@ Touch six files:
   `RERUN`, exactly as today; a verified reversible success still resolves to
   `REUSE`; `is_node_reusable` returns the same booleans it returns today for
   every existing case (g)–(t).
-- **AC4** `node_resume_decision` never raises and the fail-closed matrix holds:
-  a missing db, a malformed manifest, an `unreadable` record and a sqlite error
-  each degrade to `RERUN` for a reversible node and `RECONCILE` for an
-  irreversible one — while a `done` record still yields `REUSE`.
+- **AC4** `node_resume_decision` never raises. An exception raised while
+  evaluating a rule degrades to `RERUN` for a reversible node and `RECONCILE` for
+  an irreversible one, and never overrides an already-resolved `done` record: a
+  missing db, a malformed manifest, an `unreadable` record and a sqlite error are
+  each tested for both node types.
 - **AC5** `_handle_publisher` records the effect before `publisher_node` runs and
   returns non-zero without calling it when the record cannot be written; a
   failing or raising publisher leaves the record `pending`; `_cp` flips it to
@@ -242,12 +251,12 @@ Touch six files:
 - **AC6** `_reusable_set` puts a reconcile node in neither the reuse set nor the
   rerun set, including when that node has no checkpoint row;
   `compute_recovery` and `plan_recovery` write nothing;
-  `recover` refuses an unforced recovery whose plan has `parked_nodes` and
-  dispatches it with `--force`.
-- `${MINI_ORK_RUN_DIR}/framework-edit.diff` contains the proposed six-file
+  `recover` refuses an unforced recovery whose plan has `parked_nodes`, and
+  with `--force` builds a plan whose closure **contains** those nodes.
+- `${MINI_ORK_RUN_DIR}/framework-edit.diff` contains the proposed seven-file
   patch.
 - `${MINI_ORK_RUN_DIR}/verdict.json` contains
-  `{ "files_changed": 6, "tests_pass": true, "static_pass": true, "pass": true }`.
+  `{ "files_changed": 7, "tests_pass": true, "static_pass": true, "pass": true }`.
 
 ## Files in scope
 
@@ -257,6 +266,7 @@ Touch six files:
 - `mini_ork/recovery/plan.py`
 - `mini_ork/recovery/planner.py`
 - `tests/test_node_checkpoints.py`
+- `tests/unit/test_publisher_effect_record.py` (new)
 
 ## Out of scope
 
