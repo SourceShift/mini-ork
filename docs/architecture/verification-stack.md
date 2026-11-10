@@ -60,11 +60,19 @@ verdict:
 | `status: skipped` | not an abstention — the verifier had no subject (no toolchain for this language) and its `pass` bit is the answer |
 | no `pass` field, or no JSON | the exit code stands, unchanged |
 
-The rule is: **the envelope decides the abstention, not the rc.** A verifier may
-exit 0 (`emit_unverified` in `recipes/code-fix/verifiers/test.py`) or non-zero
-(`recipes/post-mvp-delivery/verifiers/api_contract.py`, so an abstention cannot
-green a run) — both arrive as the executor's abstain outcome, which leaves the
-fail count alone and withholds the publish instead of rolling the edit back.
+The rule is: **the envelope decides the abstention, not the rc.** Both arrive as
+the executor's abstain outcome, which leaves the fail count alone and withholds
+the publish instead of rolling the edit back.
+
+Every shipped abstainer happens to exit 0 — `emit_unverified` in
+`recipes/code-fix/verifiers/test.py` says so in its contract, as do
+`fallback_guard` and `typecheck` — but the reader must not lean on that. The
+behavioral engine under `recipes/post-mvp-delivery/verifiers/api_contract.py`
+deliberately exits non-zero on UNVERIFIED (`MO_BEHAV_ABSTAIN_EXIT`, default 1,
+so an abstention cannot green a run), and the wrapper only rewrites that to exit
+0 plus a vacuous envelope because `mini_ork/cli/verify.py` reads exit-1 as a
+plain failure. Read the rc instead of the envelope and the same abstention
+becomes a failed node the moment the wrapper is bypassed.
 
 The bug this replaced (audit 2026-11-04, `p1-2-abstention-contracts`): the
 mapping was keyed on *how the evidence file parsed*. With a warning line in

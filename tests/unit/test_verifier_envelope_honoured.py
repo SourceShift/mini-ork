@@ -86,9 +86,12 @@ def test_declared_unverified_envelope_after_warning_abstains(local_lane, tmp_pat
 
 
 def test_declared_unverified_envelope_with_exit_one_still_abstains(local_lane, tmp_path):
-    """The canonical contract keys on ``status``, not on the exit code: a
-    verifier that exits non-zero on purpose (post-mvp-delivery's
-    ``api_contract`` does, so an abstention cannot green a run) abstains too."""
+    """The canonical contract keys on ``status``, not on the exit code.
+
+    A non-zero rc alongside ``status: unverified`` is what the behavioral
+    engine prints before ``post-mvp-delivery``'s ``api_contract`` rewrites it
+    (``MO_BEHAV_ABSTAIN_EXIT``, default 1). Whether a wrapper normalises that to
+    0 or not, the executor must reach the same verdict."""
     rc, _ = _run(tmp_path, """
         import sys
         sys.stderr.write(%r)
