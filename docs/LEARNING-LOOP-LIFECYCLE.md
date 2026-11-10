@@ -248,12 +248,17 @@ would have been a statistic with no design behind it.
 - Cost is not an outcome — `cost_usd` is NULL for three quarters of
   researcher/implementer/reviewer attempts.
 
-**Measured on the live store (2026-11-10, read-only copy):** 20,104 exposure
-rows across 487 runs, of which the primary pool is 794 run-nodes — 778 clean, 16
-not. **15 held-out rows on 4 lessons.** That is the whole control arm, which is
-why every clean-arm contrast prints `insufficient_held_out` with `value=None`
-and `p=None`: there is a number the design could produce, and the arm has not yet
-earned the right to print it.
+**Measured on the live store after the first resolve (2026-11-10):** 20,152
+exposure rows across 488 runs and 546 lessons, plus 7,158 rows excluded as
+positional `c:<n>` ids. **15 held-out rows on 4 lessons**, 12 of which survive
+as distinct attempt-1 exposures. That is the whole control arm, which is why
+every clean-arm contrast prints `insufficient_held_out` with `value=None`
+and `p=None`, and why every `effect` is `0.0`: there is a number the design
+could produce, and the arm has not yet earned the right to print it. The
+correlational population gaps land between −0.002 and −0.007 across the top
+lessons — a well-used pattern does not move node success, and a large number
+here would mean the stratification is wrong rather than that the lesson is
+magic.
 
 **The arm was partly an artefact, and the diagnostic says which part.** Of the
 two `pattern:` lessons carrying held rows, neither is reachable under the current
