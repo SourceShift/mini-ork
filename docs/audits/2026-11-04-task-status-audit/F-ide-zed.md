@@ -27,12 +27,12 @@ Verdict counts: DONE 73 · OPEN 35 · STALE 10 · UNKNOWN 15
 | rp-c3-salvage | 2026-10-17 | pending | STALE | salvage 6087a708 is not an ancestor of HEAD, but its content landed as 18ffcae7; no restart needed |
 | node-crumb-visual | 2026-10-17 | in_progress | DONE | submodule 1320825 "Turn the node inspector's run/node text into a breadcrumb", pinned by fork 630318bba3 |
 | design-parity-decision | 2026-10-17 | pending | OPEN | no parity decision recorded; SESSION-GOALS.md:132 still lists it pending |
-| abstention-fold | 2026-10-17 | pending | OPEN | ABSTAIN_RC=3 exists (mini_ork/verify/levels.py:215) but no canonical abstain contract folding P0 4d + P1.2; `emit_unverified` not found in mini_ork/ |
+| abstention-fold | 2026-10-17 | pending | DONE | one mapping now covers both halves: `failure_kind: toolchain` and `status: unverified|abstain` both resolve to ABSTAIN_RC in execute._run_verifier_ref, documented in docs/architecture/verification-stack.md |
 | server-relaunch-7090 | 2026-10-17 | pending | DONE | `mini-ork serve --port 7090 --home .../researcher/.mini-ork` live (pid 24420); GET / -> 200 |
 | sh-orphan | 2026-10-17 | in_progress | DONE | c7a84dc5 "point the drivers' prose at the Python driver, not the retiring .sh" + b1c8e475 "delete the retired shell driver" |
 | r5-unprobeable-gate | 2026-10-16 | pending | DONE | mini_ork/specdir/lint.py:152 flags an all-unprobeable AC at lint time |
 | classify-spawn-refine | 2026-10-16 | pending | OPEN | mini_ork/verify/pm.py:182 classify_spawn still carries the unreviewed pattern list; no refinement record |
-| p1-2-abstention-contracts | 2026-10-16 | pending | OPEN | no canonical abstain contract recorded for emit_unverified (symbol absent) vs ABSTAIN_RC=3 |
+| p1-2-abstention-contracts | 2026-10-16 | pending | DONE | the envelope decides, not the rc: `status: unverified|abstain` → ABSTAIN_RC whatever the exit code, and identically whether the evidence parsed strictly or tolerantly (execute._run_verifier_ref + docs/architecture/verification-stack.md, "The canonical abstain contract") |
 | fix-mistagged-preconditions | 2026-10-16 | pending | OPEN | tests/unit/test_classify.py absent; docs/audits/2026-10-16-session-gaps/cb737d8d-sdd-run-revive.md:33 "NOT STARTED" |
 | part-1-promote-why | 2026-10-16 | pending | DONE | why_section at mini_ork/ide_pages/run.py:3745, rendered at :2074 as "Why? - evidence" |
 | part-3-empties | 2026-10-16 | pending | STALE | counts landed (7d0ac72a "tab badges (C9+C12)"), but empty tabs are deliberately kept with count 0 - run.py:4062 says so |
@@ -164,12 +164,8 @@ Verdict counts: DONE 73 · OPEN 35 · STALE 10 · UNKNOWN 15
   next: no boundary decision recorded; pages live in mini_ork/ide_pages AND in crates/mini_ork_ui
 - **design-parity-decision** — Decide target level and which safety surfaces must survive exact parity  
   next: no parity decision recorded; SESSION-GOALS.md:132 still lists it pending
-- **abstention-fold** — Fold P0 4d + P1.2 abstention into one assignment and settle the canonical abstain contract  
-  next: ABSTAIN_RC=3 exists (mini_ork/verify/levels.py:215) but no canonical abstain contract folding P0 4d + P1.2; `emit_unverified` not found in mini_ork/
 - **classify-spawn-refine** — User refines classify_spawn's pattern list: which rc/pattern means the tool never started  
   next: mini_ork/verify/pm.py:182 classify_spawn still carries the unreviewed pattern list; no refinement record
-- **p1-2-abstention-contracts** — Reconcile emit_unverified's rc-0 contract with ABSTAIN_RC=3 so the ledger stops claiming a check that never ran  
-  next: no canonical abstain contract recorded for emit_unverified (symbol absent) vs ABSTAIN_RC=3
 - **fix-mistagged-preconditions** — Fix the two precondition ACs citing the nonexistent tests/unit/test_classify.py and dedupe codefix AC1/AC8  
   next: tests/unit/test_classify.py absent; docs/audits/2026-10-16-session-gaps/cb737d8d-sdd-run-revive.md:33 "NOT STARTED"
 - **sdd-crate-run** — Deliver pick-files-directories via SDD  
@@ -220,3 +216,8 @@ Verdict counts: DONE 73 · OPEN 35 · STALE 10 · UNKNOWN 15
   next: the signing identity that preserves TCC is implemented (script/mini-ork-app:69) but the grant itself is a System Settings action, unrecorded
 - **launch-verify** — user relaunches and compares open time vs stock Zed  
   next: user-side open-time comparison vs stock Zed not recorded
+
+## Closed since the audit
+
+- **p1-2-abstention-contracts** — **DONE**: the executor now reads the canonical abstain contract off the ENVELOPE, not the exit code. `status: unverified|abstain` → `ABSTAIN_RC` (3) whether the verifier exited 0 or 1, and identically whether the evidence parsed strictly or through the tolerant path — the split that made the same verdict green a node on one run and fail it on the next. `status: skipped` is deliberately excluded (no subject ≠ no verdict). Contract recorded in `docs/architecture/verification-stack.md`; covered by `tests/unit/test_verifier_envelope_honoured.py`.
+- **abstention-fold** — **DONE** with the row above: one mapping in `execute._run_verifier_ref` covers `failure_kind: toolchain` and `status: unverified`, so P0 4d and P1.2 no longer have two competing abstain stories.

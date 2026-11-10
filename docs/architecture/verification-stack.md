@@ -48,6 +48,31 @@ The contract is one field. A verifier emits `"failure_kind": "toolchain"`
 into an abstention (`ABSTAINING_KINDS`), so the run is re-verified instead of
 charged to the implementer.
 
+### The canonical abstain contract (envelope, not exit code)
+
+There are two ways to say "I did not judge the code", and they are the same
+verdict:
+
+| what the verifier writes | what the executor does |
+|---|---|
+| `failure_kind: toolchain` (`pass: false`) | abstain (`ABSTAIN_RC`, 3) |
+| `status: unverified` or `status: abstain` | abstain, **whatever the exit code is** |
+| `status: skipped` | not an abstention — the verifier had no subject (no toolchain for this language) and its `pass` bit is the answer |
+| no `pass` field, or no JSON | the exit code stands, unchanged |
+
+The rule is: **the envelope decides the abstention, not the rc.** A verifier may
+exit 0 (`emit_unverified` in `recipes/code-fix/verifiers/test.py`) or non-zero
+(`recipes/post-mvp-delivery/verifiers/api_contract.py`, so an abstention cannot
+green a run) — both arrive as the executor's abstain outcome, which leaves the
+fail count alone and withholds the publish instead of rolling the edit back.
+
+The bug this replaced (audit 2026-11-04, `p1-2-abstention-contracts`): the
+mapping was keyed on *how the evidence file parsed*. With a warning line in
+front of the JSON, the tolerant parse kept the script's rc (0 = greened the
+node); as a sole JSON object it fell through to the `pass` bit (1 = a failed
+node for a check nothing ran). Same verdict, opposite outcomes — the ledger
+claimed a check that never happened, one way or the other.
+
 Three rules make it honest, and all are tested:
 
 - **Only when nothing judged the code.** A red verdict that ALSO contains a real

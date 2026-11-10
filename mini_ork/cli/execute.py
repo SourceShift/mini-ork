@@ -3081,7 +3081,6 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     if not os.path.getsize(evidence_path):
         open(evidence_path, "w").write(f"vacuous pass: verifier exited {rc} but wrote no evidence")
         return 1
-    tolerant = False
     try:
         payload = json.load(open(evidence_path))
     except Exception:
@@ -3091,7 +3090,6 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
         # then turned a failed gate into a pass (audit RB-02a). Read the
         # payload tolerantly instead: a sole JSON object, else the last
         # object carrying a boolean ``pass``.
-        tolerant = True
         payload = _levels.read_single_verifier_payload(evidence_path)
         if payload is None:
             for candidate in _levels._iter_json_objects(evidence_path):
@@ -3100,15 +3098,25 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
                     break
     if not isinstance(payload, dict) or "pass" not in payload:
         return rc  # non-JSON evidence → propagate the script's rc
-    if tolerant and isinstance(payload.get("status"), str) and (
-            payload["status"].strip().lower() in ("unverified", "skipped", "abstain")):
-        # A declared non-judgement is not a verdict about the code: recipes
-        # such as code-fix's ``_unverified`` print ``pass: false`` with a
-        # ``status`` of ``unverified`` and exit 0 so the level gate withholds
-        # the publish. Recovering that envelope from merged evidence must not
-        # turn the abstention into a node failure (regression from RB-02a) —
-        # keep the script's own rc for this evidence only.
-        return rc
+    declared = str(payload.get("status") or "").strip().lower()
+    if declared in ("unverified", "abstain"):
+        # The canonical abstain contract: the ENVELOPE decides, not the exit
+        # code. A verifier that says ``status: unverified`` never judged the
+        # code — code-fix's ``emit_unverified`` prints ``pass: false`` with that
+        # status and exits 0, another verifier may exit 1 on purpose. Both mean
+        # "no verdict", so both become the executor's abstain rc.
+        #
+        # Before this, whether an abstention refuted the change or greened the
+        # node depended on how the evidence file happened to parse: with a
+        # warning line in front, merged evidence fell through the tolerant parse
+        # and returned the script's own rc (0); as a sole JSON object it fell to
+        # the ``pass`` bit and returned 1 — the same verdict, opposite outcomes,
+        # and a node counted as failed for a check nothing ran (audit 2026-11-04
+        # ``p1-2-abstention-contracts``). ``skipped`` is deliberately NOT here:
+        # a skip declares the verifier has no subject (no toolchain for this
+        # language), and its ``pass`` bit is still the answer; the level gate
+        # already refuses to mint PROVEN from one.
+        return _levels.ABSTAIN_RC
     if _levels.abstain_kind(payload):
         # The verifier declared it could not run its tool (audit 2026-10-11).
         # That is an abstention, not a verdict about the code: a distinct rc so

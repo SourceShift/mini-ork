@@ -73,25 +73,67 @@ def test_pass_true_envelope_after_warning_line_is_accepted(local_lane, tmp_path)
     assert rc == 0
 
 
-def test_declared_unverified_envelope_after_warning_keeps_exit_zero(local_lane, tmp_path):
-    """A declared abstention is not a judgement: keep the script's rc (RBF-02a-fixup)."""
+def test_declared_unverified_envelope_after_warning_abstains(local_lane, tmp_path):
+    """A declared abstention is not a judgement: the executor abstains, and the
+    script's own rc does not decide it (the envelope does)."""
     rc, _ = _run(tmp_path, """
         import sys
         sys.stderr.write(%r)
         print('{"verifier": "test", "pass": false, "status": "unverified"}')
         sys.exit(0)
     """ % WARNING_LINE)
-    assert rc == 0
+    assert rc == levels.ABSTAIN_RC
 
 
-def test_declared_unverified_envelope_after_warning_keeps_exit_one(local_lane, tmp_path):
+def test_declared_unverified_envelope_with_exit_one_still_abstains(local_lane, tmp_path):
+    """The canonical contract keys on ``status``, not on the exit code: a
+    verifier that exits non-zero on purpose (post-mvp-delivery's
+    ``api_contract`` does, so an abstention cannot green a run) abstains too."""
     rc, _ = _run(tmp_path, """
         import sys
         sys.stderr.write(%r)
         print('{"verifier": "test", "pass": false, "status": "unverified"}')
         sys.exit(1)
     """ % WARNING_LINE)
-    assert rc == 1
+    assert rc == levels.ABSTAIN_RC
+
+
+def test_a_clean_single_object_unverified_envelope_abstains(local_lane, tmp_path):
+    """THE regression: with no warning line the strict parse succeeded, the
+    envelope fell through to its ``pass`` bit, and the SAME abstention came back
+    as rc 1 — a node failure for a check nothing ran."""
+    rc, _ = _run(tmp_path, """
+        import sys
+        print('{"verifier": "test", "pass": false, "status": "unverified"}')
+        sys.exit(0)
+    """)
+    assert rc == levels.ABSTAIN_RC
+
+
+def test_declared_abstain_status_abstains(local_lane, tmp_path):
+    rc, _ = _run(tmp_path, """
+        import sys
+        print('{"verifier": "test", "pass": false, "status": "abstain"}')
+        sys.exit(0)
+    """)
+    assert rc == levels.ABSTAIN_RC
+
+
+def test_a_skipped_verifier_keeps_its_pass_bit(local_lane, tmp_path):
+    """``skipped`` is not an abstention: the verifier had no subject (no
+    toolchain for this language) and its ``pass`` bit is still the answer."""
+    rc_pass, _ = _run(tmp_path, """
+        import sys
+        print('{"verifier": "test", "pass": true, "status": "skipped"}')
+        sys.exit(0)
+    """)
+    assert rc_pass == 0
+    rc_fail, _ = _run(tmp_path, """
+        import sys
+        print('{"verifier": "test", "pass": false, "status": "skipped"}')
+        sys.exit(0)
+    """)
+    assert rc_fail == 1
 
 
 def test_pure_json_pass_false_is_still_refuted(local_lane, tmp_path):
