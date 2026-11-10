@@ -53,6 +53,8 @@ dropped. Which thirteen is a per-group question — each group file carries a
 record that closed it.
 
 Per-row evidence for all 851 lives in the sibling files (`A-git-mo.md` … `G2-ide-mo-old.md`).
+`tests/unit/test_audit_totals_py.py` re-derives this table from those files — per group and in
+total — and fails when they disagree, so the numbers cannot drift again silently.
 
 ## The open tasks (118 at audit time, 105 as of 2026-11-10)
 
