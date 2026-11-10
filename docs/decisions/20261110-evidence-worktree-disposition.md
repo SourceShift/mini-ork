@@ -10,9 +10,10 @@ Between 2026-10-25 and 2026-10-31 the RSI cycle and its review loop parked seven
 checkouts under `$MINI_ORK_WORKTREES_DIR` (default
 `/Volumes/docker-ssd/ps/mini-ork-worktrees/`): five `review-*` trees holding the
 exact commit a review panel had just judged, and two branch trees whose commits
-had already reached `main` (one re-landed under a new SHA, one a plain ancestor). Nothing in the workflow ever reads them — a review tree is
-a frozen snapshot for a human to look at, and once the reviewed change is on
-`main` the snapshot is a second copy of a file you can read from `git show`. The
+had already reached `main` (one re-landed under a new SHA, one a plain
+ancestor). Nothing in the workflow ever reads them — a review tree is a frozen
+snapshot for a human to look at, and once the reviewed change is on `main` the
+snapshot is a second copy of a file you can read from `git show`. The
 `quarantine release` verb was fixed (`9f1a93a5`, it now drops the file claims a
 quarantined run took) but the trees themselves were never dispositioned, so they
 sat in every worktree listing (`ls` showed 128 entries at audit time) and each
