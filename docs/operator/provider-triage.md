@@ -161,19 +161,14 @@ The panel works correctly with fewer lenses, the heterogeneity claim
 just gets weaker. Document the degraded state in the next commit
 message so the reduced family-diversity isn't forgotten.
 
-If providers are persistently down and you want pushes to proceed
-anyway without the panel check:
+If providers are persistently down, pushes to main block by default —
+nothing was measured, so the gate does not pass. To proceed anyway with the
+README unmeasured:
 
 ```bash
-export MO_README_PANEL_INDETERMINATE=fail-open   # default behavior
+export MO_README_PANEL_INDETERMINATE=fail-open   # opt out of the block
 # OR
 export MO_README_PANEL_SKIP=1   # skip panel entirely (L1 still runs)
-```
-
-To make outages BLOCK pushes (strict mode):
-
-```bash
-export MO_README_PANEL_INDETERMINATE=block
 ```
 
 ## Step 6 — Permanent fix: prompt-version + key-rotation cron

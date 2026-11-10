@@ -6,10 +6,13 @@ sub-second, runs on every push). Layers 2a + 2b are LLM-based (small cost,
 fires only on push-to-main with structural diff).
 
 The whole pipeline is **local-first** — no GitHub Actions, no secrets
-shipped to cloud CI, no third-party telemetry. The LLM panel dispatches
-through your existing `lib/providers/cl_*.sh` wrappers using your local
-API keys from `.mini-ork/config/secrets.local.sh` (or
-`~/.config/mini-ork/secrets.local.sh`).
+shipped to cloud CI, no third-party telemetry. The LLM calls dispatch
+in-process through `mini_ork.dispatch.dispatch_model`, using the lanes in
+`config/providers.yaml` and the keys in your local store: `$MINI_ORK_SECRETS`
+if set, else `$MINI_ORK_HOME/config/secrets.local.sh` (`.mini-ork/…` by
+default). The store is read, never `source`d, and fails closed — a symlink,
+a group- or world-readable file, or a file owned by someone else is an error,
+not an empty credential.
 
 ## One-time setup
 
@@ -20,7 +23,8 @@ make install-hooks
 That command:
 1. Sets `git config core.hooksPath .githooks` (project-local; doesn't
    touch other clones or the global git config).
-2. Marks `.githooks/pre-push` and `scripts/readme-*.sh` executable.
+2. Marks `.githooks/pre-push`, `scripts/readme_claim_check.py`,
+   `scripts/readme_drift.py` and `scripts/mini_ork_worktree.py` executable.
 
 Verify with `git config core.hooksPath` — should print `.githooks`.
 
@@ -34,9 +38,13 @@ To uninstall: `make uninstall-hooks` resets to the git default.
 | `git push origin main`, no README/structural changes | ✓ runs | — | — |
 | `git push origin main`, README or `lib/`/`bin/`/`recipes/`/`db/migrations/` changed | ✓ runs | ✓ runs (~$0.005) | only if gatekeeper says PANEL_NEEDED (~$0.30) |
 
-**Hard block** on Layer 1 drift OR Layer 2b DRIFT verdict (push to main).
-**Fail-open** on any LLM provider outage (push proceeds, operator sees a
-warning).
+**Hard block** on Layer 1 drift, or on Layer 2b `DRIFT` / `INDETERMINATE`
+(push to main). A `DRIFT` means a claim no longer holds; an `INDETERMINATE`
+means nothing was measured, and a gate that cannot measure does not pass.
+
+**Fail-open** is opt-in: `MO_README_PANEL_INDETERMINATE=fail-open git push`
+proceeds through a provider outage with a warning. A dead gatekeeper is not
+an outage of the audit — the hook runs the panel instead.
 
 ## Bypass options (use carefully)
 
@@ -102,8 +110,11 @@ Then asks MiniMax-M3 to answer:
   claim.
 - **PANEL_SKIP** if the diff is trivial.
 
-Fails open: if MiniMax-M3 is unreachable, treats as `PANEL_SKIP` so a
-provider outage doesn't block your push.
+Fails **measured**: if MiniMax-M3 is unreachable the router has not decided
+the audit is unnecessary, so the hook reads the missing verdict as
+`PANEL_NEEDED` and runs the panel. An outage costs ~$0.30, not a push with
+the README unmeasured. (The gatekeeper's own JSON on stdout is still
+authoritative when it does answer.)
 
 Run ad-hoc:
 ```bash
@@ -168,25 +179,33 @@ catches qualitative drift. A push where:
 
 ## Failure modes you should know
 
-1. **MiniMax provider outage**: gatekeeper fails open, push proceeds
-   without the panel check. If you want a hard block on outage instead,
-   change `gatekeeper()` in `scripts/readme_drift.py` to return 1 instead
-   of 2 on an unreachable provider.
+1. **MiniMax provider outage**: the gatekeeper cannot answer, so it does not
+   decide the audit is unnecessary — the hook runs the 4-lens panel instead.
+   A router outage costs a panel run (~$0.30), never a push with the README
+   unmeasured. The gatekeeper's own error path (return 2) only skips the
+   panel when the hook reads `PANEL_SKIP` from its JSON on stdout.
 
 2. **Opus provider outage during panel arbitration**: the arbiter output
    is unparseable, so the panel reports
    `{"verdict": "INDETERMINATE", "notes": "arbiter output unparseable — …"}`,
    and a separate honesty net forces INDETERMINATE whenever every lens
    failed — absence of evidence is never reported as evidence of absence.
-   The hook's `MO_README_PANEL_INDETERMINATE` decides block vs fail-open
-   (block is the default for a push to main). Lens outputs are preserved in
-   the run dir for manual review.
+   The hook treats a panel that printed no verdict at all the same way.
+   INDETERMINATE **blocks** a push to main by default; set
+   `MO_README_PANEL_INDETERMINATE=fail-open` to push with the README
+   unmeasured, or use one of the bypasses above. Lens outputs are preserved
+   in the run dir for manual review.
 
-3. **False-positive panel verdict on a clean README**: tune the lens
+3. **The panel never runs (providers unresolvable)**: the providers-doctor
+   pre-flight reports fewer responsive lenses than its threshold, which is
+   also INDETERMINATE — blocked by default for the same reason, with the
+   same `MO_README_PANEL_INDETERMINATE=fail-open` opt-out.
+
+4. **False-positive panel verdict on a clean README**: tune the lens
    prompts in `scripts/readme_drift.py` (`LENS_PROMPTS`; inline +
    versioned, so prompt edits are reviewable in commit history).
 
-4. **Pre-push hook silent disable**: someone runs `git config
+5. **Pre-push hook silent disable**: someone runs `git config
    --unset core.hooksPath` to bypass without telling anyone. The
    `make install-hooks` target is idempotent — run it again to restore.
    Consider adding a daily check (`make readme-claim-check` in a cron)

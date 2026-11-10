@@ -14,7 +14,8 @@
 #   Fires ONLY on push to main AND only if README.md / ROADMAP.md /
 #   any structural path appeared in the push diff. ~$0.005 / 5-10s.
 #   Single MiniMax-M3 call decides: PANEL_NEEDED or PANEL_SKIP.
-#   Fail-open: any error here → PANEL_SKIP, push proceeds.
+#   Fail-measured: an unreadable router → PANEL_NEEDED, so an outage costs a
+#   panel run instead of an unmeasured push.
 #
 #   ── Layer 2b — 4-lens panel (scripts/readme_drift.py panel) ────
 #   Fires ONLY if Layer 2a returns PANEL_NEEDED. ~$0.25-0.30 / 30-60s.
@@ -119,6 +120,38 @@ def _jq_field(output: str, field: str, default: str) -> str:
     if isinstance(val, bool):
         return "true" if val else "false"
     return str(val)
+
+
+def _gatekeeper_verdict(output: str) -> str:
+    """PANEL_NEEDED / PANEL_SKIP; an unreadable router means "run the panel".
+
+    A router that could not answer has not decided the audit is unnecessary,
+    so the honest default is the measured path. Its error path writes its JSON
+    to stderr — the hook captured nothing, and the old `PANEL_SKIP` default
+    turned that silence into a clean push.
+    """
+    return _jq_field(output, "verdict", "PANEL_NEEDED") or "PANEL_NEEDED"
+
+
+def _panel_verdict(output: str) -> str:
+    """The panel's verdict; a panel that printed nothing is INDETERMINATE.
+
+    `_jq_field` returns "" for unparseable output, and the old `"NO_DRIFT"`
+    default read that as a clean audit — an unmeasured README passing the gate
+    it exists to guard. Absence of evidence is not evidence of absence.
+    """
+    return _jq_field(output, "verdict", "INDETERMINATE") or "INDETERMINATE"
+
+
+def _indeterminate_blocks() -> bool:
+    """Whether an unmeasurable panel blocks a push to main (default: yes).
+
+    The knob used to be opt-in, so a lens outage let every claim through
+    unmeasured. `MO_README_PANEL_INDETERMINATE=fail-open` is the opt-out; the
+    other escape hatches (MO_README_PANEL_SKIP, MO_README_DRIFT_SKIP,
+    --no-verify) still bypass the whole layer.
+    """
+    return os.environ.get("MO_README_PANEL_INDETERMINATE", "block") != "fail-open"
 
 
 def run_layer1(repo_root: Path) -> int:
@@ -287,7 +320,7 @@ def main() -> int:
         check=False,
     )
     gate_out = r.stdout or ""
-    gate_verdict = _jq_field(gate_out, "verdict", "PANEL_SKIP")
+    gate_verdict = _gatekeeper_verdict(gate_out)
     gate_reason = _jq_field(gate_out, "reason", "")
     print(f"  gatekeeper: {gate_verdict} — {gate_reason}")
 
@@ -326,22 +359,20 @@ def main() -> int:
                 "  Skipping the 4-lens panel (would burn ~360s on"
                 " guaranteed-empty calls)."
             )
-            if os.environ.get(
-                "MO_README_PANEL_INDETERMINATE", "fail-open"
-            ) == "block":
+            if _indeterminate_blocks():
                 print(
-                    "  MO_README_PANEL_INDETERMINATE=block — push BLOCKED on"
-                    " panel_unavailable."
+                    "  push BLOCKED on panel_unavailable (default). Fix provider"
+                    " auth: the store is $MINI_ORK_HOME/config/secrets.local.sh"
+                    " (`mini-ork vault status` reports which keys it holds)."
                 )
                 print(
-                    "  Fix provider auth (rotate keys / check gateway URLs in"
-                    " lib/providers/cl_*.sh)"
+                    "  OR set MO_README_PANEL_INDETERMINATE=fail-open to push"
+                    " with the README unmeasured."
                 )
-                print("  OR clear the env flag for fail-open behavior.")
                 return 1
             print(
-                "  Treating as fail-open (set"
-                " MO_README_PANEL_INDETERMINATE=block for strict)."
+                "  MO_README_PANEL_INDETERMINATE=fail-open — push proceeds with"
+                " the README unmeasured."
             )
             return 0
 
@@ -358,7 +389,7 @@ def main() -> int:
         check=False,
     )
     panel_out = r.stdout or ""
-    panel_verdict = _jq_field(panel_out, "verdict", "NO_DRIFT")
+    panel_verdict = _panel_verdict(panel_out)
     panel_report = _jq_field(panel_out, "report_path", "")
     panel_wall = _jq_field(panel_out, "wall_time_sec", "0")
     panel_cost = _jq_field(panel_out, "cost_estimate_usd", "0")
@@ -388,21 +419,21 @@ def main() -> int:
             " no actionable signal)."
         )
         print(f"  Report: {panel_report}")
-        if os.environ.get("MO_README_PANEL_INDETERMINATE", "fail-open") == "block":
-            print("  MO_README_PANEL_INDETERMINATE=block — push BLOCKED.")
+        if _indeterminate_blocks():
+            print("  push BLOCKED (default) — nothing was measured.")
             print(
-                "  Either fix providers (rotate API keys / check gateway URLs"
-                " in lib/providers/cl_*.sh)"
+                "  Fix providers: the store is"
+                " $MINI_ORK_HOME/config/secrets.local.sh (`mini-ork vault status`"
+                " reports which keys it holds)."
             )
-            print("  OR clear the env flag for fail-open behavior.")
+            print(
+                "  OR set MO_README_PANEL_INDETERMINATE=fail-open to push with"
+                " the README unmeasured."
+            )
             return 1
         print(
-            "  MO_README_PANEL_INDETERMINATE not set to 'block' — fail-open,"
-            " push proceeds."
-        )
-        print(
-            "  (Set MO_README_PANEL_INDETERMINATE=block to make this a hard"
-            " block.)"
+            "  MO_README_PANEL_INDETERMINATE=fail-open — push proceeds with the"
+            " README unmeasured."
         )
         return 0
 
