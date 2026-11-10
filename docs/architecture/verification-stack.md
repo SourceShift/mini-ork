@@ -84,7 +84,10 @@ the same overlay `code-fix`'s `typecheck.py` uses for `tsc`), so the repo's own
 typed rules really do run over the change. It abstains only when no overlay is
 possible — no root `tsconfig.json`, a touched file outside the repo, or a flat
 config, where `--parser-options` does not exist and rewriting the repo's config
-is not the engine's call.
+is not the engine's call (or a target tree it cannot write an overlay into). A
+retry that runs and reports a finding is a refutation, and — as everywhere in
+this stack — a refutation outranks an abstention: a `tsc` error is never
+excused by an eslint that could not start.
 
 ## Which "vacuous" guard you mean: three, not one
 

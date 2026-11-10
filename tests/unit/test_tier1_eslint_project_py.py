@@ -51,8 +51,10 @@ PROJECT_ERROR = (
 )
 
 # The stub fails on a bare run (production's behaviour) and passes when handed a
-# scoped project that actually lists the file. It also echoes the overlay it was
-# given, so the evidence log can be checked rather than trusted.
+# scoped project that actually lists the file. It copies the overlay it was
+# given, so the evidence log and the overlay bytes are checked, not trusted. The
+# error prose lives in a file: quoting a message full of backticks into a shell
+# script is how a "verbatim" fixture stops being verbatim.
 STUB_ESLINT = """#!/bin/sh
 project=""
 for a in "$@"; do
@@ -61,7 +63,7 @@ for a in "$@"; do
   esac
 done
 if [ -z "$project" ]; then
-  printf '%s' "$PROJECT_ERROR_TEXT"
+  cat .eslint-project-error.txt
   exit 2
 fi
 if ! grep -q 'server/x.ts' "$project"; then
@@ -103,8 +105,8 @@ def _build(tmp_path: Path, *, tsconfig: bool = True, flat: bool = False,
 
     bindir = repo / "node_modules" / ".bin"
     bindir.mkdir(parents=True)
-    _stub(bindir / "eslint",
-          STUB_ESLINT.replace("$PROJECT_ERROR_TEXT", "'" + PROJECT_ERROR + "'"))
+    (repo / ".eslint-project-error.txt").write_text(PROJECT_ERROR, encoding="utf-8")
+    _stub(bindir / "eslint", STUB_ESLINT)
 
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -194,6 +196,75 @@ def test_a_flat_config_is_never_handed_parser_options(tmp_path):
     assert "--parser-options=project:" not in evidence
     assert "no scoped project overlay possible" in evidence
     assert rc == 1
+
+
+# ── a refutation outranks an abstention ─────────────────────────────────────
+
+
+def _build_typed_error(tmp_path: Path) -> tuple[Path, Path]:
+    """The same repo, but its own typed rule DOES find something.
+
+    The stub exits 1 with a real finding when the overlay is good, and fails the
+    project-scope way (exit 2) when it is not — so one run exercises both
+    classifiers at once.
+    """
+    repo, run_dir = _build(tmp_path)
+    (repo / "node_modules" / ".bin" / "eslint").write_text(
+        """#!/bin/sh
+project=""
+for a in "$@"; do
+  case "$a" in
+    *project:*) project="${a##*project:}" ;;
+  esac
+done
+if [ -z "$project" ]; then
+  cat .eslint-project-error.txt
+  exit 2
+fi
+echo "server/x.ts"
+echo "  3:1  error  Promises must be awaited  @typescript-eslint/no-floating-promises"
+exit 1
+""", encoding="utf-8")
+    (repo / "node_modules" / ".bin" / "eslint").chmod(0o755)
+    return repo, run_dir
+
+
+def test_a_real_lint_finding_after_the_retry_is_a_code_failure(tmp_path):
+    repo, run_dir = _build_typed_error(tmp_path)
+    rc, payload, evidence = _run(repo, run_dir)
+
+    assert payload["pass"] is False
+    assert payload["lint_rc"] == 1, evidence
+    assert payload["failure_kind"] == "code", evidence
+    assert rc == 1
+
+
+def test_a_typecheck_refutation_is_not_excused_by_an_eslint_abstention(tmp_path):
+    """tsc judged the code and said no; eslint never started. The verdict is a
+    refutation — `toolchain` would excuse the tsc error."""
+    repo, run_dir = _build(tmp_path, tsconfig=False)
+    (repo / "package.json").write_text(json.dumps({
+        "name": "eslint-project-fixture",
+        "scripts": {"type-check:touched": "tsc --noEmit"},
+        # Declared so resolution picks npm — and our stub — over any real
+        # manager installed on the host PATH.
+        "devEngines": {"packageManager": {"name": "npm", "onFail": "error"}},
+    }), encoding="utf-8")
+    bindir = repo / "bin"
+    bindir.mkdir()
+    _stub(bindir / "npm", "#!/bin/sh\necho 'src/a.ts(1,14): error TS1005'\nexit 1\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["MINI_ORK_RUN_DIR"] = str(run_dir)
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    proc = subprocess.run([sys.executable, str(TIER1)], cwd=repo, env=env,
+                          capture_output=True, text=True, timeout=120)
+    payload = json.loads(proc.stdout.splitlines()[0])
+    evidence = (run_dir / "tier1-evidence.log").read_text()
+
+    assert payload["tsc_rc"] == 1, evidence
+    assert payload["lint_rc"] == 2, evidence
+    assert payload["failure_kind"] == "code", evidence
+    assert proc.returncode == 1
 
 
 # ── the classifier ──────────────────────────────────────────────────────────

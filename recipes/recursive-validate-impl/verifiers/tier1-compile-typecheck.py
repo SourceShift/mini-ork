@@ -59,11 +59,17 @@ def _eslint_project_overlay(root: str, files: list[str]) -> "str | None":
         "files": scoped,
         "include": [],
     }
-    handle = tempfile.NamedTemporaryFile(
-        "w", suffix=".json", prefix="mo-eslint-tsconfig-", dir=root, delete=False,
-    )
-    with handle:
-        json.dump(overlay, handle)
+    try:
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", prefix="mo-eslint-tsconfig-", dir=root, delete=False,
+        )
+        with handle:
+            json.dump(overlay, handle)
+    except OSError:
+        # A read-only or full target tree must not crash the verifier: every
+        # exit from here has to carry an envelope. No overlay → the caller
+        # abstains on the project-scope error instead.
+        return None
     return handle.name
 
 
@@ -256,11 +262,18 @@ envelope = {
     "shell_rc": shell_rc,
 }
 if not passed:
-    envelope["failure_kind"] = (
-        classify_spawn(tsc_argv, tsc_rc, tsc_out)
-        or classify_spawn(lint_argv, lint_rc, lint_out)
-        or "code"
-    )
+    # A REFUTATION outranks an abstention. `toolchain` excuses the whole
+    # verifier, so a spawn failure in one tool must never excuse a real failure
+    # in another: `tsc` reporting a type error next to an eslint that never
+    # started is still a refutation of the change.
+    kinds = []
+    for argv, rc, out in ((tsc_argv, tsc_rc, tsc_out),
+                          (lint_argv, lint_rc, lint_out)):
+        if rc != 0:
+            kinds.append(classify_spawn(argv, rc, out) or "code")
+    if shell_rc != 0:  # `bash -n` read the script and rejected it
+        kinds.append("code")
+    envelope["failure_kind"] = "code" if "code" in kinds else (kinds[0] if kinds else "code")
 
 ev.close()
 print(json.dumps(envelope))
