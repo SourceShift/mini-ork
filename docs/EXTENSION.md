@@ -228,7 +228,7 @@ Recipe-scoped verifiers take precedence over global verifiers with the same name
 # Receives: ARTIFACT_PATH, MINI_ORK_RUN_DIR, MINI_ORK_RUN_ID
 set -euo pipefail
 
-diff_output=$(sqldiff "${MINI_ORK_BASELINE_DB:-/tmp/baseline.db}" "${MINI_ORK_ARTIFACT_PATH}")
+diff_output=$(sqldiff "${MINI_ORK_BASELINE_DB:-/tmp/baseline.db}" "${ARTIFACT_PATH}")
 if [[ -n "$diff_output" ]]; then
   echo "SCHEMA_DIFF_FAIL: unexpected schema changes"
   echo "$diff_output"

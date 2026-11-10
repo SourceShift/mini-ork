@@ -145,6 +145,28 @@ def _read_run_profile(run_dir):
     return profile if isinstance(profile, dict) else {}
 
 
+def _recipe_bases(profile, root, home):
+    """Every root a run's recipe may live under, most specific first.
+
+    The run's own home comes first: a local recipe overlay lives in
+    ``$MINI_ORK_HOME/recipes/`` and is what a run resolves ahead of the engine's
+    copy. Then the engine that dispatched the run (a worktree or the primary
+    checkout), then ``MINI_ORK_RECIPE_ROOT`` for a caller verifying against a
+    tree other than the one it is running from, then the caller's root and home.
+
+    The profile's record wins over the caller's environment for the same reason
+    its recipe does: it describes the run being verified, not this process.
+    """
+    roots = profile.get("roots")
+    roots = roots if isinstance(roots, dict) else {}
+    out: list[str] = []
+    for base in (str(roots.get("home") or ""), str(roots.get("engine") or ""),
+                 os.environ.get("MINI_ORK_RECIPE_ROOT", ""), root or "", home or ""):
+        if base and base not in out:
+            out.append(base)
+    return out
+
+
 def _find_verifier_script(raw, root, home, run_dir=""):
     stem = _verifier_stem(raw)
     # Prefer the extension the contract named; fall back to the sibling so a
@@ -157,16 +179,11 @@ def _find_verifier_script(raw, root, home, run_dir=""):
     # re-run by hand against a finished run — which is exactly when the recipe
     # scripts have to be found without it.
     recipe = str(profile.get("recipe") or os.environ.get("MINI_ORK_RECIPE") or "").strip()
-    roots = profile.get("roots")
-    engine = str(roots.get("engine") or "") if isinstance(roots, dict) else ""
-    # A project recipe (home overlay) first, as runs resolve recipes, then the
-    # engine that dispatched the run (a worktree or the primary checkout), then
-    # the caller's root.
-    bases = ([os.path.join(home, "recipes", recipe, "verifiers"),
-              os.path.join(engine, "recipes", recipe, "verifiers"),
-              os.path.join(root, "recipes", recipe, "verifiers")] if recipe else []) + [
-        os.path.join(home, "verifiers"),
-        os.path.join(root, "verifiers")]
+    bases = ([os.path.join(base, "recipes", recipe, "verifiers")
+              for base in _recipe_bases(profile, root, home)] if recipe else [])
+    # Recipe-less global verifiers live directly under a home or root.
+    bases += [os.path.join(base, "verifiers")
+              for base in (home, root) if base]
     for ext in exts:
         for base in bases:
             cand = os.path.join(base, f"{stem}{ext}")
@@ -220,7 +237,7 @@ def _node_id_for_script(workflow_path, script, run_dir):
     return materialized[0] if len(materialized) == 1 else ""
 
 
-def _node_input_env(root, run_dir, script):
+def _node_input_env(root, run_dir, script, home=""):
     """The artifact boundary ``execute`` published, recovered for a re-run.
 
     ``mini-ork verify`` re-runs recipe verifiers (after a rollback, or with
@@ -253,16 +270,11 @@ def _node_input_env(root, run_dir, script):
     recipe = str(profile.get("recipe") or os.environ.get("MINI_ORK_RECIPE") or "").strip()
     if not recipe:
         return {}
-    roots = profile.get("roots")
-    engine = str(roots.get("engine") or "") if isinstance(roots, dict) else ""
-    # A recipe can live in the engine checkout, in a worktree's recipe root
-    # (MINI_ORK_RECIPE_ROOT), or under the caller's root — the winning base is
-    # whichever one actually holds this recipe's workflow.
-    bases = [engine, os.environ.get("MINI_ORK_RECIPE_ROOT", ""), root or ""]
+    # The workflow is whichever copy of this recipe the run itself would have
+    # read: an overlay in the run's own home outranks the engine's copy, and
+    # the node ids that boundary binds to are that file's, not a lookalike's.
     workflow_path = ""
-    for base in bases:
-        if not base:
-            continue
+    for base in _recipe_bases(profile, root, home):
         candidate = os.path.join(base, "recipes", recipe, "workflow.yaml")
         if os.path.isfile(candidate):
             workflow_path = candidate
@@ -314,7 +326,10 @@ def _reads_input_dir(script) -> bool:
     except OSError:
         return False
     return any(marker in text for marker in
-               ("MINI_ORK_NODE_INPUT_DIR", "_inputs import", "input_dir("))
+               ("MINI_ORK_NODE_INPUT_DIR", "_inputs import", "input_dir(",
+                # The other helper shape: a thin wrapper calling into the
+                # recipe's ``_stage`` module, which reads the boundary itself.
+                "from _stage import", "import _stage"))
 
 
 def _verifier_argv(script):
@@ -807,7 +822,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             # their namespace; ``run_check`` preserves the legacy
             # ``subprocess.run(stdout=PIPE, stderr=STDOUT)`` shape on the
             # local branch byte-for-byte.
-            boundary = _node_input_env(root, run_dir or "", script)
+            boundary = _node_input_env(root, run_dir or "", script, home)
             # Warn only where the gap is real: the verifier reads
             # $MINI_ORK_NODE_INPUT_DIR, the run materialized node inputs (so
             # the recipe uses the boundary), yet none could be mapped to this

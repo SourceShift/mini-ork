@@ -210,6 +210,31 @@ def test_the_profiles_recipe_finds_the_script_without_an_ambient_one(tmp_path, m
     assert found == str(VERIFIERS / "verify-aggregation.py")
 
 
+def test_the_runs_own_home_overlay_names_the_workflow(tmp_path):
+    """A project overlay in the run's home outranks the engine's copy.
+
+    The node ids the boundary is keyed on come from the workflow the run
+    actually read; a lookalike under the engine naming different nodes would
+    bind the verifier to someone else's inputs.
+    """
+    profile = json.loads((_run_dir(tmp_path) / "run_profile.json").read_text())
+    home = tmp_path / "home"
+    overlay = home / "recipes" / "frontier-llm-research"
+    overlay.mkdir(parents=True)
+    text = (REPO / "recipes" / "frontier-llm-research" / "workflow.yaml").read_text()
+    (overlay / "workflow.yaml").write_text(
+        text.replace("research_completeness", "overlay_node"), encoding="utf-8")
+    profile["roots"]["home"] = str(home)
+    run = tmp_path / "run"
+    (run / "run_profile.json").write_text(json.dumps(profile), encoding="utf-8")
+    _materialize(run, "overlay_node")
+
+    env = ver._node_input_env(str(REPO), str(run),
+                              str(VERIFIERS / "verify-aggregation.py"), str(home))
+
+    assert env["MINI_ORK_NODE_INPUT_DIR"].endswith("overlay_node")
+
+
 def test_a_gone_engine_root_falls_back_to_the_callers(tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_RECIPE", raising=False)
     run = _run_dir(tmp_path)
@@ -232,6 +257,61 @@ def test_the_ambient_recipe_still_resolves_a_run_with_no_profile(tmp_path, monke
     assert found == str(VERIFIERS / "verify-aggregation.py")
 
 
+# ── what the dispatched process actually sees ───────────────────────────────
+
+
+def test_main_hands_the_recovered_boundary_to_the_verifier(tmp_path, monkeypatch):
+    """The end-to-end shape: `mini-ork verify` → a script that reads the pair.
+
+    Every helper below could be right while ``main`` still dispatched with only
+    ``ARTIFACT_PATH``; this drives the real entry point and reads the
+    environment the verifier was started with.
+    """
+    run = _run_dir(tmp_path)
+    _materialize(run, "research_completeness")
+    # The probe poses as the recipe's verifier in a project overlay, so the
+    # dispatcher resolves it ahead of the engine's own copy.
+    home = tmp_path / "home"
+    probe_dir = home / "recipes" / "frontier-llm-research" / "verifiers"
+    probe_dir.mkdir(parents=True)
+    profile = json.loads((run / "run_profile.json").read_text())
+    profile["roots"]["home"] = str(home)
+    (run / "run_profile.json").write_text(json.dumps(profile), encoding="utf-8")
+    probe = probe_dir / "verify-aggregation.py"
+    probe.write_text(
+        "import json, os\n"
+        "keys = ('ARTIFACT_PATH', 'MINI_ORK_NODE_INPUT_DIR', 'MINI_ORK_NODE_INPUT_MANIFEST')\n"
+        "seen = {k: os.environ.get(k, '') for k in keys}\n"
+        "with open(os.path.join(os.environ['MINI_ORK_RUN_DIR'], 'probe-env.json'), 'w') as fh:\n"
+        "    json.dump(seen, fh)\n"
+        # A verifier that exits 0 with no output is a suppressed vacuous pass,
+        # so the probe has to leave evidence like a real one does.
+        "print('{\"verifier\": \"probe\", \"pass\": true}')\n", encoding="utf-8")
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({
+        "task_class": "generic",
+        "artifact_contract": {"success_verifiers": ["verifiers/verify-aggregation.py"]},
+    }), encoding="utf-8")
+    artifact = tmp_path / "aggregation.md"
+    artifact.write_text("# done\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run))
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MINI_ORK_RECIPE", raising=False)
+    # A boundary inherited from the node that invoked verify must not leak.
+    monkeypatch.setenv("MINI_ORK_NODE_INPUT_DIR", "/parent/node/inputs")
+    monkeypatch.delenv("MINI_ORK_NODE_INPUT_MANIFEST", raising=False)
+
+    rc = ver.main([str(artifact), "--plan", str(plan)], db=str(tmp_path / "state.db"),
+                  root=str(tmp_path / "root"))
+
+    assert rc == 0
+    seen = json.loads((run / "probe-env.json").read_text())
+    assert seen["ARTIFACT_PATH"] == str(artifact)
+    assert seen["MINI_ORK_NODE_INPUT_DIR"].endswith("inputs/research_completeness")
+    assert seen["MINI_ORK_NODE_INPUT_MANIFEST"].endswith(
+        "research_completeness.inputs.json")
+
+
 # ── the warning follows the script, not the run ─────────────────────────────
 
 
@@ -244,9 +324,14 @@ def test_the_gap_warning_only_applies_to_a_script_that_reads_the_variable(tmp_pa
                              encoding="utf-8")
     silent = tmp_path / "silent.py"
     silent.write_text("print('ok')\n", encoding="utf-8")
+    # The other shipped helper shape: a thin wrapper over the recipe's `_stage`.
+    stage_reader = tmp_path / "stage_reader.py"
+    stage_reader.write_text("from _stage import input_single\nprint(input_single('x', '.json'))\n",
+                            encoding="utf-8")
 
     assert ver._reads_input_dir(str(reader)) is True
     assert ver._reads_input_dir(str(helper_reader)) is True
+    assert ver._reads_input_dir(str(stage_reader)) is True
     assert ver._reads_input_dir(str(silent)) is False
     assert ver._reads_input_dir(str(tmp_path / "missing.py")) is False
 
