@@ -148,6 +148,11 @@ def env(tmp_path, monkeypatch) -> tuple[str, str]:
     monkeypatch.setenv("MO_INJECT_LEARNINGS", "1")
     monkeypatch.setenv("MO_EMERGENT_INJECT", "1")
     monkeypatch.setenv("MO_SEMANTIC_INJECT", "1")
+    # This file asserts *what a prompt contains*, so the per-lesson holdout is
+    # off: at the default 0.10 rate a bucketed theme is withheld from the node
+    # block on purpose, and the arm has its own tests in
+    # tests/unit/test_lesson_holdout.py.
+    monkeypatch.setenv("MO_LESSON_HOLDOUT_RATE", "0")
     for var in ("MO_TARGET_CWD", "MO_INJECT_UNVERIFIED", "MO_EMBED_PROVIDER",
                 "MO_EMERGENT_INJECT_UNLESSONED", "MO_PLANNER_SHARED_CONTEXT",
                 "MO_CONTEXT_V2", "MO_CONTEXT_V2_HOLDOUT"):

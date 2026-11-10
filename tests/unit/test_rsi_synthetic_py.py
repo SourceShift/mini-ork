@@ -60,7 +60,7 @@ OPEN_GAP = (
 #: decisions empty) and ``R5p`` (policy decisions empty) were split from one
 #: row-count rule so each predicate could become structural on its own.
 EXPECTED_RULES = (
-    *(f"L{i}" for i in (1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12)),
+    *(f"L{i}" for i in (1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13)),
     *(f"R{i}" for i in (1, 2, 3, 4, 6, 7, 8)),
     "R5b", "R5p",
     *(f"V{i}" for i in (1, 2, 3, 4, 5, 6, 7, 8, 9, 12)),
