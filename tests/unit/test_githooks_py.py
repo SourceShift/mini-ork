@@ -8,6 +8,12 @@ Drives each hook as a subprocess with fixture stdin/env:
     (c) same with ALLOW_WORKTREE_BRANCH_CREATE=1                   → pass
     (d) grafted foreign commit (synthetic two-root repo)           → rejected
     (e) same with MO_ALLOW_FOREIGN_REF=1                           → pass
+    (e2) `git stash -u` (three-parent create)                      → blocked,
+         working tree intact, no stash entry
+    (e3) a plain `git stash` (two parents)                         → pass
+    (e4) `git stash -u` with MO_ALLOW_UNTRACKED_STASH=1            → pass
+    (e5) popping a pre-existing untracked stash                    → pass
+         (pop/drop never route through reference-transaction)
 
   pre-push
     (f) MO_README_DRIFT_SKIP=1 → exit 0, bypass message, no L1 call
@@ -284,6 +290,67 @@ def test_ref_tx_ignores_tags_and_remotes(tx_repo: Path):
     stdin = f"{ZERO} {foreign} refs/tags/v9\n{ZERO} {foreign} refs/remotes/origin/x\n"
     r = _run_hook(REF_TX, ["prepared"], stdin, tx_repo)
     assert r.returncode == 0, r.stderr
+
+
+def test_ref_tx_blocks_git_stash_u(tx_repo: Path):
+    """`git stash -u` writes a three-parent stash commit whose third parent is
+    the untracked tree: a fresh deliverable leaves the working tree for a ref
+    nothing else in the workflow reads. Refuse it at `prepared`."""
+    _git(tx_repo, "config", "core.hooksPath", str(HOOKS))
+    (tx_repo / "a.txt").write_text("dirty\n")
+    (tx_repo / "deliverable.md").write_text("precious\n")
+
+    r = _git(tx_repo, "stash", "push", "-u", "-m", "sweep")
+
+    assert r.returncode != 0
+    assert "[stash-guard] REJECT" in r.stderr
+    assert "MO_ALLOW_UNTRACKED_STASH=1" in r.stderr
+    # Nothing left the working tree, and no stash entry was created.
+    assert (tx_repo / "deliverable.md").is_file()
+    assert (tx_repo / "a.txt").read_text() == "dirty\n"
+    assert _git(tx_repo, "stash", "list").stdout.strip() == ""
+
+
+def test_ref_tx_allows_a_plain_stash(tx_repo: Path):
+    """Tracked-only stashes have two parents and pass untouched."""
+    _git(tx_repo, "config", "core.hooksPath", str(HOOKS))
+    (tx_repo / "a.txt").write_text("dirty\n")
+
+    r = _git(tx_repo, "stash", "push", "-m", "tracked only")
+
+    assert r.returncode == 0, r.stderr
+    assert "stash-guard" not in r.stderr
+    assert len(_git(tx_repo, "stash", "list").stdout.strip().splitlines()) == 1
+
+
+def test_ref_tx_stash_u_allowed_with_escape_env(tx_repo: Path):
+    _git(tx_repo, "config", "core.hooksPath", str(HOOKS))
+    (tx_repo / "a.txt").write_text("dirty\n")
+    (tx_repo / "deliverable.md").write_text("precious\n")
+
+    r = _git(
+        tx_repo, "stash", "push", "-u", "-m", "sweep",
+        env={**os.environ, "MO_ALLOW_UNTRACKED_STASH": "1"},
+    )
+
+    assert r.returncode == 0, r.stderr
+    assert (tx_repo / "deliverable.md").exists() is False
+    assert len(_git(tx_repo, "stash", "list").stdout.strip().splitlines()) == 1
+
+
+def test_ref_tx_allows_popping_an_existing_untracked_stash(tx_repo: Path):
+    """Only creation is guarded: `pop`/`drop` never route through this hook, so
+    a stash made before the guard existed still applies."""
+    (tx_repo / "a.txt").write_text("dirty\n")
+    (tx_repo / "deliverable.md").write_text("precious\n")
+    assert _git(tx_repo, "stash", "push", "-u", "-m", "old").returncode == 0
+
+    _git(tx_repo, "config", "core.hooksPath", str(HOOKS))
+    r = _git(tx_repo, "stash", "pop")
+
+    assert r.returncode == 0, r.stderr
+    assert (tx_repo / "deliverable.md").is_file()
+    assert _git(tx_repo, "stash", "list").stdout.strip() == ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────

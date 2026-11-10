@@ -20,6 +20,15 @@
 #
 # Escape hatch: MO_ALLOW_FOREIGN_REF=1 (for a deliberate cross-graft).
 #
+# Second guard, same phase: `git stash -u` (or --include-untracked / -a) writes a
+# three-parent stash commit — HEAD, index, and the untracked tree. The third
+# parent is the harm: a fresh deliverable, an uncommitted report or a kickoff
+# leaves the working tree for a ref nothing else in the workflow reads, which is
+# how a finished artefact "vanishes" between two `git status` calls. A plain
+# stash has two parents and passes. Only creation is checked; `pop`/`drop` do not
+# route through this hook at all, so existing stash stacks still apply.
+# Escape hatch: MO_ALLOW_UNTRACKED_STASH=1.
+#
 # Ported from bash (bash-removal Phase 4) — semantics preserved line-for-line.
 
 import os
@@ -69,9 +78,51 @@ def main() -> int:
         new = parts[1] if len(parts) > 1 else ""
         ref = " ".join(parts[2:]) if len(parts) > 2 else ""
 
+        if ref == "refs/stash" and new != ZERO:
+            # stash-guard: `git stash -u` / `--include-untracked` / `-a` writes a
+            # THREE-parent stash commit (HEAD, index, untracked tree); a plain
+            # stash writes two. That third parent is the whole hazard: every
+            # untracked file — a fresh deliverable, an uncommitted report, a
+            # kickoff — leaves the working tree for a ref nothing else in the
+            # workflow reads.
+            #
+            # Only the CREATION is guarded. `git stash pop` / `drop` move or
+            # delete this ref without invoking reference-transaction at all
+            # (probed on this git), so an existing stash stack still applies and
+            # drops — including one made before this guard existed.
+            if os.environ.get("MO_ALLOW_UNTRACKED_STASH", "0") != "1":
+                if _git("cat-file", "-e", new + "^{commit}").returncode == 0:
+                    parents = _git("rev-list", "--parents", "-n1", new)
+                    if len(parents.stdout.split()) >= 4:  # commit + 3 parents
+                        print(
+                            "[stash-guard] REJECT: this stash captures "
+                            "untracked files into refs/stash.",
+                            file=sys.stderr,
+                        )
+                        print(
+                            "  A three-parent stash means -u / "
+                            "--include-untracked / -a: every untracked file — a "
+                            "fresh deliverable, an uncommitted report, a "
+                            "kickoff — leaves the working tree for a ref "
+                            "nothing in the workflow reads.",
+                            file=sys.stderr,
+                        )
+                        print(
+                            "  Keep them on disk: `git stash push -m \"<why>\"` "
+                            "(tracked changes only), or commit what you mean to "
+                            "keep.",
+                            file=sys.stderr,
+                        )
+                        print(
+                            "  (deliberate case: MO_ALLOW_UNTRACKED_STASH=1)",
+                            file=sys.stderr,
+                        )
+                        reject = 1
+            continue
+
         if not (ref == "HEAD" or ref.startswith("refs/heads/")
                 or ref.startswith("refs/codex/")):
-            continue  # remotes, tags, notes, stash, etc. are not the vector
+            continue  # remotes, tags, notes, etc. are not the vector
 
         # worktree-guard: keep implementation work off the main checkout.
         # Creating a feature branch here (zero -> commit on refs/heads/<x>,
