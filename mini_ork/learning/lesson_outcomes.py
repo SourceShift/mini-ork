@@ -1033,8 +1033,10 @@ def effect(db: str | None = None, *, kind: str, ident: str) -> dict:
       non-clean events both past their floors),
     * the clean arm must be significant under an exact Fisher test — a point
       estimate never prunes, only evidence does,
-    * and the population control must cover at least half the treated
-      exposures, or the delta is not attributable at all.
+    * the population control must cover at least half the treated exposures,
+      or the delta is not attributable at all,
+    * and the magnitude is the arm's own delta, not the population gap: the
+      penalty has to come from the same randomised estimate that earned it.
 
     ``value`` is ``0.0`` when it refuses, which is exactly today's behaviour.
     """
@@ -1072,20 +1074,27 @@ def _effect_from_rows(rows: Sequence[Mapping], *, kind: str, ident: str,
     if arm.get("status") != "measured":
         out["status"] = str(arm.get("status") or "insufficient_held_out")
         return out
-    # The control pool must be the *other* lessons' exposures; the lesson's own
-    # rows are excluded inside ``_gap_from_rows`` by (kind, id, delivered).
+    # The magnitude is the arm's own delta — the randomised estimate. Taking it
+    # from the population gap instead would gate on a causal test and then size
+    # the penalty from an association, which is two estimators wearing one name.
+    # Both denominators are past ``min_n`` here (``_arm_from_rows`` only reports
+    # ``measured`` when they are), so neither division can see zero.
+    d_n = int(arm.get("n_delivered") or 0)
+    h_n = int(arm.get("n_held_out") or 0)
+    d_clean = int(arm.get("clean_delivered") or 0)
+    h_clean = int(arm.get("clean_held_out") or 0)
+    # The control pool must still be the *other* lessons' exposures; the
+    # lesson's own rows are excluded inside ``_gap_from_rows`` by
+    # (kind, id, delivered).
     gap = _gap_from_rows(list(all_rows) + list(pool or []), kind=kind, ident=ident)
     out["coverage"] = gap.get("coverage")
-    if gap.get("status") != "measured_correlational":
-        out["status"] = gap.get("status") or "insufficient_n"
-        return out
     if (gap.get("coverage") or 0.0) < 0.5:
         out["status"] = "low_coverage"
         return out
-    value = float(gap.get("value") or 0.0)
+    value = (d_clean / d_n) - (h_clean / h_n)
     out["value"] = max(-1.0, min(1.0, value))
     out["status"] = "measured"
-    out["source"] = "population_standardized"
+    out["source"] = "clean_arm"
     return out
 
 

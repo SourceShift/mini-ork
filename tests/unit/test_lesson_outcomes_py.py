@@ -381,6 +381,48 @@ def test_effect_is_zero_unless_every_gate_passes(tmp_path, monkeypatch):
     assert out["status"] in ("insufficient_n", "disabled")
 
 
+def test_a_measured_effect_is_the_arms_own_delta(monkeypatch):
+    """Magnitude comes from the randomised arm, not from the population gap.
+
+    Gating on one estimator and sizing the penalty with another is how a
+    correlational artefact gets a causal licence. The control pool here is
+    deliberately far from the arm's rates: if the effect ever drifts back to
+    ``population_standardized`` this assertion changes value, not just label.
+    """
+    monkeypatch.setenv("MO_LESSON_EFFECT_RERANK", "1")
+    delivered = [_row(clean=1) for _ in range(30)] + [
+        _row(clean=0, result_1="failure", failed=1) for _ in range(30)]
+    held = [_row(arm="held_out", clean=1) for _ in range(100)] + [
+        _row(arm="held_out", clean=0, result_1="failure", failed=1)
+        for _ in range(20)]
+    control = [_row(source_id="pat-other", clean=1) for _ in range(10)] + [
+        _row(source_id="pat-other", clean=0, result_1="failure", failed=1)
+        for _ in range(90)]
+
+    out = lo._effect_from_rows(delivered + held, kind="pattern", ident="pat-a",
+                               pool=control)
+
+    assert out["status"] == "measured"
+    assert out["source"] == "clean_arm"
+    assert out["value"] == pytest.approx(0.5 - 100 / 120, abs=1e-9)
+    assert out["coverage"] == pytest.approx(1.0)
+
+
+def test_a_measured_arm_without_coverage_is_refused(monkeypatch):
+    monkeypatch.setenv("MO_LESSON_EFFECT_RERANK", "1")
+    delivered = [_row(clean=1) for _ in range(30)] + [
+        _row(clean=0, result_1="failure", failed=1) for _ in range(30)]
+    held = [_row(arm="held_out", clean=1) for _ in range(100)] + [
+        _row(arm="held_out", clean=0, result_1="failure", failed=1)
+        for _ in range(20)]
+
+    out = lo._effect_from_rows(delivered + held, kind="pattern", ident="pat-a",
+                               pool=[])
+
+    assert out["status"] == "low_coverage"
+    assert out["value"] == 0.0
+
+
 # ── the arm diagnostic ──────────────────────────────────────────────────────
 
 def test_arm_diagnostic_separates_history_from_a_missing_sink(tmp_path):

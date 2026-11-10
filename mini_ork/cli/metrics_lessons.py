@@ -3,19 +3,19 @@
 Read-only over ``lesson_outcome_exposures`` (migration 0092). Per lesson and
 arm it prints how many run-nodes received it, how many succeeded on the first
 try, and one of four statuses — ``insufficient_n``, ``insufficient_events``,
-``saturated`` or ``measured``. Then the three contrasts from
+``saturated`` or ``measured``. Then the contrasts from
 ``mini_ork.learning.lesson_outcomes``, each labelled for what it is:
 
 - **clean arm** — delivered minus held-out. Causal-looking and, while the
   withheld slice is thin, ``insufficient_held_out``. It is the number this
   command exists to make possible; it starts reporting by itself when the arm
-  fills.
-- **within-run sign test** — a treated node against an untreated but
-  injection-bearing node of the same type in the same run. The only contrast
-  that gates the rerank penalty in ``item_utility``.
+  fills, and it is the only contrast that gates the rerank penalty in
+  ``item_utility`` (value *and* significance both come from the arm).
 - **population gap** — the same ``(node_type, task_class)`` stratum in the
   window, direct-standardized to the treated weights. Correlation, printed as
   ``measured_correlational`` and allowed no control over anything.
+- **run-level** — the run's publish outcome per lesson, labelled "not
+  attribution": every lesson shown to any node of a published run is credited.
 
 Exit codes fail closed rather than print a zero for a store that is not there:
 ``0`` a report was produced (even if every row is ``insufficient``), ``1`` no

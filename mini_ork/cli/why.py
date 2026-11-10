@@ -391,7 +391,11 @@ def render(card: dict) -> str:
         if outcomes:
             lines.append("        " + _outcome_text(outcomes))
         elif ids:
-            lines.append("        outcomes: unavailable (0092 not applied)")
+            # ``_outcomes`` keys one entry per (kind, id) source, so an empty
+            # map means no source carried a *kind* — not that the migration is
+            # missing (that case arrives as ``{"status": "unavailable"}`` and
+            # is rendered above).
+            lines.append("        outcomes: no stable source kind recorded")
     else:
         lines.append("memory: not recorded")
 
