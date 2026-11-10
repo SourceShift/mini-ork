@@ -261,6 +261,35 @@ def test_cli_rejects_an_unknown_layer(dr, capsys):
     assert dr.main([]) == 2
 
 
+# ── inventory ────────────────────────────────────────────────────────────────
+
+
+def test_inventory_counts_files_instead_of_reporting_zero(dr):
+    """The numbers are inputs to the lenses' judgement; a constant 0 is a lie.
+
+    The first cut globbed `Path("db/migrations/*.sql").glob("*")` — the
+    wildcard sat inside a literal directory name, so every structural count
+    read 0 and a lens could only compare the README against nothing.
+    """
+    out = dr.inventory("2026-11-10")
+
+    migrations = len(list((REPO / "db" / "migrations").glob("*.sql")))
+    recipes = len([p for p in (REPO / "recipes").iterdir() if p.is_dir()])
+    entrypoints = len([p for p in (REPO / "bin").glob("mini-ork*") if p.is_file()])
+
+    assert f"db/migrations/*.sql count:       {migrations}" in out
+    assert f"recipes/ subdir count:           {recipes}" in out
+    assert f"bin/mini-ork-* entrypoint count: {entrypoints}" in out
+    assert migrations > 0 and recipes > 0 and entrypoints > 0
+
+
+def test_inventory_does_not_depend_on_the_callers_cwd(dr, monkeypatch, tmp_path):
+    expected = dr.inventory("2026-11-10")
+    monkeypatch.chdir(tmp_path)
+
+    assert dr.inventory("2026-11-10") == expected
+
+
 def test_the_shell_twins_are_gone(dr):
     for name in (
         "readme-drift-gatekeeper.sh",

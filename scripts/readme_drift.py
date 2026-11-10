@@ -335,12 +335,15 @@ LENS_PROMPTS = {
 
 def inventory(stamp: str) -> str:
     def count(pattern: str, *, dirs: bool = False) -> str:
-        path = Path(pattern)
-        if dirs:
-            return str(len([p for p in path.glob("*") if p.is_dir()]))
-        return str(len([p for p in path.glob("*") if p.is_file()]))
+        # The wildcard belongs to `pattern`, so it has to be the glob call —
+        # `Path("db/migrations/*.sql").glob("*")` looks inside a directory
+        # literally named `*.sql` and counts nothing. Glob from ROOT so the
+        # numbers do not depend on the caller's cwd.
+        matches = [p for p in ROOT.glob(pattern)
+                   if (p.is_dir() if dirs else p.is_file())]
+        return str(len(matches))
 
-    recipes = sorted(p.name for p in Path("recipes").glob("*") if p.is_dir())
+    recipes = sorted(p.name for p in (ROOT / "recipes").glob("*") if p.is_dir())
     providers = len(re.findall(r"^  [A-Za-z0-9_-]+:$", _read_text(ROOT / "config/providers.yaml"), re.M))
     commits = git("log", "--oneline", "-15").strip().splitlines()
     roadmap = re.findall(r"^### v[0-9].*$", _read_text(ROOT / "ROADMAP.md"), re.M)
