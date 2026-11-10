@@ -9,7 +9,9 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RECIPE_DIR = os.path.dirname(SCRIPT_DIR)
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
-INPUT_DIR = os.environ["MINI_ORK_NODE_INPUT_DIR"]
+from _inputs import input_dir
+
+INPUT_DIR = input_dir()
 
 summaries = []
 summaries_dir = os.path.join(INPUT_DIR, "source_summaries")

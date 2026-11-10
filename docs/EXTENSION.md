@@ -249,6 +249,23 @@ nodes:
     dispatch_mode: serial
 ```
 
+**What a verifier receives.** At the node boundary the engine publishes
+`MINI_ORK_ARTIFACT_PATH` (the node's declared output), `MINI_ORK_TASK_ID`,
+`MINI_ORK_RUN_ID`, and — for a recipe node whose edges carry inputs —
+`MINI_ORK_NODE_INPUT_DIR` (the staged inputs, one subdirectory per declared
+input name) and `MINI_ORK_NODE_INPUT_MANIFEST` (the JSON manifest listing
+them). `mini-ork execute` publishes both when it materializes the artifact
+ledger; `mini-ork verify` re-runs the same script after the run and recovers
+the same boundary from `<run_dir>/workspace/`, so a recipe verifier needs no
+separate replay code path.
+
+A verifier that is not a recipe node — or whose run materialized nothing —
+gets `MINI_ORK_ARTIFACT_PATH` only. Read such a variable through a helper that
+exits 2 with a sentence naming the invocation that would have set it, not
+through `os.environ[...]`, which surfaces a `KeyError` traceback that says
+nothing about why the input is missing.
+(`recipes/frontier-llm-research/verifiers/_inputs.py` is the reference.)
+
 **Registration at runtime (Python):**
 
 ```python
