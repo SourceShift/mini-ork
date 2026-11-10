@@ -527,3 +527,86 @@ def test_scheduled_flag_dispatches_to_run_once(home_db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     assert reflect_cli.main(["--scheduled"]) == 7
     assert seen == {"home": str(home), "db": db, "enabled": False}
+
+
+# ── the growth rule converges instead of oscillating ────────────────────────
+#
+# Doubling the cap after *any* success is a two-cycle: a batch that fits in
+# nine tenths of the deadline is doubled to a size that cannot fit, halved on
+# the next tick, doubled again — a deadline hit every other pass, forever.
+# Growth therefore needs room to spare, and these tests pin the boundary.
+
+def test_a_pass_that_used_most_of_its_deadline_does_not_grow_the_batch(home_db, monkeypatch):
+    home, db = home_db
+    (home / "state").mkdir()
+    (home / "state" / "reflect-schedule.json").write_text(
+        json.dumps({"last_ok_until": 9_000_000, "at": 9_000_000, "batch": 100}))
+    # 800 s of a 900 s deadline: it fits, but only just.
+    ticks = iter([1_000, 1_800])
+    monkeypatch.setattr(rs, "_wall", lambda: next(ticks))
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                reflect_fn=RecordingReflect())
+    state = _state(home)
+    assert state["batch"] == 100, "a barely-fitting batch must not be doubled"
+    assert state["last_ok_until"] == 9_998_200, "the window still moved on"
+
+
+def test_a_pass_that_finished_in_the_first_half_grows_the_batch(home_db, monkeypatch):
+    home, db = home_db
+    (home / "state").mkdir()
+    (home / "state" / "reflect-schedule.json").write_text(
+        json.dumps({"last_ok_until": 9_000_000, "at": 9_000_000, "batch": 100}))
+    # 400 s of 900: four tenths, under the half-deadline threshold.
+    ticks = iter([1_000, 1_400])
+    monkeypatch.setattr(rs, "_wall", lambda: next(ticks))
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                reflect_fn=RecordingReflect())
+    assert _state(home)["batch"] == 200
+
+
+def test_a_deadline_hit_during_a_dry_run_does_not_shrink_the_batch(
+        home_db, monkeypatch, capsys):
+    """A dry run does no model work, so its elapsed time says nothing about
+    what a batch costs — a timeout there must not be read as a capacity fact."""
+    home, db = home_db
+    (home / "state").mkdir()
+    (home / "state" / "reflect-schedule.json").write_text(
+        json.dumps({"last_ok_until": 9_000_000, "at": 9_000_000, "batch": 100}))
+    monkeypatch.setenv("MINI_ORK_DRY_RUN", "1")
+    rc = rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                     reflect_fn=RecordingReflect(rc=124))
+    assert rc == 124, "the exit code still reports the timeout"
+    state = _state(home)
+    assert state["batch"] == 100, "the cap is unchanged"
+    assert state["at"] == 9_000_000, "the state file was not rewritten at all"
+    assert "deadline" not in capsys.readouterr().err
+
+
+# ── the two ends that must not fail silently ────────────────────────────────
+
+def test_the_service_loop_survives_a_crashing_pass(home_db, monkeypatch, capsys):
+    home, db = home_db
+    calls: list[int] = []
+
+    def _boom(*_a, **_kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("state.db is locked")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(rs, "run_once", _boom)
+    assert rs.run_forever(str(home), db, _enabled_cfg(home),
+                          sleep_fn=lambda _s: None) == 0
+    err = capsys.readouterr().err
+    assert "pass 1 crashed" in err
+    assert "RuntimeError" in err and "state.db is locked" in err
+    assert len(calls) == 2, "the loop went round again after the crash"
+
+
+def test_an_uncapped_window_says_so(tmp_path, capsys):
+    """The cap falling back to the raw time window is the shape that used to
+    wedge the schedule; it must be visible, not silent."""
+    missing = str(tmp_path / "absent.db")
+    assert rs._capped_until(missing, 1, 100, 5) == 100
+    err = capsys.readouterr().err
+    assert "could not cap the window" in err

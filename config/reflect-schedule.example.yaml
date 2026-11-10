@@ -56,7 +56,9 @@ reflect_schedule:
   # SIGALRM bound on one pass (MO_REFLECT_DEADLINE_S). A pass that hits it
   # exits 124, keeps the window, and halves the batch cap so the retry can
   # finish inside the same bound (one trace per pass is the floor — raise this,
-  # not the batch, if a single trace needs longer). The lease TTL is derived
+  # not the batch, if a single trace needs longer). The cap only grows back
+  # after a pass that finishes in the first half of this bound, so a batch that
+  # merely fits is not doubled into one that cannot. The lease TTL is derived
   # from this, so it always outlives a full-length pass.
   deadline_s: 900
 

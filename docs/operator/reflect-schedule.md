@@ -97,8 +97,15 @@ spends LLM budget; the cost still lands under the existing
    re-paid for on every tick and the watermark would never move. The pass
    therefore halves the cap (`batch`, persisted) and prints
    `reflect schedule: the pass hit its <n>s deadline; …`. A pass that finishes
-   doubles it back toward `MO_REFLECTION_BATCH`, so the schedule converges on
-   the largest batch that fits its deadline instead of oscillating.
+   in the **first half** of its deadline doubles the cap back toward
+   `MO_REFLECTION_BATCH`; a pass that finishes, but used most of the deadline,
+   leaves the cap where it is.
+   The half-deadline condition is what makes the rule converge. Growing after
+   *any* success oscillates: a pass that fits in nine tenths of the deadline
+   would be doubled to a size that cannot fit, halved on the next tick, and the
+   schedule would pay a deadline hit every other pass forever. A timeout during
+   `MINI_ORK_DRY_RUN=1` is ignored — a dry run does no model work, so its
+   duration says nothing about what a batch costs.
 
 ## The state file
 

@@ -19,9 +19,12 @@ Two hazards a schedule has to avoid, both handled here:
 
 State (``<home>/state/reflect-schedule.json``) records the window actually
 covered, so a failing pass is retried next tick instead of skipped, plus the
-batch cap that retry should use: a pass that hits its deadline halves it, a
-pass that finishes doubles it back, so a window too big to finish shrinks
-until it fits rather than being re-paid for at every tick.
+batch cap that retry should use: a pass that hits its deadline halves it, and
+a pass that finishes in the first half of its deadline doubles it back, so a
+window too big to finish shrinks until it fits rather than being re-paid for
+at every tick. Growing only on a *comfortable* pass is what makes the rule
+converge: doubling after any success would bounce between a size that fits in
+nine tenths of the deadline and a size that cannot fit at all, forever.
 """
 from __future__ import annotations
 
@@ -57,6 +60,15 @@ _MIN_TTL_S = 900
 
 #: ``reflect.main`` returns this when its SIGALRM deadline fires.
 _DEADLINE_RC = 124
+
+
+def _wall() -> int:
+    """Whole seconds of wall clock for the pass timing.
+
+    Indirected through this module so a test can drive the deadline without
+    patching the global ``time`` module (which every other test shares).
+    """
+    return int(time.time())
 
 #: State key holding the batch cap for the *next* pass. A pass that hits its
 #: deadline halves it; a pass that finishes doubles it back toward the ceiling.
@@ -257,7 +269,14 @@ def _capped_until(db: str, since: int, until: int, batch: int) -> int:
             ).fetchone()
         finally:
             con.close()
-    except Exception:  # noqa: BLE001 — a read error must not stop the pass
+    except Exception as exc:  # noqa: BLE001 — a read error must not stop the pass
+        # Keep the time window (stalling reflection entirely is worse), but say
+        # so: an uncapped window is the shape that used to wedge the schedule,
+        # and a silent fallback would hide its return.
+        sys.stderr.write(
+            f"reflect schedule: could not cap the window to one batch "
+            f"({type(exc).__name__}); it may hold more than {batch} trace(s) "
+            "and the rest wait for the next tick\n")
         return until
     if row is None or row[0] is None:
         return until  # the window fits in one batch
@@ -380,7 +399,7 @@ def run_once(
             "MINI_ORK_REFLECT_RUN_ID": None,
             "MO_REFLECT_POST_RUN": None,
         }
-        started = int(time.time())
+        started = _wall()
         with scoped_environ(overrides):
             try:
                 rc = reflect_fn(["--since", str(since)])
@@ -389,20 +408,27 @@ def run_once(
                 # SystemExit(124) in-process. Map it to a return code so one
                 # timed-out pass does not kill the service loop.
                 rc = exc.code if isinstance(exc.code, int) else 1
+        elapsed_s = _wall() - started
 
         # A dry run reflected nothing, and a cost-circuit abort left the rest
         # of the window unreflected: neither may move the window on.
-        if rc == 0 and os.environ.get("MINI_ORK_DRY_RUN") != "1":
+        dry_run = os.environ.get("MINI_ORK_DRY_RUN") == "1"
+        if rc == 0 and not dry_run:
             if _circuit_aborted_since(db, started):
                 print("reflect schedule: the cost circuit stopped extraction; "
                       "keeping the window for the next pass")
             else:
-                # Finished inside the deadline: try a bigger batch next time,
-                # back toward the configured ceiling.
+                # Grow only when the pass finished with room to spare. A batch
+                # that fits, but only barely, would still be doubled back to a
+                # size that cannot fit and halved again on the next tick — an
+                # oscillation that pays a deadline hit every other pass. Half
+                # the deadline is the convergence point: a size that finishes
+                # under it is a size worth probing past, anything slower has
+                # already told us its ceiling.
+                grown = min(ceiling, batch * 2) if elapsed_s * 2 <= deadline_s else batch
                 _write_state(home, _with_batch(
-                    {"last_ok_until": until, "at": now},
-                    min(ceiling, batch * 2), ceiling))
-        elif rc == _DEADLINE_RC:
+                    {"last_ok_until": until, "at": now}, grown, ceiling))
+        elif rc == _DEADLINE_RC and not dry_run:
             # The window did not finish, so it stays where it was — but a
             # smaller batch is what makes the retry able to finish at all
             # (see _next_batch). Floor of one trace per pass: a *single* trace
@@ -426,12 +452,28 @@ def run_forever(
     sleep_fn=time.sleep,
     reflect_fn=None,
 ) -> int:
-    """Loop ``run_once`` then sleep ``interval_s``; stop on Ctrl-C with 0."""
+    """Loop ``run_once`` then sleep ``interval_s``; stop on Ctrl-C with 0.
+
+    One crashed pass must not end the service: an unhandled exception in
+    ``run_once`` is logged (type and message, never the window's contents) and
+    the loop sleeps its normal interval, so a transient DB lock or a broken
+    config file costs one tick instead of the whole cadence. The counter is
+    per-process and resets on a pass that returns, so a loop that is only ever
+    crashing says so in its line count.
+    """
     cfg = {**DEFAULTS, **cfg}
     interval_s = max(1, int(cfg["interval_s"]))
+    failures = 0
     try:
         while True:
-            run_once(home, db, cfg, reflect_fn=reflect_fn)
+            try:
+                run_once(home, db, cfg, reflect_fn=reflect_fn)
+                failures = 0
+            except Exception as exc:  # noqa: BLE001 — see the docstring
+                failures += 1
+                sys.stderr.write(
+                    f"reflect schedule: pass {failures} crashed "
+                    f"({type(exc).__name__}: {exc}); the loop continues\n")
             sleep_fn(interval_s)
     except KeyboardInterrupt:
         return 0
