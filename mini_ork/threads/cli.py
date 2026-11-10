@@ -75,14 +75,35 @@ def _text(args: argparse.Namespace) -> str | None:
     return raw.strip()
 
 
+#: The command's verbs, in usage order. ``build_parser`` builds exactly these
+#: and ``_HANDLERS`` maps exactly these, so the three cannot list different
+#: commands.
+VERBS = ("list", "show", "send", "continue", "attach", "serve")
+
+
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--home", default=None)
     parser.add_argument("--db", default=None)
     parser.add_argument("--json", action="store_true")
 
 
-def _delivery_parser(prog: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=prog, add_help=False, usage=argparse.SUPPRESS)
+def _new_parser(prog: str) -> argparse.ArgumentParser:
+    """A parser that inherits no help text of its own.
+
+    ``add_help=False`` and ``usage=SUPPRESS`` keep :data:`_USAGE` — the
+    hand-written page a person reads — as the only description of the command.
+    argparse's generated help would be a second one, and the two would drift.
+    """
+    return argparse.ArgumentParser(prog=prog, add_help=False, usage=argparse.SUPPRESS)
+
+
+def _delivery_args(parser: argparse.ArgumentParser) -> None:
+    """The arguments ``send`` and ``continue`` share.
+
+    They differ in what the service *does* with a delivered message (steer a
+    live run, or refuse), never in what the command line accepts — so the same
+    arguments build both, and a flag added here reaches both verbs.
+    """
     parser.add_argument("id")
     parser.add_argument("--text", default=None)
     parser.add_argument("--title", default="")
@@ -94,6 +115,47 @@ def _delivery_parser(prog: str) -> argparse.ArgumentParser:
     parser.add_argument("--issue-uid", dest="issue_uid", default=None)
     parser.add_argument("--source", default="threads")
     _common(parser)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The whole ``mini-ork threads`` surface as one argparse tree.
+
+    :func:`main` dispatches through this tree, so it *is* the command's
+    definition rather than a second copy that can disagree with it: a verb that
+    exists here exists on the command line, and one that does not is unknown to
+    both. The IDE's page-action check
+    (``tests/unit/test_ide_pages_actions.py``) resolves a subcommand's parser by
+    module name, so without this the ``threads`` actions the thread page emits
+    (``send`` from its composer, ``attach`` from the file picker) were the one
+    surface that check could not see.
+    """
+    parser = _new_parser("mini-ork threads")
+    subs = parser.add_subparsers(dest="verb", required=True)
+
+    p_list = subs.add_parser("list", add_help=False, usage=argparse.SUPPRESS)
+    p_list.add_argument("--limit", type=int, default=100)
+    p_list.add_argument("--origin", default=None)
+    p_list.add_argument("--status", default=None)
+    _common(p_list)
+
+    p_show = subs.add_parser("show", add_help=False, usage=argparse.SUPPRESS)
+    p_show.add_argument("id")
+    _common(p_show)
+
+    for verb in ("send", "continue"):
+        _delivery_args(subs.add_parser(verb, add_help=False, usage=argparse.SUPPRESS))
+
+    p_attach = subs.add_parser("attach", add_help=False, usage=argparse.SUPPRESS)
+    p_attach.add_argument("id")
+    p_attach.add_argument("paths", nargs="*")
+    _common(p_attach)
+
+    p_serve = subs.add_parser("serve", add_help=False, usage=argparse.SUPPRESS)
+    p_serve.add_argument("--transport", default=None,
+                         choices=("telegram", "slack", "discord"))
+    p_serve.add_argument("--once", action="store_true")
+    _common(p_serve)
+
     return parser
 
 
@@ -102,30 +164,14 @@ def main(argv=None, *, root=None) -> int:  # noqa: ARG001 - root is the dispatch
     if not argv or argv[0] in ("help", "-h", "--help"):
         sys.stdout.write(_USAGE)
         return 0 if argv else 2
-    verb, rest = argv[0], argv[1:]
-    if verb == "list":
-        return _cmd_list(rest)
-    if verb == "show":
-        return _cmd_show(rest)
-    if verb in ("send", "continue"):
-        return _cmd_deliver(verb, rest)
-    if verb == "attach":
-        return _cmd_attach(rest)
-    if verb == "serve":
-        return _cmd_serve(rest)
-    sys.stderr.write(f"threads: unknown verb {verb!r}\n\n{_USAGE}")
-    return 2
+    if argv[0] not in VERBS:
+        sys.stderr.write(f"threads: unknown verb {argv[0]!r}\n\n{_USAGE}")
+        return 2
+    args = build_parser().parse_args(argv)
+    return _HANDLERS[args.verb](args)
 
 
-def _cmd_list(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mini-ork threads list", add_help=False,
-                                     usage=argparse.SUPPRESS)
-    parser.add_argument("--limit", type=int, default=100)
-    parser.add_argument("--origin", default=None)
-    parser.add_argument("--status", default=None)
-    _common(parser)
-    args = parser.parse_args(argv)
-
+def _cmd_list(args: argparse.Namespace) -> int:
     _, db = _targets(args)
     threads = store.list_threads(limit=args.limit, db=db)
     if args.origin:
@@ -150,13 +196,7 @@ def _cmd_list(argv: list[str]) -> int:
     return 0
 
 
-def _cmd_show(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mini-ork threads show", add_help=False,
-                                     usage=argparse.SUPPRESS)
-    parser.add_argument("id")
-    _common(parser)
-    args = parser.parse_args(argv)
-
+def _cmd_show(args: argparse.Namespace) -> int:
     _, db = _targets(args)
     thread = store.get_thread(args.id, db=db)
     if thread is None:
@@ -231,8 +271,8 @@ def _print_mandate(mandate: dict) -> None:
         sys.stdout.write(line + "\n")
 
 
-def _cmd_deliver(verb: str, argv: list[str]) -> int:
-    args = _delivery_parser(f"mini-ork threads {verb}").parse_args(argv)
+def _cmd_deliver(args: argparse.Namespace) -> int:
+    verb = args.verb
     text = _text(args)
     if text is None:
         sys.stderr.write(f"threads {verb}: --text is required (use '-' to read stdin)\n")
@@ -273,7 +313,7 @@ def _cmd_deliver(verb: str, argv: list[str]) -> int:
     return 0 if out.ok else 1
 
 
-def _cmd_attach(argv: list[str]) -> int:
+def _cmd_attach(args: argparse.Namespace) -> int:
     """Copy files onto an existing thread as ``FILE`` rows sharing one new turn.
 
     Nothing is launched or steered: attaching is not a request. The files reach
@@ -284,12 +324,6 @@ def _cmd_attach(argv: list[str]) -> int:
     from mini_ork.threads import attachments
     from mini_ork.threads.model import MessageRole
 
-    parser = argparse.ArgumentParser(prog="mini-ork threads attach", add_help=False,
-                                     usage=argparse.SUPPRESS)
-    parser.add_argument("id")
-    parser.add_argument("paths", nargs="*")
-    _common(parser)
-    args = parser.parse_args(argv)
     if not args.paths:
         sys.stderr.write("threads attach: name at least one file\n")
         return 2
@@ -319,7 +353,7 @@ def _cmd_attach(argv: list[str]) -> int:
     return 0
 
 
-def _cmd_serve(argv: list[str]) -> int:
+def _cmd_serve(args: argparse.Namespace) -> int:
     """Run the chat simple tier from ``config/chat.yaml``.
 
     Everything that can be refused is refused here, before the transport is
@@ -327,14 +361,6 @@ def _cmd_serve(argv: list[str]) -> int:
     a misconfiguration never reaches the network and never becomes a retry loop
     against a platform API.
     """
-    parser = argparse.ArgumentParser(prog="mini-ork threads serve", add_help=False,
-                                     usage=argparse.SUPPRESS)
-    parser.add_argument("--transport", default=None,
-                        choices=("telegram", "slack", "discord"))
-    parser.add_argument("--once", action="store_true")
-    _common(parser)
-    args = parser.parse_args(argv)
-
     home, db = _targets(args)
 
     from mini_ork.integrations import serve as chat
@@ -395,6 +421,20 @@ def _targets(args: argparse.Namespace) -> tuple[Path, str]:
     home.mkdir(parents=True, exist_ok=True)
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     return home, db
+
+
+#: verb → handler. Declared after the handlers (they are defined below
+#: :func:`main`, which resolves this at call time). ``send`` and ``continue``
+#: share one handler because the difference between them is what the service
+#: does, not what the command accepts — it reads ``args.verb`` to decide.
+_HANDLERS = {
+    "list": _cmd_list,
+    "show": _cmd_show,
+    "send": _cmd_deliver,
+    "continue": _cmd_deliver,
+    "attach": _cmd_attach,
+    "serve": _cmd_serve,
+}
 
 
 if __name__ == "__main__":

@@ -2,17 +2,17 @@
 
 ## Summary
 
-All 133 claimed tasks from the zed-mini-ork group were checked against the fork at HEAD (`5bf984b59c`, 2026-10-29), its pinned `mini_ork_ui` submodule (`38a1f7a`), the mini-ork engine at `main` (`ef55e7d8`) and the live machine state. **76 are DONE**, **32 are OPEN**, **10 are STALE** and **15 are UNKNOWN**. The IDE half of this group has genuinely shipped: the crate pins 9 node tabs including Harness, the shared zoom cluster, the breadcrumb, full-width pages, the title-bar project switcher, the `PWD` fix and the registry helpers all exist in code, the app bundle is built and running (pid 388) and the :7090 server answers 200. What is still genuinely open splits into four families. (1) *Directory picking*: `pick_files` still hardcodes `directories: false` (store.rs:707), so the whole pick-files-directories epic (spec written, card built) is stuck on one flag. (2) *Verification, not code*: roughly a dozen rows are awaiting a human to look at a screen (gui-verify, gui-replay, zoom-gui-smoke, launch-verify, tcc-grant, user-verify) — the features exist but no one recorded the observation. (3) *Engine decisions never taken*: the abstain contract, the ide_pages-vs-Rust-FE boundary, the parity decision, the v2 context switch, the `Open in web UI` button and the ACP trio all remain unrecorded. (4) *Small real gaps*: `build_parser()` in `mini_ork/threads/cli.py`, the residual hardcoded `python3` in `_synth_verify`, the gitleaks gate, the rust-analyzer scan exclusions, the Board's filter/totals controls, board card Retry, the `issues` IDE page, and the 200-journey corpus.
+All 133 claimed tasks from the zed-mini-ork group were checked against the fork at HEAD (`5bf984b59c`, 2026-10-29), its pinned `mini_ork_ui` submodule (`38a1f7a`), the mini-ork engine at `main` (`ef55e7d8`) and the live machine state. **79 are DONE**, **29 are OPEN**, **10 are STALE** and **15 are UNKNOWN** _(2026-11-10: the four closures since the audit are listed under "Closed since the audit")_. The IDE half of this group has genuinely shipped: the crate pins 9 node tabs including Harness, the shared zoom cluster, the breadcrumb, full-width pages, the title-bar project switcher, the `PWD` fix and the registry helpers all exist in code, the app bundle is built and running (pid 388) and the :7090 server answers 200. What is still genuinely open splits into four families. (1) *Directory picking*: `pick_files` still hardcodes `directories: false` (store.rs:707), so the whole pick-files-directories epic (spec written, card built) is stuck on one flag. (2) *Verification, not code*: roughly a dozen rows are awaiting a human to look at a screen (gui-verify, gui-replay, zoom-gui-smoke, launch-verify, tcc-grant, user-verify) — the features exist but no one recorded the observation. (3) *Engine decisions never taken*: the abstain contract, the ide_pages-vs-Rust-FE boundary, the parity decision, the v2 context switch, the `Open in web UI` button and the ACP trio all remain unrecorded. (4) *Small real gaps*: the residual hardcoded `python3` in `_synth_verify`, the gitleaks gate, the rust-analyzer scan exclusions, the Board's filter/totals controls, board card Retry, the `issues` IDE page, and the 200-journey corpus. (`build_parser()` in `mini_ork/threads/cli.py` was in this list; it is closed.)
 
 
-Verdict counts: DONE 73 · OPEN 35 · STALE 10 · UNKNOWN 15
+Verdict counts: DONE 79 · OPEN 29 · STALE 10 · UNKNOWN 15 _(2026-11-10; recounted from the table after closing `threads-builder`, `p1-2-abstention-contracts` and `abstention-fold`)_
 
 
 ## Table
 
 | task_id | ts | claimed | verdict | evidence |
 |---|---|---|---|---|
-| threads-builder | 2026-10-29 | pending | OPEN | mini_ork/threads/cli.py:100 `main()` dispatches per-verb parsers; no `build_parser` in the module |
+| threads-builder | 2026-10-29 | pending | DONE | `mini_ork/threads/cli.py` now exposes `build_parser()` (subparsers for all six verbs) and `main()` dispatches through it; `VERBS`/`_HANDLERS`/`_USAGE` are cross-checked by `tests/unit/test_threads_cli_parser.py` |
 | orca-inventory | 2026-10-29 | in_progress | DONE | 9d63cfb20a "docs(orca-parity): inventory Orca and grade mini-ork against it"; docs/orca-parity/orca-cli.md + README.md |
 | orca-parity-matrix | 2026-10-29 | pending | DONE | 9d63cfb20a + f04ce2c8cd; docs/orca-parity/matrix.md |
 | journey-scale | 2026-10-29 | pending | OPEN | 15 journeys in docs/user-journeys/journeys/*.yaml; docs/user-journeys/README.md:131 still names the 200-journey floor |
@@ -148,8 +148,6 @@ Verdict counts: DONE 73 · OPEN 35 · STALE 10 · UNKNOWN 15
 
 ## Still genuinely open
 
-- **threads-builder** — Give mini_ork/threads/cli.py a build_parser()  
-  next: mini_ork/threads/cli.py:100 `main()` dispatches per-verb parsers; no `build_parser` in the module
 - **journey-scale** — Scale corpus to 200+ journeys  
   next: 15 journeys in docs/user-journeys/journeys/*.yaml; docs/user-journeys/README.md:131 still names the 200-journey floor
 - **user-relaunch-verify** — User opens lanes -> cost; confirm IDE-spawned serve  
@@ -219,5 +217,6 @@ Verdict counts: DONE 73 · OPEN 35 · STALE 10 · UNKNOWN 15
 
 ## Closed since the audit
 
+- **threads-builder** — **DONE**: `mini_ork/threads/cli.py` has `build_parser()`, and `main()` parses through it rather than hand-dispatching, so the tree *is* the command's definition instead of a second copy of it. Six subparsers (`list`, `show`, `send`, `continue`, `attach`, `serve`), the `VERBS` tuple and the `_HANDLERS` table must agree, and every verb accepts the `--home` the IDE appends. The point beyond tidiness: `tests/unit/test_ide_pages_actions.py` resolves a page action's parser by subcommand module, and `threads` was the one subcommand it could not see — so the composer's `send` and the picker's `attach` argv were unchecked. `tests/unit/test_threads_cli_parser.py` now parses those exact argv.
 - **p1-2-abstention-contracts** — **DONE**: the executor now reads the canonical abstain contract off the ENVELOPE, not the exit code. `status: unverified|abstain` → `ABSTAIN_RC` (3) whether the verifier exited 0 or 1, and identically whether the evidence parsed strictly or through the tolerant path — the split that made the same verdict green a node on one run and fail it on the next. `status: skipped` is deliberately excluded (no subject ≠ no verdict). Contract recorded in `docs/architecture/verification-stack.md`; covered by `tests/unit/test_verifier_envelope_honoured.py`.
 - **abstention-fold** — **DONE** with the row above: one mapping in `execute._run_verifier_ref` covers `failure_kind: toolchain` and `status: unverified`, so P0 4d and P1.2 no longer have two competing abstain stories.
