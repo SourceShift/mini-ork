@@ -72,6 +72,20 @@ Three rules make it honest, and all are tested:
   not determine executable to run"), and only in the first 20 lines of the log.
   rc 126/127 and a signal-killed runner abstain in both.
 
+A **configuration** failure is the same shape as a launcher failure: a
+type-aware eslint whose `parserOptions.project` does not cover a touched file
+(a new `server/**` tree the target repo's tsconfig never included) aborts with
+`However, that TSConfig does not include this file` before any rule runs — so
+no rule judged the code. `pm.project_scope_error` recognises that prose and
+`classify_spawn` returns `toolchain` for it. `tier1-compile-typecheck` does
+better than abstaining where it can: in eslintrc mode it retries once over a
+scoped overlay tsconfig (`extends` the project's, `files` = the touched files,
+the same overlay `code-fix`'s `typecheck.py` uses for `tsc`), so the repo's own
+typed rules really do run over the change. It abstains only when no overlay is
+possible — no root `tsconfig.json`, a touched file outside the repo, or a flat
+config, where `--parser-options` does not exist and rewriting the repo's config
+is not the engine's call.
+
 ## Which "vacuous" guard you mean: three, not one
 
 "There is a vacuous-pass guard, but it is off behind a flag" and "a vacuous pass

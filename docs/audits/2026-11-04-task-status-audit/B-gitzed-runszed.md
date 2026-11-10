@@ -73,7 +73,7 @@
 | researcher-install-update | 2026-10-12 | pending | OPEN | researcher/.mini-ork engine checkout HEAD 68deb674 is 780 commits behind origin/main; _recovery_target_cwd occurrence count 0 |
 | revive-75074-wit-2-documents | 2026-10-12 | in_progress | DONE | run-1791785128-75074-wit-2-documents/run-verdict.json verdict=pass failed_nodes=0 levels_decision=publish; deliverable landed as 4598b66b |
 | revive-61320-stage-3 | 2026-10-12 | in_progress | DONE | run-1791788217-61320-communication-transports-stage-3/verdict.json tests_pass/static_pass/pass all true |
-| fix-eslint-project-paths | 2026-10-12 | pending | OPEN | no implementation; the only trace is a pending line in SESSION-GOALS.md |
+| fix-eslint-project-paths | 2026-10-12 | pending | DONE | tier1 retries a type-aware lint over a scoped overlay tsconfig (extends the project's, `files`=touched) and abstains when none is possible; `pm.project_scope_error` makes the config error a toolchain fact — tests/unit/test_tier1_eslint_project_py.py |
 | revive-44675 | 2026-10-12 | failed | OPEN | run-1791818713-44675 verdict fail with 10 failed nodes; repair.json ends action:human at tier1_compile; retry-hint retryable:false |
 | revive-43108-siblings | 2026-10-12 | pending | STALE | the sibling epics' deliverables all landed by other means: jira 8448f6bc, telegram 47de862d, linear 1be093e8, documents 4598b66b |
 | revive-75074 | 2026-10-12 | pending | DONE | run-1791785128-75074 pass:true child validates commit 76140293 |
@@ -128,7 +128,7 @@
 | run-scoped-env | 2026-10-10 | pending | DONE | dispatch/run_env.py config/env.yaml overlay + context.publish_env + execute_handlers per-node env |
 | visual-verify | 2026-10-10 | pending | STALE | pre-redesign checklist (status bar, rounding, row size, cache paint) superseded by da93f40 Dispatch Console layout and da5d004 |
 
-## Still genuinely open (17)
+## Still genuinely open (16)
 
 - **repo-ops** — default branch = main and PR #1 MERGED, but gh api repos/SourceShift/zed-mini-ork/branches/main/protection -> 404 'Branch not protected'
   - next: either enable `branches/main/protection` on SourceShift/zed-mini-ork or record in a doc that the fork is intentionally unprotected
@@ -156,8 +156,6 @@
   - next: add the `/task` verb + epic-card board section; only the fail-closed `epics add` half exists
 - **researcher-install-update** — researcher/.mini-ork engine checkout HEAD 68deb674 is 780 commits behind origin/main; _recovery_target_cwd occurrence count 0
   - next: fast-forward /Volumes/docker-ssd/ps/researcher/.mini-ork to origin/main (780 commits) and re-run the affected runs' pages
-- **fix-eslint-project-paths** — no implementation; the only trace is a pending line in SESSION-GOALS.md
-  - next: implement parserOptions.project resolution in the tier1 eslint gate, or remove the item
 - **revive-44675** — run-1791818713-44675 verdict fail with 10 failed nodes; repair.json ends action:human at tier1_compile; retry-hint retryable:false
   - next: resolve the human-action escalation at tier1_compile (repair.json) then revive run-1791818713-44675
 - **run-1791733111-22332** — run-1791733111-22332/verdict.json pass:false (tests_pass:false, static_pass:false) + dismissed.json; wiz-ide worktree exists
@@ -166,6 +164,8 @@
   - next: same action as researcher-install-update - one fast-forward closes both
 
 ## Closed since the audit
+
+- **fix-eslint-project-paths** — **DONE**: a type-aware lint whose `parserOptions.project` excludes the touched files no longer refutes the change. `tier1-compile-typecheck` retries once over a scoped overlay tsconfig (extends the project's, `files` = the touched files) in eslintrc mode, so the repo's own typed rules run; `pm.project_scope_error` + `classify_spawn` make the config error a `toolchain` abstention when no overlay is possible (no root `tsconfig.json`, a file outside the repo, or a flat config where `--parser-options` does not exist). Covered by `tests/unit/test_tier1_eslint_project_py.py`; rationale in `docs/architecture/verification-stack.md`.
 
 - **stale-run-verdict-on-resume** — **DONE `e60633dc`**: recover rotates the superseded attempt's verdict.json/run-verdict.json into `attempts/<n>/` before dispatching, so the rubric cannot grade the replaced attempt. `mini_ork/recovery/planner.py` `_archive_superseded_verdicts` (best effort: no verdict → no move; an unreadable ledger → attempt 1), covered by `tests/unit/test_recover_verdict_rotation_py.py`.
 - ~~**run-page-last-node**~~ — **DONE `bbb00e1`**: `page.rs:2815-2818` derives the node from `model.last_ran()` and hands it to `MiniOrkGraph::new`, so the run page opens on the node it reached last. The engine's `graph['focus']` is redundant, not unwired.

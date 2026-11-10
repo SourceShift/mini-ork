@@ -179,6 +179,33 @@ _SPAWN_FAILURES = (
     "could not determine executable to run",               # npx, no local install
 )
 
+# A TYPE-AWARE lint reads types through ``parserOptions.project``, a property of
+# the TARGET repo's tsconfig. A touched file outside the project that option
+# names — a new ``server/**`` tree the config never covered — makes eslint abort
+# BEFORE it lints anything, exactly like a spawn that never started. Read as a
+# code failure it refutes code nothing examined (the EBADDEVENGINES defect one
+# layer up, 2026-11-04 audit `fix-eslint-project-paths`), so these markers join
+# the abstention set. Verbatim from the tools: eslint 8/9's "does not include
+# this file", the flat-config project service, and the typed-rule complaint.
+_PROJECT_SCOPE_FAILURES = (
+    "However, that TSConfig does not include this file",
+    "was not found by the project service",
+    "requires parserOptions.project",
+    "parserOptions.projectService",
+)
+
+
+def project_scope_error(output: str) -> bool:
+    """True when a type-aware lint refused to run because the repo's
+    ``parserOptions.project`` does not cover the linted files.
+
+    That is a CONFIGURATION fact about the target repo, not a finding about the
+    change — no rule ever saw the file. Callers use it both to abstain
+    (:func:`classify_spawn`) and to retry over a scoped project.
+    """
+    text = output or ""
+    return any(needle in text for needle in _PROJECT_SCOPE_FAILURES)
+
 
 def classify_spawn(argv, rc, output):  # noqa: ARG001 — argv is part of the contract
     """``"toolchain"`` when a shell-out never started its tool, else ``""``.
@@ -207,6 +234,8 @@ def classify_spawn(argv, rc, output):  # noqa: ARG001 — argv is part of the co
     if isinstance(rc, int) and rc < 0:
         return "toolchain"
     text = output or ""
+    if project_scope_error(text):
+        return "toolchain"
     for needle in _SPAWN_FAILURES:
         if needle in text:
             return "toolchain"

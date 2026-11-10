@@ -12,6 +12,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 # mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
 # (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
@@ -21,9 +22,60 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import classify_spawn, describe, exec_argv, run_argv  # noqa: E402
+from mini_ork.verify.pm import (  # noqa: E402
+    classify_spawn, describe, exec_argv, project_scope_error, run_argv,
+)
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
+
+
+def _eslint_project_overlay(root: str, files: list[str]) -> "str | None":
+    """A tsconfig EXTENDING the project's, narrowed to ``files``.
+
+    A type-aware lint reads types through ``parserOptions.project``, which names
+    a property of the TARGET repo — the engine must not rewrite it. The ordinary
+    failure is that the touched file is not IN that project (a new ``server/**``
+    tree the config never covered), and eslint then aborts before exercising a
+    single rule. This lint-only overlay — the same shape
+    ``code-fix/verifiers/typecheck.py`` uses for ``tsc`` — lets the repo's own
+    typed rules run over the change instead of refuting code nothing examined.
+
+    ``files`` (not ``include``) carries the scope so the project's own
+    ``exclude`` globs cannot silently drop a changed file. Returns ``None`` when
+    there is no root ``tsconfig.json`` to extend, or when a touched file lives
+    outside ``root`` — a tsconfig cannot include one.
+    """
+    if not os.path.isfile(os.path.join(root, "tsconfig.json")):
+        return None
+    scoped: list[str] = []
+    for path in files:
+        rel = str(os.path.relpath(os.path.abspath(path), os.path.abspath(root)))
+        if rel.startswith(".."):
+            return None
+        scoped.append(rel.replace(os.sep, "/"))
+    overlay = {
+        "extends": "./tsconfig.json",
+        "compilerOptions": {"noEmit": True, "incremental": False},
+        "files": scoped,
+        "include": [],
+    }
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".json", prefix="mo-eslint-tsconfig-", dir=root, delete=False,
+    )
+    with handle:
+        json.dump(overlay, handle)
+    return handle.name
+
+
+# `--parser-options` is an eslintrc-mode flag; ESLint 9's flat config rejects it
+# as an unknown option, so the scoped-project retry is only offered to a repo
+# that actually runs in eslintrc mode.
+_LEGACY_ESLINTRC = (".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
+                    ".eslintrc.yml", ".eslintrc.yaml")
+
+
+def _legacy_eslintrc():
+    return any(os.path.isfile(name) for name in _LEGACY_ESLINTRC)
 
 try:
     summary = json.load(open(os.path.join(RUN_DIR, "implementer-summary.json"), encoding="utf-8"))
@@ -144,6 +196,40 @@ if SOURCE_FILES and any(os.path.isfile(f) for f in
         ev.write(_lint.stdout)
         lint_rc = _lint.returncode
         lint_out = _lint.stdout
+        # A type-aware lint whose `parserOptions.project` does not cover the
+        # touched files aborts before running a rule. Retry once over a scoped
+        # overlay tsconfig; `--parser-options` only exists in eslintrc mode, so
+        # a flat-config repo falls through to the abstention `classify_spawn`
+        # gives that error instead of having its config silently overridden.
+        if lint_rc != 0 and project_scope_error(lint_out):
+            overlay = (_eslint_project_overlay(".", SOURCE_FILES)
+                       if _legacy_eslintrc() else None)
+            if overlay:
+                retry = [*lint_argv, f"--parser-options=project:{overlay}"]
+                ev.write(f"$ {shlex.join(retry)}\n"
+                         "# typed lint: scoped project overlay (the touched files\n"
+                         "# are outside the repo's own parserOptions.project)\n")
+                ev.flush()
+                try:
+                    _retry = subprocess.run(retry, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, text=True)
+                    ev.write(_retry.stdout)
+                    lint_rc = _retry.returncode
+                    lint_out = _retry.stdout
+                except OSError as exc:  # the retry itself never started
+                    ev.write(f"scoped-project retry could not run: {exc}\n")
+                finally:
+                    try:
+                        os.unlink(overlay)
+                    except OSError:
+                        pass
+                ev.flush()
+            else:
+                ev.write("typed lint: no scoped project overlay possible "
+                         "(no root tsconfig.json, a touched file outside the repo, "
+                         "or a flat config that has no --parser-options); the "
+                         "verdict abstains rather than refuting the change\n")
+                ev.flush()
 else:
     ev.write("no source files for eslint or no eslint config found\n")
     ev.flush()
