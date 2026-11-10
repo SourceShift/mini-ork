@@ -33,12 +33,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork import context_assembler as ca  # noqa: E402
+from mini_ork import context_v2 as cv  # noqa: E402
 from mini_ork.cli import execute, execute_handlers  # noqa: E402
 
 TC = "tc_lesson_holdout"
 
-# The lesson kinds the holdout owns. Steering, preference, prior-run and
-# context-v2 sources are not lessons and are never reserved.
+# The lesson kinds the *v1* holdout owns. Steering, preference and prior-run
+# sources are not lessons and are never reserved. Context-v2 pack items are
+# lessons too, but they are withheld inside the node block under their own
+# ledger key (``context_v2`` / the pack item id) — see the ``test_v2_*`` tests
+# at the end of this file.
 LESSON_KINDS = ("gradient", "theme", "pattern")
 
 # G8's ``_exercise_once`` (mini_ork/rsi/cycle.py) runs this file's scoped
@@ -528,12 +532,12 @@ def test_a_reserved_lesson_is_never_retrieved(db, run_dir, monkeypatch):
 
 
 def test_non_lesson_sources_are_never_reserved(db, run_dir, monkeypatch):
-    """Kickoff: "steering, preference, prior-run and context-v2 sources are
-    never reserved".
+    """Kickoff: "steering and preference sources are never reserved".
 
-    Those four are the operator's own instructions, not lessons the loop
-    learned. Withholding one would not be a holdout — it would be the
-    framework ignoring its operator.
+    Those are the operator's own instructions, not lessons the loop learned.
+    Withholding one would not be a holdout — it would be the framework ignoring
+    its operator. (Context-v2 pack items *are* lessons and are withheld by
+    their own key; that is covered by the ``test_v2_*`` tests below, not here.)
     """
     run_id = "holdout-run-nonlesson"
     _seed_lessons(db)
@@ -545,6 +549,163 @@ def test_non_lesson_sources_are_never_reserved(db, run_dir, monkeypatch):
     assert "steering" in kinds, "the steering source must be present"
     assert "preference" in kinds, "the preference source must be present"
     for src in sources:
-        if src.get("kind") not in LESSON_KINDS:
+        if src.get("kind") in ("steering", "preference"):
             assert not src.get("held_out"), (
                 "%s sources are never reserved" % src.get("kind"))
+
+
+# ── the holdout inside a v2 node block ──────────────────────────────────────
+#
+# A v2 pack item's ledger id IS its pack id (``t:th-…`` / ``f:…``), so the same
+# per-lesson predicate applies under the key (``"context_v2"``, item_id). The
+# rate cannot be forced high enough to catch every id (it is clamped at 0.5),
+# so these tests pick ids the predicate already reserves rather than assuming.
+
+def _in_arm_pack_ids(prefix: str, count: int) -> list[str]:
+    """``count`` pack ids the per-lesson predicate puts in the arm."""
+    found: list[str] = []
+    for i in range(4000):
+        cand = "%s%04d" % (prefix, i)
+        if ca.lesson_held_out("context_v2", cand):
+            found.append(cand)
+            if len(found) == count:
+                return found
+    raise AssertionError("could not find enough in-arm ids — is the rate 0?")
+
+
+def _out_of_arm_pack_ids(prefix: str, count: int) -> list[str]:
+    found: list[str] = []
+    for i in range(4000):
+        cand = "%s%04d" % (prefix, i)
+        if not ca.lesson_held_out("context_v2", cand):
+            found.append(cand)
+            if len(found) == count:
+                return found
+    raise AssertionError("every id landed in the arm — is the rate 1.0?")
+
+
+def _v2_pack(themes: list[str], findings: list[str]) -> dict:
+    return {
+        "constraints": [{"id": "c:0", "text": "Do NOT modify any other file."}],
+        "themes": [{"id": t, "text": "themsig %s" % t} for t in themes],
+        "file_findings": [
+            {"id": f, "n": 2, "n_runs": 2, "files": ["a.py"],
+             "worst_severity": "high", "representative": "x " * 30}
+            for f in findings
+        ],
+        "item_ids": ["c:0", *themes, *findings],
+    }
+
+
+def _bind_v2_pack(monkeypatch, pack: dict, arm_mode: str = "v2") -> None:
+    monkeypatch.delenv("MO_LESSON_HOLDOUT_RATE", raising=False)  # default 0.10
+    monkeypatch.setattr(cv, "arm", lambda run_id: arm_mode)
+    monkeypatch.setattr(cv, "pack_for_run", lambda run_dir, **kw: pack)
+
+
+def test_v2_node_block_withholds_in_arm_items_and_never_a_constraint(monkeypatch):
+    """A theme/finding the arm reserves is absent from the block and present
+    on the out-param as ``held_out``; a kickoff constraint always survives —
+    withholding it would change the task, not the guidance."""
+    held_themes = _in_arm_pack_ids("t:held", 2)
+    kept_themes = _out_of_arm_pack_ids("t:kept", 2)
+    held_findings = _in_arm_pack_ids("f:held", 1)
+    kept_findings = _out_of_arm_pack_ids("f:kept", 1)
+    pack = _v2_pack(held_themes + kept_themes, held_findings + kept_findings)
+    _bind_v2_pack(monkeypatch, pack)
+
+    sources: list[dict] = []
+    text = cv.node_block("/tmp/run", "implementer", "run-v2", sources=sources)
+
+    reserved, delivered = _split(sources)
+    for item_id in (*held_themes, *held_findings):
+        assert "[%s]" % item_id not in text, (
+            "a reserved v2 item reached the prompt: %s" % item_id)
+        assert ("context_v2", item_id) in reserved
+    for item_id in ("c:0", *kept_themes, *kept_findings):
+        assert "[%s]" % item_id in text, (
+            "an un-reserved v2 item was dropped from the prompt: %s" % item_id)
+        assert ("context_v2", item_id) in delivered
+
+
+def test_v2_acknowledgements_still_accept_a_withheld_item(monkeypatch):
+    """The planner is graded against the full pack, not the node's trimmed
+    view: a plan that cites a withheld id is legitimate, and scoring it as
+    invented would punish the planner for reading what it was shown."""
+    (held,) = _in_arm_pack_ids("t:ack", 1)
+    pack = _v2_pack([held], [])
+    _bind_v2_pack(monkeypatch, pack)
+
+    sources: list[dict] = []
+    assert "[%s]" % held not in cv.node_block(
+        "/tmp/run", "implementer", "run-v2", sources=sources)
+
+    ack = cv.acknowledgements({"context_used": [held, "c:0", "t:invented"]}, pack)
+    assert held in ack["valid"], "a withheld id is still a real pack id"
+    assert ack["invalid"] == ["t:invented"]
+
+
+def test_v2_rate_zero_withholds_nothing(monkeypatch):
+    """One switch for both tiers: ``MO_LESSON_HOLDOUT_RATE=0`` restores the
+    full pack and emits no held rows."""
+    held_themes = _in_arm_pack_ids("t:zero", 2)
+    pack = _v2_pack(held_themes, [])
+    _bind_v2_pack(monkeypatch, pack)
+    monkeypatch.setenv("MO_LESSON_HOLDOUT_RATE", "0")
+
+    sources: list[dict] = []
+    text = cv.node_block("/tmp/run", "implementer", "run-v2", sources=sources)
+
+    reserved, delivered = _split(sources)
+    assert reserved == set()
+    for item_id in held_themes:
+        assert "[%s]" % item_id in text
+        assert ("context_v2", item_id) in delivered
+
+
+def test_v2_without_a_sink_withholds_nothing(monkeypatch):
+    """No ``sources`` sink means no reservation — the same rule the v1
+    channels apply. A preview must not show less than the node gets."""
+    held_themes = _in_arm_pack_ids("t:nosink", 2)
+    _bind_v2_pack(monkeypatch, _v2_pack(held_themes, []))
+
+    text = cv.node_block("/tmp/run", "implementer", "run-v2", sources=None)
+    for item_id in held_themes:
+        assert "[%s]" % item_id in text
+
+
+def test_v2_per_run_holdout_arm_emits_nothing(monkeypatch):
+    """A run already in the per-run v2 holdout arm gets no block at all, so it
+    contributes no per-lesson rows — the two arms never double-count."""
+    _bind_v2_pack(monkeypatch, _v2_pack(_in_arm_pack_ids("t:ph", 2), []),
+                  arm_mode="holdout")
+    sources: list[dict] = []
+    assert cv.node_block("/tmp/run", "implementer", "run-v2",
+                         sources=sources) == ""
+    assert sources == []
+
+
+def test_v2_reserved_item_reaches_the_ledger_as_held_out(db, run_dir, monkeypatch):
+    """End to end on the production path: a v2 pack item the arm reserves is
+    absent from the rendered prompt, present in the learned record's reserved
+    half, and written to ``lesson_injections`` with ``held_out=1``."""
+    run_id = "holdout-run-v2-ledger"
+    _seed_lessons(db)
+    (held,) = _in_arm_pack_ids("t:e2e", 1)
+    pack = _v2_pack([held], [])
+    _bind_v2_pack(monkeypatch, pack)
+
+    block, sources = _production_block(run_dir, "node-e2e", run_id, monkeypatch)
+    assert "[%s]" % held not in block, "the reserved item reached the prompt"
+    reserved, delivered = _split(sources)
+    assert ("context_v2", held) in reserved
+    assert ("context_v2", "c:0") in delivered
+
+    execute_handlers._write_learned_record(
+        str(run_dir), "node-e2e", "implementer", "fast", TC,
+        attempt=1, block=block, sources=sources, run_id=run_id)
+
+    record = _read_json(run_dir, "node-e2e")
+    assert held not in {s.get("id") for s in record["sources"]}, (
+        "the learned record must not claim a withheld item as delivered")
+    assert ("context_v2", held, 1) in _ledger_rows(db, run_id)

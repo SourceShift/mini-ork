@@ -130,7 +130,7 @@ def lesson_injections(db: StateDB = Depends(get_db), limit: int = 100) -> dict[s
     learning it cannot prove. Guarded: a fresh state.db returns an empty list
     rather than a 500.
     """
-    empty = {"injections": [], "count": 0, "held_out": 0}
+    empty = {"injections": [], "count": 0, "held_out": 0, "outcomes": {}}
     if not db.has_table("lesson_injections"):
         return empty
     rows = db.rows(
@@ -148,7 +148,46 @@ def lesson_injections(db: StateDB = Depends(get_db), limit: int = 100) -> dict[s
         "FROM lesson_injections"
     )
     stat = totals[0] if totals else {"count": 0, "held_out": 0}
-    return {"injections": rows, "count": stat["count"], "held_out": stat["held_out"]}
+    pairs = [
+        (str(row.get("source_kind") or ""), str(row.get("source_id") or ""))
+        for row in rows
+    ]
+    return {
+        "injections": rows,
+        "count": stat["count"],
+        "held_out": stat["held_out"],
+        "outcomes": _outcomes_for(db, pairs),
+    }
+
+
+def _outcomes_for(db: StateDB, pairs: list[tuple[str, str]]) -> dict:
+    """Per-lesson node outcomes for the injected ids on this page."""
+    if not pairs or not db.has_table("lesson_outcome_exposures"):
+        return {}
+    from mini_ork.learning import lesson_outcomes  # noqa: PLC0415
+
+    return lesson_outcomes.summaries(pairs, db=str(db.db_path))
+
+
+@router.get("/lesson-outcomes")
+def lesson_outcomes_route(db: StateDB = Depends(get_db)) -> dict[str, Any]:
+    """Read-only per-lesson node outcomes. GET never resolves.
+
+    Refusing to resolve on a GET matters: folding new runs is a write, and a
+    dashboard poll would race the control plane's single writer. Consumers call
+    ``mini-ork metrics lessons --resolve-only`` (or wait for it) and read here.
+    """
+    if not db.has_table("lesson_outcome_exposures"):
+        return {"status": "unavailable", "reason": "0092_lesson_outcome_exposures.sql"}
+    from mini_ork.learning import lesson_outcomes  # noqa: PLC0415
+
+    stats = lesson_outcomes.ledger_stats(str(db.db_path))
+    rows = lesson_outcomes.exposures(str(db.db_path))
+    return {
+        "status": "ok",
+        "ledger": stats,
+        "summary": lesson_outcomes.summarize(rows),
+    }
 
 
 # ── GEPA — not just the gradients, but whether they won ──────────────────────

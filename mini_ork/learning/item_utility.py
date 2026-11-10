@@ -31,11 +31,20 @@ from mini_ork.memory.semantic import (
 )
 
 __all__ = [
+    "W_EFFECT",
     "enabled",
     "rerank",
     "resolve_finished",
     "score",
 ]
+
+# A measured *node-level* effect reorders, but never overpowers, the run-level
+# utility signal: 0.20 sits below ``W_UTILITY`` (0.30) and above ``W_EXPLORE``
+# (0.10), so a significant harm can move a rank while a stale win count still
+# dominates. It is exactly 0.0 for every lesson that is not ``measured``
+# (``learning.lesson_outcomes.effect``), so an unmeasured ledger scores
+# identically to the pre-effect formula.
+W_EFFECT = 0.20
 
 # Terminal statuses that carry an outcome. ``published`` is a win; the two
 # rollback statuses are losses; everything else (``not_needed``, an in-flight
@@ -60,13 +69,26 @@ def enabled() -> bool:
     return os.environ.get("MO_ITEM_UCB") != "0"
 
 
-def score(similarity: float, uses: int, wins: int, n_total: int) -> float:
+def score(
+    similarity: float,
+    uses: int,
+    wins: int,
+    n_total: int,
+    effect: float = 0.0,
+) -> float:
     """SimUtil-UCB composite: the same formula ``semantic.rank_with_prior``
     applies to keyed memories, with the external prior standing in for
-    similarity."""
+    similarity.
+
+    ``effect`` is the measured per-lesson node effect in ``[-1, 1]`` (or 0.0
+    when the lesson is not measured). It is one term in the same score, so a
+    lesson can fall out of the top-k but is never dropped: exploration decays
+    to zero and re-trial stays possible.
+    """
     return (
         similarity
         + W_UTILITY * (_utility(uses, wins) - UTILITY_NEUTRAL)
+        + W_EFFECT * float(effect)
         + W_EXPLORE * _exploration(uses, n_total)
     )
 
@@ -213,7 +235,11 @@ def _stats(db: str | None, item_ids: list[str]) -> dict[str, tuple[int, int]]:
 
 
 def rerank(
-    items: list[dict], *, db: str, similarity_key: str | None = None
+    items: list[dict],
+    *,
+    db: str,
+    similarity_key: str | None = None,
+    effects: dict[str, float] | None = None,
 ) -> list[dict]:
     """Order ``items`` (dicts carrying an ``"id"``) by :func:`score`.
 
@@ -221,10 +247,15 @@ def rerank(
     similarity is ``1.0 - rank / len(items)``, so an untried set reproduces the
     old order exactly and utility/exploration only adjust it. A stable sort
     keeps ties in incoming order. Any failure returns the incoming order.
+
+    ``effects`` maps item id to its measured node effect; an id absent from it
+    contributes 0.0, so passing nothing reproduces the pre-effect ordering
+    exactly.
     """
     ordered = list(items)
     if not ordered:
         return []
+    effect_map = effects or {}
     try:
         ids = [str(item.get("id")) for item in ordered if isinstance(item, dict)]
         stats = _stats(db, ids)
@@ -243,7 +274,12 @@ def rerank(
                         similarity = 0.0
             item_id = str(item.get("id")) if isinstance(item, dict) else ""
             uses, wins = stats.get(item_id, (0, 0))
-            scored.append((score(similarity, uses, wins, n_total), rank, item))
+            try:
+                effect = float(effect_map.get(item_id) or 0.0)
+            except (TypeError, ValueError):
+                effect = 0.0
+            scored.append(
+                (score(similarity, uses, wins, n_total, effect), rank, item))
         scored.sort(key=lambda entry: (-entry[0], entry[1]))
         return [entry[2] for entry in scored]
     except Exception:  # noqa: BLE001 — neutral value is the incoming order

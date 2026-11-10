@@ -34,6 +34,13 @@ defaults:
   MO_SUITE_ADEQUACY: "1"
   MO_LANE_AFFINITY: "1"
   MO_LEARNING_WRITEBACK: "1"
+  # Per-lesson node outcomes: fold finished runs into lesson_outcome_exposures
+  # in-process and read them with `mini-ork metrics lessons`. No server and no
+  # network; a missing state.db or an unapplied 0092 exits non-zero and names
+  # the migration rather than printing a zero. The secure tier keeps the same
+  # defaults and adds `--resolve-only` as the single writer on a shared store.
+  MO_LESSON_OUTCOMES: "1"
+  MO_LESSON_EFFECT_RERANK: "1"
   # Measure the certify terms but do not let them veto yet: a first user has no
   # baseline, so a blocking term would refuse work nobody has calibrated.
   MO_CODEFIX_CERTIFY: shadow

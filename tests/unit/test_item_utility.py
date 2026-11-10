@@ -361,3 +361,54 @@ def test_build_ucb_off_is_prior_order(tmp_path, monkeypatch):
         con.close()
     expected = [c["id"] for c in context_v2.cluster(findings)]
     assert _ids(pack["file_findings"]) == expected
+
+
+# ── the measured effect term ────────────────────────────────────────────────
+
+def test_score_effect_is_exactly_w_effect_times_the_effect():
+    base = item_utility.score(0.4, 5, 3, 20)
+    for effect in (-1.0, -0.3, 0.0, 0.25, 1.0):
+        assert item_utility.score(0.4, 5, 3, 20, effect) == pytest.approx(
+            base + item_utility.W_EFFECT * effect)
+
+
+def test_effect_zero_reproduces_every_pre_effect_score():
+    """The default must be exactly the old formula — an unmeasured lesson
+    cannot move by being scored."""
+    for sim in (0.0, 0.37, 1.0):
+        for uses, wins in ((0, 0), (10, 0), (7, 6)):
+            for n_total in (0, 40):
+                assert item_utility.score(sim, uses, wins, n_total) == \
+                    item_utility.score(sim, uses, wins, n_total, 0.0)
+
+
+def test_rerank_effect_reorders_near_ties_and_never_drops(tmp_path):
+    db = str(tmp_path / "fresh.db")
+    items = [{"id": "t:a", "s": 0.5}, {"id": "t:b", "s": 0.5},
+             {"id": "t:c", "s": 0.5}]
+    out = item_utility.rerank(items, db=db, similarity_key="s",
+                              effects={"t:c": 0.9, "t:a": -0.9})
+    ids = _ids(out)
+    assert ids[0] == "t:c" and ids[-1] == "t:a"
+    assert set(ids) == {"t:a", "t:b", "t:c"}, "an effect reorders, never prunes"
+
+
+def test_rerank_one_full_magnitude_effect_cannot_cross_a_rank_step(tmp_path):
+    """With the rank prior (no ``similarity_key``) one rank is ``1/N``; at the
+    three-item small-pack size that is 0.333 > ``W_EFFECT`` (0.20), so a full
+    penalty cannot move a row. The lever is deliberately weaker than a single
+    rank of the selection prior at small N — it sorts near-ties, it does not
+    re-rank a short page."""
+    db = str(tmp_path / "fresh.db")
+    items = [{"id": "t:a"}, {"id": "t:b"}, {"id": "t:c"}]
+    out = item_utility.rerank(items, db=db, effects={"t:c": 1.0, "t:a": -1.0})
+    assert _ids(out) == ["t:a", "t:b", "t:c"]
+
+
+def test_rerank_without_effects_is_the_pre_effect_order(tmp_path):
+    db = str(tmp_path / "state.db")
+    _seed_utility(db, "t:wins", 10, 10)
+    _seed_utility(db, "t:losses", 10, 0)
+    items = [{"id": "t:losses"}, {"id": "t:wins"}, {"id": "t:fresh"}]
+    assert _ids(item_utility.rerank(items, db=db)) == _ids(
+        item_utility.rerank(items, db=db, effects={}))

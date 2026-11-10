@@ -512,3 +512,68 @@ def test_v1_block_carries_the_honest_header(tmp_path):
     assert "--- /induced lessons ---" in block
     assert "--- Verified lessons from prior runs" not in block
     assert "--- /verified lessons ---" not in block
+
+
+# ── the measured per-lesson effect (rerank term) ────────────────────────────
+
+def test_effects_are_empty_without_the_outcome_table(tmp_path):
+    """A home that never ran migration 0092 has no measurements, and having
+    none must not change selection: ``_theme_effects`` returns ``{}`` and the
+    caller keeps the pre-effect order."""
+    _db, con = _build_db(tmp_path)
+    try:
+        assert themes._theme_effects(con, ["th-w-0", "th-w-1"]) == {}
+    finally:
+        con.close()
+
+
+def test_db_file_is_none_for_an_in_memory_database():
+    con = sqlite3.connect(":memory:")
+    try:
+        assert themes._db_file(con) is None
+    finally:
+        con.close()
+
+
+def test_a_maximally_harmful_effect_can_push_the_top_lesson_out(tmp_path,
+                                                              monkeypatch):
+    """A measured ``-1.0`` costs exactly ``item_utility.W_EFFECT`` (0.20).
+
+    Within a tier the rank prior is ``1 - pos/n``, so the lever is bounded by
+    the tier size: it crosses ``k`` ranks only when ``k/n < W_EFFECT``. One
+    rank needs six or more rows; two ranks (enough to fall out of a two-slot
+    page) need eleven. At five rows or fewer a full-magnitude penalty cannot
+    move a row even one place. This records the bound rather than pretending
+    a penalty can reorder anything anywhere.
+    """
+    _db, con = _build_db(tmp_path)
+    for i in range(11):
+        _add_theme(con, "th-n%02d" % i, task_class="framework_edit",
+                   lesson=" ".join("tok%02d%s" % (i, c) for c in "abcd"),
+                   n_runs=50 - i, last_seen=100 + i)
+
+    before = [r["theme_id"] for r in
+              themes.select_verified_themes(con, "framework_edit", 2)]
+    assert before == ["th-n00", "th-n01"]
+
+    monkeypatch.setattr(themes, "_theme_effects",
+                        lambda _con, _ids: {"th-n00": -1.0})
+    after = [r["theme_id"] for r in
+             themes.select_verified_themes(con, "framework_edit", 2)]
+    assert after == ["th-n01", "th-n02"], after
+    con.close()
+
+
+def test_effects_never_drop_a_lesson_that_still_fits(tmp_path, monkeypatch):
+    """Reordering only: a penalised lesson that still ranks inside ``limit``
+    is returned, just later — the effect never prunes."""
+    _db, con = _build_db(tmp_path)
+    for i in range(3):
+        _add_theme(con, "th-k%02d" % i, task_class="framework_edit",
+                   lesson=" ".join("kep%02d%s" % (i, c) for c in "wxyz"),
+                   n_runs=30 - i, last_seen=100 + i)
+    monkeypatch.setattr(themes, "_theme_effects",
+                        lambda _con, ids: {i: 0.0 for i in ids})
+    page = themes.select_verified_themes(con, "framework_edit", 3)
+    assert [r["theme_id"] for r in page] == ["th-k00", "th-k01", "th-k02"]
+    con.close()

@@ -206,7 +206,9 @@ def test_json_mode_carries_every_section(tmp_path):
     assert rc == 0
     doc = json.loads(buf.getvalue())
     assert set(doc) == {"run", "node", "run_dir", "node_type", "lane", "affinity",
-                        "route", "memory", "walked", "notes"}
+                        "route", "memory", "walked", "outcomes", "notes"}
+    # A store without 0092 contributes no outcomes — and no fabricated zero.
+    assert doc["outcomes"] == {}
 
 
 def test_no_arguments_prints_usage_and_exits_2(tmp_path):

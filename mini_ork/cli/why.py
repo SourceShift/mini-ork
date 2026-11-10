@@ -197,6 +197,7 @@ def collect(run: str, node: str, *, home: str, db: str | None = None) -> dict:
         "affinity": None,
         "route": {},
         "memory": None,
+        "outcomes": {},
         "walked": [],
         "notes": [],
     }
@@ -258,10 +259,32 @@ def collect(run: str, node: str, *, home: str, db: str | None = None) -> dict:
             "attempt": injection.get("attempt"),
             "sources": sources if isinstance(sources, list) else [],
         }
+        result["outcomes"] = _outcomes(
+            result["memory"], db or os.path.join(home, "state.db"))
     else:
         result["notes"].append(
             f"prompt memory not recorded (learned/{node}.json)")
     return result
+
+
+def _outcomes(memory: dict, db_path: str) -> dict:
+    """Per-source node outcomes for the lessons this node was given.
+
+    One read for all of them. A missing 0092 table comes back as
+    ``{"status": "unavailable"}`` per lesson — the render says so, because a
+    zero here would read as "measured, no effect" and the two are not the same
+    claim.
+    """
+    from mini_ork.learning import lesson_outcomes  # noqa: PLC0415
+
+    pairs = [
+        (str(source.get("kind")), str(source.get("id")))
+        for source in memory.get("sources") or []
+        if isinstance(source, dict) and source.get("kind") and source.get("id")
+    ]
+    if not pairs:
+        return {}
+    return lesson_outcomes.summaries(pairs, db=db_path)
 
 
 def _ids(memory) -> list[str]:
@@ -270,6 +293,29 @@ def _ids(memory) -> list[str]:
         if isinstance(source, dict) and source.get("id"):
             out.append(str(source["id"]))
     return out
+
+
+def _outcome_text(outcomes: dict, *, limit: int = 6) -> str:
+    """``clean 93%(n=778)`` per lesson, or the reason there is no number.
+
+    Every branch names its insufficiency; none of them prints ``0%`` for a
+    lesson that was simply never measured.
+    """
+    parts: list[str] = []
+    for key, summary in list(outcomes.items())[:limit]:
+        if summary.get("status") == "unavailable":
+            parts.append(f"{key}: unavailable")
+            continue
+        rate = summary.get("clean_rate_primary")
+        n = int(summary.get("n_primary") or 0)
+        if rate is None:
+            rate, n = summary.get("clean_rate"), int(summary.get("n_nodes") or 0)
+        if rate is None:
+            parts.append(f"{key}: no outcomes yet")
+            continue
+        parts.append(f"{key}: clean {round(rate * 100)}% (n={n}) · {summary['status']}")
+    more = f" (+{len(outcomes) - limit} more)" if len(outcomes) > limit else ""
+    return "outcomes: " + "; ".join(parts) + more
 
 
 def render(card: dict) -> str:
@@ -341,6 +387,11 @@ def render(card: dict) -> str:
             lines.append(f"        {len(ids)} source id(s): {shown}{more}")
         else:
             lines.append("        0 source id(s) recorded")
+        outcomes = card.get("outcomes") or {}
+        if outcomes:
+            lines.append("        " + _outcome_text(outcomes))
+        elif ids:
+            lines.append("        outcomes: unavailable (0092 not applied)")
     else:
         lines.append("memory: not recorded")
 

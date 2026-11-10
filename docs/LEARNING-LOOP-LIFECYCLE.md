@@ -95,6 +95,8 @@ answers "which model produced this artifact, and why":
 | `execution_traces` | the routing reason: `route_source` (`policy` / `learned` / `pinned` / `fallback` / `trace_governed`), `route_explore`, `route_score`, `route_margin`, `predicted_error` |
 | `llm_calls` | the chain actually walked — every lane tried, its status, tokens, cost and session id |
 | `<run_dir>/learned/<node>.json` | the memory ids injected into this node's prompt (`arm`, `attempt`, `sources`) |
+| `lesson_injections` | every lesson offered to a node — shown or withheld — with its arm |
+| `lesson_outcome_exposures` | the same join, folded into one row per `(run, node, lesson, arm)` with the node's first-attempt outcome |
 
 `mini-ork why` joins all four, read-only, and prints `not recorded` for a store
 that has no row for the node rather than leaving the field out. `--json` emits
@@ -189,6 +191,92 @@ With no row at or above the sample floor — a **cold or vacuous** learning stor
 — the configured lane comes back unchanged. That is what makes default-ON safe:
 learning can only *add* an override once it has earned the evidence; it never
 subtracts one.
+
+### 4.3 Per-lesson node outcomes (`mini_ork/learning/lesson_outcomes.py`)
+
+Everything above asks *which lane* did well. This asks the narrower question the
+injection path otherwise leaves unanswered: **did this lesson help the node that
+was given it?**
+
+The two halves already existed and were never joined. `_learned_block`
+(`mini_ork/cli/execute.py`) builds the lesson block once per run and hands it to
+every researcher / implementer / reviewer node, and `lesson_injections`
+(migration 0062) records run, node, attempt, kind, id and arm for each one.
+`node_attempts` records how every node actually fared. Nothing read the two
+together, so a lesson's support count measured how often it was *selected*, not
+whether it worked.
+
+`mini-ork metrics lessons` resolves that join into a fact table and reports one
+number per lesson and arm.
+
+| Table | What it is |
+|---|---|
+| `lesson_injections` (0062) | the write-side ledger — one row per lesson *offered* to a node, `held_out=1` when it was withheld instead of shown |
+| `lesson_outcome_exposures` (0092) | the read-side fact table — one row per `(run, node, lesson, arm)`, carrying `result_1`, `clean`, `retried`, `failed`, `attempts` |
+| `lesson_outcome_runs` (0092) | the resolution marker, so a finished run is folded exactly once and an all-withheld or no-attempt run cannot wedge the window |
+
+**The outcome variable is not "did the node succeed".** Raw node success sits at
+97.8%, and first-attempt success is *more* saturated at 98.9% — a headline over
+either is noise. The variable is **clean first attempt**: attempt 1 succeeded
+*and* no attempt 2 was needed. `retried` and `failed` are carried alongside.
+
+Three contrasts come out, and only the first is allowed to change anything:
+
+| Contrast | Reads as | What gates on it |
+|---|---|---|
+| clean arm — delivered minus held-out on primary nodes | `measured` only with ≥ 30 nodes and ≥ 20 non-clean events in **both** arms, plus an exact two-sided Fisher p < 0.05 | the rerank effect (`MO_LESSON_EFFECT_RERANK`) |
+| population gap — same `(node_type, task_class)` stratum, direct-standardized to the treated weights | `measured_correlational` | nothing |
+| run-level publish rate per lesson | labelled "not attribution" | nothing |
+
+A within-run paired test was considered and dropped: the block is built **once
+per run**, so every node of an injected type in a run is treated, and there is no
+untreated same-run comparator to pair against. Reporting that as a sign test
+would have been a statistic with no design behind it.
+
+**What is measured, and what is not.**
+
+- Injection is graded on researcher / implementer / reviewer only. **Verifier is
+  excluded by design** — it receives zero lessons and holds 98 of 125 failures
+  plus 20.8% of retries, so the node type with nearly all the variance is
+  structurally unmeasurable. Closing that is a delivery change, not a
+  measurement one.
+- Researcher is 52% of exposures and 0.39% retried. It stays in the table marked
+  `saturated` rather than being hidden, because hiding it would make the
+  denominator look healthier than it is.
+- `c:<n>` context_v2 ids are stored `stable=0` and excluded from every rate: the
+  index is a position in a kickoff, so two runs' `c:0` are different constraints.
+- Cost is not an outcome — `cost_usd` is NULL for three quarters of
+  researcher/implementer/reviewer attempts.
+
+**Measured on the live store (2026-11-10, read-only copy):** 20,104 exposure
+rows across 487 runs, of which the primary pool is 794 run-nodes — 778 clean, 16
+not. **15 held-out rows on 4 lessons.** That is the whole control arm, which is
+why every clean-arm contrast prints `insufficient_held_out` with `value=None`
+and `p=None`: there is a number the design could produce, and the arm has not yet
+earned the right to print it.
+
+**The arm was partly an artefact, and the diagnostic says which part.** Of the
+two `pattern:` lessons carrying held rows, neither is reachable under the current
+`sha1("kind:id")` bucket at any allowed rate, so those flags came from a second
+writer (the run-level `context_v2` arm stamping an arbitrary lesson). In the
+other direction, `theme:th-1e42cc51c68c` sits squarely in the arm yet has 641
+injections, all `held_out=0` — but every one of them predates the holdout
+shipping on 2026-11-08, so that is history, not a missing sink. `arm_diagnostic`
+separates the two by comparing each lesson's injections against the timestamp of
+the first held row, and only a lesson injected *since* the arm existed with no
+withheld row is reported as a channel that supplies no sink.
+
+The holdout now covers the v2 node block too: `t:` / `f:` / `p:` items are
+withheld per lesson inside a `v2` run and recorded through the existing
+`held_out=1` path. Kickoff constraints (`c:`) are never withheld — withholding a
+constraint changes the task, not the guidance — and the planner block is left
+intact so `acknowledgements()` still validates a cited id. `MO_LESSON_HOLDOUT_RATE=0`
+turns both tiers off at once.
+
+Until a lesson actually clears the gate, `effect` is exactly `0.0` and selection
+is byte-for-byte what it was: `_exploration(0, 0) = sqrt(ln 1 / 1) = 0`, so an
+unmeasured ledger adds nothing to the score. The term reorders lesson selection;
+it never prunes, retires, or rewrites a lesson.
 
 ---
 

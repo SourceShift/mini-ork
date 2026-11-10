@@ -478,6 +478,28 @@ def _lesson_holdout_rate() -> float:
     return min(max(rate, 0.0), _LESSON_HOLDOUT_RATE_MAX)
 
 
+def lesson_held_out(kind: str, lesson_id: str, *,
+                    rate: float | None = None) -> bool:
+    """Public name for the arm predicate — the one source of the flag.
+
+    ``_lesson_held_out`` delegates here, so a diagnostic (the ``arm:`` footer of
+    ``mini-ork metrics lessons``) asks exactly the question the renderer asks
+    instead of re-deriving the hash. Passing ``rate`` answers "would this id be
+    in the arm at that rate?" without touching the environment.
+    """
+    if rate is None:
+        rate = _lesson_holdout_rate()
+    else:
+        rate = min(max(float(rate), 0.0), _LESSON_HOLDOUT_RATE_MAX)
+    if rate <= 0.0:
+        return False
+    lesson_id = str(lesson_id or "").strip()
+    if not lesson_id:
+        return False
+    digest = hashlib.sha1(f"{kind}:{lesson_id}".encode("utf-8")).hexdigest()
+    return (int(digest[:8], 16) / 0xFFFFFFFF) < rate
+
+
 def _lesson_held_out(kind: str, lesson_id: str) -> bool:
     """True when this lesson belongs in the held-out arm.
 
@@ -491,14 +513,7 @@ def _lesson_held_out(kind: str, lesson_id: str) -> bool:
     through two different channels (a gradient and a theme) is two different
     lessons.
     """
-    rate = _lesson_holdout_rate()
-    if rate <= 0.0:
-        return False
-    lesson_id = str(lesson_id or "").strip()
-    if not lesson_id:
-        return False
-    digest = hashlib.sha1(f"{kind}:{lesson_id}".encode("utf-8")).hexdigest()
-    return (int(digest[:8], 16) / 0xFFFFFFFF) < rate
+    return lesson_held_out(kind, lesson_id)
 
 
 def _lesson_reserved(sources: list[dict] | None, kind: str,

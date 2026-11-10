@@ -827,6 +827,69 @@ def _l3_held_out_never_populated(ctx: _Ctx, domain: str, rule_id: str) -> list[C
     )]
 
 
+#: The held-out arm has to reach this many injections before it is worth
+#: calling an arm at all. Deliberately *not* ``lesson_outcomes.DEFAULT_MIN_N``:
+#: that floor is per lesson, and 30 rows spread over a dozen lessons still
+#: leaves every lesson at ``insufficient_held_out``. This is the weaker "it
+#: exists" check that fires long before either.
+_HOLDOUT_ARM_FLOOR = 30
+
+
+def _l13_holdout_arm_underfilled(
+        ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
+    """Some injections are held out, but far too few for one lesson to be graded.
+
+    L3 fires only at exactly zero, so an arm of 15 rows over 4 lessons reads as
+    healthy to it while ``lesson_outcomes.clean_arm_contrast`` still reports
+    ``insufficient_held_out`` for every one of those lessons — nothing is ever
+    measured, and the rerank penalty that waits on ``measured`` never fires.
+    """
+    _require_table(ctx, "lesson_injections")
+    _require_column(ctx, "lesson_injections", "held_out")
+    held = _scalar(ctx, "SELECT count(*) FROM lesson_injections WHERE held_out=1")
+    if held == 0:
+        # Zero is L3's finding; reporting it here too would open two tickets
+        # for one fix and make the queue look busier than the defect is.
+        raise _SkipRule("no held-out rows — L3 owns that gap")
+    if held >= _HOLDOUT_ARM_FLOOR:
+        raise _GapClosed(
+            f"{held} held-out injections (floor {_HOLDOUT_ARM_FLOOR})")
+    # Only checked once the rule can actually fire: a home whose truncated
+    # table makes this unreadable should read as ``probe_broken``, but a
+    # healthy minimal fixture must not turn into one.
+    for column in ("ts", "source_kind", "source_id"):
+        _require_column(ctx, "lesson_injections", column)
+    row = ctx.con.execute(
+        "SELECT count(DISTINCT source_kind || ':' || source_id), MIN(ts), MAX(ts)"
+        " FROM lesson_injections WHERE held_out=1").fetchone()
+    lessons = int(row[0] or 0)
+    first_day = _dt.datetime.fromtimestamp(
+        int(row[1]), _dt.timezone.utc).date().isoformat() if row[1] else "never"
+    last_day = _dt.datetime.fromtimestamp(
+        int(row[2]), _dt.timezone.utc).date().isoformat() if row[2] else "never"
+    return [_cand(
+        ctx, domain, rule_id,
+        kind="coverage_gap",
+        title="the held-out arm is non-empty but far too thin to measure a lesson",
+        evidence_key="table:lesson_injections:held_out:under-floor",
+        files=("mini_ork/context_assembler.py", "mini_ork/cli/execute_handlers.py"),
+        detail=f"{held} held-out injections over {lessons} distinct lessons, "
+               f"{first_day} → {last_day}; floor is {_HOLDOUT_ARM_FLOOR}. "
+               "Every lesson still reads insufficient_held_out, so no per-lesson "
+               "effect can ever be measured and the rerank penalty stays inert.",
+        evidence={"table": "lesson_injections", "held_out": held,
+                  "distinct_lessons": lessons, "first_day": first_day,
+                  "last_day": last_day, "floor": _HOLDOUT_ARM_FLOOR},
+        reach=_HOLDOUT_ARM_FLOOR,
+        fix_hint=(
+            "Record the withheld sibling for every delivered channel at "
+            "MO_LESSON_HOLDOUT_RATE (the v2 node block included), and check "
+            "`mini-ork metrics lessons` arm: a lesson inside the arm with many "
+            "injections and zero held rows means its channel supplies no sink."),
+        success_metric=f"lesson_injections held_out count >= {_HOLDOUT_ARM_FLOOR}",
+    )]
+
+
 def _l4_malformed_timestamps(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
     """``:fZ`` suffixes make these text timestamps unsortable."""
     targets = (("promotion_records", "decided_at"), ("apply_attempts", "created_at"))
@@ -1820,6 +1883,9 @@ LEARNING_RULES: tuple[tuple[str, Rule], ...] = (
     ("L10", _l10_lesson_conflicts_never_found),
     ("L11", _l11_diagnosis_unlabelled),
     ("L12", _l12_verifier_pass_rate_regression),
+    # L13 sits after L12 rather than beside L3 so the id never collides with a
+    # rule added in between; it is L3's sibling, not L3's replacement.
+    ("L13", _l13_holdout_arm_underfilled),
 )
 
 ROUTING_RULES: tuple[tuple[str, Rule], ...] = (

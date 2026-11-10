@@ -759,6 +759,43 @@ _ITEM_UCB_LAST_RESOLVE = 0.0
 _ITEM_UCB_RESOLVE_INTERVAL = 60.0
 
 
+def _lesson_effects(
+    db_path: str | None, *items: list[dict]
+) -> tuple[dict[str, float], dict[str, dict]]:
+    """``(scores, record)`` for the lessons about to be ranked.
+
+    ``scores`` maps item id to its measured node effect (each id in the v2 pack
+    is the ledger's ``context_v2`` source id, so the lookup is by that pair).
+    ``record`` keeps the full verdict — effect, n, status — for the pack
+    sidecar, so a lesson that fell out of the top-k months ago can be explained
+    from ``context-pack.v2.json`` without re-deriving the statistics.
+
+    Never raises: a missing table, a declined rerank or a broken store yields
+    ``({}, {})`` and selection keeps the pre-effect order.
+    """
+    try:
+        from mini_ork.learning import lesson_outcomes  # noqa: PLC0415
+
+        pairs = [("context_v2", str(item.get("id")))
+                 for group in items for item in group or []
+                 if isinstance(item, dict) and item.get("id")]
+        if not pairs:
+            return {}, {}
+        verdicts = lesson_outcomes.effects(pairs, db=db_path)
+        scores: dict[str, float] = {}
+        record: dict[str, dict] = {}
+        for _, ident in pairs:
+            verdict = verdicts.get(f"context_v2:{ident}")
+            if not verdict:
+                continue
+            scores[ident] = float(verdict.get("value") or 0.0)
+            if verdict.get("value"):
+                record[ident] = verdict
+        return scores, record
+    except Exception:  # noqa: BLE001 — selection falls back to prior order
+        return {}, {}
+
+
 def _resolve_item_utility_once(db_path: str | None, home: str) -> None:
     """Fold finished runs' ledgers into the utility tally, lazily.
 
@@ -832,13 +869,18 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
     # the cut so ``[:max_clusters]`` keeps the best-scored clusters rather than
     # the best-ordered ones. Any failure leaves the pre-change order in place.
     item_ranking = "prior-order"
+    effects_used: dict[str, dict] = {}
     try:
         from mini_ork.learning import item_utility
         if item_utility.enabled():
             db_path = _db_path(db)
             _resolve_item_utility_once(db_path, context_env("MINI_ORK_HOME"))
-            ranked_clusters = item_utility.rerank(clusters, db=db_path)
-            ranked_themes = item_utility.rerank(themes, db=db_path)
+            effect_scores, effects_used = _lesson_effects(
+                db_path, clusters, themes)
+            ranked_clusters = item_utility.rerank(
+                clusters, db=db_path, effects=effect_scores)
+            ranked_themes = item_utility.rerank(
+                themes, db=db_path, effects=effect_scores)
             clusters, themes = ranked_clusters, ranked_themes
             item_ranking = "simutil-ucb"
     except Exception:  # noqa: BLE001 — injection path keeps the old order
@@ -865,6 +907,10 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         # Which ranking produced the theme/cluster order: the pre-change
         # prior, or the injection-outcome-adjusted SimUtil-UCB score.
         "item_ranking": item_ranking,
+        # Only the lessons whose measured effect actually moved the order.
+        # Empty is the honest state while no lesson clears its arm, and the
+        # key is always present so a reader never has to guess.
+        "effects": effects_used,
         # R13 reads this marker to tell a run whose pack was built with the
         # once-only theme wiring from one that predates it (``v2_legacy``).
         "themes_once": True,
@@ -1107,17 +1153,82 @@ def source_entries(pack: dict, ids: list[str], *, held_out: bool = False) -> lis
     return out
 
 
+#: Pack item kinds this node may be withheld from. A kickoff constraint
+#: (``c:``) is deliberately absent: withholding it changes the task rather than
+#: the guidance, and its id is positional per kickoff (``lesson_outcomes``
+#: stores it ``stable=0`` and excludes it from every rate) so it could not be
+#: compared across runs even if it were withheld.
+_WITHHOLDABLE_KINDS = frozenset({"theme", "finding", "prior_attempt"})
+
+
+def _withhold(pack: dict, *, reserve: bool = True) -> tuple[dict, list[str]]:
+    """The node-visible pack and the ids the per-lesson arm reserves.
+
+    The predicate is the v1 one (``context_assembler.lesson_held_out``) asked
+    with the key the ledger uses — ``("context_v2", item_id)`` — because a v2
+    item's ledger ``source_id`` *is* its pack id. Renders nothing here: the
+    caller renders the trimmed copy, so a withheld item cannot leak into the
+    prompt text through a path this function does not know about.
+
+    ``reserve=False`` (no ``sources`` sink) withholds nothing, the same rule
+    ``context_assembler._lesson_reserved`` applies: a lesson withheld from a
+    render that cannot record it is a silent degradation of the prompt, and a
+    preview that shows less than the node gets without saying why is worse
+    than a preview that shows the whole pack.
+
+    The returned pack is a shallow copy with three lists filtered; every other
+    key (``item_ids``, ``constraints``, ``effects``) is shared unchanged, so
+    ``acknowledgements`` still validates a planner that cites a withheld id —
+    the pack records what was *offered*, the ledger records what was *given*.
+    """
+    if not reserve:
+        return pack, []
+    try:
+        from mini_ork.context_assembler import lesson_held_out  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — a prompt render never fails on this
+        return pack, []
+    withheld = [
+        item_id for item_id, kind in item_kinds(pack).items()
+        if kind in _WITHHOLDABLE_KINDS and lesson_held_out("context_v2", item_id)
+    ]
+    if not withheld:
+        return pack, []
+    drop = set(withheld)
+    trimmed = dict(pack)
+    for key in ("themes", "file_findings", "prior_attempts"):
+        trimmed[key] = [
+            item for item in (pack.get(key) or [])
+            if not (isinstance(item, dict) and str(item.get("id")) in drop)
+        ]
+    return trimmed, withheld
+
+
 def node_block(run_dir: str, node_type: str, run_id: str, *, task_class: str = "",
                sources: list[dict] | None = None) -> str:
     """The v2 block for one LLM node, or ``""`` unless this run's arm is ``v2``.
+
     Appends one ``kind: "context_v2"`` source per injected item id, carrying
-    the item's own kind (:func:`source_entries`)."""
+    the item's own kind (:func:`source_entries`), and one ``held_out`` source
+    per item the per-lesson arm reserved (:func:`_withhold`). Only this node
+    block is trimmed: the planner's render is untouched, so a plan that cites a
+    withheld id is still scored against the full pack. A run in the per-run
+    ``holdout`` arm never reaches here (``arm()`` is not ``v2``), which is what
+    keeps the two arms from being counted twice.
+    """
     if not run_dir or arm(run_id) != "v2":
         return ""
     pack = pack_for_run(run_dir, task_class=task_class, run_id=run_id)
-    text = render(pack, node_type) if pack else ""
+    visible, withheld = (_withhold(pack, reserve=sources is not None)
+                         if pack else (pack, []))
+    text = render(visible, node_type) if visible else ""
     if text and sources is not None:
-        sources.extend(source_entries(pack, rendered_ids(text, pack)))
+        sources.extend(source_entries(visible, rendered_ids(text, visible)))
+    if withheld and sources is not None:
+        # Recorded even when nothing rendered: the reservation is a fact about
+        # what the node was offered, and this row is the only evidence the
+        # lesson was ever in front of it. `MO_LESSON_HOLDOUT_RATE=0` makes
+        # `_withhold` return nothing, which disables both tiers at once.
+        sources.extend(source_entries(pack, withheld, held_out=True))
     return text
 
 

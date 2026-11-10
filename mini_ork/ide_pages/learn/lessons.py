@@ -308,7 +308,33 @@ def _injection_text(home: Path, conn, kind: str, source_id: str) -> str:
     uses = int(entry.get("uses") or 0)
     if not uses:
         return "not given to any agent yet"
-    return f"{uses}× · last {_epoch_date(entry.get('last_ts'))}"
+    text = f"{uses}× · last {_epoch_date(entry.get('last_ts'))}"
+    outcome = _outcome_text(home, conn, kind, source_id)
+    return f"{text} · {outcome}" if outcome else text
+
+
+def _outcome_text(home: Path, conn, kind: str, source_id: str) -> str:
+    """``clean 93% (n=778)`` for the nodes that received this lesson.
+
+    ``""`` when there is nothing honest to say: the 0092 table is absent, the
+    lesson never reached a graded node, or no node had a first attempt
+    recorded. The count is printed beside the rate on purpose — a 100% over
+    four nodes reads as four nodes.
+    """
+    if not conn.has_table("lesson_outcome_exposures"):
+        return ""
+    from mini_ork.learning.lesson_outcomes import lesson_summary  # noqa: PLC0415
+
+    summary = lesson_summary(str(home / "state.db"), kind=kind, ident=source_id)
+    if summary.get("status") == "unavailable":
+        return ""
+    rate = summary.get("clean_rate_primary")
+    n = int(summary.get("n_primary") or 0)
+    if rate is None:
+        rate, n = summary.get("clean_rate"), int(summary.get("n_nodes") or 0)
+    if rate is None:
+        return ""
+    return f"clean {round(float(rate) * 100)}% (n={n})"
 
 
 def _run_title(home: Path, run_id: Any) -> tuple[str, str]:

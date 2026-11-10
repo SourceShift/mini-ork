@@ -1123,6 +1123,51 @@ def _reclassify_con(con: sqlite3.Connection) -> int:
     return changed
 
 
+def _db_file(con: sqlite3.Connection) -> str | None:
+    """The file backing ``con``'s ``main`` database, or None for ``:memory:``."""
+    try:
+        for _seq, name, path in con.execute("PRAGMA database_list"):
+            if str(name) == "main" and path:
+                return str(path)
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _theme_effects(con: sqlite3.Connection, theme_ids: list[str]) -> dict[str, float]:
+    """``{theme_id: measured effect}`` for the candidates, or ``{}``.
+
+    The selector is handed a live connection, while ``lesson_outcomes`` reads
+    by path, so the path is taken from the connection rather than plumbed
+    through every call site. Everything that is not ``measured`` — the whole
+    ledger today — resolves to ``0.0`` and the ranking is unchanged. Any
+    failure is ``{}``: this runs while a prompt is being built, and a missing
+    effect must never cost a node its lessons.
+    """
+    if not theme_ids:
+        return {}
+    path = _db_file(con)
+    if not path:
+        return {}
+    try:
+        from mini_ork.learning import item_utility, lesson_outcomes  # noqa: PLC0415
+
+        if not (item_utility.enabled() and lesson_outcomes.effect_rerank_enabled()):
+            return {}
+        got = lesson_outcomes.effects(
+            [("theme", theme_id) for theme_id in theme_ids], db=path)
+    except Exception:  # noqa: BLE001 — selection never fails on a measurement
+        return {}
+    out: dict[str, float] = {}
+    for key, value in got.items():
+        _kind, _, ident = str(key).partition(":")
+        try:
+            out[ident] = float(value.get("value") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def select_verified_themes(
     con: sqlite3.Connection, task_class: str, limit: int
 ) -> list[dict]:
@@ -1144,7 +1189,11 @@ def select_verified_themes(
 
     Within a tier the order is ``n_runs DESC, last_seen DESC``; the tier always
     beats ``n_runs``, so one own-class theme outranks every wildcard however
-    many runs the wildcard has. A candidate whose ``lesson_text`` token set
+    many runs the wildcard has. A *measured* per-lesson node effect
+    (``lesson_outcomes.effects``) is added inside the tier as one term of the
+    same SimUtil-UCB score the v2 pack uses (``item_utility.score``), so a
+    theme that measurably hurts can fall out of the ``limit`` — unmeasured
+    lessons contribute exactly ``0.0`` and keep today's order. A candidate whose ``lesson_text`` token set
     (``_tokenize``) overlaps an already-selected one by
     ``|A∩B| / min(|A|,|B|) >= 0.8`` is dropped as a near-duplicate — a check
     against the selected page, not the whole pool, so distinct lessons in one
@@ -1185,9 +1234,34 @@ def select_verified_themes(
         tier = _tier(str(r[3] or ""))
         if tier is not None:
             ranked.append((tier, r))
-    # Stable sort: rows are already in n_runs DESC, last_seen DESC order, so
-    # sorting on the tier alone preserves that order within each tier.
-    ranked.sort(key=lambda tr: tr[0])
+    effects = _theme_effects(con, [str(r[0]) for _tier_no, r in ranked])
+    if not effects:
+        # Stable sort: rows are already in n_runs DESC, last_seen DESC order,
+        # so sorting on the tier alone preserves that order within each tier.
+        ranked.sort(key=lambda tr: tr[0])
+    else:
+        # Same tier-by-tier pass, with rank-as-similarity for the rows that
+        # are already in support order: with every effect at 0.0 this is
+        # exactly the stable tier sort above, so an unmeasured ledger cannot
+        # change what any run sees.
+        from mini_ork.learning import item_utility  # noqa: PLC0415 — heavy
+
+        by_tier: dict[int, list[tuple[int, tuple]]] = {}
+        for entry in ranked:
+            by_tier.setdefault(entry[0], []).append(entry)
+        ordered: list[tuple[int, tuple]] = []
+        for tier_no in sorted(by_tier):
+            group = by_tier[tier_no]
+            n = len(group)
+            scored = [
+                (item_utility.score(
+                    1.0 - pos / n, 0, 0, 0,
+                    float(effects.get(str(entry[1][0])) or 0.0)), pos, entry)
+                for pos, entry in enumerate(group)
+            ]
+            scored.sort(key=lambda s: (-s[0], s[1]))
+            ordered.extend(entry for _score, _pos, entry in scored)
+        ranked = ordered
 
     out: list[dict] = []
     selected_tokens: list[set[str]] = []
