@@ -5,7 +5,9 @@
 
 **Answer.** Of 851 tasks whose last self-report was `pending` / `in_progress` / `failed` /
 `blocked`, **554 (65%) had already shipped**, **61 (7%) are superseded**, **118 (14%) left no
-trace either way**, and **118 (14%) are genuinely still open**.
+trace either way**, and **118 (14%) are genuinely still open**. Recounted 2026-11-10: 567
+shipped and 105 still open — thirteen rows closed in the week after the audit (see
+"Result").
 
 The failure mode is not false completion claims. It is **stale re-emission**: a session
 finishes work, stops mentioning the task, and ContextNest keeps the last thing it said.
@@ -38,20 +40,19 @@ Every verdict carries a receipt. The vocabulary is `DONE` (commit / file / branc
 | E engine core + RSI | 75 | 52 | 12 | 7 | 4 |
 | F zed IDE frontend | 133 | 80 | 28 | 10 | 15 |
 | G1 IDE surface, 10-14→11-04 | 96 | 60 | 16 | 3 | 17 |
-| G2 IDE surface, 10-07→10-13 | 101 | 74 | 11 | 1 | 15 |
-| **total** | **855** | **571** | **105** | **61** | **118** |
+| G2 IDE surface, 10-07→10-13 | 97 | 70 | 11 | 1 | 15 |
+| **total** | **851** | **567** | **105** | **61** | **118** |
 
-Recounted 2026-11-10 by reading the status column of every row rather than
-trusting the totals above them: **+17 DONE / −13 OPEN** since the audit's own
-pass (`threads-builder`, `reflect-timeout-shape`, `sweep-node`, `bif-e1`,
-`on-event-hook`, `guard-primary-stash-u`, `rrl-build`, `b2-preflight`,
-`quarantine-cleanup` among them — each closed row carries its commit or decision
-record). G2 counts 101
-rows, not 97, because four rows carry a struck-through id with an empty status
-column (a row closed in place); they are `DONE` here, which is where G2's +4
-comes from.
+Recounted 2026-11-10 by tallying the verdict column of every row in the eight
+sibling files rather than trusting the totals above them: **851 rows, 567 DONE,
+105 OPEN, 61 STALE, 118 UNKNOWN**. Because the four verdicts partition the same
+851 rows, OPEN falling 118 → 105 means exactly thirteen rows moved OPEN → DONE
+and nothing else moved; STALE and UNKNOWN are unchanged, and no row was added or
+dropped. Which thirteen is a per-group question — each group file carries a
+"Closed since the audit" section naming its own, each with the commit or decision
+record that closed it.
 
-Per-row evidence for all 855 lives in the sibling files (`A-git-mo.md` … `G2-ide-mo-old.md`).
+Per-row evidence for all 851 lives in the sibling files (`A-git-mo.md` … `G2-ide-mo-old.md`).
 
 ## The open tasks (118 at audit time, 105 as of 2026-11-10)
 
@@ -194,12 +195,14 @@ alone exempted every credential under `tests/`.
 
 ## Cross-cutting findings
 
-1. **Stale emission, not dishonesty.** 65% of "open" work had landed. A session that
+1. **Stale emission, not dishonesty.** 65% of "open" work had landed on audit day,
+   67% a week later. A session that
    finishes a task usually stops naming it, so its last record freezes at `in_progress`.
    A todo queue fed by such blocks decays toward optimism-in-reverse: it accumulates tasks
    that are already done.
 2. **Task ids multiply; work items do not.** 6 sandbox rows → 3 providers, 3 emitter rows →
-   1 sweep, 5 SDD rows → 1 chain. Deduping by `task_id` counts emissions, not work.
+   1 sweep, 4 SDD rows → 1 chain (a fifth, `b2-preflight`, closed 2026-11-10 as
+   `mini-ork board preflight`). Deduping by `task_id` counts emissions, not work.
 3. **A rewritten file hides an unfixed defect.** G2 first read the `flow.rs` diff as proof the
    rubric-score defect was fixed; the `score` branch still rendered `-1` until 2026-11-09
    (`mini-ork-ui` `2480d71`). Verify the branch, not the diff.
@@ -281,8 +284,9 @@ was written to delete moot trees, and its probe found the opposite of a moot tre
   inbox rows were still pending. Tests: 17 in `test_approvals_resume_waiting_node_py.py`.
 
 Neither row existed in this audit. They are recorded here rather than added to A's table,
-because adding rows after the fact would move the 126-row denominator every total in this
-file is quoted against.
+because A's 126 rows are the tasks the harvest *emitted*: a task found in a parked worktree
+was never emitted, so a row for it would answer a different question from every other row in
+the table.
 
 ## Caveat on the group tables
 

@@ -10,7 +10,7 @@ Between 2026-10-25 and 2026-10-31 the RSI cycle and its review loop parked seven
 checkouts under `$MINI_ORK_WORKTREES_DIR` (default
 `/Volumes/docker-ssd/ps/mini-ork-worktrees/`): five `review-*` trees holding the
 exact commit a review panel had just judged, and two branch trees whose commits
-were later re-landed. Nothing in the workflow ever reads them — a review tree is
+had already reached `main` (one re-landed under a new SHA, one a plain ancestor). Nothing in the workflow ever reads them — a review tree is
 a frozen snapshot for a human to look at, and once the reviewed change is on
 `main` the snapshot is a second copy of a file you can read from `git show`. The
 `quarantine release` verb was fixed (`9f1a93a5`, it now drops the file claims a
@@ -86,9 +86,12 @@ The general lesson is the reason this ADR probes instead of trusting names: a
   behind, `zed-acp-slice0` 2798 behind); deleting a tree another session is
   using is a different risk from deleting a review snapshot, so that sweep needs
   its own check-and-act pass and its own record.
-- After the seven removals the directory held **92** entries of which **57** are
-  registered worktrees — 44 are unregistered leftovers, the directory half of a
-  checkout whose git registration went away in an earlier clean. They are also
-  out of scope here: a leftover directory can still hold untracked run output,
-  so each needs its own content check before deletion. Recorded so the next
-  sweep does not mistake them for this ADR's unfinished business.
+- The leftover population, measured 2026-11-10 after the seven removals
+  (`ls -1 $MINI_ORK_WORKTREES_DIR`, cross-checked against
+  `git worktree list --porcelain`): **95 directories, 50 of them worktrees
+  registered to this repo** (a 51st registration sits nested inside a scratch
+  tree), so **45 are unregistered leftovers** — the directory half of a checkout
+  whose git registration went away in an earlier clean. They are out of scope
+  here: a leftover directory can still hold untracked run output, so each needs
+  its own content check before deletion. Recorded so the next sweep does not
+  mistake them for this ADR's unfinished business.
