@@ -2,6 +2,12 @@ version: "0.1.0"
 task_class: bdd_first_delivery
 description: "BDD-first multi-epic delivery: decompose → parallel (spec_author + implementer) → bdd_runner → reviewer → publisher"
 
+# Per-sub-epic dispatch is NOT a workflow field. `dispatch_mode: partitioned`
+# groups nodes by type at the same dependency level; the per-sub-epic fan-out
+# lives in the recipe's own lib/dispatch.sh (bfd_list_sub_epics reads the
+# decomposer's output) and, for engine-side work, in
+# mini_ork.orchestration.item_fanout.
+
 nodes:
   - name: decomposer
     type: planner
@@ -14,27 +20,23 @@ nodes:
     model_lane: spec_author
     prompt_ref: prompts/spec_author.md
     dispatch_mode: partitioned
-    partition_key: sub_epic_id
 
   - name: implementer
     type: implementer
     model_lane: worker
     prompt_ref: prompts/implementer.md
     dispatch_mode: partitioned
-    partition_key: sub_epic_id
 
   - name: bdd_runner
     type: verifier
     verifier_ref: verifiers/playwright_runner.py
     dispatch_mode: partitioned
-    partition_key: sub_epic_id
 
   - name: spec_reviewer
     type: reviewer
     model_lane: spec_reviewer
     prompt_ref: prompts/spec_reviewer.md
     dispatch_mode: partitioned
-    partition_key: sub_epic_id
 
   - name: reviewer
     type: reviewer

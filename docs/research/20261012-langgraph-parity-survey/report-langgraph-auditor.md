@@ -366,28 +366,35 @@ divergent-by-design: a sub-recipe node (`type: subrecipe` /
 
 `langgraph`'s `Send` is a per-input routing primitive that lets a node fan out one sub-invocation per element of an input list, and the runtime collects the partial states into a single reducer. — (unverified)
 
-mini-ork's `dispatch_mode: partitioned` is the map primitive — a node
-declared `partitioned` is sharded by an item key declared on the node's
-`partition_key` field (see `schemas/workflow.schema.json` §`WorkflowNode`
-at the `partition_key` property, line ~155), and the executor writes
-one attempt per partition. The fan-out dispatch itself is real (the
-mode is one of the four values in the `dispatch_mode` enum and the
-executor honors it at `mini_ork/cli/execute.py` ~`1097`); the reduce
-step is narrower than `langgraph`'s — there is no in-recipe `merge:`
-enum on the output schema, so a recipe that needs list-reduction
-behavior either names a downstream `transform` node (per the
-`WorkflowNode.type` enum) or relies on the filesystem-level last-writer
-behavior. A custom reducer is exposed via
+**Correction (2026-11-10):** this section originally described
+`dispatch_mode: partitioned` as sharding by a per-node `partition_key`
+field. That field never existed in the executor — no Python read it, the
+compiler dropped it silently, and `partitioned` groups nodes **by node
+type** at the same dependency level (`mini_ork/cli/execute.py`, the
+`partitioned` branch of the readiness-wave dispatch). The property has been
+removed from `schemas/workflow.schema.json` and the compiler now refuses it
+with a `WorkflowCompileError` naming the replacement.
+
+So mini-ork has **no** per-item map primitive at the workflow level. The
+sanctioned data-driven fan-out is `mini_ork/orchestration/item_fanout.py`: a
+`transform` node writes a JSON work list, and an implementer submode (or a
+registered node handler) runs one item per worker from a bounded pool, with a
+per-item checkpoint (`recipes/goal-loop` is the reference). The reduce step
+is narrower than `langgraph`'s — there is no in-recipe `merge:` enum on the
+output schema, so a recipe that needs list-reduction either names a
+downstream `transform` node (per the `WorkflowNode.type` enum) or relies on
+filesystem-level last-writer behavior. A custom reducer is available via
 `mini_ork.cli.execute.register_implementer_submode(recipe, node_id, fn)`
-(`mini_ork/cli/execute_handlers.py:892`) for the rare cases that need a
-real `Annotated[..., reducer]`.
+(`mini_ork/cli/execute_handlers.py:892`) for the rare cases that need a real
+`Annotated[..., reducer]`.
 
 ```yaml
-# mini-ork map-reduce: partitioned dispatch (real per schemas/workflow.schema.json)
+# mini-ork map-reduce: partitioned dispatch groups by node TYPE.
+# There is no partition_key. For one invocation per input item, use
+# mini_ork.orchestration.item_fanout from a transform node.
 - name: lens_node
   type: implementer
   dispatch_mode: partitioned
-  partition_key: lens_id
   # outputs declared per schemas/workflow.schema.json §WorkflowNode.outputs;
   # no `merge:` enum — reduce is downstream-transform.
 edges:

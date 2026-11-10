@@ -241,6 +241,15 @@ One of the "held exactly" claims has since changed — it was true on audit day,
 - **`native_gates.py` `indeterminate → pass`** — open on audit day, closed by `a5001821`
   once the hackability positive control moved from the seeded weakness into the harness
   (`hackability.control()`). `D-lane-framework.md`'s row is **DONE**.
+- **The `partition_key` finding** — the probe above ("zero `partition_key` readers") was
+  right, and the conclusion drawn from it was wrong. It was not a missing feature to wire
+  up: `dispatch_mode: partitioned` groups nodes by *type*, and the sanctioned data-driven
+  fan-out is `mini_ork.orchestration.item_fanout` (a transform writes the work list; an
+  implementer submode runs one item per worker). So the field is now *refused* —
+  `mini_ork/workflow/compiler.py:272` raises `WorkflowCompileError` naming `item_fanout`,
+  the property is gone from `schemas/workflow.schema.json`, and the four partitioned nodes
+  in `recipes/bdd-first-delivery/workflow.yaml` no longer declare it.
+  `E-engine-rsi.md`'s `sweep-node` row is **DONE**.
 
 ## Caveat on the group tables
 

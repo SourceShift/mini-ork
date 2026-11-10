@@ -269,6 +269,18 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         raise WorkflowCompileError(
             f"node {name} type {node_type!r} cannot declare outputs because its handler does not publish artifacts"
         )
+    if "partition_key" in details:
+        # ``dispatch_mode: partitioned`` groups by node *type*; nothing reads a
+        # partition key, so declaring one was a silent no-op: the recipe
+        # described a fan-out it never got. Refuse it rather than let a second
+        # partitioning mechanism grow beside ``item_fanout``.
+        raise WorkflowCompileError(
+            f"node {name} declares partition_key, which no executor honours "
+            "(dispatch_mode: partitioned groups by node type). Fan out over a "
+            "data-driven work list with mini_ork.orchestration.item_fanout — "
+            "a transform writes the list, an implementer submode runs one item "
+            "per worker (recipes/goal-loop is the reference)"
+        )
     strict_handshake = details.get("strict_handshake", False)
     if not isinstance(strict_handshake, bool):
         raise WorkflowCompileError(f"node {name} strict_handshake must be a boolean")

@@ -168,10 +168,6 @@
           "maximum": 5,
           "default": 1
         },
-        "partition_key": {
-          "type": "string",
-          "description": "Artifact or item key used to partition this node's work."
-        },
         "requires_capabilities": {
           "type": ["string", "array"],
           "items": { "type": "string" },

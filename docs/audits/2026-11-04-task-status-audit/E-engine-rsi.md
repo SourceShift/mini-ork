@@ -5,9 +5,10 @@
 
 ## Summary
 
-Of 75 claimed tasks: **51 DONE**, **13 OPEN**, **7 STALE**, **4 UNKNOWN**.
+Of 75 claimed tasks: **52 DONE**, **12 OPEN**, **7 STALE**, **4 UNKNOWN**
+(recounted 2026-11-10 after `sweep-node` closed).
 
-The RSI/learning half is in much better shape than the claims suggested: the rsi-cycle C1–C5 graph, Tier-0 fixes, lane unblock, reflector deadline cap, oracle-integrity instrument, held-out/injection ledger, benchmark_delta computation (785963d0) and the L9 called-writer fix (ef55e7d8) all have concrete receipts (commits, docs, or live DB rows) — with one correction (2026-11-08): the `benchmark_delta` writeback **computes nothing**, because `benchmark_results` / `benchmark_tasks` have no producer anything calls; the repair is the candidate↔run link, not a merge (`8a6cc25e` makes L9 say so instead of closing hollow). The engine-core migration and path work also mostly landed. What genuinely still needs doing clusters in five places: (1) the **anytime-valid certificate (E3) is built but never merged** — it exists only as commit `4ff3a0aa` under `refs/mini-ork/ckpt/*`, not on `main`, so the RSI "held-out + certificate" item is half-delivered; (2) ~~`fetch_run_recipes` guard~~ **DONE** `c34cc5db` — all seven `task_runs` readers now guard on `has_table`, so a pre-migration DB returns empty instead of raising; (3) **`partition_key` is declarative only** — the schema and recipes carry it but no Python reads it, so there is no data-driven sweep node; (4) **environment debt**: the 401 `KIMI_API_KEY` is still exported in `config/secrets.local.sh`, 7 `mo-e2e-node-host` images (≈12.8 GB) remain, and a root-owned electron cache is still on disk; (5) **IDE/orca and journey work is graded but not closed** — 35 partial + 1 cli-only Orca rows and a 15-journey corpus against a 200 target.
+The RSI/learning half is in much better shape than the claims suggested: the rsi-cycle C1–C5 graph, Tier-0 fixes, lane unblock, reflector deadline cap, oracle-integrity instrument, held-out/injection ledger, benchmark_delta computation (785963d0) and the L9 called-writer fix (ef55e7d8) all have concrete receipts (commits, docs, or live DB rows) — with one correction (2026-11-08): the `benchmark_delta` writeback **computes nothing**, because `benchmark_results` / `benchmark_tasks` have no producer anything calls; the repair is the candidate↔run link, not a merge (`8a6cc25e` makes L9 say so instead of closing hollow). The engine-core migration and path work also mostly landed. What genuinely still needs doing clusters in five places: (1) the **anytime-valid certificate (E3) is built but never merged** — it exists only as commit `4ff3a0aa` under `refs/mini-ork/ckpt/*`, not on `main`, so the RSI "held-out + certificate" item is half-delivered; (2) ~~`fetch_run_recipes` guard~~ **DONE** `c34cc5db` — all seven `task_runs` readers now guard on `has_table`, so a pre-migration DB returns empty instead of raising; (3) ~~**`partition_key` is declarative only**~~ **DONE (2026-11-10)** — the field was never read by an executor (the compiler dropped it silently), so it is now *refused* at compile time with a message pointing at `mini_ork.orchestration.item_fanout`, and the property is gone from the schema; no data-driven sweep node is planned, `item_fanout` is the mechanism; (4) **environment debt**: the 401 `KIMI_API_KEY` is still exported in `config/secrets.local.sh`, 7 `mo-e2e-node-host` images (≈12.8 GB) remain, and a root-owned electron cache is still on disk; (5) **IDE/orca and journey work is graded but not closed** — 35 partial + 1 cli-only Orca rows and a 15-journey corpus against a 200 target.
 
 ## Per-task verdicts
 | task_id | ts | claimed | verdict | evidence |
@@ -74,7 +75,7 @@ The RSI/learning half is in much better shape than the claims suggested: the rsi
 | wire-or-delete | 2026-10-09T16:43:12.054Z | pending | DONE | e404bd14 removes the dead healer/cleaner/finalize chain (the delete branch); reward saturation addressed by artifact@v1 aae3dd7f |
 | b1-wire-or-remove | 2026-10-09T08:21:21.246Z | pending | DONE | bcee2dff "chore(db): drop orphaned textual_gradients table (0068)" + db/migrations/0068_drop_textual_gradients.sql |
 | p1-injection-ledger-render | 2026-10-09T07:03:42.711Z | pending | DONE | mini_ork/ide_pages/run.py:2596 _injection_ledger, "Injected per node" :2834; 1e5cb369 adds the held-out/sources arm |
-| sweep-node | 2026-10-08T10:09:20.409Z | pending | OPEN | no `partition_key` reference in mini_ork/*.py; execute.py:1451 partitioned dispatch groups by node_type only |
+| sweep-node | 2026-10-08T10:09:20.409Z | pending | DONE | resolved as a refusal, not a feature: `mini_ork/workflow/compiler.py:272` raises `WorkflowCompileError` on a declared `partition_key` (naming `mini_ork.orchestration.item_fanout` as the sanctioned data-driven fan-out), the property is gone from `schemas/workflow.schema.json` `$defs/WorkflowNode`, `recipes/bdd-first-delivery/workflow.yaml` no longer declares it, and `tests/unit/test_workflow_partition_key_py.py` covers refusal + schema + recipe |
 | registry-audit-recipe | 2026-10-08T10:09:20.409Z | pending | DONE | c944bbba + recipes/registry-audit/{workflow.yaml,register.py}; publisher rewrites Status cells |
 | repo-dead-guard-fix | 2026-10-07T14:53:39.020Z | pending | DONE | `c34cc5db` — all seven unguarded `task_runs` readers now guard on `has_table` (RunDetailRepository's fetch_task_run_row/input_paths/correlation_row/trace_window/run_recipe/run_recipes/run_classifications, LearningRepository's fetch_task_run); both new tests fail with `sqlite3.OperationalError` when the guards are reverted |
 | triage-failure-rsi | 2026-10-07T12:07:15.971Z | in_progress | DONE | mini_ork/triage/{blame,failures}.py; docs/plans/2026-10-13-self-driving-epic.md progress: SDE-1..SDE-6 merged |
@@ -117,7 +118,16 @@ The RSI/learning half is in much better shape than the claims suggested: the rsi
 - **contextnest-boot-decision** — User decision: boot read-path representation for ContextNest (flat binary snapshot vs off SQLite)
   - Next: user decision: ContextNest boot read-path (flat binary snapshot vs off SQLite)
 - ~~**ctxfile-prompt-cleanup**~~ — **DONE** `0ca1b9d6` (same edit as #49).
-- **sweep-node** — Wire partition_key into a data-driven sweep node
-  - Next: make execute.py read partition_key (or a sweep transform) and cover it with a test
+- ~~**sweep-node**~~ — **DONE (2026-11-10), as a refusal rather than a feature.**
+  `partition_key` was never read by any executor: the compiler dropped it
+  silently while `dispatch_mode: partitioned` groups nodes by *type*. Wiring it
+  up would have grown a second partitioning mechanism beside the sanctioned
+  data-driven fan-out (`mini_ork.orchestration.item_fanout`, driven by a
+  transform that writes the work list — `recipes/goal-loop` is the reference).
+  So the compiler now rejects the declaration with a message naming
+  `item_fanout`, the property is gone from `schemas/workflow.schema.json`, and
+  `recipes/bdd-first-delivery/workflow.yaml` no longer carries it on its four
+  partitioned nodes. `tests/unit/test_workflow_partition_key_py.py` pins the
+  refusal, the schema rejection, and that the bdd recipe still compiles.
 - ~~**repo-dead-guard-fix**~~ — **DONE** `c34cc5db`: all seven `task_runs` readers guard on
   `has_table` (see the per-task row); nothing left here.
