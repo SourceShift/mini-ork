@@ -16,25 +16,33 @@ is irreversible, which is why gates decompose into `any_fail` / `any_defer` /
 answer, so the runtime converts "we cannot prove this effect did not land" into
 "do it again".
 
-The window that matters most is the one with **no checkpoint row at all**: the
-publisher commits, then the process dies before `_cp` records the node. Today
-that node reads as `no_row` → rerun → a duplicate commit. A marker written
-before the effect and removed only after the success row is durable is what
-distinguishes that case from a node that never ran.
+Two facts make the publisher the hard case:
+
+- it has **two** irreversible write paths (the artifact-contract copy plus commit
+  through `_publisher_try_commit_files`, and the outputs[] copy-then-`git commit`
+  loop), and
+- it writes **no `node_checkpoints` row** — `_cp` reaches its checkpoint branch
+  only when `output_file` is non-empty, and the publisher reports none, so its
+  node end is an `append_node_attempt` row and nothing else. Every publisher
+  resume today therefore reads as `no_row`.
+
+So the ordering evidence cannot be a checkpoint row. It is an effect record with
+two states, written before the effect and closed when the node end says success.
 
 Add the third answer. `node_resume_decision` returns `reuse`, `rerun` or
-`reconcile`; a `reconcile` decision parks the run for a person instead of
-re-executing an irreversible node. `is_node_reusable` keeps its signature and
-becomes `decision is reuse`, so no existing caller changes.
+`reconcile`; `reconcile` parks the run for a person instead of re-executing an
+irreversible node. `is_node_reusable` keeps its signature and becomes
+`decision is reuse`, so no existing caller changes.
 
 ## Scope Hint
 
 - `mini_ork/stores/checkpoints.py` — the vocabulary, the decision function, the
-  marker helpers.
-- `mini_ork/cli/execute_handlers.py` — `_handle_publisher` (line 3010) marks the
-  effect pending before it calls `publisher_node`, and aborts if it cannot.
-- `mini_ork/cli/execute.py` — `_cp`, the node-end bookkeeping (line 5058),
-  clears the marker only once a success checkpoint is durable.
+  effect-record helpers.
+- `mini_ork/cli/execute_handlers.py` — `_handle_publisher` (line 3010) records
+  the effect as pending before it calls `publisher_node`, and refuses when it
+  cannot.
+- `mini_ork/cli/execute.py` — `_cp`, the node-end bookkeeping (line 5057),
+  closes the record on success in **both** of its branches.
 - `mini_ork/recovery/plan.py` — `_reusable_set` (line 252) is the only
   reuse/rerun classifier; it grows a reconcile outcome.
 - `tests/test_node_checkpoints.py` — the existing `is_node_reusable` case file
@@ -67,17 +75,23 @@ Touch five files:
        """Why a prior attempt at this node can or cannot be reused.
 
        Evaluated in this order:
-       1. an irreversible node with a pending-effect marker → RECONCILE,
-          BEFORE any row is looked up, because the marker exists precisely
-          for the case where no row was ever written;
-       2. otherwise the existing is_node_reusable rules → REUSE;
-       3. otherwise, an irreversible node whose success row exists but whose
+       1. an irreversible node whose effect record is ``done`` → REUSE: the
+          effect demonstrably completed, so re-running it duplicates it;
+       2. an irreversible node whose effect record is ``pending`` → REUSE when
+          the operator approved the node's ``node:`` reconciliation row
+          (a person confirmed the effect landed), RERUN when they rejected it,
+          else RECONCILE;
+       3. an irreversible node whose effect record cannot be read → RECONCILE
+          (a record it cannot read is not evidence the effect did not land);
+       4. otherwise the existing is_node_reusable rules → REUSE;
+       5. otherwise, an irreversible node whose success row exists but whose
           artifact manifest no longer re-verifies → RECONCILE;
-       4. otherwise RERUN.
+       6. otherwise RERUN.
 
-       NEVER raises. Any sqlite/IO/JSON error degrades to RERUN for a
-       reversible node and to RECONCILE for an irreversible one: a db it
-       cannot read is not evidence that the effect did not land."""
+       Checked before any row lookup, because the publisher writes no
+       checkpoint row at all. NEVER raises: any sqlite/IO/JSON error degrades
+       to RERUN for a reversible node and to RECONCILE for an irreversible one.
+       """
    ```
 
    `is_node_reusable` keeps its exact signature and documented fail-closed
@@ -86,46 +100,58 @@ Touch five files:
    `node_type=""`, so a caller that passes no node type keeps today's behaviour
    byte for byte.
 
-2. **`mini_ork/stores/checkpoints.py`** — the pending-effect marker. No new
-   table, no new column, no `db/migrations/` change:
+2. **`mini_ork/stores/checkpoints.py`** — the effect record. No new table, no
+   new column, no `db/migrations/` change. One JSON file per node under
+   `<run_dir>/.effects/<node_id>.json`:
+   `{"effect": "publish", "state": "pending"|"done", "started_at": <epoch>,
+   "ended_at": <epoch>}`.
 
    ```python
    def mark_effect_pending(run_dir: str, node_id: str, effect: str) -> int:
-       """Write <run_dir>/.effects/<node_id>.json {effect, started_at} and fsync
-       it. rc=0 written, non-zero otherwise (never raises)."""
+       """Record the effect as started, fsync it, and return 0. Non-zero when
+       ``run_dir`` is missing/unwritable (never raises)."""
 
-   def clear_effect_pending(run_dir: str, node_id: str) -> int:
-       """Remove the marker; rc=0 when absent or removed. Never raises."""
+   def mark_effect_done(run_dir: str, node_id: str) -> int:
+       """Flip an existing record to ``done`` (adding ``ended_at``) and fsync.
+       Returns 0 when the record is already done or absent; non-zero only on a
+       write error. Never raises."""
 
-   def effect_pending(run_dir: str, node_id: str) -> bool:
-       """True when a marker file exists for this node."""
+   def clear_effect_record(run_dir: str, node_id: str) -> int:
+       """Delete the record; 0 when absent or removed. Never raises."""
+
+   def effect_state(run_dir: str, node_id: str) -> str:
+       """'pending', 'done', 'absent' or 'unreadable'. Never raises."""
    ```
 
-   A missing or unwritable `run_dir` is an error, not a default:
-   `mark_effect_pending` returns non-zero and `effect_pending` returns False. The
-   caller treats a non-zero rc as a refusal (item 3), so the pair fails closed:
-   an effect that cannot be recorded is an effect that is not performed.
+   These three answers are what make the record usable: `absent` means nothing
+   was ever started, `done` means the effect completed, and `unreadable` is the
+   one the decision must not treat as `absent`.
 
 3. **`mini_ork/cli/execute_handlers.py`** — `_handle_publisher(ctx)` calls
    `mark_effect_pending(ctx.run_dir_eff, ctx.node_id, "publish")` immediately
    before `publisher_node(...)`, and **returns non-zero with finish_reason
-   `"effect_marker_failed"` when that returns non-zero**. `publisher_node` has
-   two irreversible write paths — the artifact-contract copy plus commit through
-   `_publisher_try_commit_files` (publisher.py:353, called at 770), and the
-   outputs[] copy-then-`git commit` loop (publisher.py:889-895). Both are
-   downstream of that one call, so one marker before it covers both. Do not mark
-   inside `publisher_node`: it has no `node_id` parameter, and the marker must
-   outlive its return (item 4).
+   `"effect_marker_failed"` without calling it when that returns non-zero**. An
+   effect that cannot be recorded is an effect that is not performed. Both
+   publisher write paths are downstream of that one call, so one record covers
+   both. Do not record inside `publisher_node`: it has no `node_id` parameter.
 
-4. **`mini_ork/cli/execute.py`** — `_cp(node_id, status, node_type, ...)` at
-   line 5058 is the single node-end bookkeeping path. Call
-   `clear_effect_pending(run_dir, node_id)` **only** in the branch where
-   `status == "success"` and `ckpt_rc == 0`, right beside `_node_git_ckpt(...)`.
-   On every other outcome — failure, error, skipped, or a success whose
-   checkpoint write returned non-zero — leave the marker in place. That ordering
-   is the point: the marker dies only once the effect *and* the row recording it
-   are both durable. Clearing it earlier reopens the window this change exists to
-   close.
+4. **`mini_ork/cli/execute.py`** — `_cp(node_id, status, node_type, output_file,
+   finish_reason)` at line 5057 is the single node-end bookkeeping path. Right
+   after its status validation, before the branch that decides whether a
+   checkpoint row can be written:
+
+   ```python
+   if status == "success":
+       mc.mark_effect_done(run_dir, node_id)   # never raises; no-op when absent
+   ```
+
+   This must sit **before** the `if status != "success" or not output_file:`
+   split, because the publisher takes the `append_node_attempt` branch and never
+   reaches the checkpoint branch — that is exactly why the record, not the
+   checkpoint row, carries the ordering evidence here. On every other outcome
+   (failure, error, skipped) leave the record `pending`. Calling
+   `mark_effect_done` unconditionally on a reversible node is a no-op: there is
+   no record to flip.
 
 5. **`mini_ork/recovery/plan.py`** — `_reusable_set(dag, db_path, run_id,
    run_dir, *, recipe, task_class, node_types)` (line 252) already receives the
@@ -137,40 +163,56 @@ Touch five files:
    For each node, in this order:
 
    - if `effect_class_for_node_type(types.get(nid, "")) == "irreversible"` and
-     `effect_pending(run_dir, nid)` → `reconcile.add(nid)`,
-     reason `"effect_may_have_landed"`, `continue`. This branch must come
-     **before** the `row_status is None` branch — the missing row is the case
-     the marker exists for;
+     `effect_state(run_dir, nid)` in `("pending", "unreadable")` →
+     `node_resume_decision` decides between `RECONCILE` and `RERUN` (the
+     approved/rejected reconciliation row is the difference). `RECONCILE` →
+     `reconcile.add(nid)`, reason `"effect_may_have_landed"`, `continue`; the
+     other → fall through to today's handling. This branch must come **before**
+     the `row_status is None` branch — the publisher has no row at all;
+   - if the effect record is `done` → `reuse.add(nid)`, reason `""`;
    - then today's `row_status is None` handling (`plan_json` / `no_row`);
    - then today's non-success handling (`status=<s>`);
-   - then `node_resume_decision(...)` with
-     `node_type=types.get(nid, "")`: `REUSE` → reuse set, `RECONCILE` →
-     reconcile set, `RERUN` → today's `hash_mismatch_or_artifact_corrupt`.
+   - then `node_resume_decision(db_path, run_id, nid,
+     current_input_hash=..., current_recipe_version=...,
+     current_config_hash=..., run_dir=run_dir, node_type=types.get(nid, ""))`:
+     `REUSE` → reuse set, `RECONCILE` → reconcile set, `RERUN` → today's
+     `hash_mismatch_or_artifact_corrupt`.
 
    `compute_recovery` (line 576) is the **read-only** classifier behind
    `recover --status`: it reports the reconcile set in the formatted status and
-   must write nothing — no inbox row, no sidecar.
+   writes nothing — no inbox row, no record change.
 
-   `plan_recovery` (line 751) is the mutating path. When its reconcile set is
-   non-empty it must not dispatch, must not add those nodes to the closure, and
-   must park the run through the mechanism that already exists for a node review
-   — `execute_handlers.py:956-985`:
-   - write `<run_dir>/.review-pause` as JSON with
-     `{waiting_node: <first reconcile node>, awaiting: [<reconcile nodes>],
+   `plan_recovery` (line 751) returns a `RecoveryPlan`; keep that contract. Add
+   a `parked_nodes: tuple[str, ...]` field to the plan (empty by default) and
+   fill it from the reconcile set. On a non-empty park set, `plan_recovery`
+   must not add those nodes to the closure and must park the run through the
+   mechanism that already exists for a node review (`execute_handlers.py:956-985`):
+   - write `<run_dir>/.review-pause` as JSON
+     `{waiting_node: <first parked node>, awaiting: [<parked nodes>],
      inbox_ids: [...], ts: <epoch>}`;
-   - enqueue one row per reconcile node through
-     `oversight_inbox.enqueue(gate_id=f"resume-reconcile:{run_id}:{nid}",
-     feature="resume-reconcile", phase="recover", context={"run_id": ...,
-     "node_id": nid, "reason": "effect_may_have_landed"}, db_path=db_path)`;
-   - return the run's existing paused-for-review outcome
-     (`node_review.REVIEW_PAUSE_RC`, `"paused_for_review"`), not an error rc.
+   - enqueue one row per parked node with **`gate_id =
+     f"node:{run_id}:{nid}:reconcile-{started_at}"`**, `feature="resume-reconcile"`,
+     `phase="recover"`, `context={"run_id":..., "node_id": nid,
+     "reason": "effect_may_have_landed", "effect": <effect name>}`. The `node:`
+     prefix is what makes the row resolvable by
+     `mini-ork approvals approve <run_id> --node <nid>`, which is the documented
+     unpark path.
 
-   `enqueue` is a plain INSERT with no idempotency, so guard each one:
-   `SELECT 1 FROM mo_inbox_gates WHERE gate_id=? AND status='pending'` first and
-   skip the insert when a row already exists. That guard is what makes a second
-   `plan_recovery` call a no-op, and it makes the row resolvable by
-   `mini-ork approvals approve <run_id> --node <nid>`, which is the documented
-   unpark path.
+   Enqueue atomically, not with a preceding SELECT: one statement of the form
+   `INSERT INTO mo_inbox_gates (...) SELECT ?,?,?,?,... WHERE NOT EXISTS
+   (SELECT 1 FROM mo_inbox_gates WHERE gate_id=? AND status='pending')`. A
+   separate check-then-insert races with another recovery pass and re-enqueues.
+
+   The CLI layer maps a plan whose `parked_nodes` is non-empty to
+   `node_review.REVIEW_PAUSE_RC` with finish_reason `"paused_for_review"` — the
+   same exit code the executor already uses to stop dispatching and end a run in
+   `reviewing`. Do not invent a new status.
+
+   The transition out of reconcile is the existing approval, read on the next
+   pass: an **approved** row means the operator confirmed the effect landed →
+   the decision returns `REUSE`; a **rejected** row means it did not land →
+   `RERUN`, and `plan_recovery` calls `clear_effect_record` before dispatching so
+   the same node is not parked again. There is no automatic unpark.
 
 ## Requirements
 
@@ -192,30 +234,33 @@ Touch five files:
 
 ## Done When
 
-- **AC1** An irreversible node with a pending-effect marker resolves to
-  `RECONCILE` **both when a checkpoint row exists and when none exists**, and
-  `is_node_reusable` still returns `False` for it.
-- **AC2** On the decision function alone (a synthetic `status='success'` row
-  whose artifact manifest no longer re-verifies, `node_type="publisher"`), the
+- **AC1** An irreversible node whose effect record is `pending` resolves to
+  `RECONCILE` both when a checkpoint row exists and when none exists (the
+  publisher's real shape); one whose record is `done` resolves to `REUSE`.
+- **AC2** On the decision function alone — a synthetic `status='success'` row
+  whose artifact manifest no longer re-verifies, `node_type="publisher"` — the
   answer is `RECONCILE`. This is a unit test of `node_resume_decision`; the
-  publisher itself does not need to produce such a row for the case to be
-  covered.
+  publisher does not need to produce such a row for the case to be covered.
 - **AC3** A reversible node in each of those situations still resolves to
   `RERUN`, exactly as today; a verified reversible success still resolves to
   `REUSE`; `is_node_reusable` returns the same booleans it returns today for
   every existing case (g)–(t).
-- **AC4** `node_resume_decision` never raises: a missing db, a malformed
-  manifest, an unreadable marker and a sqlite error each degrade to `RERUN` for
-  a reversible node and `RECONCILE` for an irreversible one.
-- **AC5** `_handle_publisher` marks before `publisher_node` runs and returns
-  non-zero without calling it when the mark fails; the marker survives a failing
-  or raising publisher; `_cp` clears it only after a success checkpoint commits
-  and leaves it in place on every non-success outcome.
-- **AC6** `_reusable_set` puts a reconcile node in neither the reuse set nor
-  the rerun set, including when that node has no checkpoint row;
-  `compute_recovery` writes nothing; `plan_recovery` writes the
-  `.review-pause` sidecar, returns `REVIEW_PAUSE_RC`, and writes exactly one
-  oversight row — a second call writes none.
+- **AC4** `node_resume_decision` never raises, and the fail-closed matrix holds:
+  a missing db, a malformed manifest, an `unreadable` record and a sqlite error
+  each degrade to `RERUN` for a reversible node and `RECONCILE` for an
+  irreversible one.
+- **AC5** `_handle_publisher` records the effect before `publisher_node` runs and
+  returns non-zero without calling it when the record cannot be written; a
+  failing or raising publisher leaves the record `pending`; `_cp` flips it to
+  `done` on success in **both** branches (including the
+  `append_node_attempt` branch the publisher actually takes) and leaves it
+  `pending` on every non-success outcome.
+- **AC6** `_reusable_set` puts a reconcile node in neither the reuse set nor the
+  rerun set, including when that node has no checkpoint row; `compute_recovery`
+  writes nothing; `plan_recovery` writes the `.review-pause` sidecar, sets
+  `parked_nodes`, and enqueues exactly one `node:`-prefixed row per parked node —
+  a second call enqueues none. An approved row on the next pass yields `REUSE`;
+  a rejected one yields `RERUN` with the record cleared.
 - `${MINI_ORK_RUN_DIR}/framework-edit.diff` contains the proposed five-file
   patch.
 - `${MINI_ORK_RUN_DIR}/verdict.json` contains
