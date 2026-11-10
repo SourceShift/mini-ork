@@ -209,12 +209,14 @@ Follow-ups found while landing Tier 0 (corrected 2026-10-27):
 - ~~`mini-ork epics show` lists no outgoing dependencies.~~ **Not a bug.** The
   output had been piped through `head -12`, which cut the section off.
 - **R8's cap counts `in progress` epics**, and R8 spawned the scheduler in the
-  engine checkout. Both are **fixed on main**: `recovery/supervisor.py:1296`
-  refuses a `target_root` that is the engine checkout (returning the refusal
-  action instead of a dispatch), and `recovery/supervisor.py:1359` calls
-  `scheduler.reclaim_stale(db)` before counting the cap. The kickoff that asked
-  for this, `kickoffs/auto/rsi-t0f-r8-hardening.md`, was later lost with its
-  worktree — its run stayed `failed`, but the deliverable landed another way (see
+  engine checkout. Both are **fixed on main**:
+  `mini_ork/recovery/supervisor.py:1296` refuses a `target_root` that is the
+  engine checkout (returning the refusal action instead of a dispatch), and
+  `mini_ork/recovery/supervisor.py:1359` calls `scheduler.reclaim_stale(db)`
+  before counting the cap. The kickoff that asked for this,
+  `kickoffs/auto/rsi-t0f-r8-hardening.md`, is on `main` — only its *run* stayed
+  `failed` (retryability is a property of the run, not of the repository), and
+  the deliverable landed independently (see
   `docs/audits/2026-11-06-revive-batch.md`).
 
 ### Changes on main since this audit (2026-10-25 / 10-26, other sessions)
@@ -255,7 +257,9 @@ Follow-ups found while landing Tier 0 (corrected 2026-10-27):
 Each item went through one or more framework-edit runs
 (`kickoffs/auto/rsi-t1-*.md`, waves 196a3603 and f049dc4c). Every run was then
 reviewed by hand, checked by its kickoff suite and an importer gate, and passed
-the pre-push review. The matrix below still shows the 10-24 audit.
+the pre-push review. Neither table is restated here: the Tier 1 rows
+**above** still describe the 10-24 audit, and the progress matrix below
+is what landed on 10-27.
 
 Defaults, so nobody assumes a merged item is inert:
 

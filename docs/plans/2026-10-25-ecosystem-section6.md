@@ -86,7 +86,13 @@ Every framework-edit diff was read before merge; five needed hand fixes:
 
 - An auditor's `grep` printed the API keys in `config/secrets.local.sh` into a
   subagent transcript on 2026-10-25. Rotate them.
-- `MINI_ORK_ON_EVENT` (`observability/emit_hook.py`) is documented but nothing
-  calls `mo_emit_hook`.
+- ~~`MINI_ORK_ON_EVENT` (`observability/emit_hook.py`) is documented but nothing
+  calls `mo_emit_hook`.~~ **Closed 2026-10-27, `d322c5ab`** — `_insert_event` in
+  `mini_ork/observability/node_events.py` (every node/run event, heartbeats
+  opt-in), `mo_recursive_emit_event` in `orchestration/recursive.py`, and
+  `close_run_record` in `orchestration/run_reaper.py` (`run_finished`) all fire
+  the hook after their commit. The dispatch is non-blocking: a 5 s daemon-thread
+  kill, an argv form with no shell, and one warning (never the value) when the
+  command is not executable. `tests/unit/test_event_hook_wired.py` covers it.
 - The supervisor wrapper's `git fetch` fails intermittently (permission errors,
   timeouts), so "has the fix landed" checks sometimes read a stale `origin/main`.

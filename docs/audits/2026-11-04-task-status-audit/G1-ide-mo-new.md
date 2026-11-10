@@ -29,9 +29,9 @@ Of 96 self-reported tasks, **58 are DONE**, **18 are OPEN**, **3 are STALE**, an
 | rls-tenant-gate | 2026-10-28 13:02 | pending | OPEN | `server/platform/__tests__/rlsIsolation.test.ts:25` — `const describeRls = databaseUrl ? describe : describe.skip`; the gate never runs without `DATABASE_URL` |
 | otlp-tracing | 2026-10-28 13:02 | pending | DONE | attestia 6113a29 "export OTLP spans … off by default"; mini-ork side K10 `d10a34a2` |
 | fix-probe-grader | 2026-10-27 12:04 | in_progress | DONE | `mini_ork/learning/probe_scorer.py:809` `[sys.executable, "-E", "-P", "-B", …]`; 89553eeb clean-snapshot grading; 1eb1842e / 8e9eaa85 |
-| bif-e1 | 2026-10-27 09:42 | in_progress | OPEN | `docs/plans/2026-10-25-ecosystem-section6.md:88-90` — "`MINI_ORK_ON_EVENT` … is documented but nothing calls `mo_emit_hook`" |
+| bif-e1 | 2026-10-27 09:42 | in_progress | DONE | stale-by-hours: `d322c5ab` (2026-10-27 11:35, on `main`) wired the hook — `node_events._insert_event` (:451-456), `recursive.mo_recursive_emit_event` (:170), `run_reaper.close_run_record` (:296, `run_finished`); `tests/unit/test_event_hook_wired.py` (36 tests with `test_mo_emit_hook_py.py`) green under python3.11 |
 | gsc-sitemaps | 2026-10-27 09:30 | pending | UNKNOWN | `/Volumes/docker-ssd/ps/miniork-site/sitemap.xml` exists; no Search-Console submission artifact in any audited repo |
-| on-event-hook | 2026-10-27 09:30 | pending | OPEN | duplicate of bif-e1 — `mini_ork/observability/emit_hook.py` still has no caller |
+| on-event-hook | 2026-10-27 09:30 | pending | DONE | duplicate of bif-e1 — closed by `d322c5ab`; the module now has three callers in production code |
 | ci-verify-e27d3ac4 | 2026-10-26 12:40 | in_progress | UNKNOWN | e27d3ac4 is a *docs* commit ("record phase 1 as built"); no CI-run receipt exists in the repos to confirm the later green state |
 | rev6-r5 | 2026-10-26 12:25 | pending | DONE | rev6 R5a salvage 7af706df + R5b rounds-to-pass 640d37e0; decision record `docs/plans/2026-10-26-review-layers.md` |
 | eco6-k16 | 2026-10-25 18:03 | in_progress | DONE | e9682838 removed the three unread `recursion:` keys |
@@ -120,11 +120,10 @@ Of 96 self-reported tasks, **58 are DONE**, **18 are OPEN**, **3 are STALE**, an
 9. **apply-migration** — apply `0100_control_plane.sql` + `0150_platform_rls_coverage.sql` to a live database.
 10. **rls-tenant-gate** — run `rlsIsolation.test.ts` against a real `DATABASE_URL` and make the skip fail closed.
 11. **verify-4f781acd / ide-live-smoke** — run the GUI replay of all eight orchestrator tabs with the IDE window open (one human in the loop).
-12. **bif-e1 / on-event-hook** — either call `mo_emit_hook` from a real dispatch path or delete the documented `MINI_ORK_ON_EVENT` hook.
-13. **bifrost-research** — scope B2 and B4 (both explicitly deferred in `docs/plans/2026-10-27-dispatch-resilience.md`).
-14. **lf-wave2** — decide whether R8 (opt-in supervisor dispatch) proceeds once rsi-e8 is scoped.
-15. **docs-repo-remote** — add a remote to `/Volumes/docker-ssd/ps/miniork-docs`.
-16. **zed-prebuilt-install** — ship a prebuilt, signed Zed install path in `mini-ork onboard` instead of a zed.dev link.
-17. **reward-g-saturation** — measure the reward-g same-family zeroing and pick a fix (new family or a different normalization).
-18. **s3-policy** — surface the framework-theme policy decision to the user and record the answer.
-19. **act-b-e** — get the user's pick among the B/C/D/E/F triage follow-ups and record it.
+12. **bifrost-research** — scope B2 and B4 (both explicitly deferred in `docs/plans/2026-10-27-dispatch-resilience.md`).
+13. **lf-wave2** — decide whether R8 (opt-in supervisor dispatch) proceeds once rsi-e8 is scoped.
+14. **docs-repo-remote** — add a remote to `/Volumes/docker-ssd/ps/miniork-docs`.
+15. **zed-prebuilt-install** — ship a prebuilt, signed Zed install path in `mini-ork onboard` instead of a zed.dev link.
+16. **reward-g-saturation** — measure the reward-g same-family zeroing and pick a fix (new family or a different normalization).
+17. **s3-policy** — surface the framework-theme policy decision to the user and record the answer.
+18. **act-b-e** — get the user's pick among the B/C/D/E/F triage follow-ups and record it.
