@@ -32,18 +32,26 @@ Every verdict carries a receipt. The vocabulary is `DONE` (commit / file / branc
 | group | rows | DONE | OPEN | STALE | UNKNOWN |
 |---|---:|---:|---:|---:|---:|
 | A git mechanics (mini-ork + worktrees) | 126 | 90 | 6 | 5 | 25 |
-| B git + run triage (zed fork) | 121 | 73 | 18 | 27 | 3 |
+| B git + run triage (zed fork) | 121 | 75 | 16 | 27 | 3 |
 | C run triage (mini-ork) | 106 | 82 | 3 | 6 | 15 |
 | D lane / framework-edit | 97 | 54 | 17 | 2 | 24 |
-| E engine core + RSI | 75 | 51 | 13 | 7 | 4 |
-| F zed IDE frontend | 133 | 76 | 32 | 10 | 15 |
-| G1 IDE surface, 10-14→11-04 | 96 | 58 | 18 | 3 | 17 |
-| G2 IDE surface, 10-07→10-13 | 97 | 70 | 11 | 1 | 15 |
-| **total** | **851** | **554** | **118** | **61** | **118** |
+| E engine core + RSI | 75 | 52 | 12 | 7 | 4 |
+| F zed IDE frontend | 133 | 80 | 28 | 10 | 15 |
+| G1 IDE surface, 10-14→11-04 | 96 | 60 | 16 | 3 | 17 |
+| G2 IDE surface, 10-07→10-13 | 101 | 74 | 11 | 1 | 15 |
+| **total** | **855** | **567** | **109** | **61** | **118** |
 
-Per-row evidence for all 851 lives in the sibling files (`A-git-mo.md` … `G2-ide-mo-old.md`).
+Recounted 2026-11-10 by reading the status column of every row rather than
+trusting the totals above them: **+13 DONE / −9 OPEN** since the audit's own
+pass (`threads-builder`, `reflect-timeout-shape`, `sweep-node`, `bif-e1`,
+`on-event-hook` among them — each closed row carries its commit). G2 counts 101
+rows, not 97, because four rows carry a struck-through id with an empty status
+column (a row closed in place); they are `DONE` here, which is where G2's +4
+comes from.
 
-## The 118 open tasks
+Per-row evidence for all 855 lives in the sibling files (`A-git-mo.md` … `G2-ide-mo-old.md`).
+
+## The open tasks (118 at audit time, 109 as of 2026-11-10)
 
 The raw count overstates the work: agents found several rows collapsing onto one item.
 
