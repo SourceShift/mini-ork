@@ -66,7 +66,7 @@
 | hint-failed-node-attribution | 2026-10-13 | pending | UNKNOWN | run-1791821930-72687 retry-hint.json still failed_node=implementer kind=unknown; d1c0c871 moved the recover entry point but does not settle the misattribution claim |
 | build-p1-3 | 2026-10-13 | pending | DONE | bd789718 lands LangGraph-parity P1.3 (run --resume) |
 | land-engine-fix | 2026-10-12 | pending | UNKNOWN | /tmp/mo-fold does not exist; no commit in the 10-07..11-04 log references it, so the changes cannot be matched to a landing |
-| stale-run-verdict-on-resume | 2026-10-12 | pending | OPEN | no attempt-scoped verdict rotation found: run dirs carry a single verdict.json/run-verdict.json and no attempt_* archive |
+| stale-run-verdict-on-resume | 2026-10-12 | pending | DONE | `recovery/planner.py` `_archive_superseded_verdicts` moves verdict.json/run-verdict.json into `attempts/<n>/` (n from the ledger's `attempt <n> started` notes) before `_emit_recovery_env`, so a resumed run cannot be graded on the replaced attempt; tests/unit/test_recover_verdict_rotation_py.py |
 | engine-node-runtime | 2026-10-12 | pending | OPEN | decision never recorded - only a pending line in SESSION-GOALS.md; no config/doc chooses a node runtime for researcher worktrees |
 | linear-py-salvage | 2026-10-12 | pending | DONE | 4379ff03 + 1be093e8; mini_ork/pm/providers/linear.py present |
 | board-phase1 | 2026-10-12 | pending | OPEN | fail-closed 'epics add' landed (epics.py:110) but the /task command and the epic-card board-with-Runs-tab do not exist |
@@ -150,8 +150,8 @@
   - next: revive chat-listen-shape-be-20261013 with a working lane, or close it as abandoned
 - **revive-1791887097** — run-1791887097-86207 verdict fail with 4 failed nodes; review-verdict fail, implementer status=no_changes, NEEDS-CHANGE.md 10-13 14:27
   - next: fix the implementer's no_changes outcome on run-1791887097-86207 then revive through the verifier chain
-- **stale-run-verdict-on-resume** — no attempt-scoped verdict rotation found: run dirs carry a single verdict.json/run-verdict.json and no attempt_* archive
-  - next: rotate verdict.json/run-verdict.json into attempt_<n>/ on resume so the rubric cannot grade the replaced attempt
+- **stale-run-verdict-on-resume** — CLOSED: recover now rotates the superseded attempt's verdict.json/run-verdict.json into `attempts/<n>/` before dispatching, so the rubric cannot grade the replaced attempt
+  - landed: `mini_ork/recovery/planner.py` `_archive_superseded_verdicts` (best effort; a run with no verdict, or an unreadable ledger, is left alone) + `tests/unit/test_recover_verdict_rotation_py.py`
 - **engine-node-runtime** — decision never recorded - only a pending line in SESSION-GOALS.md; no config/doc chooses a node runtime for researcher worktrees
   - next: write the decision (which runtime the researcher target worktrees use) into docs/plans
 - **board-phase1** — fail-closed 'epics add' landed (epics.py:110) but the /task command and the epic-card board-with-Runs-tab do not exist

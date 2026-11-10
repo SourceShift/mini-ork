@@ -307,6 +307,42 @@ def _recipe_from_run_profile(run_dir: str) -> str:
         return ""
 
 
+#: The attempt-level verdicts a run dir carries. A resumed run overwrites them,
+#: and the rubric grader reads whatever sits at the run root — so the replaced
+#: attempt's verdict has to be archived before the new attempt writes one.
+_SUPERSEDED_VERDICT_FILES = ("verdict.json", "run-verdict.json")
+
+
+def _archive_superseded_verdicts(run_dir: str, db_path: str, run_id: str) -> str:
+    """Move the previous attempt's verdicts under ``attempts/<n>/``.
+
+    Returns the archive directory, or "" when the run has no verdict to move
+    (nothing has finished yet) or the move failed. Best effort by design: a
+    recovery must never fail because an archive path was unreadable, and the
+    verdicts stay where they are if the move does not complete.
+
+    ``<n>`` is the attempt that just ended, from the ledger's ``attempt <n>
+    started`` notes — the same number the publisher archives its markers under,
+    so one directory holds one attempt's whole record.
+    """
+    if not run_dir or not os.path.isdir(run_dir):
+        return ""
+    present = [name for name in _SUPERSEDED_VERDICT_FILES
+               if os.path.isfile(os.path.join(run_dir, name))]
+    if not present:
+        return ""
+    from mini_ork.cli.publisher import _current_attempt_number  # noqa: PLC0415
+    target = os.path.join(run_dir, "attempts",
+                          str(_current_attempt_number(db_path, run_id)))
+    for name in present:
+        try:
+            os.makedirs(target, exist_ok=True)
+            os.replace(os.path.join(run_dir, name), os.path.join(target, name))
+        except OSError:
+            return ""
+    return target
+
+
 def _emit_recovery_env(plan: RecoveryPlan) -> None:
     """Publish the closure set + sku into the env so a follow-up
     ``mini-ork execute`` can pick it up. Keyed by run_id
@@ -1491,6 +1527,16 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     # The executor honours it before the first node, so leaving it makes the
     # closure a no-op that still reports the run as failed.
     _clear_stale_stop_request(run_dir)
+
+    # The attempt that just ended left its verdict at the run root. Move it
+    # aside before the new attempt writes one: the grader reads whichever file
+    # is there, and "resume still fails the old verdict" is not the closure
+    # anyone asked for.
+    archived = _archive_superseded_verdicts(run_dir, db_path, run_id)
+    if archived:
+        sys.stdout.write(
+            f"[mini-ork-recover] archived the superseded verdict to {archived}\n"
+        )
 
     # Active strategies: emit the env, print the plan, hand off to
     # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
