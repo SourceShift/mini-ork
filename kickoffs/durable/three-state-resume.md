@@ -279,5 +279,5 @@ Touch seven files:
 ## Verification command
 
 ```bash
-python3 -m pytest tests/test_node_checkpoints.py -q && make lint
+python3 -m pytest tests/test_node_checkpoints.py tests/unit/test_publisher_effect_record.py -q && make lint
 ```
