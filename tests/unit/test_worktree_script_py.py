@@ -135,6 +135,38 @@ def test_merge_green_gate_failure_blocks_push(repo: dict) -> None:
     assert after == before
 
 
+def test_merge_hands_the_engine_home_to_the_push(repo: dict, tmp_path: Path) -> None:
+    """The pre-push hook must see the engine's home, not the worktree's.
+
+    `.mini-ork/config/` is committed, so every worktree has one; the secret
+    store and the state DB are not. A hook that resolves its store against the
+    worktree finds no keys and — since the panel blocks on `panel_unavailable`
+    — refuses every push from a worktree.
+    """
+    marker = tmp_path / "home.txt"
+    hook = repo["clone"] / ".git" / "hooks" / "pre-push"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(f'#!/bin/sh\nprintf "%s" "$MINI_ORK_HOME" > {marker}\nexit 0\n')
+    hook.chmod(0o755)
+
+    assert run_wt(repo, "create", "zeta").returncode == 0
+    commit_in(repo["worktrees"] / "zeta", "zeta.txt")
+    merged = run_wt(repo, "merge", "zeta",
+                    extra_env={"MINI_ORK_TEST_CMD": "true", "MINI_ORK_HOME": ""})
+    assert merged.returncode == 0, merged.stderr
+    assert marker.read_text() == str(repo["clone"] / ".mini-ork")
+
+    # An operator's explicit home still wins over the default.
+    explicit = tmp_path / "explicit-home"
+    assert run_wt(repo, "create", "eta").returncode == 0
+    commit_in(repo["worktrees"] / "eta", "eta.txt")
+    merged = run_wt(repo, "merge", "eta",
+                    extra_env={"MINI_ORK_TEST_CMD": "true",
+                               "MINI_ORK_HOME": str(explicit)})
+    assert merged.returncode == 0, merged.stderr
+    assert marker.read_text() == str(explicit)
+
+
 def test_clean_removes_worktree_branch_and_claims(repo: dict) -> None:
     assert run_wt(repo, "create", "epsilon", "--owns", "lib/x.sh").returncode == 0
     wt = repo["worktrees"] / "epsilon"

@@ -14,6 +14,12 @@ default). The store is read, never `source`d, and fails closed — a symlink,
 a group- or world-readable file, or a file owned by someone else is an error,
 not an empty credential.
 
+`make worktree-merge` pushes with `MINI_ORK_HOME` set to the **engine's**
+home, not the worktree's: `.mini-ork/config/` is committed so every worktree
+has one, while the store, the state DB and the approvals ledger do not. An
+explicitly exported home still wins, and a hand-run `git push` from inside a
+worktree needs it exported.
+
 ## One-time setup
 
 ```bash

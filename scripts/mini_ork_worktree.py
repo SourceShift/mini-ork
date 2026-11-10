@@ -799,6 +799,13 @@ def _push_env(reviewed: str) -> dict:
     env = {k: v for k, v in os.environ.items() if k != "MO_REVIEW_PRECHECKED_PATCH"}
     if reviewed:
         env["MO_REVIEW_PRECHECKED_PATCH"] = reviewed
+    # A worktree's own `.mini-ork/` carries config, not credentials: the secret
+    # store and the state DB live in the engine's home, the checkout the
+    # worktree is a branch of. Left unset, the in-lock pre-push hook resolves
+    # its store to `<worktree>/.mini-ork`, finds no keys, cannot run the
+    # README drift audit, and blocks every push from a worktree.
+    if not env.get("MINI_ORK_HOME"):
+        env["MINI_ORK_HOME"] = os.path.join(ROOT, ".mini-ork")
     return env
 
 

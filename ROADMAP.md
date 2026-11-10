@@ -197,14 +197,18 @@ All four calibration-list items shipped 2026-06-13. The list is closed.
   panel arbiter now emits 3-valued `NO_DRIFT | DRIFT | INDETERMINATE`
   with a post-process safety net that overrides arbiter NO_DRIFT to
   INDETERMINATE when all 4 lenses returned confidence=0 OR errored.
-  Pre-push hook treats INDETERMINATE as fail-open by default,
-  block-on `MO_README_PANEL_INDETERMINATE=block`.
+  A push to main **blocks** on INDETERMINATE, as it does on a gatekeeper
+  that could not decide (2026-11-10: the pre-push hook used to default
+  both to the permissive verdict, so a provider outage let an unaudited
+  README through). `MO_README_PANEL_INDETERMINATE=fail-open` opts out.
 - providers-doctor pre-flight (closed 2026-06-05):
   `scripts/readme_drift.py doctor` probes each lens provider
   with a 1-token prompt before the panel fires. If <
   `MO_DRIFT_MIN_RESPONSIVE_LENSES` (default 2) respond within
   `MO_DRIFT_PROBE_TIMEOUT_SEC` (default 20s), panel is skipped with
   `reason=panel_unavailable`. Cuts ~360s wasted-timeout wall to ~30s.
+  The skip is a measurement the hook has to read: on a push to main it
+  counts as INDETERMINATE and blocks, same opt-out as above.
 - Provider triage playbook at
   [`docs/operator/provider-triage.md`](docs/operator/provider-triage.md)
   documents 6-step diagnosis + remediation for the
