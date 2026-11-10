@@ -31,7 +31,7 @@ Every verdict carries a receipt. The vocabulary is `DONE` (commit / file / branc
 
 | group | rows | DONE | OPEN | STALE | UNKNOWN |
 |---|---:|---:|---:|---:|---:|
-| A git mechanics (mini-ork + worktrees) | 126 | 92 | 4 | 5 | 25 |
+| A git mechanics (mini-ork + worktrees) | 126 | 93 | 3 | 5 | 25 |
 | B git + run triage (zed fork) | 121 | 75 | 16 | 27 | 3 |
 | C run triage (mini-ork) | 106 | 82 | 3 | 6 | 15 |
 | D lane / framework-edit | 97 | 55 | 16 | 2 | 24 |
@@ -39,20 +39,21 @@ Every verdict carries a receipt. The vocabulary is `DONE` (commit / file / branc
 | F zed IDE frontend | 133 | 80 | 28 | 10 | 15 |
 | G1 IDE surface, 10-14→11-04 | 96 | 60 | 16 | 3 | 17 |
 | G2 IDE surface, 10-07→10-13 | 101 | 74 | 11 | 1 | 15 |
-| **total** | **855** | **570** | **106** | **61** | **118** |
+| **total** | **855** | **571** | **105** | **61** | **118** |
 
 Recounted 2026-11-10 by reading the status column of every row rather than
-trusting the totals above them: **+16 DONE / −12 OPEN** since the audit's own
+trusting the totals above them: **+17 DONE / −13 OPEN** since the audit's own
 pass (`threads-builder`, `reflect-timeout-shape`, `sweep-node`, `bif-e1`,
-`on-event-hook`, `guard-primary-stash-u`, `rrl-build`, `b2-preflight` among
-them — each closed row carries its commit). G2 counts 101
+`on-event-hook`, `guard-primary-stash-u`, `rrl-build`, `b2-preflight`,
+`quarantine-cleanup` among them — each closed row carries its commit or decision
+record). G2 counts 101
 rows, not 97, because four rows carry a struck-through id with an empty status
 column (a row closed in place); they are `DONE` here, which is where G2's +4
 comes from.
 
 Per-row evidence for all 855 lives in the sibling files (`A-git-mo.md` … `G2-ide-mo-old.md`).
 
-## The open tasks (118 at audit time, 106 as of 2026-11-10)
+## The open tasks (118 at audit time, 105 as of 2026-11-10)
 
 The raw count overstates the work: agents found several rows collapsing onto one item.
 
