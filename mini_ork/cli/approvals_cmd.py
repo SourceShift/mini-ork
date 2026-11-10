@@ -46,6 +46,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -264,17 +265,30 @@ def _review_pause_sentinel(home: Path, run_id: str) -> Path:
     return home / "runs" / run_id / ".review-pause"
 
 
+_NODE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}")
+
+
 def _waiting_node(home: Path, run_id: str) -> str | None:
     """The ``waiting_node`` the executor recorded in ``.review-pause``, or ``None``.
 
-    ``None`` when the sentinel is missing, empty, not JSON, or has no non-empty
+    ``None`` when the sentinel is missing, empty, not JSON, or has no usable
     string ``waiting_node`` (sentinels written by an older engine). Never raises:
-    a degraded sentinel must fall back to a plain resume, not crash the CLI.
+    a degraded sentinel must fall back to a plain resume, not crash the CLI —
+    which is why the read catches ``UnicodeDecodeError`` too, not just ``OSError``.
+
+    The value is *validated*, not trusted: it is about to become the argv of
+    ``recover --from-node <value>``, so a node id holding whitespace, a leading
+    ``-`` or a path separator would either mis-parse as a flag or point the
+    planner somewhere the workflow never declared. Anything outside
+    ``[A-Za-z0-9_.:-]{1,128}`` is treated as absent — the same fallback as a
+    sentinel that carries no node at all, which prints the operator note.
     """
     sentinel = _review_pause_sentinel(home, run_id)
     try:
         text = sentinel.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError: a sentinel with a stray byte is
+        # a degraded sentinel, not a reason to traceback.
         return None
     if not text.strip():
         return None
@@ -285,7 +299,7 @@ def _waiting_node(home: Path, run_id: str) -> str | None:
     if not isinstance(payload, dict):
         return None
     node = payload.get("waiting_node")
-    if isinstance(node, str) and node:
+    if isinstance(node, str) and _NODE_ID.fullmatch(node):
         return node
     return None
 
@@ -686,19 +700,28 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             resume_args = ["--from-node", waiting_node, "--strategy", "resume"]
         else:
             resume_args = ["--strategy", "resume"]
-        # Only a parked run (sentinel present) resumes; an approval of a run
-        # that never parked must not claim it is "resuming".
-        if not waiting_node and _review_pause_sentinel(home, args.run_id).is_file():
+        # Only a parked run whose LAST pending row this approval cleared
+        # resumes, and only when the spawn is not skipped. Warning about a
+        # missing entry point in any other case is a lie the operator cannot
+        # tell from the truth — `--no-resume` spawns nothing, and a run with
+        # rows still pending is not resumable yet.
+        no_resume = bool(getattr(args, "no_resume", False))
+        will_resume = (
+            not no_resume
+            and not node_review.pending_for_run(args.run_id, db_path=db)
+            and _review_pause_sentinel(home, args.run_id).is_file()
+        )
+        if will_resume and not waiting_node:
             sys.stderr.write(
-                "approvals approve: .review-pause has no waiting_node; "
-                "resuming without an entry point (the recovery planner "
-                "picks the first node it cannot reuse)\n"
+                "approvals approve: .review-pause has no waiting_node "
+                "(missing or unusable); resuming without an entry point "
+                "(the recovery planner picks the first node it cannot reuse)\n"
             )
         status_line = _maybe_resume_parked_run(
             home, args.run_id,
             db=db,
             extra_args=resume_args,
-            no_resume=bool(getattr(args, "no_resume", False)),
+            no_resume=no_resume,
         )
         if status_line:
             sys.stdout.write(status_line)

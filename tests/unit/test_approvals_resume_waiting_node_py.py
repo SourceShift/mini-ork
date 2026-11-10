@@ -91,6 +91,31 @@ def test_waiting_node_non_dict_json(tmp_path):
     assert approvals_cmd._waiting_node(tmp_path, run_id) is None
 
 
+@pytest.mark.parametrize("node", ["--strategy", "-x", "a b", "../etc/passwd",
+                                  "node;rm -rf /", "n" * 129])
+def test_waiting_node_rejects_a_value_that_is_not_a_node_id(tmp_path, node):
+    """The value becomes ``recover --from-node <value>``; anything that could
+    read as a flag, split into two argv entries, or leave the node namespace is
+    treated as absent so the caller falls back to a plain resume."""
+    from mini_ork.cli import approvals_cmd
+
+    run_id = "run-unit-badnode"
+    trr._write_review_pause(tmp_path, run_id, {"waiting_node": node})
+    assert approvals_cmd._waiting_node(tmp_path, run_id) is None
+
+
+def test_waiting_node_survives_a_non_utf8_sentinel(tmp_path):
+    """A sentinel with a stray byte is degraded, not fatal — the docstring's
+    "never raises" must cover ``UnicodeDecodeError`` too, not just ``OSError``."""
+    from mini_ork.cli import approvals_cmd
+
+    run_id = "run-unit-badbytes"
+    sentinel = _sentinel(tmp_path, run_id)
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_bytes(b'{"waiting_node": "ratification_check", "\xff": 1}')
+    assert approvals_cmd._waiting_node(tmp_path, run_id) is None
+
+
 # ── approve resumes from the waiting node ────────────────────────────────
 
 
@@ -205,3 +230,48 @@ def test_no_resume_hint_includes_from_node(monkeypatch, tmp_path, capsys):
     assert spawns == [], "--no-resume must not spawn"
     assert "--from-node ratification_check" in out
     assert "--strategy resume" in out
+
+
+# ── the warning is printed only when a resume actually happens ───────────
+
+
+def test_no_resume_does_not_warn_about_a_missing_entry_point(
+        monkeypatch, tmp_path, capsys):
+    """``--no-resume`` spawns nothing, so "resuming without an entry point"
+    would describe work this command did not do."""
+    from mini_ork.cli import approvals_cmd
+
+    run_id = "run-waiting-6"
+    _parked_run(tmp_path, run_id)
+    _sentinel(tmp_path, run_id).write_text("", encoding="utf-8")
+    trr._stub_spawn(monkeypatch, approvals_cmd)
+
+    capsys.readouterr()
+    rc = approvals_cmd.main(
+        ["approve", run_id, "--node", "contract_compiler", "--no-resume"]
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "no waiting_node" not in err
+
+
+def test_a_still_pending_row_does_not_warn_about_a_missing_entry_point(
+        monkeypatch, tmp_path, capsys):
+    """Approving one of two pending rows resumes nothing yet; the run is not
+    waiting on the operator's last decision, so there is no warning to give."""
+    from mini_ork.cli import approvals_cmd
+
+    run_id = "run-waiting-7"
+    trr._setup_parked_run(tmp_path, run_id,
+                          node_ids=["contract_compiler", "ratification_check"])
+    _sentinel(tmp_path, run_id).write_text("", encoding="utf-8")
+    spawns = trr._stub_spawn(monkeypatch, approvals_cmd)
+
+    capsys.readouterr()
+    rc = approvals_cmd.main(["approve", run_id, "--node", "contract_compiler"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert spawns == [], "a run with rows still pending must not resume"
+    assert "no waiting_node" not in captured.err
