@@ -128,7 +128,7 @@
 | run-scoped-env | 2026-10-10 | pending | DONE | dispatch/run_env.py config/env.yaml overlay + context.publish_env + execute_handlers per-node env |
 | visual-verify | 2026-10-10 | pending | STALE | pre-redesign checklist (status bar, rounding, row size, cache paint) superseded by da93f40 Dispatch Console layout and da5d004 |
 
-## Still genuinely open (19)
+## Still genuinely open (17)
 
 - **repo-ops** — default branch = main and PR #1 MERGED, but gh api repos/SourceShift/zed-mini-ork/branches/main/protection -> 404 'Branch not protected'
   - next: either enable `branches/main/protection` on SourceShift/zed-mini-ork or record in a doc that the fork is intentionally unprotected
@@ -150,8 +150,6 @@
   - next: revive chat-listen-shape-be-20261013 with a working lane, or close it as abandoned
 - **revive-1791887097** — run-1791887097-86207 verdict fail with 4 failed nodes; review-verdict fail, implementer status=no_changes, NEEDS-CHANGE.md 10-13 14:27
   - next: fix the implementer's no_changes outcome on run-1791887097-86207 then revive through the verifier chain
-- **stale-run-verdict-on-resume** — CLOSED: recover now rotates the superseded attempt's verdict.json/run-verdict.json into `attempts/<n>/` before dispatching, so the rubric cannot grade the replaced attempt
-  - landed: `mini_ork/recovery/planner.py` `_archive_superseded_verdicts` (best effort; a run with no verdict, or an unreadable ledger, is left alone) + `tests/unit/test_recover_verdict_rotation_py.py`
 - **engine-node-runtime** — decision never recorded - only a pending line in SESSION-GOALS.md; no config/doc chooses a node runtime for researcher worktrees
   - next: write the decision (which runtime the researcher target worktrees use) into docs/plans
 - **board-phase1** — fail-closed 'epics add' landed (epics.py:110) but the /task command and the epic-card board-with-Runs-tab do not exist
@@ -166,4 +164,8 @@
   - next: recover 22332 from the reviewer node (its verdict.json is red and it was dismissed)
 - **sync-researcher-engine** — researcher/.mini-ork engine 780 commits behind origin/main (same probe as row 64)
   - next: same action as researcher-install-update - one fast-forward closes both
+
+## Closed since the audit
+
+- **stale-run-verdict-on-resume** — **DONE `e60633dc`**: recover rotates the superseded attempt's verdict.json/run-verdict.json into `attempts/<n>/` before dispatching, so the rubric cannot grade the replaced attempt. `mini_ork/recovery/planner.py` `_archive_superseded_verdicts` (best effort: no verdict → no move; an unreadable ledger → attempt 1), covered by `tests/unit/test_recover_verdict_rotation_py.py`.
 - ~~**run-page-last-node**~~ — **DONE `bbb00e1`**: `page.rs:2815-2818` derives the node from `model.last_ran()` and hands it to `MiniOrkGraph::new`, so the run page opens on the node it reached last. The engine's `graph['focus']` is redundant, not unwired.
