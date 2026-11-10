@@ -18,7 +18,10 @@ Two hazards a schedule has to avoid, both handled here:
   reflecting.
 
 State (``<home>/state/reflect-schedule.json``) records the window actually
-covered, so a failing pass is retried next tick instead of skipped.
+covered, so a failing pass is retried next tick instead of skipped, plus the
+batch cap that retry should use: a pass that hits its deadline halves it, a
+pass that finishes doubles it back, so a window too big to finish shrinks
+until it fits rather than being re-paid for at every tick.
 """
 from __future__ import annotations
 
@@ -51,6 +54,17 @@ DEFAULTS = {
 }
 _INT_KEYS = ("interval_s", "deadline_s", "settle_s", "max_window_s")
 _MIN_TTL_S = 900
+
+#: ``reflect.main`` returns this when its SIGALRM deadline fires.
+_DEADLINE_RC = 124
+
+#: State key holding the batch cap for the *next* pass. A pass that hits its
+#: deadline halves it; a pass that finishes doubles it back toward the ceiling.
+#: Persisted, so a crash between ticks cannot forget the miss.
+BATCH_KEY = "batch"
+
+#: The default ceiling on traces per pass (``MO_REFLECTION_BATCH``).
+_DEFAULT_BATCH = 500
 
 LEASE_HELD_MESSAGE = "reflect schedule: another scheduled pass holds the lease"
 DISABLED_MESSAGE = "reflect schedule: disabled"
@@ -163,6 +177,20 @@ def _write_state(home: str, state: dict) -> None:
         raise
 
 
+def _with_batch(state: dict, batch: int, ceiling: int) -> dict:
+    """``state`` with the batch cap recorded — omitted at the ceiling.
+
+    A full-size pass leaves no key behind, so the file keeps the two fields it
+    has always had and an operator reading it sees only a deviation from the
+    configured cap.
+    """
+    if batch == ceiling:
+        state.pop(BATCH_KEY, None)
+    else:
+        state[BATCH_KEY] = batch
+    return state
+
+
 def _last_ok_until(state: dict) -> int | None:
     raw = state.get("last_ok_until")
     try:
@@ -171,14 +199,42 @@ def _last_ok_until(state: dict) -> int | None:
         return None
 
 
-def _capped_until(db: str, since: int, until: int) -> int:
+def _batch_ceiling() -> int:
+    """The configured cap on traces per pass (``MO_REFLECTION_BATCH``, 500)."""
+    try:
+        return max(1, int(os.environ.get("MO_REFLECTION_BATCH", _DEFAULT_BATCH)))
+    except ValueError:
+        return _DEFAULT_BATCH
+
+
+def _next_batch(state: dict, ceiling: int) -> int:
+    """The batch cap for this pass: the previous pass's, clamped to ``ceiling``.
+
+    A deadline miss is what this remembers. Without it the schedule wedges:
+    the window is re-covered from the same ``since`` after a timeout, so a
+    batch that cannot finish inside ``deadline_s`` is re-paid for on every
+    tick and ``last_ok_until`` never advances. The pass that timed out halves
+    the cap (:func:`run_once`), the pass that finishes doubles it back, so the
+    schedule converges on the largest batch that fits its deadline.
+    """
+    raw = state.get(BATCH_KEY)
+    try:
+        value = int(raw) if raw is not None else ceiling
+    except (TypeError, ValueError):
+        return ceiling
+    return min(ceiling, max(1, value))
+
+
+def _capped_until(db: str, since: int, until: int, batch: int) -> int:
     """``until``, lowered so the window ``(since, until]`` fits one batch.
 
-    The pipeline selects at most ``MO_REFLECTION_BATCH`` traces (default 500)
-    per pass, oldest first, and the scheduled pass selects strictly after
-    ``since`` (``MO_REFLECTION_SINCE_EXCLUSIVE``). When the window holds more
-    than one batch, it ends just before the (batch+1)-th trace's second, so
-    every trace in it is selected and the next tick continues from there.
+    The pipeline selects at most ``batch`` traces per pass — the pass cap
+    ``run_once`` resolved from the state file and ``MO_REFLECTION_BATCH``
+    (:func:`_next_batch`) — oldest first, and the scheduled pass selects
+    strictly after ``since`` (``MO_REFLECTION_SINCE_EXCLUSIVE``). When the
+    window holds more than one batch, it ends just before the (batch+1)-th
+    trace's second, so every trace in it is selected and the next tick
+    continues from there.
 
     Each pass always moves forward: the cap is never below the first second
     after ``since``. When that single second alone holds more than a batch,
@@ -186,10 +242,6 @@ def _capped_until(db: str, since: int, until: int) -> int:
     skipped (one stderr line says so) rather than wedging the schedule. Any
     read error keeps ``until``.
     """
-    try:
-        batch = max(1, int(os.environ.get("MO_REFLECTION_BATCH", 500)))
-    except ValueError:
-        batch = 500
     try:
         import sqlite3  # noqa: PLC0415
 
@@ -262,7 +314,8 @@ def run_once(
     prints one line and returns 0, so a cron overlap is a no-op. The window is
     ``since = max(last_ok_until, now - max_window_s)`` to
     ``until = now - settle_s``; nothing settled means nothing to do. State
-    advances only on exit 0, so a failed window is retried next tick.
+    advances only on exit 0, so a failed window is retried next tick — and a
+    deadline hit (124) additionally halves the batch cap for that retry.
     """
     cfg = {**DEFAULTS, **cfg}
     if not cfg.get("enabled"):
@@ -294,6 +347,8 @@ def run_once(
     try:
         state = _read_state(home)
         last_ok = _last_ok_until(state)
+        ceiling = _batch_ceiling()
+        batch = _next_batch(state, ceiling)
         floor = now - max_window_s
         since = max(last_ok, floor) if last_ok is not None else floor
         until = now - settle_s
@@ -305,7 +360,7 @@ def run_once(
             print(NOTHING_SETTLED_MESSAGE)
             return 0
 
-        until = _capped_until(db, since, until)
+        until = _capped_until(db, since, until, batch)
 
         if reflect_fn is None:
             from mini_ork.cli import reflect as reflect_cli  # noqa: PLC0415
@@ -315,6 +370,9 @@ def run_once(
         overrides = {
             "MO_REFLECT_DEADLINE_S": str(deadline_s),
             "MO_REFLECTION_UNTIL_TS": str(until),
+            # The selection must take exactly the traces the cap allowed, or a
+            # shrunk batch would still be overrun by the pipeline's own default.
+            "MO_REFLECTION_BATCH": str(batch),
             "MO_REFLECTION_SINCE_EXCLUSIVE": "1",
             # A scheduled pass is never run-scoped: an inherited run id would
             # route reflect through its run-scoped selector, which ignores the
@@ -339,7 +397,22 @@ def run_once(
                 print("reflect schedule: the cost circuit stopped extraction; "
                       "keeping the window for the next pass")
             else:
-                _write_state(home, {"last_ok_until": until, "at": now})
+                # Finished inside the deadline: try a bigger batch next time,
+                # back toward the configured ceiling.
+                _write_state(home, _with_batch(
+                    {"last_ok_until": until, "at": now},
+                    min(ceiling, batch * 2), ceiling))
+        elif rc == _DEADLINE_RC:
+            # The window did not finish, so it stays where it was — but a
+            # smaller batch is what makes the retry able to finish at all
+            # (see _next_batch). Floor of one trace per pass: a *single* trace
+            # slower than deadline_s is a config problem, not a batch-size one.
+            smaller = max(1, batch // 2)
+            _write_state(home, _with_batch({**state, "at": now}, smaller, ceiling))
+            sys.stderr.write(
+                f"reflect schedule: the pass hit its {deadline_s}s deadline; the "
+                f"next one takes at most {smaller} trace(s) so the window can "
+                "finish (raise deadline_s if a single trace cannot)\n")
         return rc
     finally:
         lease.release_lease(db, LEASE_KEY, token)

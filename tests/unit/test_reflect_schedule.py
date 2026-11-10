@@ -442,6 +442,76 @@ def test_a_plain_dispatch_failure_still_advances_the_window(home_db):
     assert _state(home)["last_ok_until"] == 10_000_000 - 1800
 
 
+# ── the deadline shrinks the batch instead of wedging the window ────────────
+
+def test_a_deadline_halves_the_next_batch_and_keeps_the_window(home_db, capsys):
+    """The livelock this prevents: the window is retried from the same ``since``,
+    so a batch that cannot finish inside ``deadline_s`` is re-paid for on every
+    tick and the watermark never moves."""
+    home, db = home_db
+    reflect = RecordingReflect(rc=rs._DEADLINE_RC)
+    rc = rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                     reflect_fn=reflect)
+    assert rc == 124
+    state = _state(home)
+    assert "last_ok_until" not in state, "a timed-out window must not advance"
+    assert state["batch"] == 250
+    assert "next one takes at most 250 trace(s)" in capsys.readouterr().err
+
+
+def test_a_finished_pass_grows_the_batch_back_toward_the_ceiling(home_db):
+    home, db = home_db
+    (home / "state").mkdir()
+    (home / "state" / "reflect-schedule.json").write_text(
+        json.dumps({"last_ok_until": 9_000_000, "at": 9_000_000, "batch": 100}))
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                reflect_fn=RecordingReflect())
+    assert _state(home)["batch"] == 200
+
+
+def test_a_full_size_pass_leaves_no_batch_key(home_db):
+    """Steady state writes the two fields it always had; the key marks a
+    deviation from the configured cap, not a second source of truth."""
+    home, db = home_db
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                reflect_fn=RecordingReflect())
+    assert "batch" not in _state(home)
+
+
+def test_the_shrunk_batch_is_what_the_window_and_reflect_use(home_db, monkeypatch):
+    """Both ends of the cap must agree: the boundary ``_capped_until`` picks and
+    the selection the pipeline actually runs."""
+    home, db = home_db
+    monkeypatch.setenv("MO_REFLECTION_BATCH", "10")
+    (home / "state").mkdir()
+    (home / "state" / "reflect-schedule.json").write_text(
+        json.dumps({"last_ok_until": 9_499_999, "at": 9_499_999, "batch": 2}))
+    _add_traces(db, [9_500_000, 9_500_100, 9_500_200])
+    reflect = RecordingReflect()
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000, reflect_fn=reflect)
+    # Two traces fit; the window ends just before the third (9_500_200).
+    assert reflect.calls[0]["env"]["MO_REFLECTION_UNTIL_TS"] == str(9_500_199)
+    assert reflect.calls[0]["env"]["MO_REFLECTION_BATCH"] == "2"
+
+
+def test_repeated_deadlines_shrink_to_one_trace_and_stop_there(home_db):
+    home, db = home_db
+    reflect = RecordingReflect(rc=rs._DEADLINE_RC)
+    for _ in range(12):
+        rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                    reflect_fn=reflect)
+    assert _state(home)["batch"] == 1
+
+
+def test_a_non_deadline_failure_does_not_touch_the_batch(home_db):
+    """Only 124 means "the window did not fit". A provider 500 says nothing
+    about batch size, and shrinking on it would slow a healthy schedule down."""
+    home, db = home_db
+    rs.run_once(str(home), db, _enabled_cfg(home), now=10_000_000,
+                reflect_fn=RecordingReflect(rc=1))
+    assert not (home / "state" / "reflect-schedule.json").exists()
+
+
 def test_scheduled_flag_dispatches_to_run_once(home_db, monkeypatch):
     from mini_ork.cli import reflect as reflect_cli
 

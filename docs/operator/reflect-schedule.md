@@ -82,14 +82,23 @@ spends LLM budget; the cost still lands under the existing
    (`until == since`) is still attempted and selects at most the traces on the
    boundary.
 4. **Reflect.** One in-process `mini_ork.cli.reflect.main(["--since", ...])`
-   pass with `MO_REFLECT_DEADLINE_S=<deadline_s>` and
-   `MO_REFLECTION_UNTIL_TS=<until>` set for the duration. The until bound adds
-   `created_at <= until` to the trace selection, so the pass stays off traces
-   a fresh run's own post-run pass may still be reflecting.
+   pass with `MO_REFLECT_DEADLINE_S=<deadline_s>`,
+   `MO_REFLECTION_UNTIL_TS=<until>` and `MO_REFLECTION_BATCH=<batch>` set for
+   the duration. The until bound adds `created_at <= until` to the trace
+   selection, so the pass stays off traces a fresh run's own post-run pass may
+   still be reflecting; the until bound is also narrowed so the window holds at
+   most one batch of traces, so no trace is skipped by the cap.
 5. **State.** Exit 0 → `<home>/state/reflect-schedule.json` is atomically
-   replaced with `{"last_ok_until": until, "at": now}`. Any non-zero exit
-   (including the deadline's 124) leaves the old state, so the window is
-   retried next tick. The lease is released in `finally` either way.
+   replaced with `{"last_ok_until": until, "at": now}`. Any other exit leaves
+   the window where it was, so it is retried next tick. The lease is released
+   in `finally` either way.
+6. **A deadline hit (124) shrinks the next batch.** The window is retried from
+   the same `since`, so a batch that cannot finish inside `deadline_s` would be
+   re-paid for on every tick and the watermark would never move. The pass
+   therefore halves the cap (`batch`, persisted) and prints
+   `reflect schedule: the pass hit its <n>s deadline; …`. A pass that finishes
+   doubles it back toward `MO_REFLECTION_BATCH`, so the schedule converges on
+   the largest batch that fits its deadline instead of oscillating.
 
 ## The state file
 
@@ -103,6 +112,9 @@ spends LLM budget; the cost still lands under the existing
   bound of the last window that exited 0.
 - `at` — wall-clock time of that pass, for operators (`cat` the file to see
   when the schedule last made progress).
+- `batch` — present only while it differs from `MO_REFLECTION_BATCH`: the cap
+  the next pass will use, after a deadline hit shrank it. Absent means the
+  configured cap.
 
 A missing or corrupt file reads as "no state" — the pass falls back to the
 `max_window_s` look-back. It is safe to delete to force a full-window catch-up
@@ -116,12 +128,19 @@ A missing or corrupt file reads as "no state" — the pass falls back to the
   (fresh traces), but a post-run pass for an old or revived run can still
   overlap a scheduled pass and pay twice for the same trace. Set `settle_s` at
   or above the post-run reflect bound for long runs.
-- **A cost-circuit abort still advances the window.** If the cost circuit
-  opens mid-pass, `reflect` returns 0 and the state advances past the
-  unreflected traces. Batch truncation (`MO_REFLECTION_BATCH`, default 500) has
-  the same effect: only the first 500 rows in the window are processed, and the
-  state advances to `until`. Both are recorded as follow-ups; a narrow
-  `max_window_s` keeps the exposure small.
+- **A cost-circuit abort is caught, a plain failure is not.** If the cost
+  circuit opens mid-pass, `learning_pass_stats` records it and the window does
+  not advance. A pass that merely returns 0 with traces left unreflected is
+  indistinguishable from one that finished, and the window advances — narrow
+  `max_window_s` keeps that exposure small. The batch cap does *not* have this
+  effect: `_capped_until` narrows `until` to the batch boundary, so the traces
+  past the cap stay in the next window. The one exception is a single second
+  holding more traces than the whole batch, which is taken whole (with a
+  stderr line) rather than wedging the schedule.
+- **A single trace slower than `deadline_s` cannot be shrunk away.** The cap
+  floors at one trace per pass, so if reflecting one trace alone exceeds the
+  deadline the window still never advances. That is a config problem: raise
+  `deadline_s` (and the lease TTL follows it automatically).
 - **Lane changes need a restart.** The first pass of a service pins
   `MINI_ORK_GRADIENT_MODEL` in the process environment, so editing
   `agents.yaml` takes effect only after the service is restarted.
