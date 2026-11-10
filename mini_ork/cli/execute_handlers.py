@@ -3008,6 +3008,14 @@ def _handle_verifier(ctx: NodeDispatch):
 
 
 def _handle_publisher(ctx: NodeDispatch):
+    # An effect that cannot be recorded is an effect that is not performed:
+    # the pending record must be durable before either of the publisher's
+    # irreversible write paths runs, or a crash leaves a landed effect that
+    # the resume path cannot see (and so duplicates). Both paths are
+    # downstream of this call, so one record covers both.
+    from mini_ork.stores import checkpoints as _mc  # noqa: PLC0415
+    if _mc.mark_effect_pending(ctx.run_dir_eff, ctx.node_id, "publish") != 0:
+        return 1, "effect_marker_failed"
     rc, finish_reason = publisher_node(
         ctx.root, ctx.run_dir_eff, ctx.db, ctx.run_id,
         ctx.recipe_eff, ctx.task_class,

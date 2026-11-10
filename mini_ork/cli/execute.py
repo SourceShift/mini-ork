@@ -5063,6 +5063,14 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
         # row through ``append_node_attempt`` instead.
         if status not in ("success", "failure", "skipped", "error"):
             return
+        # Close the effect record at node end, BEFORE the success/output_file
+        # split below: the publisher takes the append_node_attempt branch and
+        # never reaches the checkpoint branch, so a flip inside the artifact
+        # half would never run for the one node the record exists for. A
+        # non-success end leaves the record pending — that is the evidence a
+        # recovery must reconcile rather than blindly repeat.
+        if status == "success":
+            mc.mark_effect_done(run_dir, node_id)
         now = int(time.time())
         attempt_started = _attempt_started.get(node_id, started_at)
         cost_usd, max_call_id = mc.node_llm_cost_usd(

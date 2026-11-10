@@ -197,7 +197,12 @@ class RecoveryPlan:
                        → recompute.
       node_types     — name → type map parsed from workflow.yaml (used by
                        the ``verify`` strategy's entry resolution; carries
-                       through ``to_dict`` for downstream consumers)."""
+                       through ``to_dict`` for downstream consumers).
+      parked_nodes   — irreversible nodes whose effect may already have
+                       landed, so they are in neither ``reuse`` nor
+                       ``closure``. Empty unless a reconcile decision parked
+                       them; ``recover`` refuses an unforced plan with a
+                       non-empty list."""
 
     run_id: str
     recipe: str
@@ -212,11 +217,13 @@ class RecoveryPlan:
     reason: dict[str, str]
     sku: str
     node_types: dict[str, str] = dataclasses.field(default_factory=dict)
+    parked_nodes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         out = dataclasses.asdict(self)
         out["closure"] = sorted(self.closure)
         out["reuse"] = sorted(self.reuse)
+        out["parked_nodes"] = list(self.parked_nodes)
         return out
 
 
@@ -258,11 +265,24 @@ def _reusable_set(
     recipe: str,
     task_class: str,
     node_types: dict[str, str] | None = None,
-) -> tuple[set[str], dict[str, str]]:
-    """For every node in the DAG, ask E1 ``is_node_reusable`` and return
-    (reuse_set, reason_map). reason_map[node] = "" if reusable, else a
-    short explanation (no row / status=failure / hash mismatch /
-    missing artifact / corrupt artifact) for the ``--status`` print.
+    force: bool = False,
+) -> tuple[set[str], dict[str, str], set[str]]:
+    """For every node in the DAG, return (reuse, reason, reconcile).
+
+    ``reuse`` is the reusable set. ``reason`` maps every node to a short
+    explanation (``""`` when reusable) for the ``--status`` print; the
+    existing strings (``"no_row"``, ``f"status={s}"``,
+    ``"hash_mismatch_or_artifact_corrupt"``, ``"plan_json"``) are unchanged.
+    ``reconcile`` is the third answer: irreversible nodes whose effect may
+    already have landed. They are in neither ``reuse`` nor the rerun set
+    unless ``force`` is true, in which case the operator has taken
+    responsibility and they are treated as RERUN so ``--force`` can actually
+    re-dispatch them — a refusal the operator can override but not act on is
+    a dead end.
+
+    ``node_resume_decision`` is consulted FIRST, before the row lookups,
+    because the publisher writes no checkpoint row: a row-first order would
+    classify every publisher resume as ``no_row`` and duplicate the effect.
 
     A node with NO row is the common case for nodes that never ran
     (e.g. a failed predecessor kept a downstream branch from being
@@ -273,7 +293,7 @@ def _reusable_set(
     a no_row means "this node never ran").
 
     Planner shortcut (kickoff §2 / lens §1.2): the planner node is special —
-    ``mini_ork/cli/execute_handlers.py:453`` short-circuits when
+    ``mini_ork/cli/execute_handlers.py`` short-circuits when
     ``MINI_ORK_RECOVERY_CLOSURE`` is set, so the planner never writes a
     checkpoint row. Today its ``no_row`` makes it the closure root and
     swallows every reusable upstream node. To fix this without scope_cheek,
@@ -286,15 +306,42 @@ def _reusable_set(
     types = node_types or {}
     reuse: set[str] = set()
     reason: dict[str, str] = {}
+    reconcile: set[str] = set()
     plan_json_present = _plan_json_present_and_parses(run_dir)
     for nid in dag.node_ids:
+        node_type = types.get(nid, "")
+        decision = mc.node_resume_decision(
+            db_path, run_id, nid,
+            current_input_hash=_current_input_hash_for_node(
+                run_id, nid, recipe_eff),
+            current_recipe_version=recipe_eff,
+            current_config_hash=_current_config_hash(tc_eff, recipe_eff, run_id),
+            run_dir=run_dir,
+            node_type=node_type,
+        )
+        if decision is mc.ResumeDecision.REUSE:
+            reuse.add(nid)
+            # Only an irreversible node can be reused off a done effect
+            # record; a reversible node keeps the historical empty reason.
+            reason[nid] = (
+                "effect_done"
+                if mc.effect_class_for_node_type(node_type) == "irreversible"
+                else ""
+            )
+            continue
+        if decision is mc.ResumeDecision.RECONCILE and not force:
+            reconcile.add(nid)
+            reason[nid] = "effect_may_have_landed"
+            continue
+        # RERUN (or a forced RECONCILE) falls through to today's handling so
+        # every existing reason string survives byte for byte.
         # Direct DB read first to classify the failure mode. Cheap,
         # and the planner needs the distinction for the --status print
         # (a "no_row" node is NOT a regression — it's a never-dispatched
         # downstream; a "hash_mismatch" node IS a regression signal).
         row_status = _peek_row_status(db_path, run_id, nid)
         if row_status is None:
-            if plan_json_present and types.get(nid) == "planner":
+            if plan_json_present and node_type == "planner":
                 reuse.add(nid)
                 reason[nid] = "plan_json"
                 continue
@@ -316,7 +363,7 @@ def _reusable_set(
             reason[nid] = ""
         else:
             reason[nid] = "hash_mismatch_or_artifact_corrupt"
-    return reuse, reason
+    return reuse, reason, reconcile
 
 
 def _plan_json_present_and_parses(run_dir: str) -> bool:
@@ -583,6 +630,7 @@ def compute_recovery(
     task_class: str = "generic",
     from_node: str | None = None,
     check_verifiers: bool = True,
+    force: bool = False,
 ) -> RecoveryPlan:
     """Compute the dependency-closure recovery plan.
 
@@ -623,11 +671,16 @@ def compute_recovery(
     recipe_eff = recipe or "unknown"
     tc_eff = task_class or "generic"
     node_types = _node_types(workflow_yaml_path)
-    reuse, reason = _reusable_set(
+    reuse, reason, reconcile = _reusable_set(
         dag, db_path, run_id, run_dir,
         recipe=recipe_eff, task_class=tc_eff,
-        node_types=node_types,
+        node_types=node_types, force=force,
     )
+    # A reconcile node's effect may already have landed; it belongs in neither
+    # reuse nor the rerun set. Park it for the operator instead. ``force``
+    # already turned every reconcile into a RERUN upstream, so this set is
+    # empty on the override path.
+    parked_nodes = tuple(nid for nid in dag.topo if nid in reconcile)
     # Verifier outcomes are invisible to ``is_node_reusable`` (verifiers
     # write only a ``node_attempts`` row), so a node whose direct verifier
     # rejected its output still looks reusable and recover would re-run
@@ -667,7 +720,10 @@ def compute_recovery(
     # Passed verifiers are excluded from non_reusable (so they don't become
     # closure roots) but added back to the closure after the fixpoint (so
     # execute re-runs them without forcing downstream re-runs).
-    non_reusable = [nid for nid in dag.topo if nid not in reuse and nid not in passed]
+    non_reusable = [
+        nid for nid in dag.topo
+        if nid not in reuse and nid not in passed and nid not in reconcile
+    ]
     failed_node: str | None = non_reusable[0] if non_reusable else None
 
     if from_node:
@@ -697,6 +753,12 @@ def compute_recovery(
     closure |= passed
     for v in passed:
         reason[v] = "passed_verifier"
+
+    # A parked node is never dispatched, even when an earlier rerun root
+    # would otherwise sweep it in as a descendant: re-running an effect that
+    # may already have landed is exactly what the third state exists to
+    # prevent. ``--force`` emptied ``reconcile`` above, so this no-ops there.
+    closure -= set(parked_nodes)
 
     # No node may appear in BOTH reuse and rerun (kickoff §3 fix 2):
     # the status printer and downstream consumers assume the sets are
@@ -745,6 +807,7 @@ def compute_recovery(
         reason=reason_view,
         sku=_sku(run_id, recipe_eff, tc_eff),
         node_types=node_types,
+        parked_nodes=parked_nodes,
     )
 
 
@@ -758,6 +821,7 @@ def plan_recovery(
     task_class: str = "generic",
     from_node: str | None = None,
     strategy: str = "resume",
+    force: bool = False,
 ) -> RecoveryPlan:
     """Same as ``compute_recovery`` but pins the strategy into the plan.
 
@@ -797,6 +861,7 @@ def plan_recovery(
         # what keeps a failed first verifier from refusing its own
         # strategy (kickoff N3 §Mechanism).
         check_verifiers=(strategy != "verify"),
+        force=force,
     )
 
     # ``verify`` strategy override (kickoff §3). Entry = first verifier in
@@ -832,6 +897,9 @@ def plan_recovery(
                 kind="verify_no_reusable_upstream",
             )
         plan.closure = dag.descendants(verify_entry)
+        # A parked node is never dispatched, even under an explicit entry
+        # override; ``--force`` already emptied ``parked_nodes``.
+        plan.closure -= set(plan.parked_nodes)
         plan.failed_node = verify_entry
         plan.first_node = next(
             (nid for nid in dag.topo if nid in plan.closure),

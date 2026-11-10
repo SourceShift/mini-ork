@@ -56,6 +56,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Iterable
 
 __all__ = [
@@ -68,6 +69,14 @@ __all__ = [
     "is_node_reusable",
     "hash_file",
     "compute_artifact_manifest",
+    # three-state resume (durable/three-state-resume)
+    "IRREVERSIBLE_NODE_TYPES",
+    "effect_class_for_node_type",
+    "ResumeDecision",
+    "node_resume_decision",
+    "mark_effect_pending",
+    "mark_effect_done",
+    "effect_state",
 ]
 
 # finish_reason → ``node_attempts.failure_class`` (the 0050 vocabulary).
@@ -659,7 +668,7 @@ def write_checkpoint(
         return 1
 
 
-def is_node_reusable(
+def _node_reusable_from_checkpoint(
     db: str,
     run_id: str,
     node_id: str,
@@ -669,23 +678,12 @@ def is_node_reusable(
     current_config_hash: str,
     run_dir: str = "",
 ) -> bool:
-    """Decide whether a prior node's checkpoint is safe to reuse.
+    """The pre-three-state validity check: design §3 rules, byte for byte.
 
-    Design §3 rules, all three must hold:
-      1. input_hash matches the current run's resolved inputs.
-      2. recipe_version and config_hash match the current run.
-      3. every artifact in artifact_manifest_json exists and its sha256
-         verifies against the live file's bytes.
-
-    Any other outcome (no row, hash mismatch, missing file, corrupt file,
-    malformed manifest, sqlite error) returns False. The function NEVER
-    raises — the design rule is "fail closed". Callers can rely on
-    ``bool(is_node_reusable(...))`` being safe in any context.
-
-    The run_dir is optional but REQUIRED for rule 3; if a caller omits
-    it, rule 3 is treated as failing (returned False) so the runtime
-    cannot accidentally re-use a checkpoint whose artifacts it cannot
-    re-verify.
+    Kept as a private seam so ``is_node_reusable`` can delegate to
+    ``node_resume_decision`` while ``node_resume_decision`` evaluates the
+    same row rules without recursing back into itself. NEVER raises — any
+    exception path is coerced to False (fail closed).
     """
     if not db or not run_id or not node_id:
         return False
@@ -753,3 +751,296 @@ def is_node_reusable(
         if not actual or actual != expected:
             return False
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Three-state resume: reuse / rerun / reconcile
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A boolean resume decision is correct for a reversible node and wrong for one
+# that has already touched the outside world: "we cannot prove this effect did
+# not land" must not become "do it again". The gate layer already carries this
+# distinction (``gate_registry`` decomposes into any_fail / any_defer /
+# all_pass rather than one bool); resume needs the same third answer. The
+# ordering evidence cannot be a checkpoint row, because the publisher writes
+# none — it is an effect record written before the effect and closed at node
+# end.
+
+#: The node types that can change state outside the run directory. Verified
+#: against the recipe corpus: recipes declare ``type: publisher`` and nothing
+#: else in this class. ``rollback`` is deliberately absent — it reverts an
+#: effect rather than producing one, and it writes no effect record yet.
+IRREVERSIBLE_NODE_TYPES = frozenset({"publisher"})
+
+#: The per-node effect record lives beside the run's artifacts, not in
+#: SQLite: a sidecar is the smallest persistence that survives the crash the
+#: record exists for, and it needs no schema migration.
+_EFFECTS_DIRNAME = ".effects"
+
+
+def effect_class_for_node_type(node_type: str) -> str:
+    """'irreversible' for a node type that can change state outside the run
+    directory, else 'reversible'. Unknown and empty types are reversible."""
+    return "irreversible" if node_type in IRREVERSIBLE_NODE_TYPES else "reversible"
+
+
+class ResumeDecision(str, Enum):
+    """The three answers a prior attempt at a node can give.
+
+    ``REUSE`` is the old boolean True: the prior work is durably valid.
+    ``RERUN`` is the old boolean False for a reversible node. ``RECONCILE``
+    is the new answer: an irreversible node's effect may already have landed,
+    so rerunning it would duplicate the effect — a person must decide.
+    """
+
+    REUSE = "reuse"
+    RERUN = "rerun"
+    RECONCILE = "reconcile"
+
+
+def _effects_root(run_dir: str) -> str:
+    """The ``.effects`` directory for a run dir, canonicalized.
+
+    ``realpath`` makes the publisher's ``run_dir_eff`` and ``_cp``'s
+    ``run_dir`` agree even when one caller passes a symlinked path (macOS
+    ``/tmp`` → ``/private/tmp``): pending and done must not land in two
+    different directories, or the node reads pending forever.
+    """
+    return os.path.join(os.path.realpath(run_dir), _EFFECTS_DIRNAME)
+
+
+def _fsync_dir(path: str) -> None:
+    """fsync a directory so a create/rename inside it survives a crash.
+
+    Best-effort: a platform that cannot open a directory for fsync has
+    already given us the file-level fsync, so the caller does not fail on it.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def mark_effect_pending(run_dir: str, node_id: str, effect: str) -> int:
+    """Record the effect as started, return 0.
+
+    Non-zero when ``run_dir`` is missing or unwritable (never raises). The
+    write is fsync'd and so is the ``.effects`` directory, because a
+    rename/create that is not directory-synced can be lost by a crash — which
+    is the case this record exists to survive.
+    """
+    if not run_dir or not node_id:
+        return 1
+    try:
+        base = os.path.realpath(run_dir)
+        if not os.path.isdir(base):
+            return 1
+        effects = _effects_root(base)
+        os.makedirs(effects, exist_ok=True)
+        record = {
+            "effect": effect,
+            "state": "pending",
+            "started_at": int(time.time()),
+            "ended_at": None,
+        }
+        path = os.path.join(effects, f"{node_id}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(effects)
+        return 0
+    except OSError as e:
+        _log_err(f"mark_effect_pending: {e}")
+        return 1
+
+
+def mark_effect_done(run_dir: str, node_id: str) -> int:
+    """Flip an existing record to ``done`` with ``ended_at`` and fsync.
+
+    Returns 0 when the record is already done or absent (a reversible node
+    has nothing to flip); non-zero only on a write error. Never raises. An
+    unreadable record is left alone — this helper may not manufacture a
+    ``done`` state over evidence it cannot parse.
+    """
+    if not run_dir or not node_id:
+        return 0
+    try:
+        path = os.path.join(_effects_root(run_dir), f"{node_id}.json")
+        if not os.path.isfile(path):
+            return 0
+        try:
+            with open(path, encoding="utf-8") as fh:
+                record = json.load(fh)
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(record, dict) or record.get("state") == "done":
+            return 0
+        record["state"] = "done"
+        record["ended_at"] = int(time.time())
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(os.path.dirname(path))
+        return 0
+    except OSError as e:
+        _log_err(f"mark_effect_done: {e}")
+        return 1
+
+
+def effect_state(run_dir: str, node_id: str) -> str:
+    """'pending', 'done', 'absent' or 'unreadable'. Never raises.
+
+    ``absent`` means nothing was ever started; ``done`` means the effect
+    completed; ``unreadable`` is the one the decision must not treat as
+    ``absent`` — an effect record it cannot parse is not evidence the effect
+    did not land.
+    """
+    if not run_dir or not node_id:
+        return "absent"
+    try:
+        path = os.path.join(_effects_root(run_dir), f"{node_id}.json")
+        if not os.path.isfile(path):
+            return "absent"
+        with open(path, encoding="utf-8") as fh:
+            record = json.load(fh)
+    except (OSError, ValueError):
+        return "unreadable"
+    if not isinstance(record, dict):
+        return "unreadable"
+    state = record.get("state")
+    return state if state in ("pending", "done") else "unreadable"
+
+
+def _strict_row_status(db: str, run_id: str, node_id: str) -> str | None:
+    """The checkpoint status for ``(run, node)``, or None when there is no row.
+
+    Unlike ``is_node_reusable`` this lets a broken/unreadable DB raise, so
+    ``node_resume_decision`` can apply the irreversible fallback (reconcile)
+    instead of silently reading "cannot verify" as "did not happen".
+    """
+    if not db or not run_id or not node_id or not os.path.isfile(db):
+        raise sqlite3.OperationalError("checkpoint db unavailable")
+    con = _open(db)
+    try:
+        row = con.execute(
+            "SELECT status FROM node_checkpoints WHERE run_id=? AND node_id=?",
+            (run_id, node_id),
+        ).fetchone()
+    finally:
+        con.close()
+    return row[0] if row else None
+
+
+def node_resume_decision(
+    db: str,
+    run_id: str,
+    node_id: str,
+    *,
+    current_input_hash: str,
+    current_recipe_version: str,
+    current_config_hash: str,
+    run_dir: str = "",
+    node_type: str = "",
+) -> ResumeDecision:
+    """Why a prior attempt at this node can or cannot be reused.
+
+    Ordered rules, first match wins:
+      1. an irreversible node whose effect record is ``done`` → REUSE: the
+         effect demonstrably completed, so re-running it duplicates it;
+      2. an irreversible node whose effect record is ``pending`` → RECONCILE;
+      3. an irreversible node whose effect record is ``unreadable`` →
+         RECONCILE (a record it cannot read is not evidence the effect did not
+         land);
+      4. otherwise the existing ``_node_reusable_from_checkpoint`` rules →
+         REUSE;
+      5. otherwise, an irreversible node whose success row exists but no
+         longer re-verifies → RECONCILE;
+      6. otherwise RERUN.
+
+    Rules 1-3 run before any row lookup, because the publisher writes no
+    checkpoint row at all. NEVER raises: an exception raised while evaluating
+    rules 4-5 degrades to RERUN for a reversible node and to RECONCILE for an
+    irreversible one; it never overrides a ``done`` record resolved by rule 1.
+    """
+    irreversible = node_type in IRREVERSIBLE_NODE_TYPES
+    fallback = ResumeDecision.RECONCILE if irreversible else ResumeDecision.RERUN
+
+    # rules 1-3: the effect record, before any row lookup. the publisher
+    # writes no checkpoint row, so a row-first order would read every
+    # publisher resume as "never ran" and duplicate the effect.
+    if irreversible:
+        state = effect_state(run_dir, node_id)
+        if state == "done":
+            return ResumeDecision.REUSE
+        if state in ("pending", "unreadable"):
+            return ResumeDecision.RECONCILE
+
+    try:
+        if _node_reusable_from_checkpoint(
+            db, run_id, node_id,
+            current_input_hash=current_input_hash,
+            current_recipe_version=current_recipe_version,
+            current_config_hash=current_config_hash,
+            run_dir=run_dir,
+        ):
+            return ResumeDecision.REUSE
+        # rule 5: a success row that no longer verifies is not proof the
+        # effect did not land. only an irreversible node parks on it; a
+        # reversible node keeps today's rerun.
+        if irreversible and _strict_row_status(db, run_id, node_id) == "success":
+            return ResumeDecision.RECONCILE
+        return ResumeDecision.RERUN
+    except Exception as e:  # noqa: BLE001 — the resume decision must never raise
+        _log_err(f"node_resume_decision: {e}")
+        return fallback
+
+
+def is_node_reusable(
+    db: str,
+    run_id: str,
+    node_id: str,
+    *,
+    current_input_hash: str,
+    current_recipe_version: str,
+    current_config_hash: str,
+    run_dir: str = "",
+) -> bool:
+    """Decide whether a prior node's checkpoint is safe to reuse.
+
+    Design §3 rules, all three must hold:
+      1. input_hash matches the current run's resolved inputs.
+      2. recipe_version and config_hash match the current run.
+      3. every artifact in artifact_manifest_json exists and its sha256
+         verifies against the live file's bytes.
+
+    Any other outcome (no row, hash mismatch, missing file, corrupt file,
+    malformed manifest, sqlite error) returns False. The function NEVER
+    raises — the design rule is "fail closed". Callers can rely on
+    ``bool(is_node_reusable(...))`` being safe in any context.
+
+    The run_dir is optional but REQUIRED for rule 3; if a caller omits
+    it, rule 3 is treated as failing (returned False) so the runtime
+    cannot accidentally re-use a checkpoint whose artifacts it cannot
+    re-verify.
+
+    This is the reversible-node reading of ``node_resume_decision``: every
+    caller that passes no node type keeps today's behaviour byte for byte.
+    """
+    return node_resume_decision(
+        db, run_id, node_id,
+        current_input_hash=current_input_hash,
+        current_recipe_version=current_recipe_version,
+        current_config_hash=current_config_hash,
+        run_dir=run_dir,
+        node_type="",
+    ) is ResumeDecision.REUSE

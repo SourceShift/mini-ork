@@ -500,3 +500,348 @@ def test_reusable_rejects_unsafe_manifest_path(db_path, run_dir):
         current_input_hash="a" * 64, current_recipe_version="v",
         current_config_hash="0" * 64, run_dir=run_dir,
     ) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Three-state resume (durable/three-state-resume): the vocabulary, the
+# decision, the effect record, recovery parking. Cases (g)-(t) above pin the
+# reversible-node behaviour this layer must preserve byte for byte.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _write_effect(run_dir: str, node_id: str, state: str) -> None:
+    d = Path(run_dir) / ".effects"
+    d.mkdir(exist_ok=True)
+    (d / f"{node_id}.json").write_text(json.dumps({
+        "effect": "publish", "state": state,
+        "started_at": 1, "ended_at": 2 if state == "done" else None,
+    }))
+
+
+def _write_unreadable_effect(run_dir: str, node_id: str) -> None:
+    d = Path(run_dir) / ".effects"
+    d.mkdir(exist_ok=True)
+    (d / f"{node_id}.json").write_text("{not json")
+
+
+def _seed_row(db_path: str, node_id: str, *, run_id: str = "r1",
+              status: str = "success", manifest: str = "[]",
+              input_hash: str | None = None, recipe: str = "test-recipe",
+              config_hash: str | None = None) -> None:
+    ih, rv, ch = _good_hashes(run_id, node_id, recipe)
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO node_checkpoints (run_id, node_id, attempt,"
+            " status, input_hash, recipe_version, config_hash,"
+            " artifact_manifest_json, session_ref, failure_class, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, node_id, 1, status, input_hash or ih, rv,
+             config_hash or ch, manifest, None, None, 1))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _stale_manifest(run_dir: str) -> str:
+    (Path(run_dir) / "out.txt").write_bytes(b"new bytes on disk")
+    return json.dumps([{"path": "out.txt", "sha256": "0" * 64, "bytes": 3}])
+
+
+def _decide(db_path: str, run_dir: str, node_id: str, node_type: str,
+            *, run_id: str = "r1", recipe: str = "test-recipe"):
+    ih, rv, ch = _good_hashes(run_id, node_id, recipe)
+    return mc.node_resume_decision(
+        db_path, run_id, node_id,
+        current_input_hash=ih, current_recipe_version=rv,
+        current_config_hash=ch, run_dir=run_dir, node_type=node_type,
+    )
+
+
+# ── vocabulary ─────────────────────────────────────────────────────────────
+
+def test_irreversible_node_types_is_publisher_only():
+    assert isinstance(mc.IRREVERSIBLE_NODE_TYPES, frozenset)
+    assert mc.IRREVERSIBLE_NODE_TYPES == frozenset({"publisher"})
+    assert "rollback" not in mc.IRREVERSIBLE_NODE_TYPES
+
+
+@pytest.mark.parametrize("node_type,expected", [
+    ("publisher", "irreversible"),
+    ("rollback", "reversible"),
+    ("implementer", "reversible"),
+    ("", "reversible"),
+    ("no-such-type", "reversible"),
+])
+def test_effect_class_for_node_type(node_type, expected):
+    assert mc.effect_class_for_node_type(node_type) == expected
+
+
+def test_resume_decision_vocabulary():
+    from enum import Enum
+    assert issubclass(mc.ResumeDecision, Enum)
+    assert issubclass(mc.ResumeDecision, str)
+    assert mc.ResumeDecision.REUSE.value == "reuse"
+    assert mc.ResumeDecision.RERUN.value == "rerun"
+    assert mc.ResumeDecision.RECONCILE.value == "reconcile"
+
+
+# ── the decision: rules 1-3 (the effect record) ────────────────────────────
+
+def test_pending_effect_reconciles_with_and_without_a_row(db_path, run_dir):
+    _write_effect(run_dir, "pub1", "pending")
+    assert _decide(db_path, run_dir, "pub1", "publisher") is mc.ResumeDecision.RECONCILE
+    # the row-less shape is the publisher's real one; a verified row must not
+    # override the pending record either (rule 2 runs before the row lookup)
+    _seed_row(db_path, "pub1")
+    assert _decide(db_path, run_dir, "pub1", "publisher") is mc.ResumeDecision.RECONCILE
+
+
+def test_done_effect_reuses_without_any_row(db_path, run_dir):
+    _write_effect(run_dir, "pub1", "done")
+    assert _decide(db_path, run_dir, "pub1", "publisher") is mc.ResumeDecision.REUSE
+
+
+def test_unreadable_effect_reconciles_not_absent(db_path, run_dir):
+    _write_unreadable_effect(run_dir, "pub1")
+    assert _decide(db_path, run_dir, "pub1", "publisher") is mc.ResumeDecision.RECONCILE
+
+
+def test_absent_effect_without_row_reruns_even_for_publisher(db_path, run_dir):
+    assert _decide(db_path, run_dir, "pub1", "publisher") is mc.ResumeDecision.RERUN
+
+
+# ── the decision: rules 4-6 (the row) ──────────────────────────────────────
+
+def test_stale_success_row_reconciles_only_for_irreversible(db_path, run_dir):
+    _seed_row(db_path, "pub1", manifest=_stale_manifest(run_dir))
+    assert _decide(db_path, run_dir, "pub1", "publisher") is mc.ResumeDecision.RECONCILE
+    _seed_row(db_path, "impl1", manifest=_stale_manifest(run_dir))
+    assert _decide(db_path, run_dir, "impl1", "implementer") is mc.ResumeDecision.RERUN
+
+
+@pytest.mark.parametrize("record_state", ["pending", "done", "unreadable"])
+def test_reversible_node_ignores_the_effect_record(db_path, run_dir, record_state):
+    if record_state == "unreadable":
+        _write_unreadable_effect(run_dir, "impl1")
+    else:
+        _write_effect(run_dir, "impl1", record_state)
+    assert _decide(db_path, run_dir, "impl1", "implementer") is mc.ResumeDecision.RERUN
+    _seed_row(db_path, "impl2")
+    assert _decide(db_path, run_dir, "impl2", "implementer") is mc.ResumeDecision.REUSE
+
+
+# ── the decision: never raises (AC4) ───────────────────────────────────────
+
+@pytest.mark.parametrize("db_kind", ["missing", "garbage"])
+@pytest.mark.parametrize("node_type,expected_name", [
+    ("implementer", "RERUN"),
+    ("publisher", "RECONCILE"),
+])
+def test_broken_db_degrades_by_node_type(tmp_path, run_dir, db_kind,
+                                          node_type, expected_name):
+    if db_kind == "missing":
+        db = str(tmp_path / "does-not-exist.db")
+    else:
+        db = str(tmp_path / "garbage.db")
+        Path(db).write_bytes(b"this is not a sqlite database" * 8)
+    assert _decide(db, run_dir, "n1", node_type) is getattr(
+        mc.ResumeDecision, expected_name)
+
+
+@pytest.mark.parametrize("node_type,expected_name", [
+    ("implementer", "RERUN"),
+    ("publisher", "RECONCILE"),
+])
+def test_malformed_manifest_degrades_by_node_type(db_path, run_dir, node_type,
+                                                   expected_name):
+    _seed_row(db_path, "n1", manifest='{"not": "json"')
+    assert _decide(db_path, run_dir, "n1", node_type) is getattr(
+        mc.ResumeDecision, expected_name)
+
+
+def test_done_record_survives_a_broken_db(tmp_path, run_dir):
+    db = str(tmp_path / "garbage.db")
+    Path(db).write_bytes(b"this is not a sqlite database" * 8)
+    _write_effect(run_dir, "pub1", "done")
+    assert _decide(db, run_dir, "pub1", "publisher") is mc.ResumeDecision.REUSE
+
+
+# ── the effect record helpers ──────────────────────────────────────────────
+
+def test_mark_effect_pending_writes_record(run_dir):
+    assert mc.mark_effect_pending(run_dir, "pub1", "publish") == 0
+    record = json.loads((Path(run_dir) / ".effects" / "pub1.json").read_text())
+    assert record["effect"] == "publish"
+    assert record["state"] == "pending"
+    assert isinstance(record["started_at"], int)
+
+
+def test_mark_effect_pending_missing_run_dir_is_nonzero(tmp_path):
+    assert mc.mark_effect_pending(str(tmp_path / "no-such-run"), "pub1", "publish") != 0
+
+
+def test_mark_effect_done_flips_pending_and_is_absent_noop(run_dir):
+    mc.mark_effect_pending(run_dir, "pub1", "publish")
+    assert mc.mark_effect_done(run_dir, "pub1") == 0
+    assert mc.effect_state(run_dir, "pub1") == "done"
+    # a no-op flip must not manufacture a done record for a node that never
+    # started, or a never-run irreversible node would read as reusable
+    assert mc.mark_effect_done(run_dir, "ghost") == 0
+    assert mc.effect_state(run_dir, "ghost") == "absent"
+    assert not (Path(run_dir) / ".effects" / "ghost.json").exists()
+
+
+def test_effect_state_four_answers(tmp_path, run_dir):
+    assert mc.effect_state(str(tmp_path / "no-such-dir"), "pub1") == "absent"
+    assert mc.effect_state(run_dir, "pub1") == "absent"
+    mc.mark_effect_pending(run_dir, "pub1", "publish")
+    assert mc.effect_state(run_dir, "pub1") == "pending"
+    mc.mark_effect_done(run_dir, "pub1")
+    assert mc.effect_state(run_dir, "pub1") == "done"
+    _write_unreadable_effect(run_dir, "pub2")
+    assert mc.effect_state(run_dir, "pub2") == "unreadable"
+
+
+# ── is_node_reusable keeps today's contract ────────────────────────────────
+
+def test_is_node_reusable_signature_unchanged():
+    import inspect
+    assert list(inspect.signature(mc.is_node_reusable).parameters) == [
+        "db", "run_id", "node_id", "current_input_hash",
+        "current_recipe_version", "current_config_hash", "run_dir",
+    ]
+
+
+def test_is_node_reusable_blind_to_the_effect_record(db_path, run_dir):
+    _write_effect(run_dir, "pub1", "done")  # done record, but no checkpoint row
+    ih, rv, ch = _good_hashes("r1", "pub1")
+    assert mc.is_node_reusable(
+        db_path, "r1", "pub1",
+        current_input_hash=ih, current_recipe_version=rv,
+        current_config_hash=ch, run_dir=run_dir,
+    ) is False
+
+
+# ── recovery: the third value, parking, and the CLI refusal ────────────────
+
+def _write_workflow(tmp_path, nodes, edges) -> str:
+    lines = ["nodes:"]
+    for name, typ in nodes:
+        lines += [f"  - name: {name}", f"    type: {typ}"]
+    lines.append("edges:")
+    for src, dst in edges:
+        lines += [f"  - from: {src}", f"    to: {dst}",
+                  "    edge_type: depends_on"]
+    path = tmp_path / "workflow.yaml"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def _parking_workflow(tmp_path, db_path, run_dir) -> str:
+    wf = _write_workflow(
+        tmp_path,
+        [("build", "implementer"), ("publish", "publisher")],
+        [("build", "publish")])
+    _seed_row(db_path, "build")
+    _write_effect(run_dir, "publish", "pending")
+    return wf
+
+
+def test_reusable_set_returns_reconcile_and_keeps_reasons(tmp_path, db_path,
+                                                          run_dir):
+    from mini_ork.recovery.dag import load_dag
+    from mini_ork.recovery.plan import _reusable_set
+    wf = _write_workflow(
+        tmp_path,
+        [("build", "implementer"), ("publish", "publisher"),
+         ("nf", "implementer"), ("nnorow", "implementer")],
+        [("build", "publish")])
+    _seed_row(db_path, "build")
+    _seed_row(db_path, "nf", status="failure")
+    _write_effect(run_dir, "publish", "pending")
+    dag = load_dag(wf)
+    reuse, reason, reconcile = _reusable_set(
+        dag, db_path, "r1", run_dir, recipe="test-recipe",
+        task_class="tc",
+        node_types={"build": "implementer", "publish": "publisher",
+                    "nf": "implementer", "nnorow": "implementer"})
+    assert "build" in reuse and reason["build"] == ""
+    assert "publish" in reconcile and "publish" not in reuse
+    assert reason["publish"] == "effect_may_have_landed"
+    assert reason["nf"] == "status=failure"
+    assert reason["nnorow"] == "no_row"
+    assert not reuse & reconcile
+
+
+def test_compute_recovery_parks_and_excludes_from_closure(tmp_path, db_path,
+                                                           run_dir):
+    from mini_ork.recovery.plan import compute_recovery
+    wf = _parking_workflow(tmp_path, db_path, run_dir)
+    plan = compute_recovery(wf, "r1", db_path, run_dir,
+                            recipe="test-recipe", task_class="tc")
+    assert set(plan.parked_nodes) == {"publish"}
+    assert "publish" not in plan.closure and "publish" not in plan.reuse
+    assert "build" in plan.reuse
+    assert plan.reason["publish"] == "effect_may_have_landed"
+
+
+def test_compute_and_plan_recovery_write_nothing(tmp_path, db_path, run_dir):
+    from mini_ork.recovery.plan import compute_recovery, plan_recovery
+
+    def snapshot(root):
+        snap = {}
+        for base, _dirs, files in os.walk(root):
+            for name in files:
+                p = os.path.join(base, name)
+                snap[os.path.relpath(p, root)] = Path(p).read_bytes()
+        return snap
+
+    wf = _parking_workflow(tmp_path, db_path, run_dir)
+    before = snapshot(run_dir)
+    compute_recovery(wf, "r1", db_path, run_dir,
+                     recipe="test-recipe", task_class="tc")
+    plan_recovery(wf, "r1", db_path, run_dir,
+                  recipe="test-recipe", task_class="tc", strategy="resume")
+    assert snapshot(run_dir) == before  # no record change, no sidecar, no row
+
+
+def test_recovery_plan_parked_nodes_defaults_empty(tmp_path, db_path, run_dir):
+    from mini_ork.recovery.plan import compute_recovery
+    wf = _write_workflow(tmp_path, [("build", "implementer")], [])
+    _seed_row(db_path, "build")
+    plan = compute_recovery(wf, "r1", db_path, run_dir,
+                            recipe="test-recipe", task_class="tc")
+    assert plan.parked_nodes == ()
+
+
+def test_plan_recovery_force_puts_parked_node_in_closure(tmp_path, db_path,
+                                                          run_dir):
+    from mini_ork.recovery.plan import plan_recovery
+    wf = _parking_workflow(tmp_path, db_path, run_dir)
+    plan = plan_recovery(wf, "r1", db_path, run_dir,
+                         recipe="test-recipe", task_class="tc",
+                         strategy="resume", force=True)
+    assert "publish" in plan.closure
+    assert not plan.parked_nodes
+
+
+def test_recover_cli_refuses_unforced_parked_plan(tmp_path, db_path, run_dir,
+                                                   monkeypatch, capsys):
+    from mini_ork.recovery import planner
+    wf = _parking_workflow(tmp_path, db_path, run_dir)
+    (Path(run_dir) / "run_profile.json").write_text(
+        json.dumps({"recipe": "test-recipe"}))
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", run_dir)
+    monkeypatch.setenv("MINI_ORK_DB", db_path)
+    monkeypatch.setenv("MINI_ORK_WORKFLOW", wf)
+    monkeypatch.setenv("MINI_ORK_TASK_CLASS", "tc")
+    monkeypatch.delenv("MINI_ORK_RECIPE", raising=False)
+    rc = planner.main(["r1"])
+    output = capsys.readouterr()
+    assert rc == 1
+    text = output.out + output.err
+    assert ("refusing: publish is an irreversible effect that may already "
+            f"have landed; inspect {run_dir}/.effects/publish.json") in text
+    # a parked plan must not read as a clean run with nothing to do
+    assert "nothing to recover" not in text

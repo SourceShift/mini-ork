@@ -1394,6 +1394,7 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             workflow, run_id, db_path, run_dir,
             recipe=recipe, task_class=task_class,
             from_node=from_node_eff, strategy=strategy,
+            force=force,
         )
     except RecoveryRefused as exc:
         # Strategy-specific refusals (verify without reusable upstream
@@ -1418,6 +1419,22 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             + "\n"
         )
         return 0
+
+    # ── Parked-effect refusal (durable/three-state-resume) ──
+    # A reconcile node's effect may already have landed, so it is in neither
+    # the closure nor the reuse set. Rerunning it would duplicate the effect
+    # (a second commit, a second push); the operator's transition out is the
+    # existing ``--force``, not an automatic retry. This must sit before the
+    # empty-closure return below, or a parked-only plan would read as
+    # "nothing to recover" and exit 0.
+    if plan.parked_nodes and not force:
+        for nid in plan.parked_nodes:
+            sys.stderr.write(
+                f"refusing: {nid} is an irreversible effect that may already "
+                f"have landed; inspect "
+                f"{os.path.join(run_dir, '.effects', f'{nid}.json')}\n"
+            )
+        return 1
 
     if not plan.closure:
         # Nothing to rerun — clean exit so the orchestrator advances
