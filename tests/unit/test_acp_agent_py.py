@@ -38,6 +38,7 @@ from acp.schema import (  # noqa: E402
     AgentPlanUpdate,
     ContentToolCallContent,
     FileEditToolCallContent,
+    PromptResponse,
     ResourceContentBlock,
     SessionInfoUpdate,
     TextContentBlock,
@@ -6410,3 +6411,191 @@ def test_run_slash_command_keeps_the_attachment_lines(tmp_path):
     assert "fix the thing" in kickoff
     home = agent._home_for(sid)
     assert f"Attached image: {home / 'attachments' / sid / '0.png'}" in kickoff
+
+
+# ── /run and /race run-id guard ─────────────────────────────────────────────
+
+_GUARD_SID = "s-guard"
+_GUARD_EXISTING = "run-1794331944-51032"
+_GUARD_MISSING = "run-1794331944-abc123def0"
+
+
+class _GuardReached(AssertionError):
+    """Raised when a refusal enters a launch or workspace helper."""
+
+
+def _guard_raising(label: str):
+    def _spy(*args: Any, **kwargs: Any):
+        raise _GuardReached(f"{label} was called: args={args!r} kwargs={kwargs!r}")
+
+    return _spy
+
+
+def _guard_agent(home: Path, *, direct: str = "raise", race: str = "raise") -> MiniOrkAcpAgent:
+    """A constructor-less agent shell that drives ``_prompt_thread`` in-thread.
+
+    The guard, the slash strippers and the emitter are real class code;
+    ``_emit``, ``_record``, ``_home_for`` and the dispatch helpers are stubs,
+    so a refusal can never reach the launcher or a worktree.
+    """
+    agent = object.__new__(MiniOrkAcpAgent)
+    agent._cancelled = set()
+    agent._thread_rewrites = {}
+    # seeded so the first-prompt title update never fires: the only chunk a
+    # refusal may emit is the refusal's own.
+    agent._first_prompt_sent = {_GUARD_SID}
+    agent._thread_titles = {}
+    agent._thread_config = {}
+    agent._sessions = {}
+    agent._launches = {}
+    agent._run_base_titles = {}
+    agent._emitted = []
+    agent._captured_direct = []
+    agent._captured_race = []
+
+    async def _emit(session_id, update):
+        agent._emitted.append((session_id, update))
+
+    async def _capture(session_id, text, **kwargs):
+        target = (
+            agent._captured_direct if direct == "capture" and race != "capture"
+            else agent._captured_race
+        )
+        target.append((session_id, text))
+        return PromptResponse(stop_reason="end_turn")
+
+    agent._emit = _emit
+    agent._home_for = lambda session_id: home
+    agent._record = lambda session_id, record: None
+    agent._launch = _guard_raising("_launch")
+    agent._prompt_thread_direct = (
+        _capture if direct == "capture" else _guard_raising("_prompt_thread_direct")
+    )
+    agent._prompt_thread_race = (
+        _capture if race == "capture" else _guard_raising("_prompt_thread_race")
+    )
+    agent._prompt_thread_orchestrate = _guard_raising("_prompt_thread_orchestrate")
+    return agent
+
+
+def _guard_drive(agent: MiniOrkAcpAgent, text: str):
+    return asyncio.run(agent._prompt_thread(_GUARD_SID, [_text_block(text)]))
+
+
+def _guard_chunks(agent: MiniOrkAcpAgent) -> list[str]:
+    return [
+        update.content.text
+        for _sid, update in agent._emitted
+        if isinstance(update, AgentMessageChunk)
+    ]
+
+
+def test_run_id_payload_matches_only_minted_tokens() -> None:
+    """Only a single minted-shape token is a run-id payload; prose is not."""
+    from mini_ork.acp import agent as agent_module
+
+    pred = agent_module._run_id_payload
+    for _ in range(5):
+        minted = mint_run_id()
+        assert pred(minted) == minted
+    assert pred(f"   {_GUARD_EXISTING} ") == _GUARD_EXISTING
+    for text in (
+        f"fix the flaky test {_GUARD_EXISTING}",
+        f"{_GUARD_EXISTING} please",
+        f"{_GUARD_EXISTING} {_GUARD_EXISTING}",
+        "run-1794331944-510ABC",
+        f"{_GUARD_EXISTING}.",
+        "",
+    ):
+        assert pred(text) is None, f"must not be treated as a run id: {text!r}"
+
+
+def test_run_existing_run_id_refuses_without_launching(tmp_path: Path) -> None:
+    """`/run <id>` for an existing run names it and never mints or launches."""
+    home = tmp_path / "home"
+    (home / "runs" / _GUARD_EXISTING).mkdir(parents=True)
+    agent = _guard_agent(home)
+
+    resp = _guard_drive(agent, f"/run {_GUARD_EXISTING}")
+
+    assert resp is not None and resp.stop_reason == "refusal"
+    chunks = _guard_chunks(agent)
+    assert len(agent._emitted) == 1 and len(chunks) == 1
+    assert _GUARD_EXISTING in chunks[0]
+    assert "existing run" in chunks[0]
+    assert agent._captured_direct == [] and agent._captured_race == []
+    assert agent._launches == {} and agent._run_base_titles == {}
+
+
+def test_run_unknown_run_id_refuses_not_found(tmp_path: Path) -> None:
+    """A minted-shape id with no run under the home gets the not-found refusal."""
+    home = tmp_path / "home"
+    (home / "runs").mkdir(parents=True)
+    agent = _guard_agent(home)
+
+    resp = _guard_drive(agent, f"/run {_GUARD_MISSING}")
+
+    assert resp is not None and resp.stop_reason == "refusal"
+    chunks = _guard_chunks(agent)
+    assert len(agent._emitted) == 1 and len(chunks) == 1
+    assert _GUARD_MISSING in chunks[0]
+    assert "no run with that id exists" in chunks[0]
+    assert agent._captured_direct == [] and agent._captured_race == []
+
+
+def test_race_run_id_refuses_and_names_race(tmp_path: Path) -> None:
+    """`/race <id>` refuses the same way and names `/race` in its message."""
+    home = tmp_path / "home"
+    (home / "runs" / _GUARD_EXISTING).mkdir(parents=True)
+
+    agent = _guard_agent(home)
+    resp = _guard_drive(agent, f"/race {_GUARD_EXISTING}")
+    assert resp is not None and resp.stop_reason == "refusal"
+    existing_text = _guard_chunks(agent)[0]
+    assert _GUARD_EXISTING in existing_text and "/race" in existing_text
+    assert "/run" not in existing_text
+
+    agent = _guard_agent(home)
+    resp = _guard_drive(agent, f"/race {_GUARD_MISSING}")
+    assert resp is not None and resp.stop_reason == "refusal"
+    missing_text = _guard_chunks(agent)[0]
+    assert _GUARD_MISSING in missing_text and "/race" in missing_text
+    assert "/run" not in missing_text
+    assert agent._captured_direct == [] and agent._captured_race == []
+
+
+def test_run_prose_containing_run_id_still_launches(tmp_path: Path) -> None:
+    """A run id embedded in prose is a kickoff, not a payload."""
+    home = tmp_path / "home"
+    (home / "runs" / _GUARD_EXISTING).mkdir(parents=True)
+
+    agent = _guard_agent(home, direct="capture")
+    prose = f"fix the flaky test {_GUARD_EXISTING}"
+    resp = _guard_drive(agent, f"/run {prose}")
+    assert resp is not None and resp.stop_reason == "end_turn"
+    assert agent._captured_direct == [(_GUARD_SID, prose)]
+    assert _guard_chunks(agent) == []
+
+    resp = _guard_drive(agent, f"/run {_GUARD_EXISTING} please")
+    assert resp is not None and resp.stop_reason == "end_turn"
+    assert agent._captured_direct[-1] == (_GUARD_SID, f"{_GUARD_EXISTING} please")
+
+
+def test_emit_run_id_refusal_shape_and_slash(tmp_path: Path) -> None:
+    """The emitter sends exactly one chunk naming the id and the slash."""
+    home = tmp_path / "home"
+    (home / "runs" / _GUARD_EXISTING).mkdir(parents=True)
+    for slash, run_id in (
+        ("run", _GUARD_EXISTING),
+        ("run", _GUARD_MISSING),
+        ("race", _GUARD_EXISTING),
+        ("race", _GUARD_MISSING),
+    ):
+        agent = _guard_agent(home)
+        asyncio.run(agent._emit_run_id_refusal(_GUARD_SID, run_id, home, slash=slash))
+
+        assert len(agent._emitted) == 1, f"{slash} {run_id}: one chunk only"
+        text = _guard_chunks(agent)[0]
+        assert run_id in text and f"/{slash}" in text
+        other = "/race" if slash == "run" else "/run"
+        assert other not in text

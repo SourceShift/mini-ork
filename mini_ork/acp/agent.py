@@ -194,6 +194,26 @@ def mint_run_id() -> str:
     return f"run-{int(time.time())}-{secrets.token_hex(3)}"
 
 
+#: The shape ``mint_run_id`` mints. Used to tell "a run id" from "a kickoff
+#: that happens to contain a run id": only a payload that is a *single*
+#: token of this shape is treated as an id.
+_RUN_ID_PAYLOAD = re.compile(r"^run-\d{6,}-[0-9a-f]{4,}$")
+
+
+def _run_id_payload(text: str) -> str | None:
+    """The run id ``text`` names, or None when it is ordinary kickoff text.
+
+    A run id is a single token of the minted shape. Prose that merely
+    contains an id (``fix run-1794-abc``) is a kickoff and is left alone.
+    """
+    candidate = (text or "").strip()
+    if not candidate or any(ch.isspace() for ch in candidate):
+        return None
+    if _RUN_ID_PAYLOAD.fullmatch(candidate):
+        return candidate
+    return None
+
+
 def task_name_for_kickoff(kickoff_text: str) -> str:
     """First non-empty kickoff line with leading ``#`` stripped.
 
@@ -1900,12 +1920,20 @@ class MiniOrkAcpAgent:
         home = self._home_for(session_id)
         slash_text = self._strip_slash_run(text)
         if slash_text is not None:
+            named = _run_id_payload(slash_text)
+            if named is not None:
+                await self._emit_run_id_refusal(session_id, named, home, slash="run")
+                return PromptResponse(stop_reason="refusal")
             lines = _attachment_lines(prompt, session_id, home)
             return await self._prompt_thread_direct(
                 session_id, _compose_payload(slash_text, lines)
             )
         race_text = self._strip_slash_race(text)
         if race_text is not None:
+            named = _run_id_payload(race_text)
+            if named is not None:
+                await self._emit_run_id_refusal(session_id, named, home, slash="race")
+                return PromptResponse(stop_reason="refusal")
             return await self._prompt_thread_race(session_id, race_text)
         # Z9c-3: every plain prompt flows to the orchestrator. A stored or
         # legacy ``mode=direct`` keeps being accepted by ``set_config_option``
@@ -1935,6 +1963,29 @@ class MiniOrkAcpAgent:
         if not text.startswith(_SLASH_RACE_PREFIX):
             return None
         return text[len(_SLASH_RACE_PREFIX):].strip()
+
+    async def _emit_run_id_refusal(
+        self, session_id: str, run_id: str, home: Path, *, slash: str
+    ) -> None:
+        """Refuse a slash payload that is a run id, not a kickoff.
+
+        ``/run <id>`` would otherwise mint a second run whose entire kickoff
+        is the identifier; point at the existing run (or the typo) instead.
+        """
+        if (Path(home) / "runs" / run_id).exists():
+            text = (
+                f"`/{slash} {run_id}` names an existing run, not a kickoff — "
+                "a new run would have been started with that id as its prompt. "
+                f"Open run {run_id} from the board to read or steer it, or "
+                f"give `/{slash}` a kickoff sentence."
+            )
+        else:
+            text = (
+                f"`/{slash} {run_id}` looks like a run id, not a kickoff, and "
+                "no run with that id exists in this home. Check the id, or "
+                f"give `/{slash}` a kickoff sentence."
+            )
+        await self._emit(session_id, self._build_refusal_message(text))
 
     async def _prompt_thread_direct(
         self, session_id: str, text: str, *, recipe: str | None = None
