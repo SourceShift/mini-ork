@@ -198,3 +198,78 @@ def test_closed_record_body_carries_ended_at(db, run_dir):
         record = json.load(fh)
     assert record["state"] == "done"
     assert isinstance(record["ended_at"], int)
+
+
+# ── format_status: the parked set is visible before dispatch ───────────────
+
+
+def _status_plan(parked=()):
+    from mini_ork.recovery.plan import RecoveryPlan
+    return RecoveryPlan(
+        run_id="run-status", recipe="code-fix", task_class="code_fix",
+        closure={"impl", "verify"}, reuse={"plan"}, failed_node="impl",
+        first_node="impl", from_node=None, strategy="retry",
+        cost_boundary={"budget_usd": 1.5}, reason={"impl": "no E1 row"},
+        sku="sku-abc",
+        node_types={
+            "impl": "implementer",
+            "verify": "verifier",
+            "publish": "publisher",
+        },
+        parked_nodes=tuple(parked),
+    )
+
+
+def test_status_prints_parked_node_and_effect_record_path():
+    from mini_ork.recovery.plan import format_status
+    lines = format_status(_status_plan(parked=("publish",))).splitlines()
+    assert "    parked (1 node):" in lines
+    parked = [ln for ln in lines if "[parked]" in ln]
+    assert len(parked) == 1
+    assert "[parked] publish" in parked[0]
+    assert ".effects/publish.json" in parked[0]
+    # the section sits between the rerun block and the cost boundary block
+    out = "\n".join(lines)
+    assert out.index("    rerun (") < out.index("    parked (")
+    assert out.index("    parked (") < out.index("    cost boundary")
+
+
+def test_status_prints_empty_parked_section_as_none():
+    from mini_ork.recovery.plan import format_status
+    lines = format_status(_status_plan(parked=())).splitlines()
+    assert "    parked (0 nodes):" in lines
+    # reuse and closure are non-empty here, so the only "(none)" is parked's
+    assert lines.count("      (none)") == 1
+    assert not any("[parked]" in ln for ln in lines)
+    header_at = lines.index("    parked (0 nodes):")
+    assert lines[header_at + 1] == "      (none)"
+
+
+def test_status_existing_lines_unchanged_by_parked_set():
+    from mini_ork.recovery.plan import format_status
+    unchanged = [
+        "    reuse (1 node):",
+        "      [reuse]  plan",
+        "    rerun (2 nodes):",
+        "      [first] impl  (no E1 row)",
+        "      [      ] verify",
+        "    cost boundary (repair): $1.50 ceiling",
+        "    entry: impl",
+        "    sku: sku-abc",
+    ]
+    for parked in ((), ("publish",)):
+        lines = format_status(_status_plan(parked=parked)).splitlines()
+        for expected in unchanged:
+            assert expected in lines, f"missing unchanged line {expected!r}"
+
+
+def test_recover_help_documents_force_on_a_parked_node():
+    from mini_ork.recovery.planner import _USAGE
+    entry = _USAGE[_USAGE.index("  --force"):]
+    entry = entry[:entry.index("\n  --", 1)]
+    low = entry.lower()
+    assert "retryable" in low
+    assert "dispatch anyway" in low
+    assert "parked" in low
+    assert "irreversible" in low
+    assert "pending" in low

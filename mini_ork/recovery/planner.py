@@ -201,7 +201,11 @@ Options:
                                  Required when ``<run_dir>/retry-hint.json``
                                  is present with ``needs_change`` set.
   --force                      Override a ``retryable: false`` retry hint
-                                 and dispatch anyway.
+                                 and dispatch anyway. Also re-dispatches an
+                                 irreversible node (the publisher) that a
+                                 prior run parked for reconciliation because
+                                 its effect may already have landed; the
+                                 ``pending`` effect record is left in place.
   --allow-local                Revive a run recorded as ``--placement remote``
                                  on the host when that placement can no longer
                                  be restored (no node env resolvable). Without

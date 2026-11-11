@@ -812,8 +812,15 @@ def _effects_root(run_dir: str) -> str:
 def _fsync_dir(path: str) -> None:
     """fsync a directory so a create/rename inside it survives a crash.
 
-    Best-effort: a platform that cannot open a directory for fsync has
-    already given us the file-level fsync, so the caller does not fail on it.
+    A directory that cannot be opened is tolerated: the file-level fsync
+    already covered the write, and some filesystems refuse to open a
+    directory for sync. An ``OSError`` from ``os.fsync`` itself is not
+    swallowed — it propagates to the caller, which fails closed: for
+    ``mark_effect_pending`` that is a non-zero return, so the publisher
+    refuses to run and the record stays ``pending`` for
+    ``mark_effect_done``. The asymmetry is deliberate: failing open on a
+    sync error is how a crash loses exactly the record the sync exists to
+    protect.
     """
     try:
         fd = os.open(path, os.O_RDONLY)

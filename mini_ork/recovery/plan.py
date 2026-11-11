@@ -974,6 +974,23 @@ def format_status(plan: RecoveryPlan) -> str:
     else:
         lines.append("      (none — every node is reusable)")
     lines.append("")
+    lines.append(
+        f"    parked ({len(plan.parked_nodes)} "
+        f"node{'s' if len(plan.parked_nodes) != 1 else ''}):"
+    )
+    if plan.parked_nodes:
+        # Sorted so the printout is stable between runs; the record path is
+        # relative to the run dir named in the header, and names what the
+        # operator must read before deciding whether to --force.
+        for nid in sorted(plan.parked_nodes):
+            rec = os.path.join(".effects", f"{nid}.json")
+            lines.append(
+                f"      [parked] {nid}  ({rec} — irreversible effect, "
+                f"may have landed)"
+            )
+    else:
+        lines.append("      (none)")
+    lines.append("")
     if plan.cost_boundary.get("budget_usd") is not None:
         lines.append(
             f"    cost boundary (repair): ${plan.cost_boundary['budget_usd']:.2f} ceiling"
