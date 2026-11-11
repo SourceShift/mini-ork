@@ -41,7 +41,10 @@ PINNED_STATES = {
     # 693dc18c made promotion_check the producer it used to only consume from:
     # the hermetic audit runs inside the gate (~0.06 s, no network, no model).
     "⑦": "live (hermetic, ~0.06 s)",
-    "⑧": "off by default; `shadow` measures without enforcing",
+    # 2026-11-11: unset now means `shadow` (the audit ran only when asked,
+    # which made a measured lane and an empty one read identically). The state
+    # column changes with it; enforcement is still the opt-in half.
+    "⑧": "live in shadow (the default); `1`/`enforce` quarantines",
     "⑨": "live",
     "⑩": "consumer on, producer manual",
     "⑪": "removed (669c181c)",

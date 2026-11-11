@@ -484,7 +484,7 @@ Two tiers, one call site: on a laptop the audit runs inline at promotion — no 
 
 ## ⑪ Conformal abstention — removed (2026-10)
 
-The split-conformal gate (`gates/conformal_gate.py`) and the calibrated `abstain_gate` evaluator were removed: no verifier writes a confidence or a false-positive label, so neither ever had calibration data, and the only switch (a recipe's per-node `gates:` list) is never read by the executor. The Learn-Then-Test bar in `gates/abstain_gate.py` stays; the self-driving escalation policy uses it. See `docs/plans/2026-10-25-ecosystem-section6.md`.
+The split-conformal gate (`gates/conformal_gate.py`) and the calibrated `abstain_gate` evaluator were removed: no verifier writes a confidence or a false-positive label, so neither ever had calibration data, and the only switch (a recipe's per-node `gates:` list) is never read by the executor. The Learn-Then-Test bar in `gates/abstain_gate.py` stays; the self-driving escalation policy uses it, under its own knobs (`MO_ABSTAIN_ALPHA`, `MO_ABSTAIN_MIN_CALIB`). The gate's three switches went with it: `MO_CONFORMAL_ORACLE`, `MO_CONFORMAL_ALPHA` and `MO_CONFORMAL_MIN_CALIB` are no longer read by anything, which is why they are documented as removed rather than configurable. See `docs/plans/2026-10-25-ecosystem-section6.md`.
 
 ## ⑫ Discrimination-anchored test evidence (G06-T01): `mini_ork/certify/discrimination.py`, `mini_ork/certify/oracle.py`
 
@@ -701,8 +701,8 @@ With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
   everywhere: `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement) measures on every promotion in `shadow` — 
   recorded, never quarantining — and only `1`/`enforce` lets a measured lane change the outcome. That switch is a
   promotion-policy change, not a quality-of-life toggle. Unmeasured never blocks, and an abstention is never
-  converted into a pass. (The split-conformal abstention gate, `MO_CONFORMAL_ORACLE`, was removed in 2026-10: no
-  verifier writes the confidence it would calibrate on.)
+  converted into a pass. (The split-conformal abstention gate was removed in 2026-10 because no verifier writes the
+  confidence it would calibrate on — section ⑪ records the removal and its knobs.)
 - **Hidden-check hiding is strongest with a secret.** With `MO_HIDDEN_CHECK_SECRET` set, the variant names are
   unpredictable to the implementer. With only `run_id` or the patch digest they are reproducible by anyone who knows
   those inputs — so the certificate records `key_source` rather than implying secret-backed hiding.
