@@ -40,17 +40,33 @@ shipped **eight** more instruments, documented in sections ⑦–⑭ of
 | # | Technique | Module | Knob (default) |
 |---|---|---|---|
 | ⑦ | Oracle integrity audit (7 injected defects + 3 controls) | `mini_ork/gates/oracle_integrity.py` | `MO_ORACLE_INTEGRITY` (`1`) |
-| ⑧ | Judge validity vs execution evidence, per lane | `mini_ork/gates/judge_validity.py` | `MO_JUDGE_VALIDITY` (off), `MO_JUDGE_VALIDITY_MIN` (`0.80`, tighten-only) |
+| ⑧ | Judge validity vs execution evidence, per lane | `mini_ork/gates/judge_validity.py` | `MO_JUDGE_VALIDITY` (`shadow` by default; `1`/`enforce` quarantines; `0`/`off` disables), `MO_JUDGE_VALIDITY_MIN` (`0.80`, tighten-only) |
 | ⑨ | Reward↔evidence pairing (drop contradicted positive rewards) | `mini_ork/learning/reward_audit.py` + `learning/writeback.py` | `MO_REWARD_EVIDENCE_PAIRING` (`1`; `shadow`; `0`) |
 | ⑩ | Verifier mutation discrimination (6 mutations) | `mini_ork/gates/verifier_mutation.py` + `verify/catalog.py` | `MO_VERIFIER_MUTATION` (`1`), `MO_VERIFIER_MUTATION_MIN` (`0.8`) |
-| ⑪ | Split-conformal abstention gate | `mini_ork/gates/conformal_gate.py` | `MO_CONFORMAL_ORACLE` (off), `MO_CONFORMAL_ALPHA` (`0.10`) |
+| — | **Split-conformal abstention gate — REMOVED** (commit `669c181c`) | *gone*: `mini_ork/gates/conformal_gate.py` no longer exists | — |
 | ⑫ | Discrimination-anchored test evidence | `mini_ork/certify/discrimination.py` + `certify/oracle.py` | `MO_ASSAY_DISCRIMINATION` (`1`), `MO_DISCRIMINATION_MIN` (`1.0`) |
 | ⑬ | Behavioral recomputation (two independent replays) | `mini_ork/certify/recompute.py` + `verify/behavioral.py` | declared `Observable.recompute` block |
 | ⑭ | Hidden regenerable ground truth (PoC variants) | `mini_ork/certify/hidden_checks.py` + `certify/oracle.py` | `MO_ASSAY_HIDDEN` (`1`), `MO_HIDDEN_TRIALS` (`2`), `MO_HIDDEN_CHECK_SECRET` |
 
-All eight have unit coverage; each was merged through a `framework-edit` run
-and a scoped green test gate. The review's remaining 51 "next" and 64 "watch"
-techniques are NOT shipped — they are still legitimate recommendations.
+Seven of the eight are shipped (⑦–⑭ minus ⑪) with unit coverage; each was
+merged through a `framework-edit` run and a scoped green test gate.
+
+**⑪ split-conformal abstention was built and then removed** (`669c181c`,
+2026-10-25) because it could never act: the only switch was a per-node `gates:`
+list the executor never read, and no verifier writes a confidence or a
+false-positive label (0 of 1,164 `verifier_results` rows carried either), so
+there was nothing to calibrate on. Only `abstain_gate.alpha()`, `min_calib()`
+and `_ltt_min_confidence` survived, for the self-driving escalation policy.
+**Do not re-recommend a conformal/abstain gate without first proposing the
+confidence writer that gives it calibration data** — re-adding the gate alone
+reproduces the same dead evaluator. This is the general rule for the
+recommendations below: an instrument with no producer is a comment.
+
+The review's remaining 51 "next" and 64 "watch" techniques are NOT shipped —
+they are still legitimate recommendations, but check the four blocking groups in
+`docs/audits/2026-11-11-verification-techniques-implementation.md` §4 (corpus
+gap / signal gap / independence gap / already shipped) before proposing one:
+most are blocked on an input the runtime does not yet produce, not on code.
 
 ## Shipped and acting (the loop uses these today)
 

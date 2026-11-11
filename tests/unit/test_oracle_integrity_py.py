@@ -27,8 +27,8 @@ INJECTION_NAMES = [
 CONTROL_NAMES = list(oi.CONTROLS)
 
 AUDIT_RESULT_KEYS = {
-    "pass", "detected", "missed", "controls_ok", "controls_failed",
-    "judge", "audited_at",
+    "pass", "detected", "missed", "wrong_kind", "decisions",
+    "controls_ok", "controls_failed", "judge", "audited_at",
 }
 
 #: The 10-key promotion result shape when both optional consumers are off.
@@ -67,9 +67,12 @@ def _scripted_cases(decisions: dict[str, str]) -> list[oi.Case]:
 
 
 def _honest_decisions() -> dict[str, str]:
-    decisions = {name: "REFUTED" for name in INJECTION_NAMES}
-    decisions["silent_payload_non_delivery"] = "UNVERIFIED"
-    decisions["test_defect_as_failure"] = "UNVERIFIED"
+    """A judge that returns the correct verdict *kind* on every injection.
+
+    Derived from ``EXPECTED`` rather than hand-listed, so the fixture cannot
+    drift from the map it is supposed to satisfy.
+    """
+    decisions = dict(oi.EXPECTED)
     decisions["known_good_proven"] = "PROVEN"
     decisions["known_bad_refuted"] = "REFUTED"
     decisions["known_empty_abstains"] = "UNVERIFIED"
@@ -126,6 +129,42 @@ def test_holey_judge_returning_proven_on_apply_fail_is_missed():
     assert result["pass"] == (
         result["missed"] == [] and result["controls_failed"] == []
     )
+
+
+def test_honest_judge_records_every_verdict_and_no_wrong_kind():
+    decisions = _honest_decisions()
+    result = oi.audit(_forbid_judge, cases=_scripted_cases(decisions))
+    assert result["decisions"] == decisions
+    assert result["wrong_kind"] == []
+    assert result["pass"] is True
+
+
+def test_abstaining_judge_names_the_class_it_should_have_refuted():
+    """The measured hole: "not PROVEN" cannot tell REFUTED from UNVERIFIED.
+
+    An oracle that abstains on everything is still *detected* on every
+    injection, and this test pins that down as a measurement rather than
+    fixing it silently — the pass rule is unchanged, ``wrong_kind`` now says
+    which injection the abstention got wrong in kind.
+    """
+    decisions = {name: "UNVERIFIED" for name in INJECTION_NAMES}
+    decisions.update({name: "UNVERIFIED" for name in CONTROL_NAMES})
+    result = oi.audit(_forbid_judge, cases=_scripted_cases(decisions))
+    assert sorted(result["detected"]) == sorted(INJECTION_NAMES)
+    assert result["wrong_kind"] == ["apply_fail_masked_as_pass"]
+    # Unchanged pass rule: the control miss is what fails this judge, not the
+    # verdict-kind deviation.
+    assert result["pass"] == (
+        result["missed"] == [] and result["controls_failed"] == []
+    )
+
+
+def test_wrong_kind_never_changes_the_pass_rule():
+    decisions = _honest_decisions()
+    decisions["apply_fail_masked_as_pass"] = "UNVERIFIED"  # right refusal, wrong kind
+    result = oi.audit(_forbid_judge, cases=_scripted_cases(decisions))
+    assert result["wrong_kind"] == ["apply_fail_masked_as_pass"]
+    assert result["pass"] is True, "abstention remains a safe answer"
 
 
 def test_always_abstaining_judge_fails_the_anti_theater_control():
@@ -246,6 +285,10 @@ def _quiet_gate_env(monkeypatch, *, oracle_knob=None) -> None:
         monkeypatch.setenv("MO_ORACLE_INTEGRITY", oracle_knob)
     monkeypatch.setenv("MO_PROMOTION_VERIFIER_AUDIT", "0")
     monkeypatch.setenv("MO_PROMOTION_GATE_HACKABILITY", "0")
+    # judge_validity defaults to `shadow` (measures, never quarantines), so a
+    # promotion result now carries a `judge_validity` block unless it is off.
+    # These tests pin the oracle guard in isolation: switch the sibling off.
+    monkeypatch.setenv("MO_JUDGE_VALIDITY", "0")
     monkeypatch.delenv("MO_PROMOTION_MIN_RUNS", raising=False)
 
 

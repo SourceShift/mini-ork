@@ -178,9 +178,12 @@ promotion gate read a record nothing in production wrote, so every promotion
 reported `unmeasured` and the guard could never fire. The gate now runs the
 audit itself (`oracle_integrity.promotion_check`) and `mini-ork instruments
 oracle-integrity` is the out-of-band producer, not a prerequisite. ⑧ has no
-separate producer — `MO_JUDGE_VALIDITY=shadow` runs the audit from the
-promotion path, records the per-lane envelopes, and never quarantines, so an
-operator can see a lane's agreement before switching to enforcement.
+separate producer either, and for the same reason its default *is* the
+producer: `MO_JUDGE_VALIDITY` unset means `shadow` — the audit runs from the
+promotion path, the per-lane envelopes are recorded, and nothing quarantines,
+so lanes accumulate the overlap history the 0.80 floor would act on.
+`MO_JUDGE_VALIDITY=1` (or `enforce`) turns quarantine on; `0`/`off` disables
+both halves.
 
 | # | Instrument | Runs in | State |
 |---|---|---|---|
@@ -191,7 +194,7 @@ operator can see a lane's agreement before switching to enforcement.
 | ⑤ | Gate hackability | read by the promotion gate; records come only from a manual `mini-ork gate-fuzz --hackability` | consumer on, producer manual |
 | ⑥ | Equivalence operator | the behavioral verifier, for recipes whose contract declares an operator | opt-in per recipe |
 | ⑦ | Oracle integrity | the promotion gate — it audits the judge, then records and scores that record | **live** (hermetic, ~0.06 s) |
-| ⑧ | Judge validity | the promotion gate | off by default; `shadow` measures without enforcing |
+| ⑧ | Judge validity | the promotion gate | **live in shadow** (the default); `1`/`enforce` quarantines |
 | ⑨ | Reward↔evidence pairing | every GRPO writeback | **live** |
 | ⑩ | Verifier mutation | read by the verify catalog; records come only from a manual `mini-ork instruments verifier-mutation --card` | consumer on, producer manual |
 | ⑪ | Conformal abstention | — | removed (669c181c) |
@@ -425,6 +428,7 @@ flowchart TB
 - **Fail.** Any defect accepted OR any control rejected. A would-be promote becomes `quarantined` with reason `oracle_integrity_failed`.
 - **Could not run.** The audit raising is reported as `"status": "error"` on the result and never blocks: a measurement that did not happen is not a pass, but neither is it evidence the judge is broken.
 - **Abstention.** The only `unmeasured` case left is the knob flipping off between the gate's check and its call; it is never treated as a pass.
+- **Verdict kind (measured, never gated).** "Rejected" is `!= PROVEN`, which cannot tell `REFUTED` from `UNVERIFIED`. The audit therefore records `decisions` (every case's verdict) and `wrong_kind` — the injections whose non-proof verdict differed from `EXPECTED` (the correct answer per class; only `apply_fail_masked_as_pass` is decisively `REFUTED`, the rest are `UNVERIFIED` because the evidence cannot establish anything). `wrong_kind` never changes `pass`: an abstention is a safe refusal. It is the signal that separates "refused to prove" from "refused to measure".
 
 **Knobs.**
 - `MO_ORACLE_INTEGRITY` (ON): producer and consumer together. `0`/`off`/`false`/`no` disables both — no audit is run, no record is written, and the result keeps its pre-guard shape.
@@ -440,11 +444,11 @@ Two tiers, one call site: on a laptop the audit runs inline at promotion — no 
 **How it decides.**
 - **Per-lane accuracy** uses a Wilson lower bound. Below `MO_JUDGE_VALIDITY_MIN` the gate quarantines the promotion with reason `judge_validity_below_threshold`.
 - **Abstention.** A lane with fewer than 30 overlapping rows is unmeasured and admits; the gate never converts abstention into a pass.
-- **Off by default.** `MO_JUDGE_VALIDITY` unset disables it; `shadow` measures and records without enforcing; `1` enables enforcement.
-- **Shadow.** The same audit runs and its envelopes are written, and the promotion result carries `judge_validity` with `"mode": "shadow"`, but a below-floor lane never quarantines the promote. Use it to gather agreement evidence before enforcing.
+- **Shadow by default.** `MO_JUDGE_VALIDITY` unset means `shadow`: the audit runs and records without enforcing; `1`/`enforce` adds the quarantine; `0`/`off` disables both halves.
+- **Why the default moved.** Shadow-when-asked kept every lane permanently unmeasured — a lane needs ≥30 overlapping rows and nothing wrote them unless an operator had already turned the audit on. Unset now *means* "measure": the promotion result carries `judge_validity` with `"mode": "shadow"`, the envelopes are written, and a below-floor lane never quarantines the promote.
 
 **Knobs.**
-- `MO_JUDGE_VALIDITY` (unset → off; `shadow` → measure only; `1`/`enforce` → quarantine below floor): master switch.
+- `MO_JUDGE_VALIDITY` (unset → `shadow`; `1`/`enforce` → quarantine below floor; `0`/`off` → disabled): master switch.
 - `MO_JUDGE_VALIDITY_MIN` (0.80): agreement floor; tighten-only (lower values clamp up).
 - `MO_JUDGE_VALIDITY_ROWS` (200): history rows audited per promotion check.
 

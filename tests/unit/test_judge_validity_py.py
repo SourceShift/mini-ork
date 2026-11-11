@@ -14,6 +14,7 @@ fails here rather than silently degrading to "no history" in production.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 import pytest
@@ -432,10 +433,14 @@ def test_write_envelopes_skips_unmeasured_and_no_history(tmp_path):
 # ── (5) promotion_check ─────────────────────────────────────────────────────
 
 
-def test_promotion_check_off_by_default_and_explicit_off(tmp_path, monkeypatch):
+def test_promotion_check_shadow_by_default_and_explicit_off(tmp_path, monkeypatch):
     db = _bad_db(tmp_path)
+    # Unset is `shadow`: the audit is the producer, so it must run by default
+    # or no lane ever accumulates the overlap history the floor needs.
     monkeypatch.delenv("MO_JUDGE_VALIDITY", raising=False)
-    assert judge_validity.promotion_check(db) is None
+    default = judge_validity.promotion_check(db)
+    assert isinstance(default, dict)
+    assert default["admit"] is False, "shadow still measures the below-floor lane"
     for off in ("0", "off"):
         monkeypatch.setenv("MO_JUDGE_VALIDITY", off)
         assert judge_validity.promotion_check(db) is None
@@ -549,14 +554,9 @@ def _gate_db(tmp_path, *, judge_history):
     return str(path)
 
 
-def test_gate_knob_off_leaves_legacy_shape(tmp_path, isolated_gate_env,
-                                           monkeypatch):
+def test_gate_explicit_off_leaves_legacy_shape(tmp_path, isolated_gate_env,
+                                               monkeypatch):
     db = _gate_db(tmp_path, judge_history="failing")
-    result = promotion_evaluate(db, "cand-1")
-    assert result["decision"] == "promoted"
-    assert "judge_validity" not in result
-    assert set(result) == LEGACY_RESULT_KEYS
-
     for off in ("0", "off"):
         monkeypatch.setenv("MO_JUDGE_VALIDITY", off)
         result = promotion_evaluate(db, "cand-1")
@@ -564,6 +564,22 @@ def test_gate_knob_off_leaves_legacy_shape(tmp_path, isolated_gate_env,
         assert "judge_validity" not in result
         assert set(result) == LEGACY_RESULT_KEYS
     assert not (tmp_path / "judge-validity").exists()
+
+
+def test_gate_unset_knob_is_shadow(tmp_path, isolated_gate_env):
+    """Unset must not mean unmeasured: the default is `shadow`.
+
+    The measured lane is below its floor, so the decision stays `promoted` —
+    but the measurement and its envelope are recorded, which is the whole point
+    of making shadow the default.
+    """
+    assert "MO_JUDGE_VALIDITY" not in os.environ
+    db = _gate_db(tmp_path, judge_history="failing")
+    result = promotion_evaluate(db, "cand-1")
+    assert result["decision"] == "promoted", "shadow never quarantines"
+    assert result["judge_validity"]["mode"] == "shadow"
+    assert result["judge_validity"]["admit"] is False
+    assert (tmp_path / "judge-validity" / "glm.json").is_file()
 
 
 def test_gate_failing_measured_lane_quarantines(tmp_path, isolated_gate_env,
@@ -613,7 +629,7 @@ def test_gate_unmeasured_reports_status_and_promotes(tmp_path,
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        (None, "off"),
+        (None, "shadow"),
         ("", "off"),
         ("0", "off"),
         ("false", "off"),

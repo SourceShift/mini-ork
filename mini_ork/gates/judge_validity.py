@@ -22,8 +22,13 @@ Disciplines (mirroring the sibling guards):
 
 Env knobs (read at call time, never cached at import):
 
-  ``MO_JUDGE_VALIDITY``       off by default; ``"1"``/any non-off value enables
-                              the promotion consumer (``"0"``/``"off"`` = off).
+  ``MO_JUDGE_VALIDITY``       ``shadow`` by default: the promotion consumer runs
+                              and records envelopes but never quarantines.
+                              ``"0"``/``"off"``/``"false"``/``"no"`` disable it
+                              outright; ``"enforce"``/``"1"`` enables the
+                              quarantine path. An unset knob must not mean
+                              "unmeasured": a lane with no history can never
+                              accumulate any if the audit only runs when asked.
   ``MO_JUDGE_VALIDITY_ROWS``  history rows to audit (default 200).
   ``MO_JUDGE_VALIDITY_MIN``   agreement floor; values below 0.80 clamp up.
 
@@ -74,14 +79,16 @@ _SHADOW_VALUES = frozenset({"shadow"})
 def mode() -> str:
     """``"off" | "shadow" | "enforce"`` from ``MO_JUDGE_VALIDITY``.
 
-    ``shadow`` measures and records the audit but never quarantines; any other
-    non-off value (``1``, ``true``, ``enforce``, …) is ``enforce`` and keeps
-    today's quarantine path. ``off`` covers unset and ``0``/``false``/``no``/
-    ``off``.
+    ``shadow`` is the **default** (unset): the audit runs and records envelopes
+    on every promotion, but never quarantines — it measures before anyone
+    enforces. A ``shadow`` lane can therefore fill its overlap floor from real
+    traffic; an ``off`` default would keep every lane permanently unmeasured.
+    ``enforce`` (``"1"``, ``"true"``, ``"enforce"``, …) keeps today's quarantine
+    path. ``off`` covers ``""``/``"0"``/``"false"``/``"no"``/``"off"``.
     """
     raw = os.environ.get("MO_JUDGE_VALIDITY")
     if raw is None:
-        return "off"
+        return "shadow"
     token = str(raw).strip().lower()
     if token in _OFF_VALUES:
         return "off"
@@ -93,8 +100,9 @@ def mode() -> str:
 def enabled() -> bool:
     """True when ``MO_JUDGE_VALIDITY`` asks the promotion consumer to run.
 
-    The guard is off by default: an unset knob must leave the promotion result
-    dict byte-identical to the pre-guard shape.
+    True by default (``shadow``). ``MO_JUDGE_VALIDITY=0`` (or ``off``/``false``/
+    ``no``/empty) restores the pre-guard behaviour: no audit, no envelopes, and
+    a promotion result dict byte-identical to the shape before the guard.
     """
     return mode() != "off"
 

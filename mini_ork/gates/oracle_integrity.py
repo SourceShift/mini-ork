@@ -29,14 +29,21 @@ If the real judge cannot be imported, it raises ``RuntimeError`` naming what is
 missing rather than returning a passing result from a stub.
 
 One honest caveat about the predicate: an injection is "detected" iff the decision
-is not ``PROVEN``. ``REFUTED`` and ``UNVERIFIED`` are therefore indistinguishable to
-this module — it scores the literal contract (a broken evidence boundary must not
-prove a patch), not whether the judge picked the *right* non-proof verdict. That
-gap was real once: ``test_defect_as_failure`` used to come back ``REFUTED``, which
-blamed the patch for the harness's own defect and still counted as detected here.
-The judge and its predicate are now pinned by
-``tests/unit/test_certify_evidence_py.py`` (the injected case must decide
-``UNVERIFIED``), because this audit alone cannot see the difference.
+is not ``PROVEN``. ``REFUTED`` and ``UNVERIFIED`` both count, because both refuse to
+prove. That is the right *pass* rule — an abstention is a correct refusal — but it
+is blind to whether the judge picked the right non-proof verdict. That gap was real
+once: ``test_defect_as_failure`` came back ``REFUTED``, which blamed the patch for
+the harness's own defect and still counted as detected here.
+
+The audit now records the distinction instead of ignoring it. Every injection has an
+expected verdict (``EXPECTED``); ``decisions`` records what the judge returned for
+each case, and ``wrong_kind`` names the injections whose non-proof verdict was not
+the expected one — for example, an ``apply_fail_masked_as_pass`` answered
+``UNVERIFIED`` when the patch demonstrably did not apply and ``REFUTED`` was
+available. ``wrong_kind`` is a **measurement, not a gate**: abstention is safe, so
+failing the audit on it would quarantine promotions for a distinction no test pins
+yet. It exists so a judge that always abstains has a recorded, comparable score
+rather than a clean bill of health.
 
 Import discipline: stdlib only at module import time (``mini_ork.*`` imports are
 function-local) so the audit stays importable in a stripped runtime.
@@ -80,6 +87,7 @@ __all__ = [
     "Case",
     "INJECTIONS",
     "CONTROLS",
+    "EXPECTED",
     "audit",
     "enabled",
     "run_default_audit",
@@ -113,6 +121,25 @@ _CONTROL_EXPECTATIONS = {
     "known_good_proven": PROVEN,
     "known_bad_refuted": REFUTED,
     "known_empty_abstains": UNVERIFIED,
+}
+
+#: The verdict a judge that reads the defective evidence correctly returns for each
+#: injection class. ``UNVERIFIED`` is the expected answer wherever the evidence
+#: cannot establish anything (no executed test, no discrimination between base and
+#: candidate, another input's digest, a crashed runner, a harness defect, or a
+#: non-``ExecOutcome`` object). ``apply_fail_masked_as_pass`` is the one class with
+#: decisive evidence: if the patch did not apply, the claim it fixes the bug is
+#: false, so the right answer is ``REFUTED`` rather than an abstention.
+#:
+#: Recorded as ``wrong_kind`` in the audit result; never used to fail the audit.
+EXPECTED: dict[str, str] = {
+    "silent_payload_non_delivery": UNVERIFIED,
+    "frozen_result_swap": UNVERIFIED,
+    "apply_fail_masked_as_pass": REFUTED,
+    "stale_evidence_replay": UNVERIFIED,
+    "runner_error_as_pass": UNVERIFIED,
+    "test_defect_as_failure": UNVERIFIED,
+    "contract_violating_outcome": UNVERIFIED,
 }
 
 #: The synthetic bug the default cases judge. Small, self-contained, and never
@@ -488,25 +515,37 @@ def audit(judge, cases: list[Case] | None = None) -> dict:
     is *detected* when its decision is not ``PROVEN``; a control is *ok* when its
     decision equals the fixed known answer. A case whose ``run`` raises is scored
     as ``UNVERIFIED`` -- a judge that crashes on evidence did not prove anything.
+
+    ``decisions`` records every case's verdict, and ``wrong_kind`` names the
+    injections whose non-proof verdict differed from ``EXPECTED``. Neither affects
+    ``pass``: the pass rule stays "no injection proven, no control missed",
+    because an abstention is a safe answer. ``wrong_kind`` is the recorded signal
+    that distinguishes "refused to prove" from "refused to measure".
     """
     if cases is None:
         cases = default_cases(judge)
 
     detected: list[str] = []
     missed: list[str] = []
+    wrong_kind: list[str] = []
     controls_ok: list[str] = []
     controls_failed: list[str] = []
+    decisions: dict[str, str] = {}
 
     for case in cases:
         try:
             decision = case.run()
         except Exception:  # noqa: BLE001 - a crash cannot certify a proof
             decision = UNVERIFIED
+        decisions[case.name] = decision
         if case.injected:
             if decision == PROVEN:
                 missed.append(case.name)
-            else:
-                detected.append(case.name)
+                continue
+            detected.append(case.name)
+            expected = EXPECTED.get(case.name)
+            if expected is not None and decision != expected:
+                wrong_kind.append(case.name)
         else:
             expected = _CONTROL_EXPECTATIONS.get(case.name)
             if expected is not None and decision == expected:
@@ -518,6 +557,8 @@ def audit(judge, cases: list[Case] | None = None) -> dict:
         "pass": not missed and not controls_failed,
         "detected": detected,
         "missed": missed,
+        "wrong_kind": wrong_kind,
+        "decisions": decisions,
         "controls_ok": controls_ok,
         "controls_failed": controls_failed,
         "judge": _judge_label(judge),

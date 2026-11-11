@@ -73,7 +73,7 @@ feature decides and the evidence it writes.
 | `MO_BEHAV_EQUIVALENCE` | *(unset → `exact`)* | Behavioral comparison operator: `exact`, `set`, `canonical`, `tolerant`, or a JSON spec |
 | `MO_BEHAV_EXPECT_BODY` | *(unset)* | Expected body (JSON) for the behavioral `expect_body` check |
 | `MO_ORACLE_INTEGRITY` | `"1"` | Producer *and* consumer of the oracle-integrity audit: the promotion gate audits the judge and records it, and a failed audit → `quarantined` (`oracle_integrity_failed`). `0`/`off`/`false`/`no` turns both halves off |
-| `MO_JUDGE_VALIDITY` | *(unset → off)* | `1` runs the reviewer-vs-execution agreement audit at promotion; a measured lane below the floor → `quarantined` (`judge_validity_below_threshold`). `shadow` runs the same audit and records it but never quarantines — the way to collect the agreement numbers a floor would act on before switching enforcement on |
+| `MO_JUDGE_VALIDITY` | *(unset → `shadow`)* | Unset is `shadow`: the reviewer-vs-execution agreement audit runs at promotion and its per-lane envelopes are recorded, but nothing quarantines — lanes fill the overlap history the floor would act on. `1`/`enforce` also quarantines a measured lane below the floor (`judge_validity_below_threshold`). `0`/`off`/`false`/`no` disables both halves |
 | `MO_JUDGE_VALIDITY_MIN` | `0.80` | Agreement floor; tighten-only (lower values clamp up) |
 | `MO_JUDGE_VALIDITY_ROWS` | `200` | History rows audited per promotion check |
 | `MO_REWARD_EVIDENCE_PAIRING` | `"1"` | `1` drops positive rewards execution contradicts; `shadow` records and enqueues without dropping; `0`/`off` restores pre-pairing |
