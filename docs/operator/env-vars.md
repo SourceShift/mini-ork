@@ -393,10 +393,12 @@ The verification stack — six instruments from the 2026-10-05/06 review
 level vector, the gate-hackability audit, and the declared equivalence operator)
 plus eight from the 2026-10-18 review (`verify-agentic-20261018-215339`), one of
 which (split-conformal abstention, `MO_CONFORMAL_ORACLE`) was later removed
-because it had no calibration data — is documented there. All of the shipped
-ones are on by default. The single exception is *enforcement*: judge validity
-(`MO_JUDGE_VALIDITY`) runs in `shadow` by default (measured, recorded, never
-quarantining) and only `1`/`enforce` makes it block a promotion. Knobs are
+because it had no calibration data — is documented there. Each shipped
+instrument is on by default *where it runs*, and several only run when a recipe
+or `mini-ork certify` invokes them (⑥ ⑬ per recipe, ⑫ ⑭ under `certify`; ⑤ ⑩
+need a manual producer). The one opt-in that would otherwise run everywhere is
+judge validity: `MO_JUDGE_VALIDITY` measures in `shadow` by default (recorded,
+never quarantining) and only `1`/`enforce` makes it block a promotion. Knobs are
 listed under [Feature flags › Verification
 stack](feature-flags.md#verification-stack) and explained in [the verification
 stack](../architecture/verification-stack.md).

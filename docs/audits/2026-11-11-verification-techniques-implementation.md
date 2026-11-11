@@ -306,16 +306,17 @@ lesson of §3.1 and §3.5: **an instrument without an input is a comment.**
 
 - Status for ①–⑭ is verified against module presence, importers, knob defaults and
   the last commit touching each file at `8f129f90`; the "runs in" column comes from
-  `docs/architecture/verification-stack.md` ("checked 2026-10-27") plus the 2026-11-08
+  `docs/architecture/verification-stack.md` ("checked 2026-11-11") plus the 2026-11-08
   promotion-gate commit, not from a fresh end-to-end run.
 - The `next`/`watch`/`skip` rows are keyword probes, not read-throughs. "Not built"
   means no distinctive term appears in `mini_ork/`; a differently-named partial
   implementation is possible.
-- Nobody has measured whether the 14 instruments change outcomes in aggregate;
-  the per-instrument evidence is the one-off live A/B recorded in the stack doc.
+- Nobody has measured whether the 13 shipped instruments change outcomes in
+  aggregate; the per-instrument evidence is the one-off live A/B recorded in the
+  stack doc.
 - **The 2026-11-11 fixes are covered by tests, not by a live run:** the
   `wrong_kind` / `decisions` semantics in `tests/unit/test_oracle_integrity_py.py`
-  (32 tests), the `shadow` default and its `0`/`off` escape in
+  (33 tests), the `shadow` default and its `0`/`off` escape in
   `tests/unit/test_judge_validity_py.py` (52 tests), and the sibling promotion
   suites (`test_promotion_gate_py.py`, `test_gate_hackability.py`,
   `test_verifier_audit_py.py`, 44 tests) for the extra promotion-result key.

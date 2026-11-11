@@ -3,9 +3,9 @@
 *Added 2026-10-05/06. Six techniques from the 2000-paper verification review
 (`recipes/verification-technique-review/`, run `verify-review-20261005-122958`),
 each built by a mini-ork `framework-edit` run with RSI on and proven by a real
-mini-ork run. Each is on by default **where it runs**, but most do not run
-in a plain `mini-ork run`; see "Where each instrument runs today" (checked
-2026-10-27) below.*
+mini-ork run. Each is on by default **where it runs** — the exceptions are
+enumerated per instrument in "Where each instrument runs today" (checked
+2026-11-11) below — but most do not run in a plain `mini-ork run`.*
 
 *Scope of ① and ② specifically: they are ON in `mini-ork certify`, and in
 `mini-ork run code-fix` they run in **shadow** — the verifier executes both
@@ -163,7 +163,7 @@ flowchart TB
   end
 ```
 
-## Where each instrument runs today (checked 2026-10-27)
+## Where each instrument runs today (checked 2026-11-11)
 
 "On by default" means on inside the path that calls the instrument. Only ③,
 ④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
@@ -696,12 +696,13 @@ With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
   - Code-fix adds up to 2 + `MAX_MUTANTS` suite runs per green verifier.
 - **Reviewer interaction.** The glm reviewer already rejects runs whose verifier reported `pass:false`. The level gate
   matters most where the verifier is *green but unproven*, which the reviewer approves.
-- **Honest limits (2026-11 review).** One instrument can change a promotion outcome the moment it runs, and it is
-  therefore the only one whose enforcement is opt-in: `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement). It runs
-  in `shadow` by default — measured and recorded on every promotion, never quarantining — and `1`/`enforce` is a
-  deliberate promotion-policy change, not a quality-of-life toggle. Unmeasured never blocks, and an abstention is
-  never converted into a pass. (The split-conformal abstention gate, `MO_CONFORMAL_ORACLE`, was removed in 2026-10:
-  no verifier writes the confidence it would calibrate on.)
+- **Honest limits (2026-11 review).** Some instruments are opt-in because they only run where a recipe or a caller
+  invokes them (⑥ ⑬ per recipe, ⑫ ⑭ under `certify`), and one is deliberately opt-in where it *would* run
+  everywhere: `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement) measures on every promotion in `shadow` — 
+  recorded, never quarantining — and only `1`/`enforce` lets a measured lane change the outcome. That switch is a
+  promotion-policy change, not a quality-of-life toggle. Unmeasured never blocks, and an abstention is never
+  converted into a pass. (The split-conformal abstention gate, `MO_CONFORMAL_ORACLE`, was removed in 2026-10: no
+  verifier writes the confidence it would calibrate on.)
 - **Hidden-check hiding is strongest with a secret.** With `MO_HIDDEN_CHECK_SECRET` set, the variant names are
   unpredictable to the implementer. With only `run_id` or the patch digest they are reproducible by anyone who knows
   those inputs — so the certificate records `key_source` rather than implying secret-backed hiding.
