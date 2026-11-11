@@ -26,9 +26,14 @@ Env knobs (read at call time, never cached at import):
                               and records envelopes but never quarantines.
                               ``"0"``/``"off"``/``"false"``/``"no"`` disable it
                               outright; ``"enforce"``/``"1"`` enables the
-                              quarantine path. An unset knob must not mean
-                              "unmeasured": a lane with no history can never
-                              accumulate any if the audit only runs when asked.
+                              quarantine path. The audit's *inputs* come from
+                              the runtime (``execution_traces`` and
+                              ``verifier_results`` are written whether or not
+                              this runs); the knob only decides when the
+                              measurement is reported. Defaulting it to
+                              ``shadow`` is what makes that measurement part of
+                              every promotion result instead of a number an
+                              operator had to already know to ask for.
   ``MO_JUDGE_VALIDITY_ROWS``  history rows to audit (default 200).
   ``MO_JUDGE_VALIDITY_MIN``   agreement floor; values below 0.80 clamp up.
 
@@ -81,10 +86,12 @@ def mode() -> str:
 
     ``shadow`` is the **default** (unset): the audit runs and records envelopes
     on every promotion, but never quarantines — it measures before anyone
-    enforces. A ``shadow`` lane can therefore fill its overlap floor from real
-    traffic; an ``off`` default would keep every lane permanently unmeasured.
-    ``enforce`` (``"1"``, ``"true"``, ``"enforce"``, …) keeps today's quarantine
-    path. ``off`` covers ``""``/``"0"``/``"false"``/``"no"``/``"off"``.
+    enforces. An ``off`` default does not withhold the underlying rows (the
+    runtime writes them regardless), it withholds the *report*, so a lane with
+    enough history to be measured still shows up as nothing until someone
+    decides to ask. ``enforce`` (``"1"``, ``"true"``, ``"enforce"``, …) keeps
+    today's quarantine path. ``off`` covers
+    ``""``/``"0"``/``"false"``/``"no"``/``"off"``.
     """
     raw = os.environ.get("MO_JUDGE_VALIDITY")
     if raw is None:

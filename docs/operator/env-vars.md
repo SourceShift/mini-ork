@@ -391,10 +391,13 @@ UNVERIFIED, with the reason on stderr when a terminal is attached.
 The verification stack — six instruments from the 2026-10-05/06 review
 (metamorphic relations, the differential check, mutation suite adequacy, the
 level vector, the gate-hackability audit, and the declared equivalence operator)
-plus eight from the 2026-10-18 review (`verify-agentic-20261018-215339`) — is
-documented there. All but two are ON by default; judge validity
-(`MO_JUDGE_VALIDITY`) and conformal abstention (`MO_CONFORMAL_ORACLE`) are
-opt-in. Knobs are listed under [Feature flags › Verification
+plus eight from the 2026-10-18 review (`verify-agentic-20261018-215339`), one of
+which (split-conformal abstention, `MO_CONFORMAL_ORACLE`) was later removed
+because it had no calibration data — is documented there. All of the shipped
+ones are on by default. The single exception is *enforcement*: judge validity
+(`MO_JUDGE_VALIDITY`) runs in `shadow` by default (measured, recorded, never
+quarantining) and only `1`/`enforce` makes it block a promotion. Knobs are
+listed under [Feature flags › Verification
 stack](feature-flags.md#verification-stack) and explained in [the verification
 stack](../architecture/verification-stack.md).
 

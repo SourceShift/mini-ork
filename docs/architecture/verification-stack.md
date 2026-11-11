@@ -445,7 +445,7 @@ Two tiers, one call site: on a laptop the audit runs inline at promotion — no 
 - **Per-lane accuracy** uses a Wilson lower bound. Below `MO_JUDGE_VALIDITY_MIN` the gate quarantines the promotion with reason `judge_validity_below_threshold`.
 - **Abstention.** A lane with fewer than 30 overlapping rows is unmeasured and admits; the gate never converts abstention into a pass.
 - **Shadow by default.** `MO_JUDGE_VALIDITY` unset means `shadow`: the audit runs and records without enforcing; `1`/`enforce` adds the quarantine; `0`/`off` disables both halves.
-- **Why the default moved.** Shadow-when-asked kept every lane permanently unmeasured — a lane needs ≥30 overlapping rows and nothing wrote them unless an operator had already turned the audit on. Unset now *means* "measure": the promotion result carries `judge_validity` with `"mode": "shadow"`, the envelopes are written, and a below-floor lane never quarantines the promote.
+- **Why the default moved.** The audit's inputs — `execution_traces` and `verifier_results` — are written by the runtime whether or not the audit runs, so `off` never withheld the data; it withheld the *report*. Every promotion returned a result with no `judge_validity` key at all, and a lane that already had 300 overlapping rows read exactly like a lane with none. Unset now *means* "measure": the promotion result carries `judge_validity` with `"mode": "shadow"`, the envelopes are written, and a below-floor lane never quarantines the promote.
 
 **Knobs.**
 - `MO_JUDGE_VALIDITY` (unset → `shadow`; `1`/`enforce` → quarantine below floor; `0`/`off` → disabled): master switch.
@@ -696,10 +696,12 @@ With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
   - Code-fix adds up to 2 + `MAX_MUTANTS` suite runs per green verifier.
 - **Reviewer interaction.** The glm reviewer already rejects runs whose verifier reported `pass:false`. The level gate
   matters most where the verifier is *green but unproven*, which the reviewer approves.
-- **Honest limits (2026-10 review).** One instrument is **OFF by default** because it changes promotion outcomes:
-  `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement). It abstains rather than blocks when unmeasured — it never
-  converts abstention into a pass — so flipping it to `1` is a deliberate promotion-policy change, not a
-  quality-of-life toggle. (The split-conformal abstention gate, `MO_CONFORMAL_ORACLE`, was removed in 2026-10.)
+- **Honest limits (2026-11 review).** One instrument can change a promotion outcome the moment it runs, and it is
+  therefore the only one whose enforcement is opt-in: `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement). It runs
+  in `shadow` by default — measured and recorded on every promotion, never quarantining — and `1`/`enforce` is a
+  deliberate promotion-policy change, not a quality-of-life toggle. Unmeasured never blocks, and an abstention is
+  never converted into a pass. (The split-conformal abstention gate, `MO_CONFORMAL_ORACLE`, was removed in 2026-10:
+  no verifier writes the confidence it would calibrate on.)
 - **Hidden-check hiding is strongest with a secret.** With `MO_HIDDEN_CHECK_SECRET` set, the variant names are
   unpredictable to the implementer. With only `run_id` or the patch digest they are reproducible by anyone who knows
   those inputs — so the certificate records `key_source` rather than implying secret-backed hiding.

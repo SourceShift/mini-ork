@@ -88,6 +88,13 @@ def test_injections_are_exactly_the_seven_named_builders():
     assert all(callable(builder) for builder in oi.INJECTIONS.values())
 
 
+def test_every_injection_has_exactly_one_expected_verdict():
+    """`EXPECTED` must cover the injection set, or a new class is silently
+    exempt from `wrong_kind` (the deviation is skipped, not reported)."""
+    assert set(oi.EXPECTED) == set(INJECTION_NAMES)
+    assert set(oi.EXPECTED.values()) <= {oi.PROVEN, oi.REFUTED, oi.UNVERIFIED}
+
+
 def test_controls_are_exactly_the_three_known_answers():
     assert isinstance(oi.CONTROLS, tuple)
     assert oi.CONTROLS == (

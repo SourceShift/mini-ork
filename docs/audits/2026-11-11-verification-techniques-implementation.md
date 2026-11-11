@@ -43,7 +43,7 @@ flowchart LR
     C["130 techniques<br/>8 implement-now"] --> D["⑦ ⑧ ⑨ ⑩ ⑫ ⑬ ⑭ shipped"]
     C --> E["⑪ conformal<br/>built, then REMOVED 669c181c"]
   end
-  B --> F["implemented: 14"]
+  B --> F["shipped: 13"]
   D --> F
   E --> G["missing: 1<br/>blocked on calibration data"]
   C --> H["next: 51 · watch: 64 · skip: 7<br/>mostly not built"]
@@ -51,7 +51,7 @@ flowchart LR
 
 ---
 
-## 2. Implemented — 14 instruments
+## 2. Implemented — 13 instruments (14 built, 1 removed)
 
 Verified at HEAD by module presence, importers, the env knob, and the last commit
 that changed each file. "Runs in" is the call site that actually invokes it.
@@ -152,18 +152,20 @@ consumer sees an empty record set. Oracle integrity was in exactly this state
 until `693dc18c` made the promotion gate its producer; the same move is available
 here (run in shadow, write the record, grade nothing until there is history).
 
-### 3.4 Judge validity is off, and with no shadow history it will abstain forever — fixed 2026-11-11
+### 3.4 Judge validity was off, so the result was silent rather than unmeasured — fixed 2026-11-11
 
 `MO_JUDGE_VALIDITY` unset meant disabled; a lane needs ≥30 overlapping
-reviewer/verifier rows before it can even report. Nothing wrote that history in
-shadow, so the instrument would have stayed at zero rows forever — a
-measurement that can only run once you already know the answer.
+reviewer/verifier rows before it can report. Those rows are written by the
+runtime (`execution_traces`, `verifier_results`) whether or not the audit runs,
+so the data was never missing — the *report* was. Every promotion came back with
+no `judge_validity` key, and a lane with 300 overlapping rows read exactly like a
+lane with none. The instrument existed; the measurement only happened if an
+operator already knew to ask for it.
 
 **What changed.** Unset now means `shadow`: the promotion gate runs the audit,
 writes the per-lane envelopes, and never quarantines. `MO_JUDGE_VALIDITY=1`
 (or `enforce`) enables the quarantine path; `0`/`off` disables both halves and
-restores the pre-guard promotion-result shape. Every promotion now contributes
-evidence for the 0.80 floor instead of requiring an operator to pre-enable it.
+restores the pre-guard promotion-result shape.
 
 ### 3.5 Discrimination and hidden checks stop at `certify` — and that is deliberate
 
@@ -267,9 +269,10 @@ lesson of §3.1 and §3.5: **an instrument without an input is a comment.**
    class) + `decisions` + `wrong_kind`. Pass rule unchanged; the wrong-kind signal
    is now recorded, and the first measurement shows the production judge abstains
    on the one class it should refute. (§3.2)
-2. **Judge validity → `shadow` by default.** Unset now measures and records
-   instead of disabling, so lanes can fill the 30-row overlap floor. `1`/`enforce`
-   still quarantines; `0`/`off` still restores the pre-guard shape. (§3.4)
+2. **Judge validity → `shadow` by default.** Unset now reports instead of
+   staying silent, so a measured lane's agreement is visible on every promotion.
+   `1`/`enforce` still quarantines; `0`/`off` still restores the pre-guard shape.
+   (§3.4)
 3. **State snapshot refreshed.** ⑪ removed with its reason; ⑧ documented as
    `shadow` by default. (§3.7)
 4. **⑫/⑭ in code-fix reclassified as blocked, not scheduled.** They need an input
@@ -317,5 +320,7 @@ lesson of §3.1 and §3.5: **an instrument without an input is a comment.**
   suites (`test_promotion_gate_py.py`, `test_gate_hackability.py`,
   `test_verifier_audit_py.py`, 44 tests) for the extra promotion-result key.
   The only behavioural evidence is the one-off `run_default_audit()` measurement
-  quoted in §3.2. The cost is one extra audit per promotion: a 200-row sqlite
-  read plus ~0.06 s of hermetic judging, both wrapped fail-open.
+  quoted in §3.2. The cost is one audit per promotion — two when the audit comes
+  back unmeasured, because the gate re-runs it to name the reason instead of
+  reporting a placeholder: a 200-row sqlite read plus ~0.06 s of hermetic
+  judging per run, both wrapped fail-open.

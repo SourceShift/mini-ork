@@ -73,7 +73,7 @@ feature decides and the evidence it writes.
 | `MO_BEHAV_EQUIVALENCE` | *(unset → `exact`)* | Behavioral comparison operator: `exact`, `set`, `canonical`, `tolerant`, or a JSON spec |
 | `MO_BEHAV_EXPECT_BODY` | *(unset)* | Expected body (JSON) for the behavioral `expect_body` check |
 | `MO_ORACLE_INTEGRITY` | `"1"` | Producer *and* consumer of the oracle-integrity audit: the promotion gate audits the judge and records it, and a failed audit → `quarantined` (`oracle_integrity_failed`). `0`/`off`/`false`/`no` turns both halves off |
-| `MO_JUDGE_VALIDITY` | *(unset → `shadow`)* | Unset is `shadow`: the reviewer-vs-execution agreement audit runs at promotion and its per-lane envelopes are recorded, but nothing quarantines — lanes fill the overlap history the floor would act on. `1`/`enforce` also quarantines a measured lane below the floor (`judge_validity_below_threshold`). `0`/`off`/`false`/`no` disables both halves |
+| `MO_JUDGE_VALIDITY` | *(unset → `shadow`)* | Unset is `shadow`: the reviewer-vs-execution agreement audit runs at promotion and its per-lane envelopes are recorded, so the report exists without an operator asking for it. Nothing quarantines. `1`/`enforce` also quarantines a measured lane below the floor (`judge_validity_below_threshold`). `0`/`off`/`false`/`no` disables both halves (the runtime still writes the trace/verifier rows the audit reads) |
 | `MO_JUDGE_VALIDITY_MIN` | `0.80` | Agreement floor; tighten-only (lower values clamp up) |
 | `MO_JUDGE_VALIDITY_ROWS` | `200` | History rows audited per promotion check |
 | `MO_REWARD_EVIDENCE_PAIRING` | `"1"` | `1` drops positive rewards execution contradicts; `shadow` records and enqueues without dropping; `0`/`off` restores pre-pairing |
@@ -82,9 +82,9 @@ feature decides and the evidence it writes.
 | `MO_VERIFIER_MUTATION_MIN` | `0.8` | Minimum kill score for a verifier card |
 | `MO_ASSAY_DISCRIMINATION` | `"1"` | Candidates-discrimination term in the certify oracle |
 | `MO_DISCRIMINATION_MIN` | `1.0` | Required discrimination rate for a generated test |
-| `MO_CONFORMAL_ORACLE` | `"0"` | Split-conformal abstention gate; OFF by default |
-| `MO_CONFORMAL_ALPHA` | `0.10` | Conformal risk level; tighten-only |
-| `MO_CONFORMAL_MIN_CALIB` | `30` | Minimum calibration rows; raise-only |
+| *(removed)* `MO_CONFORMAL_ORACLE` | — | **Removed 2026-10-25 (`669c181c`)** with the split-conformal abstention gate. No verifier writes a confidence or a false-positive label, so the gate had nothing to calibrate on and this switch was never read. Re-adding a gate here requires the confidence writer first |
+| *(removed)* `MO_CONFORMAL_ALPHA` | — | Removed with the conformal gate. `abstain_gate.alpha` survives as the self-driving escalation bar |
+| *(removed)* `MO_CONFORMAL_MIN_CALIB` | — | Removed with the conformal gate. `abstain_gate.min_calib` survives for the escalation policy |
 | `MO_ASSAY_HIDDEN` | `"1"` | Hidden regenerated PoC trials in the certify oracle |
 | `MO_HIDDEN_TRIALS` | `2` | Hidden trials per judgement; a malformed value raises |
 | `MO_HIDDEN_CHECK_SECRET` | *(unset)* | Key material for hidden-check variants; absent → `run_id`, then patch digest (recorded in `key_source`) |
