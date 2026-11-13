@@ -1,0 +1,194 @@
+{
+  "source": "arxiv",
+  "date_from": "2026-01-01",
+  "required_source_count": 2000,
+  "results_per_query": 100,
+  "max_workers": 4,
+  "ranking_policy": "Security-technique scan for mini-ork, a task OS for coding agents that ships code it writes (recipe DAGs of LLM + deterministic verifier nodes, a publish gate, a worktree merge gate, sandboxed places to run, and a secrets vault). mini-ork's security posture is FAIL-CLOSED and EVIDENCE-ANCHORED: a guard that cannot measure blocks, an unverified result is an abstention, and no change is promoted on a model's opinion. Rank 2026 papers by how directly their SECURITY technique could be adopted by one of mini-ork's surfaces: vulnerability discovery in code an agent wrote or is about to merge (SAST/taint, LLM review, CWE detection), red teaming and exploit generation used AS a verification signal, prompt injection and untrusted-content handling for agents that read repos and tool output, sandboxing and capability restriction (filesystem, shell, network egress, tool allowlists), supply-chain and secret leakage detection, secure code generation and vulnerability repair, patch verification by reproduction, agent audit trails, and benchmark validity for security claims. Papers that build or measure the DETECTOR itself (precision/recall on real code, false-positive cost, adversarial evasion) rank above papers whose security is a side experiment; papers matched by multiple topics rank above single-topic matches; break ties by citation signal (citation_count, influential_citation_count) and recency.",
+  "queries": [
+    {
+      "topic": "vuln-discovery-llm",
+      "query": "LLM agents discovering vulnerabilities in source code repository"
+    },
+    {
+      "topic": "agentic-pentest",
+      "query": "autonomous penetration testing agent LLM benchmark"
+    },
+    {
+      "topic": "red-teaming",
+      "query": "automated red teaming large language model attack generation"
+    },
+    {
+      "topic": "exploit-generation",
+      "query": "LLM exploit generation proof of concept vulnerability reproduction"
+    },
+    {
+      "topic": "fuzzing-llm",
+      "query": "LLM guided fuzzing harness generation coverage"
+    },
+    {
+      "topic": "sast-llm",
+      "query": "LLM static analysis false positive reduction vulnerability detection"
+    },
+    {
+      "topic": "cwe-detection",
+      "query": "vulnerability detection large language model CWE benchmark"
+    },
+    {
+      "topic": "repo-audit-agents",
+      "query": "multi-agent repository security audit code review"
+    },
+    {
+      "topic": "prompt-injection",
+      "query": "prompt injection attack defense tool-using agent"
+    },
+    {
+      "topic": "agent-sandbox",
+      "query": "sandboxing coding agents least privilege tool permissions"
+    },
+    {
+      "topic": "supply-chain",
+      "query": "software supply chain attack detection LLM dependency package hallucination"
+    },
+    {
+      "topic": "secret-leak",
+      "query": "credential leak detection repository secret scanning"
+    },
+    {
+      "topic": "secure-codegen",
+      "query": "secure code generation vulnerability prevention training"
+    },
+    {
+      "topic": "patch-generation",
+      "query": "automated vulnerability repair patch generation LLM"
+    },
+    {
+      "topic": "bug-bounty",
+      "query": "bug bounty automation agent severity triage"
+    },
+    {
+      "topic": "threat-modeling",
+      "query": "threat modeling LLM system architecture attack surface"
+    },
+    {
+      "topic": "malware-analysis",
+      "query": "LLM malware analysis reverse engineering assistant"
+    },
+    {
+      "topic": "agent-security-bench",
+      "query": "benchmark agent security misuse dangerous capability evaluation"
+    },
+    {
+      "topic": "data-exfiltration",
+      "query": "data exfiltration detection agent network access control"
+    },
+    {
+      "topic": "web-security-testing",
+      "query": "web application security testing automation LLM"
+    },
+    {
+      "topic": "memory-poisoning",
+      "query": "memory poisoning agent persistent state attack"
+    },
+    {
+      "topic": "mcp-security",
+      "query": "MCP tool server security tool confusion attack"
+    },
+    {
+      "topic": "ci-security",
+      "query": "CI CD pipeline security agent workflow injection"
+    },
+    {
+      "topic": "soc-triage",
+      "query": "security operations center alert triage LLM agent"
+    },
+    {
+      "topic": "incident-response",
+      "query": "incident response automation agent log analysis"
+    },
+    {
+      "topic": "security-code-review",
+      "query": "security focused code review benchmark precision recall"
+    },
+    {
+      "topic": "backdoor-detection",
+      "query": "adversarial backdoor detection code model supply chain"
+    },
+    {
+      "topic": "patch-verification",
+      "query": "security patch verification exploit reproduction test"
+    },
+    {
+      "topic": "capability-restriction",
+      "query": "capability restriction agent filesystem shell command allowlist"
+    },
+    {
+      "topic": "dependency-reachability",
+      "query": "dependency vulnerability reachability analysis LLM"
+    },
+    {
+      "topic": "binary-vuln",
+      "query": "binary vulnerability discovery machine learning embedding"
+    },
+    {
+      "topic": "privacy-leakage",
+      "query": "PII detection leakage LLM pipeline redaction"
+    },
+    {
+      "topic": "security-eval-harness",
+      "query": "LLM agent security evaluation harness reproducibility"
+    },
+    {
+      "topic": "exploitability-prediction",
+      "query": "vulnerability severity exploitability prediction CVSS"
+    },
+    {
+      "topic": "grammar-fuzzing",
+      "query": "grammar based fuzzing LLM mutation input generation"
+    },
+    {
+      "topic": "auth-bypass",
+      "query": "authentication authorization bypass detection automated testing"
+    },
+    {
+      "topic": "injection-detection",
+      "query": "SQL injection cross-site scripting detection LLM sanitizer"
+    },
+    {
+      "topic": "taint-analysis",
+      "query": "taint analysis LLM interprocedural dataflow vulnerability"
+    },
+    {
+      "topic": "sandbox-escape",
+      "query": "container sandbox escape detection agent isolation"
+    },
+    {
+      "topic": "deception-honeypot",
+      "query": "deception honeypot attacker behavior modeling LLM"
+    },
+    {
+      "topic": "multi-agent-redteam",
+      "query": "multi-agent adversarial collaboration security testing"
+    },
+    {
+      "topic": "vuln-triage",
+      "query": "vulnerability triage prioritization fixed bug prediction"
+    },
+    {
+      "topic": "config-security",
+      "query": "infrastructure configuration security misconfiguration detection LLM"
+    },
+    {
+      "topic": "agent-audit-trail",
+      "query": "agent audit trail provenance tamper evidence logging"
+    }
+  ],
+  "fulltext": {
+    "enabled": true,
+    "max_tokens_per_paper": 6000,
+    "digest_tokens": 120,
+    "workers": 4,
+    "fetch_missing": true,
+    "ingest_budget_seconds": 1800
+  }
+}

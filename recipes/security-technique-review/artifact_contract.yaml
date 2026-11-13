@@ -1,0 +1,32 @@
+source_artifact: security-technique-review.md
+task_class: security_technique_review
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/verify.py
+
+failure_policy: escalate
+rollback_policy: keep_all_source_and_summary_artifacts
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
+    mime: application/json
+    description: LibWit source manifest of the top 2026 security papers with retrieval metadata, per-paper body-text evidence, and evidence coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/papers"
+    mime: text/markdown
+    description: One markdown evidence file per paper with body text (abstract plus ordered LibWit chunks). Referenced by `evidence_path` in source-corpus.json and read by the extraction nodes.
+  - path: "${MINI_ORK_RUN_DIR}/technique-catalog.json"
+    mime: application/json
+    description: Validated canonical security techniques with corpus-checked source ids and coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/clusters.json"
+    mime: application/json
+    description: Ten security technique groups covering the catalog.
+  - path: "${MINI_ORK_RUN_DIR}/review-pack.json"
+    mime: application/json
+    description: Per-group implementable security techniques plus the mini-ork security state snapshot.
+  - path: "${MINI_ORK_RUN_DIR}/merged-review.json"
+    mime: application/json
+    description: Two-reviewer impact scores merged into a ranked list with disagreement flags.
+  - path: "${MINI_ORK_RUN_DIR}/security-technique-review.md"
+    mime: text/markdown
+    description: Final ranked security review with implement-now plan and full appendices.
