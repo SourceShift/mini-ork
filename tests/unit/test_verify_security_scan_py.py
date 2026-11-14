@@ -19,7 +19,11 @@ from mini_ork.verify import security_scan as ss
 
 REPO_ROOT = Path(mini_ork.__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "recipes" / "code-fix" / "verifiers" / "security.py"
-AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+
+# Assembled at runtime: the canonical AWS documentation example key is itself a
+# credential shape, so written as a literal it trips this repository's own
+# pre-push secret lens — including in a fixture that never leaves the sandbox.
+AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
 
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None, reason="git is not installed"
@@ -240,6 +244,42 @@ def test_build_added_bogus_base_returns_empty_pair(tmp_path):
 
 
 @requires_git
+def test_build_added_reads_untracked_paths_git_would_quote(tmp_path):
+    """A space or a non-ASCII byte must not be enough to hide a credential.
+
+    Git's default porcelain C-escapes such paths (``"odd name \\303\\274.py"``).
+    De-quoting that without unescaping points at a file that does not exist, so
+    the file is reported unreadable and never scanned — the gate would pass a
+    diff that plainly contains a key. ``status -z`` sidesteps quoting entirely.
+    """
+    repo = _make_repo(tmp_path)
+    odd = repo / "odd name ü.py"
+    odd.write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+
+    added, unreadable = ss.build_added(str(repo), "")
+
+    assert unreadable == []
+    assert list(added) == ["odd name ü.py"]
+    assert [f.rule for f in ss.scan_added(added)] == ["aws-access-key"]
+
+
+@requires_git
+def test_collect_added_skips_untracked_files_outside_the_surface(tmp_path):
+    """Off-surface untracked files are skipped by path, never read then dropped."""
+    repo = _make_repo(tmp_path)
+    (repo / "leaky.py").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+    (repo / "other.py").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+
+    added, unreadable, measured = ss.collect_added(
+        str(repo), "", only={"leaky.py"}
+    )
+
+    assert measured is True
+    assert list(added) == ["leaky.py"]
+    assert unreadable == []
+
+
+@requires_git
 def test_collect_added_ignores_repo_diff_drivers(tmp_path):
     """A repo-controlled diff driver must not be able to blank out its own diff.
 
@@ -321,6 +361,25 @@ def test_verifier_passes_clean_touched_file(tmp_path):
     assert envelope["reasons"] == []
     details = " ".join(c.get("detail", "") for c in envelope["checks"])
     assert "no added lines" in details or "0 added lines across 0 files" in details
+
+
+@requires_git
+def test_verifier_loads_the_scanner_by_path_when_the_package_is_not_importable(tmp_path):
+    """The file-load fallback must find the engine, not ``recipes/``.
+
+    With no repo on ``PYTHONPATH`` the package import cannot succeed, so the
+    whole check rides on the path fallback. A ``parents[2]`` taken from the file
+    instead of its directory lands in ``recipes/``, the module is "not found",
+    and the gate abstains on a diff that plainly holds a credential — a silent
+    downgrade from fail to abstain that no other test would notice.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / "leaky.py").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+    proc = _run_verifier(repo, touched="leaky.py", pythonpath="")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    envelope = json.loads(proc.stdout.strip())
+    assert envelope["verdict"] == "fail", envelope
+    assert "security scanner module not found" not in proc.stderr
 
 
 @requires_git

@@ -15,7 +15,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from mini_ork.verify.gaming_scan import added_lines
 
@@ -93,23 +93,36 @@ def _git(root: str, *args: str) -> tuple[int, str]:
 
 
 def _untracked_paths(status_text: str) -> list[str]:
-    """Repo-relative, forward-slashed paths for ``??`` entries in porcelain."""
+    """Repo-relative, forward-slashed paths for ``??`` entries in porcelain.
+
+    ``status -z`` is required, not cosmetic: without it git quotes any path that
+    contains a space, a quote or a non-ASCII byte and C-escapes the contents
+    (``"odd name \\303\\274.py"``). De-quoting that by stripping the quotes yields
+    a name that does not exist on disk, so the file is reported unreadable and
+    its lines are never scanned — a rename is enough to hide a credential.
+    With ``-z`` the path arrives verbatim, NUL-terminated, and quoting is off.
+    """
     paths: list[str] = []
-    for line in status_text.splitlines():
-        if not line.startswith("?? "):
+    for record in status_text.split("\x00"):
+        if not record.startswith("?? "):
             continue
-        rel = line[3:].strip()
-        if len(rel) >= 2 and rel[0] == rel[-1] == '"':
-            rel = rel[1:-1]
+        rel = record[3:].strip()
         if rel:
             paths.append(rel.replace("\\", "/"))
     return paths
 
 
 def collect_added(
-    root: str, base: str
+    root: str, base: str, only: Iterable[str] | None = None
 ) -> tuple[dict[str, dict[int, str]], list[str], bool]:
-    """``build_added`` plus a ``measured`` flag: False when git failed."""
+    """``build_added`` plus a ``measured`` flag: False when git failed.
+
+    ``only`` bounds the untracked-file harvest to a known change surface. A
+    checkout carries untracked directories that are not source at all (run
+    records, build output, a vendored tree), and reading every one of them in
+    full costs time and memory for lines no caller asked for. ``None`` means
+    "read every untracked file", which is what the CLI does.
+    """
     # ``--no-ext-diff``/``--no-textconv`` are load-bearing: both are driven by
     # repo-controlled config and attributes, so a repository being audited could
     # otherwise make its own diff render empty and pass the gate by hiding the
@@ -123,13 +136,19 @@ def collect_added(
 
     added = added_lines(diff_text)
 
-    rc, status_text = _git(root, "status", "--porcelain", "-uall")
+    rc, status_text = _git(root, "status", "--porcelain", "-z", "-uall")
     if rc != 0:
         return {}, [], False
+
+    surface = None if only is None else {
+        path.replace("\\", "/") for path in only
+    }
 
     unreadable: list[str] = []
     for rel in _untracked_paths(status_text):
         if rel in added:
+            continue
+        if surface is not None and rel not in surface:
             continue
         try:
             text = (Path(root) / rel).read_text(
@@ -146,13 +165,15 @@ def collect_added(
     return added, unreadable, True
 
 
-def build_added(root: str, base: str) -> tuple[dict, list[str]]:
+def build_added(
+    root: str, base: str, only: Iterable[str] | None = None
+) -> tuple[dict, list[str]]:
     """Added lines for the run's change surface, plus unreadable paths.
 
     Any git non-zero exit yields ``({}, [])`` — the caller decides that this is
     an abstention, not that the diff is clean.
     """
-    added, unreadable, _measured = collect_added(root, base)
+    added, unreadable, _measured = collect_added(root, base, only)
     return added, unreadable
 
 

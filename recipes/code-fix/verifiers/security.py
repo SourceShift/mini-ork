@@ -16,13 +16,15 @@ Exit: 0 pass or abstain, 1 fail.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
 
-_HERE = Path(__file__).resolve()
+# ``parents[2]`` of this file's DIRECTORY is the repo root (verifiers → code-fix
+# → recipes → root); of the file itself it would be ``recipes/``, so the file
+# fallback would look for the scanner in the wrong tree and silently abstain.
+_HERE = Path(__file__).resolve().parent
 
 CHECK_NAMES = ["no-credential-in-diff", "no-dangerous-api-in-diff"]
 
@@ -46,34 +48,32 @@ _DANGEROUS_RULES = frozenset({
 def _load_scanner():
     """The rules come from the ENGINE, never from the repo being scanned.
 
-    Prepending the target to ``sys.path`` would let a repository under audit
+    Prepending the TARGET to ``sys.path`` would let a repository under audit
     ship its own ``mini_ork/verify/security_scan.py`` that finds nothing — the
-    gate would be bypassed by the very content it exists to check. The engine
-    is this file's own tree (``HERE.parents[2]``), which for a self-edit run is
-    the run's copy of the framework.
+    gate would be bypassed by the very content it exists to check. The engine is
+    this file's own tree (``_HERE.parents[2]``), which for a self-edit run is the
+    run's copy of the framework.
+
+    The engine goes on ``sys.path`` because a verifier runs as a bare script and
+    the package is not installed, so without it nothing under ``mini_ork`` is
+    importable — including ``security_scan``'s own import of
+    ``gaming_scan.added_lines``. Inserting the engine is safe in the way
+    inserting the target is not: the engine tree is the code doing the checking.
     """
     try:
         from mini_ork.verify import security_scan  # type: ignore
         return security_scan
     except ImportError:
         pass
-    candidate = _HERE.parents[2] / "mini_ork" / "verify" / "security_scan.py"
-    if not candidate.is_file():
-        sys.stderr.write("[security] scanner module not found\n")
-        return None
-    spec = importlib.util.spec_from_file_location("_mo_security_scan", candidate)
-    if spec is None or spec.loader is None:
-        sys.stderr.write("[security] scanner module not loadable\n")
-        return None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
+    engine = str(_HERE.parents[2])
+    if engine not in sys.path:
+        sys.path.insert(0, engine)
     try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
-        sys.modules.pop(spec.name, None)
-        sys.stderr.write(f"[security] scanner module failed to load: {exc}\n")
+        from mini_ork.verify import security_scan  # type: ignore
+        return security_scan
+    except ImportError as exc:
+        sys.stderr.write(f"[security] scanner not importable from {engine}: {exc}\n")
         return None
-    return module
 
 
 def _load_scope():
@@ -210,16 +210,20 @@ def main() -> int:
         _emit(_abstain("cannot attribute changed files — not checked"))
         return 0
 
+    # The surface is known before the diff is read, so hand it to the collector:
+    # it can skip untracked paths outright instead of reading a whole run-record
+    # tree to then throw the lines away.
+    allowed = set(touched)
     base = scope.scoped_base(root) if scope is not None else ""
-    added, unreadable, measured = scanner.collect_added(root, base)
+    added, unreadable, measured = scanner.collect_added(root, base, only=allowed)
     if not measured:
         _emit(_abstain("git could not produce a diff — not checked"))
         return 0
 
     # The diff is the whole dirty tree; the gate's surface is what the run
     # changed. Without this filter an unrelated dirty file in the checkout
-    # refutes a run that never touched it.
-    allowed = set(touched)
+    # refutes a run that never touched it. (The collector already skipped
+    # out-of-surface untracked files; this covers tracked ones.)
     added = {path: lines for path, lines in added.items() if path in allowed}
     unreadable = [path for path in unreadable if path in allowed]
 

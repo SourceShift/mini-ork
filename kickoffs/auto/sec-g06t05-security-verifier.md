@@ -161,7 +161,8 @@ strings (1-based line numbers).
 - **`credential-literal`** fires on `password = "hunter2hunter2"` and on
   `api_key: 'abcdef123456'`; does not fire on `password = os.environ["PW"]` or
   `password = ""`.
-- **`aws-access-key`** fires on `key = "AKIAIOSFODNN7EXAMPLE"`; does not fire on
+- **`aws-access-key`** fires on the canonical AWS documentation example key id
+  (assembled at runtime in the test, never written as a literal); does not fire on
   `AKIA1234` (too short).
 - **private-key / github-token / slack-token / provider-api-key** each fire on
   their canonical fixture line and not on an obviously benign line.
@@ -170,7 +171,7 @@ strings (1-based line numbers).
   `unsafe-deserialization` on `pickle.loads(blob)`.
 - **no text leak**: every finding's `text == "<redacted>"` and the matched
   secret never appears in `repr(findings)`.
-- **allowance**: `x = "AKIAIOSFODNN7EXAMPLE"  # sec-allow: aws-access-key`
+- **allowance**: the same example key id with `# sec-allow: aws-access-key`
   produces no finding; the same line with `# sec-allow: github-token` still
   produces the `aws-access-key` finding.
 - **ordering**: a two-path, two-rule diff returns findings sorted by
