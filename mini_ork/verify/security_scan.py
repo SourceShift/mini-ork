@@ -110,7 +110,11 @@ def collect_added(
     root: str, base: str
 ) -> tuple[dict[str, dict[int, str]], list[str], bool]:
     """``build_added`` plus a ``measured`` flag: False when git failed."""
-    diff_args = ["diff", "--no-color", "-U0"]
+    # ``--no-ext-diff``/``--no-textconv`` are load-bearing: both are driven by
+    # repo-controlled config and attributes, so a repository being audited could
+    # otherwise make its own diff render empty and pass the gate by hiding the
+    # lines it added.
+    diff_args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-U0"]
     if base:
         diff_args.append(base)
     rc, diff_text = _git(root, *diff_args)

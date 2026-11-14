@@ -7,16 +7,22 @@ one JSON envelope on stdout, and anything that cannot be measured is an
 abstention — never a pass and never a refutation. ``mini_ork.verify.security_scan``
 owns the rules; this node only adapts them to the verifier contract.
 
-Env: MO_TARGET_CWD?, MINI_ORK_TOUCHED_FILES?, MINI_ORK_HOME?, MINI_ORK_RUN_ID?
+Env: MO_TARGET_CWD?, MINI_ORK_TOUCHED_FILES?, MINI_ORK_HOME?, MINI_ORK_RUN_ID?,
+and ``MO_SECURITY_SCANNER`` (``auto`` default | ``off`` — an operator switch
+that ABSTAINS, it never turns the gate into a pass).
 Output: single-line JSON on stdout.
 Exit: 0 pass or abstain, 1 fail.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve()
 
 CHECK_NAMES = ["no-credential-in-diff", "no-dangerous-api-in-diff"]
 
@@ -37,16 +43,37 @@ _DANGEROUS_RULES = frozenset({
 })
 
 
-def _load_scanner(root: str):
-    """The rules live in the framework, imported after ``root`` joins the path."""
-    if root and root not in sys.path:
-        sys.path.insert(0, root)
+def _load_scanner():
+    """The rules come from the ENGINE, never from the repo being scanned.
+
+    Prepending the target to ``sys.path`` would let a repository under audit
+    ship its own ``mini_ork/verify/security_scan.py`` that finds nothing — the
+    gate would be bypassed by the very content it exists to check. The engine
+    is this file's own tree (``HERE.parents[2]``), which for a self-edit run is
+    the run's copy of the framework.
+    """
     try:
         from mini_ork.verify import security_scan  # type: ignore
         return security_scan
-    except Exception:
-        sys.stderr.write("[security] scanner module could not be imported\n")
+    except ImportError:
+        pass
+    candidate = _HERE.parents[2] / "mini_ork" / "verify" / "security_scan.py"
+    if not candidate.is_file():
+        sys.stderr.write("[security] scanner module not found\n")
         return None
+    spec = importlib.util.spec_from_file_location("_mo_security_scan", candidate)
+    if spec is None or spec.loader is None:
+        sys.stderr.write("[security] scanner module not loadable\n")
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        sys.modules.pop(spec.name, None)
+        sys.stderr.write(f"[security] scanner module failed to load: {exc}\n")
+        return None
+    return module
 
 
 def _load_scope():
@@ -167,9 +194,14 @@ def _emit(payload: dict) -> None:
 def main() -> int:
     root = os.environ.get("MO_TARGET_CWD", "").strip() or os.getcwd()
 
-    scanner = _load_scanner(root)
+    mode = os.environ.get("MO_SECURITY_SCANNER", "auto").strip().lower()
+    if mode == "off":
+        _emit(_abstain("MO_SECURITY_SCANNER=off — the gate did not run"))
+        return 0
+
+    scanner = _load_scanner()
     if scanner is None:
-        _emit(_abstain("security scanner module could not be imported — not checked"))
+        _emit(_abstain("security scanner module could not be loaded — not checked"))
         return 0
 
     scope = _load_scope()

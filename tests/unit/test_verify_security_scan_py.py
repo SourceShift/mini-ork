@@ -239,11 +239,31 @@ def test_build_added_bogus_base_returns_empty_pair(tmp_path):
     assert ss.build_added(str(plain), "") == ({}, [])
 
 
+@requires_git
+def test_collect_added_ignores_repo_diff_drivers(tmp_path):
+    """A repo-controlled diff driver must not be able to blank out its own diff.
+
+    Without ``--no-ext-diff`` this returns nothing and the gate passes a diff
+    that plainly contains a credential.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / "leaky.py").write_text("x = 1\n", encoding="utf-8")
+    _commit_all(repo, "clean fixture")
+    (repo / "leaky.py").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "diff.external", "true"], check=False,
+    )
+    added, _unreadable = ss.build_added(str(repo), "HEAD")
+    assert any(
+        AWS_KEY in line for lines in added.values() for line in lines.values()
+    )
+
+
 # ---------------------------------------------------------------------------
 # recipes/code-fix/verifiers/security.py end to end
 # ---------------------------------------------------------------------------
 
-def _run_verifier(repo, touched, pythonpath=None):
+def _run_verifier(repo, touched, pythonpath=None, extra_env=None):
     env = {
         key: value for key, value in os.environ.items()
         if not key.startswith(("MO_", "MINI_ORK_"))
@@ -253,6 +273,7 @@ def _run_verifier(repo, touched, pythonpath=None):
     if pythonpath is None:
         pythonpath = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = pythonpath
+    env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, str(SCRIPT)],
         cwd=str(repo), env=env,
@@ -345,10 +366,13 @@ def test_verifier_abstains_when_git_cannot_measure(tmp_path):
 
 
 @requires_git
-def test_verifier_abstains_when_scanner_unimportable(tmp_path):
+def test_verifier_abstains_when_the_operator_turns_it_off(tmp_path):
+    """An off switch abstains — it must never be a way to make the gate pass."""
     repo = _make_repo(tmp_path)
     (repo / "leaky.py").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
-    proc = _run_verifier(repo, touched="leaky.py", pythonpath="")
+    proc = _run_verifier(repo, touched="leaky.py", extra_env={
+        "MO_SECURITY_SCANNER": "off",
+    })
     assert proc.returncode == 0, proc.stdout + proc.stderr
     envelope = json.loads(proc.stdout.strip())
     assert envelope["verdict"] == "abstain"
