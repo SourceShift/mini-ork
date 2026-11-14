@@ -1,6 +1,6 @@
 version: "0.1.0"
 task_class: code_fix
-description: "Single-patch code fix with typecheck, fallback-guard, test, and reviewer gates"
+description: "Single-patch code fix with typecheck, fallback-guard, security, test, and reviewer gates"
 
 nodes:
   # Reference capability profiles — enforced hermetically by
@@ -42,6 +42,16 @@ nodes:
     type: verifier
     prompt_ref: null
     verifier_ref: verifiers/fallback_guard.py
+    dispatch_mode: serial
+
+  # SEC-G06-T05: deterministic security gate over the same change surface the
+  # test/typecheck/fallback gates use — committed credentials and dangerous-API
+  # additions. Fails closed on a hit; abstains (never passes) when the scanner
+  # or the change surface cannot be resolved.
+  - name: security
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/security.py
     dispatch_mode: serial
 
   - name: test
@@ -103,6 +113,10 @@ edges:
   # run only after the rounds are exhausted).
   - { from: typecheck,   to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: fallbacks,   to: implementer, edge_type: retries, max_rounds: 2 }
+  - { from: implementer, to: security,   edge_type: depends_on      }
+  - { from: security,    to: reviewer,   edge_type: depends_on      }
+  - { from: security,    to: rollback,   edge_type: escalates_to    }
+  - { from: security,    to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: test,        to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: reviewer,    to: implementer, edge_type: retries, max_rounds: 2 }
 
