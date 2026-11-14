@@ -1,291 +1,505 @@
-# Synthesis — Is mini-ork actually intelligent?
+# R1 Synthesis: How the LiveKit Agents framework actually works
 
-**Run:** `run-1783718682-45995`
-**Question:** Which decision + learning mechanisms are INTELLIGENT (close a read-write loop from past runs) versus NOT-INTELLIGENT (static config, write-only tables, dead code)? Direct answer to the COMPOSER / interleaved-runs feature-isolation question.
-**Date:** 2026-07-10
-**Scope:** `bin/mini-ork*`, `lib/*.sh`, `mini_ork/**`, `recipes/**`, `config/**` at HEAD of `feat/gepa-gradient-fixes`.
+**Run:** run-1794655682-58785 · **Date:** 2026-11-14 · **Cluster:** R1
+**Audience:** a staff-level engineer preparing for a hiring-manager screen with the LiveKit Agents product lead. Agent loops in general are assumed; LiveKit-specific shape and tradeoffs are the target.
 
-Lens sources (read in full before composing):
-- `lens-glm.md` — breadth surface-scan (54 static sites, 11 DB tables tagged LIVE/WRITE-ONLY/DEAD)
-- `lens-kimi.md` — methodological rigor (6 closed-loop criteria, per-loop verdict table, 18 arxiv citations)
-- `lens-codex.md` — code-pattern survey (11 public frameworks, comparative table)
-- `lens-opus.md` — deep narrative (composer-question end-to-end trace)
+**Lenses read in full before writing:** `lens-glm.md` (21 primary public sources, breadth), `lens-kimi.md` (15 literature entries, rigor), `lens-codex.md` (15 code-pattern entries at pinned refs, practice), `lens-opus.md` (~2,260-word narrative, theory).
+
+**Version frame.** The current stable line is `livekit-agents` 1.8.12, released 2026-11-13 (lens-glm S13; lens-codex pins commit `cbb5770c716c70009969cd7fa88e3c3662222ce9`, 2026-11-13). A 2.0.0b1 pre-release exists on PyPI dated 2026-10-12 (lens-glm S13). lens-opus read the tree at `a77605e` (2026-11-10), three days older. Every behavior below is pinned to 1.8.x unless stated otherwise. Anything about 2.0 is a gap, not a claim.
+
+| Version | Date | What it anchors | Source |
+|---|---|---|---|
+| 1.0 GA | 2025-04 | `AgentSession` replaces `VoicePipelineAgent` and `MultimodalAgent` | lens-glm S1, S2 |
+| 1.6.0 | 2026-06-11 | async tools: `ctx.update()`, `ToolFlag.CANCELLABLE` | lens-glm S11 |
+| 1.6.1 | 2026 | turn detector v1-mini bundled in the Python SDK | lens-glm S6, S7 |
+| 1.8.6 | 2026 | `max_tool_steps` enforced on the realtime tool loop; MCP cancellation notices | lens-glm S12 |
+| 1.8.7 | 2026-10-14 | tools still running at interruption timeout continue asynchronously, deferred results delivered | lens-glm S12 |
+| 1.8.9 | 2026-10-24 | interruption errors fall back to VAD without reconnecting | lens-glm S12 |
+| 1.8.10 | 2026 | Silero VAD no longer auto-loaded | lens-glm S12 |
+| 1.8.12 | 2026-11-13 | current stable; lens-codex pin | lens-glm S13, lens-codex header |
+| 2.0.0b1 | 2026-10-12 | pre-release; text `MultilingualModel` removal promised | lens-glm S13, S7 |
 
 ---
 
 ## 1. TL;DR
 
-- **★ Three genuine INTELLIGENT loops**, but only one is load-bearing for routing. GRPO lane routing (write→read symmetry, credit-assigned, decay-aware), gradient→context/role-evolver feedback, and within-run GEPA Pareto search. *(GLM-7 + Kimi-1+2+5; high confidence.)*
-- **★★ Three structurally correct mechanisms collapse toward STATIC in practice** because of reward starvation and a 3-sample floor. The lane router clears 5 of Kimi's 6 criteria on paper but degrades to noise-dominated at the floor; the explore rule never converges (constant ε-greedy); the reward rail silently NULLs on most runs. *(GLM-9 + Kimi-3+4.)*
-- **★★ At least five DB tables look like memory but aren't consulted**: `emergent_patterns`, `prompt_win_rates`, `conductor_decisions.outcome/realized_score`, `run_artifact_edges`, plus the WRITE-ONLY reflection chain (`gradient_records`/`pattern_records` w.r.t. routing). *(GLM-12 + Kimi-6.)*
-- **★★ Composer / interleaved-runs verdict: MIXED-WITH-LIMITS leaning GLOBAL-POLLUTED under default env.** `objective_domain="code-delivery"` is the universal default; `code_region` collapses feature dirs to top-level directory; `context_prior_runs_md`, `topology_win_rates`, `prompt_win_rates` all pool on `task_class` alone. Opt-in feature isolation is theoretically possible via `MINI_ORK_OBJECTIVE_DOMAIN=<feature>` but undocumented. *(Kimi-7 + Opus-3+4; high confidence.)*
-- **★ No public framework closes the full outcome→policy loop** — every one of the 11 surveyed (LangGraph, AutoGen, OpenHands, SWE-agent, MetaGPT, AutoGPT, Letta, Mem0, LlamaIndex, Agno, CAMEL) persists state or memory but none automatically turns graded outcomes into changed routing/prompt/topology. Mini-ork is not behind the field here, but it is also not ahead — closing this gap would be a genuine contribution. *(Codex-5 + Kimi-1.)*
+- **1.8.12 is a pre-warmed process-pool runtime, not a spawn-per-job runtime.** A worker advertises availability over a websocket, reserves a slot, waits for a `JobAssignment`, and hands the job to an already-initialized job process; `AgentSession` is assembled inside that process. (lens-codex E1, E2; lens-glm S16) **Confidence: high for the shape, medium for exact constants.**
+- **The turn loop is a synchronous commit pipeline.** VAD and STT feed a recognition state machine that owns endpointing, a separate end-of-turn decision, and a synchronous `on_end_of_turn` that spawns the reply; preemptive generation is speculative cascaded-LLM work cancelled on transcript drift. (lens-codex E4, E5, E7; lens-glm S7, S9) **Confidence: high.**
+- **Tools are async-dispatched with progress updates, errors returned as `ToolError` outputs, per-session duplicate detection that fails open, and no documented timeout or retry policy.** (lens-codex E9; lens-glm S11; lens-opus §4) **Confidence: high.**
+- **Session state is in-memory `ChatContext` plus `JobProcess.userdata`.** Nothing is written to durable storage and the job process is disposed after the session, so restart survival is an application problem. (lens-codex E10; lens-glm gaps; lens-opus §4) **Confidence: high.**
+- **The three JD-named gaps are seams, not missing features.** Text modality has no runtime, durable workflows exist only as an experimental `livekit-durable` plugin not wired into core, and agent-to-agent communication stops at in-session handoff. (lens-glm gaps; lens-codex divergent 2; lens-kimi E14, E15; lens-opus §6) **Confidence: high for the absence, medium for the durability mechanism.**
+
+**Framing line, attributed as interpretation:** LiveKit Agents is a floor-control system for realtime conversation. It owns who has the turn. Everything thin about it is a seam where floor control meets a channel or a duration it was not built for (lens-opus §3; synthesis judgment, not a sourced fact).
 
 ---
 
-## 2. Consensus findings (sources agree)
+## 2. How to read the stars, and a warning about the panel
 
-Items where ≥2 lenses converge. ★ = 2-lens, ★★ = 3-lens, ★★★ = 4-lens.
+Star markers count lenses, not source families:
 
-### ★★ GRPO lane routing is the only adaptive decision-maker (GLM-1 + Kimi-1)
+- **★** = 2 of 4 lenses converge
+- **★★** = 3 of 4 lenses converge
+- **★★★** = 4 of 4 lenses converge
 
-`agent_performance_memory` ← writes from `lane_router.py:235-245` (EMA-blended `relative_advantage` with shrinkage, recency, defect penalty); `lane_*_advantage` ← writes from `lane_router.py:247-279`; `preferred_lane` ← reads at `lane_router.py:286-330`; `decide()` consumes at `mini_ork/steering/decision_service.py:284-287` and `lib/decision_service.sh:80-217`. Region→domain→global fallback (GLM-21, Kimi-1) gives graceful degradation. This is the closest thing to a closed loop in the repo. The Kimi verdict "INTELLIGENT but NOISE-DOMINATED at floor" is the more honest reading; GLM calls it "INTELLIGENT closed loop" without quantifying the floor's variance cost. Both agree: it is the only one.
+Every finding states its lens count and names the lenses. Two caveats are load-bearing:
 
-### ★★ Reward starvation is the structural failure mode of the learning rail (GLM-12 + Kimi-3)
+1. **The panel is not family-heterogeneous.** The run profile records that `lens-glm` and `lens-opus` resolve to the same zai family, while the `kimi` and `codex` lanes differ from their nameplates. Treat any agreement between lens-glm and lens-opus as one family's view unless lens-codex or lens-kimi corroborates it. For LiveKit internals, lens-codex is the load-bearing lens and lens-kimi is the independent check on the underlying problem, not on the code.
+2. **A star is not a vote.** The recipe's discipline rule, citing Nasser 2026 (arxiv:2601.05114), is that voting between same-conviction agents amplifies bias rather than averaging it. Section 4 follows that rule: disputes are reported, not counted.
 
-`compute_reward_g` (`mini_ork/trace_store.py:28-40`) writes NULL when anchor==0; `grade_run_reward` (`mini_ork/trace_store.py:195-223`) only fires when `rubric.json` exists. The lane router skips NULL rows (`lib/lane_router.sh:173-187`). GLM identifies the 3-level step function at `bin/mini-ork-execute:289-299` (`_mo_reward_from_status` maps to 1.0/0.0/0.5) as the weak link; Kimi calls out the rubric gate as the reason most runs never produce `reward_g`. Both converge: the rail is mathematically sound but practically starved.
-
-### ★★ Constant ε-greedy exploration cannot converge (GLM-8 + Kimi-4)
-
-`MO_LEARNING_EPSILON=0.10` default at `lib/decision_service.sh:121`, no decay schedule. Kimi cites Auer et al. 2002 and Langford & Zhang 2008 — constant ε ⇒ linear cumulative regret. GLM notes "10% of dispatches ignore the learned route forever, no anneal" as risk shape. Worse, Kimi surfaces that exploration is gated `if learned_route:` (decision_service.py:289-297) — cold slices never explore at all, so the system cannot bootstrap its first sample.
-
-### ★★ The reflection chain (`gradient_records`/`pattern_records`/`emergent_patterns`) is memory-as-staging, not memory-as-decision-input (GLM-12 + Kimi-5)
-
-GLM tags `gradient_records` LIVE for context_assembler (failure-mode injection) and role_evolver (proposals); `pattern_records` LIVE as input to `emergent_patterns` promotion; `emergent_patterns` WRITE-ONLY (no consumer in routing/decision/context paths). Kimi calls the chain "WRITE-ONLY w.r.t. routing" — intelligent as memory substrate, not as a closed loop. Both agree: this is the largest gap between "the system looks reflective" and "reflection changes routing."
-
-### ★★ Composer / interleaved-runs feature isolation is nominally supported but in practice global-polluted (Kimi-7 + Opus-3+4)
-
-Kimi's formal analysis: `lane_router`'s region and domain tiers DO carry `objective_domain` end-to-end, so feature isolation is *theoretically* achievable. But (a) `objective_domain` defaults to `"code-delivery"` (`bin/mini-ork-execute:352`); (b) `code_region` collapses feature dirs to top-level directory (`bin/mini-ork-execute:1665-1737`, `_mo_infer_trace_code_region`); (c) `context_prior_runs_md` (`lib/context_assembler.sh:457-469`), `topology_preferred` (`lib/topology.sh:127-136`), `rho_top_prompts` (`lib/rho_aggregator.sh:108-111`) all pool on `task_class` alone. Opus's narrative trace says "MIXED-WITH-LIMITS leaning GLOBAL-POLLUTED under default env." Both lenses reach the same verdict via different paths.
-
-### ★★ Every cross-run learning surface except lane routing is keyed on `task_class` alone (Opus-3 + Kimi-7)
-
-`context_prior_runs_md`, `topology_preferred`, `rho_top_prompts`, GRPO grouping at `bin/mini-ork-execute:651` (`(node_type, task_class)`), agent_performance_memory global fallback (no `objective_domain` predicate, `lane_router.py:319-327`). The shared assumption is "task_class is the transfer boundary" — Kimi reads this from the SQL predicates; Opus reads it from the architectural commentary in `docs/architecture/techniques-compendium.md:121`. Both agree this is the load-bearing assumption and both agree it is contested in the literature.
-
-### ★ Static values dominate the decision surface (GLM-1..54 + Kimi-7+8)
-
-54 entries in GLM Catalog A; Kimi singles out reward starvation and constant ε as structural. The convergence: every per-run decision input that is *not* derived from prior traces is hardcoded somewhere (model names, fallback chains, reward weights, sample floors, budget caps, classifier keywords). GLM identifies a critical dual-edit hazard: `lib/process_reward.sh:99` and `mini_ork/learning/process_reward.py:55` mirror the same weights; `lib/lane_router.sh:87-90` and `mini_ork/lane_router.py:35-38` mirror the same hyperparameters.
-
-### ★ No public framework closes the full outcome→policy loop (Codex-5 + Kimi-1)
-
-Codex surveyed 11 frameworks; zero deliver "outcome/eval → credit assignment → policy/prompt/topology selection → future run." The dominant public pattern is **CLOSED context-state** (memory injection into next prompt) or **PERSISTENCE-ONLY** (durable state for human inspection). Kimi cites Shen et al. 2026 [arxiv:2606.16733] as the formal grounding for why write-read symmetry is the persistence half of any RL guarantee. Convergence: the field has not solved this problem either; mini-ork's GRPO loop is *one* of the few actually-attempted closures.
-
-### ★ Within-run intelligence ≠ cross-run intelligence (Kimi-5 + Codex-6)
-
-Kimi: GEPA's Pareto front is intelligent within one optimize run but rebuilt each run (gepa.py:62, no cross-run archive). Codex: "Within-run closure is kept separate from cross-run reuse. LangGraph closes resume/replay; SWE-agent closes reviewer/retry; AutoGPT records node execution. Those loops improve reliability without implying that run N learns a policy from runs 1..N-1." This is the most important conceptual distinction in the audit.
-
-### ★★ The reward signal is too coarse to discriminate at feature granularity (Opus-4-C + GLM-12)
-
-PRM weights at `lib/process_reward.sh:1-20` and `mini_ork/learning/process_reward.py:55-61` are a hardcoded 0.40/0.20/0.10/0.15/0.10/0.05 linear blend over trace observables. Opus Case C: a composer run that shipped a regression is indistinguishable from a clean run as long as `status=success`. GLM: the 3-level `_mo_reward_from_status` map collapses nuanced verdicts. Skalse et al. 2022 [arxiv:2209.13085] (reward hacking) is Opus's theoretical anchor. Both agree: the reward rail cannot form the per-feature GRPO signal that would make isolation valuable.
-
-### ★ Public frameworks mandate composite scope; mini-ork makes scope best-effort (Codex-2 + Opus-6)
-
-Codex convergent pattern #1: "Identity-scoped state is the unit of continuity" (LangGraph thread_id, OpenHands conversation_id, Letta agent/block, Mem0 user/agent/run, Agno user, AutoGPT execution/parent). Opus recommendation #6: "make a bare `mini-ork run` inherit its parent run's `objective_domain` (via `MINI_ORK_PARENT_RUN_ID`) when the caller doesn't stamp one." Both lenses converge: scope should be a mandatory composite namespace, not a default-everything fallback.
+Lens anchors used inline: `lens-glm S<n>` = source number in `lens-glm.md`; `lens-kimi E<n>` = entry in `lens-kimi.md`; `lens-codex E<n>` = entry in `lens-codex.md`; `lens-opus §<n>` = section in `lens-opus.md`.
 
 ---
 
-## 3. Disputed findings (sources disagree)
+## 3. Findings by kickoff question
 
-### Dispute 1 — Is the lane router "INTELLIGENT" or "EFFECTIVELY-STATIC"?
+### Q1. The runtime path: worker, job, session, ownership, process boundaries
 
-**GLM position:** Tags the lane router as a **genuinely closed learning loop** in Catalog B "What is genuinely INTELLIGENT" (#1). The write→read symmetry is clean; region/domain/global fallback is in place; the only qualifier is the static reward rail feeding it.
+**Finding 1.1 ★ (2/4: lens-codex, lens-glm). Dispatch is a two-phase handshake, not a push.**
+The LiveKit server sends `AvailabilityRequest` over the worker websocket. The worker increments `_reserved_slots` before calling the user's `request_fnc`, so concurrent availability checks see updated load. On accept it sends the availability response, registers a future in `_pending_assignments`, waits up to `ASSIGNMENT_TIMEOUT` for the matching `JobAssignment`, then calls `ProcPool.launch_job` (lens-codex E1, `worker.py:1391`, slot reservation `:1415`, assignment wait `:1452`, `launch_job` `:1477`, resolution `:1520`). Rejecting with `terminate=true` is a distinct verb from being unavailable (lens-codex E1, `worker.py:1409`). The operational view matches: "backend dispatch, LiveKit server routes the job to a worker, warm process or spawn/initialize a new one, entrypoint runs, then `connect()`" (lens-glm S16). lens-kimi confirms the literature does not cover this layer at all (lens-kimi §1, §5).
 
-**Kimi position:** "INTELLIGENT but **NOISE-DOMINATED at floor**." The loop formally closes but the 3-sample floor combined with NULL-reward starvation makes the learned preference indistinguishable from sampling noise (He & Gu 2025 [arxiv:2503.12020]; Tang et al. 2025 [arxiv:2502.10985]). Effective verdict: the loop "degrades toward static for three compounding reasons" — reward starvation, noise at the floor, cold-start blindness.
+**Finding 1.2 ★ (2/4: lens-codex, lens-glm). The process model is a warm pool with a forkserver preload, not worker-per-job.**
+`ProcPool` keeps `num_idle_processes` already-initialized job processes in `_warmed_proc_queue`; each spawn runs plugin prewarm once (lens-codex E2, `proc_pool.py:32`, warm queue `:71`, spawn-on-demand `:122-128`, `launch_job` `:168`). `_preload.py` imports `av`, builds the SSL context, and loads local inference weights; on Linux the worker calls `set_forkserver_preload(plugin_packages)` so children inherit the preload copy-on-write (lens-codex E2, `worker.py:786`, `ipc/_preload.py:1-17`). Child processes set SIGINT/SIGTERM to ignore, so the parent owns shutdown (lens-codex E2, `ipc/job_proc_lazy_main.py:8-11`). Operationally, the framework logs "no warmed process available for job, waiting for one to be created" when the pool is empty; `num_idle_processes` defaults from CPU count and `load_fnc`/`load_threshold` govern admission (lens-glm S16). This is the concrete answer to "why does `dev` spawn several processes."
 
-**Why they disagree:** GLM verified write→read symmetry by grep; Kimi applied a statistical-validity test to the same evidence. GLM's framing is structural ("does the loop close?"); Kimi's framing is operational ("does the loop's output drive a better-than-random decision?"). Both are correct on their own terms.
+**Finding 1.3 ★ (2/4: lens-codex, lens-glm). The failure modes are documented as symptoms, not internals.**
+Slow joins come from cold starts on plans that scale to zero, blocking entrypoint code before `connect()` or `session.start()`, avatars whose `wait_for_join()` blocks first speech, burstable instances, and an `agent_name` mismatch with the registered worker that means the agent never joins (lens-glm S16). Tokens can 401 when join exceeds 60 seconds (lens-glm S16). lens-codex shows the reservation counter is in-process only, so load is per-process, not per-cluster (lens-codex E1). That last point is the one an operator is most likely to get wrong in a screen.
 
-**My judgment:** Kimi is more useful for a practitioner. The structural closure is necessary but not sufficient — a loop that closes but emits noise is not a learner in any operational sense. The correct reclassification is **INTELLIGENT (structure) / STATIC (de-facto outcome)**.
+**Finding 1.4 ★ (2/4, same family: lens-glm, lens-opus). Ownership is session-centric.**
+`AgentSession` is the composition root; `Agent` carries persona and, in 1.8, optional `stt`/`llm`/`tts` overrides (lens-codex E3, `agent_session.py:409`, `agent.py:47`). lens-opus states the same at the conceptual level: "the unit of design is the session, not the agent" (lens-opus §2). Codex is the stronger anchor here; the opus agreement is a same-family echo, so weight it as one source.
 
-**Additional evidence needed:** η² (variance explained) of the learned advantage after conditioning on `task_class`/`objective_domain`/`code_region`. Opus §5 sketches the experiment design; it can be run on existing `state.db` data without code changes.
+**Ownership table (sourced from lens-codex E1-E4, E10):**
 
-### Dispute 2 — Is `objective_domain` a feature isolation lever or a consumer bucket?
-
-**Opus position (from migration `0042` + techniques-compendium.md:121):** The official framing is consumer identity — "code-delivery" vs "book-gen." Within "code-delivery," runs of different features pool. The renaming recommendation #1 ("rename the env var to reflect its dual role") is based on this reading.
-
-**Codex position (convergent pattern #1):** Identity-scoped state should be a *mandatory composite namespace* such as `(objective_domain, workflow_version_id, feature_id)`, not a single bucket. This implies `objective_domain` SHOULD serve as feature isolation if the user opts in.
-
-**Why they disagree:** Opus is reading what mini-ork actually does (single bucket, consumer framing); Codex is prescribing what mini-ork should do (composite scope). Both are correct in their frame.
-
-**My judgment:** The current implementation is the consumer-bucket design (Opus is right about the code). The codebase pattern that *would* make it a feature-isolation lever already exists in `lane_*_advantage` (Kimi-1+7) — the env var just isn't documented as such. The reconciliation: `objective_domain` is *technically* feature-isolated at the lane-router region/domain tiers, but the docs and the global fallback keep it consumer-bucketed in practice.
-
-**Additional evidence needed:** A scan of how many prior runs actually set `MINI_ORK_OBJECTIVE_DOMAIN` to a non-default value vs left it at "code-delivery." If <10%, the lever is dormant regardless of capability.
-
-### Dispute 3 — Are the WRITE-ONLY tables the right next thing to wire, or are they correctly dead?
-
-**GLM position (Catalog B):** `emergent_patterns`, `prompt_win_rates`, `conductor_decisions.outcome` are WRITE-ONLY — "the classic 'looks like memory, isn't consulted' case." Highest-leverage fix #1: read `conductor_decisions.realized_score` back into the conductor's predicted-score model.
-
-**Kimi position (criterion 1):** Write-only reflection rows are WRITE-ONLY but if wired back into routing without a judge gate, they risk "memory confabulation" (Dixit et al. 2026 [arxiv:2605.29463]). The recommendation is extract→distill→verify before any reflection row becomes a routing input.
-
-**Why they disagree:** GLM is identifying a closed-loop gap (read is missing). Kimi is identifying a correctness gap (if you just close it naively, you risk poisoning the rail with confident-but-wrong self-diagnoses).
-
-**My judgment:** Both are right. The fix order should be (1) build the extract→distill→verify pipeline (Kimi's safety argument), then (2) wire the verified rows into routing/context (GLM's closure argument). Naively closing the gap first is exactly the kind of self-poisoning failure mode that makes the audit worth doing.
-
-**Additional evidence needed:** A controlled test where promoted patterns are surfaced to one run group and withheld from another; compare downstream outcome variance to estimate whether the wiring would help or hurt.
+| Object | Lives in | Owns | Lifetime |
+|---|---|---|---|
+| `Worker` | worker process | server websocket, availability, assignment futures, proc pool | worker process |
+| `ProcPool` | worker process | warmed job processes, spawn-on-demand, `launch_job` | worker process |
+| `JobProcess` | job subprocess | plugin preload, `userdata` | one job |
+| `AgentSession` | job subprocess | models, turn handling, tools, `ChatContext` | one session |
+| `Agent` | inside session | persona/instructions, optional model overrides | until handoff |
+| `AgentActivity` | inside session | turn loop, `AudioRecognition`, `SpeechHandle`s, preemption, delegation checks | until handoff |
 
 ---
 
-## 4. Cross-lens gaps (what's NOT in any source)
+### Q2. The turn loop: what the framework does and what the plugin does
 
-Items the lenses collectively did NOT investigate or answer. Candidates for future research:
+**Finding 2.1 ★ (2/4: lens-codex, lens-glm). One recognition state machine owns VAD, STT, endpointing, and turn commit.**
+`AudioRecognition` owns an `_STTPipeline` (audio in, events out) plus the endpointing and turn timers. It drives `RecognitionHooks` into `AgentActivity`: `on_start_of_speech`, `on_interim_transcript`, `on_final_transcript`, `on_end_of_turn`, `on_transcription_timeout`, `on_preemptive_generation`, `on_eot_prediction` (lens-codex E4, `audio_recognition.py:294`, hooks `:161-182`, STT pump `:241`). `AgentActivity.on_end_of_turn` is deliberately synchronous so it cannot be cancelled mid-commit, and it immediately spawns `_user_turn_completed_task` (lens-codex E4, `agent_activity.py:2834`, `:2929`). The configuration surface names five detection modes: the audio `TurnDetector`, `"stt"`, `"realtime_llm"`, `"vad"`, `"manual"` (lens-glm S9).
 
-1. **η² for feature after task_class is controlled** (Opus §5 sketched this; nobody ran it). Without it, the entire feature-isolation debate is unresolvable in principle.
-2. **Realized-score regression.** GLM identified the missing edge; nobody has measured how much variance in conductor accuracy would be explained by `realized_score` regressed onto the predicted-score model's `0.3` gain.
-3. **Eval-node rollout.** The eval-after-verify node from `internal-docs/research/2026-07-03-adding-eval-to-miniork-run-flow.md` would solve the reward-starvation problem by guaranteeing a graded `reward_g` on every run. Nobody estimated the eval-cost-per-run vs the variance-reduction payoff.
-4. **Empirical shrinkage.** Adaptive sample-floor (Opus recommendation #5) with empirical-Bayes shrinkage. Theoretical benefit is clear; nobody benchmarked the cost in mini-ork's specific reward distribution.
-5. **Cross-framework GRPO audit.** Codex surveyed persistence/memory but did not check whether any framework has a similar GRPO-on-prior-outcomes loop. The closest is SWE-agent's within-run best-of-attempt — it is not cross-run.
-6. **Performance under non-stationary task mix.** Kimi cited Tang 2025 on Elo/BT misspecification but did not measure how mini-ork's diff-in-means advantage degrades when the lane population shifts (e.g., adding a new lane to the family).
-7. **`MINI_ORK_PARENT_RUN_ID` lineage propagation.** Opus recommendation #6 notes the write sites but no lens tested whether parent→child inheritance actually works end-to-end in the recursive spawn path.
+**Finding 2.2 ★ (2/4: lens-codex, lens-glm). Endpointing is learned per user; the ceiling is fixed.**
+`DynamicEndpointing` runs an exponentially weighted estimator (`alpha=0.9`) over the user's end-of-speech pauses and moves `min_delay` toward observed pausing, clamped by a fixed `max_delay`. It distinguishes `between_utterance_delay`, `between_turn_delay`, and `immediate_interruption_delay`, and updates differently on agent speech start/end and on overlapping speech (lens-codex E5, `endpointing.py:49`, learning state `:74-88`, surfaces `:97`, `:106`, `:115`). `max_delay` cannot be learned because there is no natural upper bound to observe (lens-codex E5). lens-glm adds the config floor: with the audio detector the endpointing defaults move to `min_delay` 0.3 s and `max_delay` 2.5 s, and Silero's `min_silence_duration` must be at least 0.25 s (lens-glm S7). No peer in the codex survey learns the floor from the user's own pause distribution (lens-codex divergent 5).
 
----
+**Finding 2.3 ★ (2/4: lens-codex, lens-glm). Interruption is a pausable speech handle, not a kill.**
+Each agent utterance is a `SpeechHandle` with priority, `allow_interruptions`, and an `_interrupt_fut` (lens-codex E6, `speech_handle.py:33`, `:201`). Interruption by audio activity is gated by a minimum word count from the live transcript, AEC warmup, and whether a realtime model already does turn detection (lens-codex E6, `agent_activity.py:2493`). With `false_interruption_timeout` set, the framework pauses audio output and can resume it instead of killing the utterance (lens-codex E6, `agent_activity.py:2540-2554`). A separate `AdaptiveInterruptionDetector` streams overlapping speech to `inference/interruption.py`, which returns a probability and a backchannel verdict, with `max_retry=0` because a late verdict is worthless (lens-codex E6, `inference/interruption.py:268`, `:125`, `:60`). lens-glm's config list matches: `enabled`, `mode` (`"adaptive"` vs `"vad"`), `false_interruption_timeout`, `resume_false_interruption`, `backchannel_boundary`, `min_words`, `min_duration`, `discard_audio_if_uninterruptible`; VAD runs first on every frame, turn detection applies when the agent is silent, interruption handling when it is speaking (lens-glm S9). Resumable false-interruption handling is rare; Pipecat models interruption as an irreversible frame (lens-codex E6, E14).
 
-## 5. Numbered recommendations
+**Finding 2.4 ★ (2/4: lens-codex, lens-glm). Preemptive generation is speculative cascaded-LLM work, cancelled on transcript drift.**
+On an interim transcript the activity starts a scheduled-less `_generate_reply` for the cascaded LLM path only, recording the transcript, chat context, tools, and `tool_choice` in `_PreemptiveGeneration`. `on_preflight_stale` cancels it when a later interim transcript is not equivalent to the one it was built from (`_transcripts_equivalent`) (lens-codex E7, `agent_activity.py:2753`, staleness `:2810`, equivalence check `:2820`, retry cap `:2779`). Caps are `max_speech_duration` and `max_retries`. It is skipped for `RealtimeModel` and while another speech is live and uninterrupted (lens-codex E7). lens-glm's turn-handling guide states preemptive generation is "on by default" (lens-glm S9). The explicit equivalence check is the detail that prevents a reply to a half-heard sentence being committed as if it answered the full one (lens-codex E7).
 
-What a thoughtful practitioner should DO with this synthesis today. Each item: action, supporting lenses, condition under which it would be wrong.
+**Finding 2.5 ★ (2/4, same family: lens-glm, lens-opus). The framework's turn loop is a turn-loop story, not a cold-start story.**
+Preemptive generation buys interior latency, the time between end of speech and first audio; it cannot buy time before the process exists (lens-opus §4). lens-glm's operator note is the same point from the other side: cold starts dominate slow joins on scale-to-zero plans (lens-glm S16). This is a same-family pair; the underlying claim is safe because the mechanism is separately visible in lens-codex E2.
 
-1. **Promote `emergent_patterns` (status='proposed'→'approved') into `context_assembler`'s failure-mode injection path.**
-   - Lenses: GLM-12 (highest-leverage #2), Kimi-3 (criterion 1 fails today)
-   - Wrong if: pattern promotion has no judge-gate; the patterns could be confidently-wrong self-diagnoses (Kimi §6 caveat; Dixit 2026 [arxiv:2605.29463]).
-   - Pre-condition: build extract→distill→verify pipeline first, then wire.
+**Framework vs plugin, by stage (lens-codex E4-E7, E13; lens-glm S7, S9):**
 
-2. **Read `conductor_decisions.realized_score` back into the conductor's predicted-score model** (replace fixed `0.3` gain with fitted/EMA coefficient).
-   - Lenses: GLM-12 (highest-leverage #1), Opus §4 case A (interleaved-runs pollution requires the conductor to self-correct)
-   - Wrong if: the predicted-score model is dominated by topology/lane-advantage terms that overwhelm the realized-score signal — measure first.
-   - Source: write at `bin/mini-ork-conductor:248-256`; current reader is only `scripts/smoke-learning-loops.sh:142`.
+| Stage | Core owns | Plugin/model owns |
+|---|---|---|
+| VAD | consumes the VAD stream, decides whether detection or interruption applies | Silero ONNX CPU VAD with a buffered `VADStream` |
+| STT | `_STTPipeline` in `AudioRecognition`, flush at turn boundaries | `STT.stream()` / `RecognizeStream` |
+| Endpointing | `DynamicEndpointing` learns `min_delay`, clamps at `max_delay` | none |
+| End-of-turn | selects the detection strategy, fires `on_eot_prediction`, commits synchronously | `TurnDetector` ONNX `predict_end_of_turn` (architecture disputed, Section 4) |
+| LLM | `_generate_reply`, preemptive generation, tool loop | `LLM.chat()` / `RealtimeModel.session()` |
+| TTS | `SpeechHandle`, playout, pause/resume | `TTS.stream()` / `synthesize()` |
+| Interruption | `_interrupt_by_audio_activity`, `min_words`, AEC warmup, pause/resume | `AdaptiveInterruptionDetector` via inference |
 
-3. **Run the η² experiment from Opus §5 on existing `state.db` data** before investing in feature-scoping infrastructure. SQL-only, no code changes.
-   - Lenses: Opus §5 (full design), Kimi-7 (the formal reading), GLM-7 (region advantage write site)
-   - Wrong if: the experiment is run on rows that pre-date the `objective_domain` column (migration `0042`); restrict to post-migration rows.
-   - Pre-condition: filter to post-2026 rows where `objective_domain IS NOT NULL`.
+**What the literature says about the underlying problem.** Three findings matter for the screen and none of them are LiveKit-specific:
 
-4. **Replace `_mo_reward_from_status` (3-level step function at `bin/mini-ork-execute:289-299`) with a graded signal** OR guarantee the eval node populates `reward_g` on every run.
-   - Lenses: GLM-12 (Catalog A #12), Kimi-3 (reward starvation), Opus Case C (reward-source coarseness)
-   - Wrong if: the eval node is too expensive per-trace or its reward is noisier than the PRM; cost-benefit must be measured first.
-   - Source: Skalse et al. 2022 [arxiv:2209.13085] on reward hacking (Opus-4-C).
+- Acoustic plus prosodic features beat a text-only end-of-turn signal decisively: F1 0.930 at 7.8% false alarms and 400 ms median latency for acoustic+prosodic, against F1 0.292 at 74.8% false alarms for text alone; adding text to the pair made premature detection significantly worse (lens-kimi E2, arXiv:2609.11066). This is a 2026 re-derivation of a result established in 2002 (lens-kimi E2 citation chain).
+- A frozen multilingual encoder plus a small per-language head transfers cheaply: zero-shot gap 0.017 AUC, about a quarter of the penalty paid for causal encoding (lens-kimi E3, arXiv:2610.39755).
+- A cheap local screen plus an expensive server adjudicator is the right shape for a realtime turn loop, and the remote call costs 98 to 140 ms round trip (lens-kimi E5, arXiv:2503.23439).
 
-5. **Document `MINI_ORK_OBJECTIVE_DOMAIN` as a feature-scoping lever** and make the default-on recursive path inherit parent_run_id → objective_domain automatically.
-   - Lenses: Opus §6 recommendation #1+#6, Kimi-7 (the lever exists, just dormant), Codex convergent pattern #1 (composite scope)
-   - Wrong if: η² experiment (recommendation #3) shows feature explains <5% of reward variance — then the lever is structurally useless.
-   - Source: write sites at `bin/mini-ork-spawn:113,123`, `recipes/doc-to-features-loop/lib/per_feature_dispatcher.py:422`; default at `bin/mini-ork-execute:352` and `mini_ork/trace_store.py:125`.
+**Third-party numbers for LiveKit's own turn loop exist, and they are mixed.** FireRedChat's authors measured LiveKit at 140 ms T90 barge-in with a 33.4% false barge-in rate, 70.8% average Chinese end-of-turn accuracy (45.3% on "unfinished") and 86.2% English, and 3.598 s P50 end-to-first-response latency, against FireRedChat at 170 ms and 10.2%, 96.0% and 94.9%, and 2.341 s (lens-kimi E4, arXiv:2509.06502). These are third-party, unreviewed, and the latency sample is 25 utterances. Quote them with those qualifiers or not at all.
 
-6. **Reconcile the dual-source-of-truth hazards** — three `$50/day` literals (`config/agents.yaml:57`, `bin/mini-ork-conductor:48`, `lib/llm-dispatch.sh:1377`) and two PRM weight tables (`lib/process_reward.sh:99`, `mini_ork/learning/process_reward.py:55`).
-   - Lenses: GLM-1 + GLM-2 + GLM-27 + GLM-39 + GLM-43 (dual-edit hazards)
-   - Wrong if: the literals are intentionally different (e.g., per-pipeline budget vs global); if so, add a comment explaining.
-   - Pre-condition: verify the values are meant to match before consolidating.
-
-7. **Add adaptive sample floor** (empirical-Bayes shrinkage for thin slices) rather than moving the static floor.
-   - Lenses: Kimi-3 (criterion 2 marginal), Opus §6 recommendation #5
-   - Wrong if: shrinkage adds complexity but the underlying signal is dominated by static heuristics anyway (η² small per recommendation #3).
-   - Source: Efron & Morris 1975 (shrinkage theory).
+**Cascade versus speech-to-speech is measured per stack, not settled per architecture.** Full-Duplex-Bench v3 ran six configurations through the LiveKit framework with identical audio: GPT-Realtime led Pass@1 at 0.600 with 6.89 s task completion; Gemini Live 3.1 was fastest at 4.25 s but took the turn only 78.0% of the time and produced no speech on 22% of examples; the cascaded Whisper to GPT-4o to TTS baseline had a perfect 100% turn-take rate and the worst latency at 10.12 s (lens-kimi E1, arXiv:2604.04847). LiveKit's own post refuses a verdict and ships hybrids: realtime plus separate STT, or realtime plus separate TTS (lens-glm S10). No paper isolates architecture from model, ASR, and TTS (lens-kimi §4).
 
 ---
 
-## 6. Direct answer to the COMPOSER / interleaved-runs question
+### Q3. Tools: schema, dispatch, timeout, error, retry
 
-**Verdict: MIXED-WITH-LIMITS — leaning GLOBAL-POLLUTED under default env.**
+**Finding 3.1 ★ (2/4: lens-codex, lens-glm). Schema derivation is real and has a repair path.**
+`function_arguments_to_pydantic_model` walks `inspect.signature`, resolves hints with `get_type_hints(include_extras=True)`, pulls parameter descriptions from `docstring_parser.parse_from_object`, skips context-typed parameters (`RunContext` and subclasses), and builds a model with `create_model` (lens-codex E8, `llm/utils.py:530`, context skip `:553`). The decorator collects the description from the docstring or an explicit `description=`; `raw_schema=` bypasses derivation entirely (lens-codex E8, `llm/tool_context.py:335`, `:420`, `:445`). Argument parsing has a three-step repair path tuned for small open-weight models: strict JSON, then `json_repair`, then stripping leaked chat-template tokens such as `<|...|>` and Gemma turn markers (lens-codex E8, `llm/utils.py:568-604`). lens-glm's migration note confirms `@function_tool` replaced `@llm.ai_callable` plus `FunctionContext`, with schemas from signatures and docstrings and a `RunContext` passed to tools (lens-glm S2).
 
-Three regimes, in order of likelihood for real usage:
+**Finding 3.2 ★★ (3/4: lens-codex, lens-glm, lens-opus). Tool execution is async, and errors are model-visible strings.**
+`_ToolExecutor.execute` builds a `RunContext`, attaches it to a `first_update_fut`, and runs the tool in its own task (lens-codex E9, `tool_executor.py:329`). A tool may call `ctx.update()` to stream progress; the first update answers dispatch, and the later return is coalesced into a synthetic final output so the model never waits on a result that will not come (lens-codex E9). Exceptions are captured and returned as `ToolError` outputs rather than propagated (lens-codex E9, `:396-420`). lens-glm's async-tools post says the same in product terms: the first `ctx.update(message)` returns control to the LLM immediately, the agent voices progress while the tool runs, deferred results surface when both agent and customer are idle, and the final `return` is spoken as the closing line; `ctx.with_filler(...)` plays audio bypassing the LLM (lens-glm S11). lens-opus draws the operational consequence: an outage looks like a model-visible string unless the app logs it (lens-opus §4).
 
-- **Default (`MINI_ORK_OBJECTIVE_DOMAIN` unset):** **GLOBAL-POLLUTED.** All runs stamp `objective_domain="code-delivery"` (`bin/mini-ork-execute:352`, `mini_ork/trace_store.py:125`). `lane_domain_advantage`/`lane_region_advantage` pool across every eng-team run; `context_prior_runs_md` filters on `task_class` alone; `topology_preferred` and `rho_top_prompts` likewise. The only partition is `code_region` = top-level directory of `files_written[0]` (`bin/mini-ork-execute:1665-1737`), which collapses `src/composer` and `src/auth-middleware` to a shared key. Maximum effective continuity = the sample floor (3 runs) IF the composer's exact `(task_class, node_type)` triple clears it; otherwise global fallback.
+**Finding 3.3 ★ (2/4: lens-codex, lens-glm). Duplicate detection is per-session and fails open.**
+Duplicate calls are keyed per tool with an `on_duplicate` mode, `allow` by default, plus a confirm mode that injects an `lk_agents_confirm_duplicate` parameter into the schema; detection is by tool name only (lens-codex E9, `tool_executor.py:359`; lens-glm S11). Dedupe state is per session, so two sessions can double-book the same side effect (lens-codex E9). lens-opus's version: duplicate detection fails open by design and the docstring delegates exactly-once to the tool body; a booking tool cancelled after the charge and then retried by a resumed turn is a correctness failure the framework will not prevent (lens-opus §4). The two descriptions agree on behavior; opus adds the failure story.
 
-- **With `MINI_ORK_OBJECTIVE_DOMAIN=composer` explicitly exported:** **MIXED-WITH-LIMITS.** Region and domain slices (`lib/lane_router.sh:511-545`) DO carry composer identity into `lane_domain_advantage` / `lane_region_advantage`. But `context_prior_runs_md` (planner context), `topology_preferred` (recipe selection), and `rho_top_prompts` (prompt selection) still ignore the domain — those stages remain feature-blind. Effective feature memory reaches ~3 runs of continuity on lane routing alone, with cold-start on every fresh `(task_class, node_type)` pair.
+**Finding 3.4 ★★ (3/4: lens-codex, lens-glm, lens-kimi). There is no documented tool timeout or retry policy.**
+lens-glm's async-tools post states plainly that timeouts and retries are not covered (lens-glm S11). lens-codex shows error capture and per-call cancellation gated on `ToolFlag.CANCELLABLE`, but no timeout or retry path in `_ToolExecutor.execute` (lens-codex E9, `:513`). lens-kimi reports that the literature studies error text and concurrency but not timeout and retry policy; the one benchmark that could have tested it used zero-latency mock APIs by design (lens-kimi §5, E1). The nearest thing to a timeout is the 1.8.7 release note: tools still running at an interruption timeout now continue asynchronously and deliver deferred results (lens-glm S12). That is an interruption timeout, not a tool deadline. Do not conflate them.
 
-- **With the audit recommendations implemented** (rec #1, #3, #5): Theoretically **FEATURE-ISOLATED** at the lane-routing layer and the planner-context layer, with adaptive shrinkage smoothing cold starts. Empirically untested.
+**Finding 3.5 ★ (2/4: lens-codex, lens-glm). Cancellation is opt-in and separate from interruption.**
+`ToolFlag.CANCELLABLE` opts a tool into auto-exposed `get_running_tasks()` / `cancel_task(call_id)`, which raises `asyncio.CancelledError`; interrupting a tool is not cancelling it (lens-glm S11). Cancellation is per-call and gated on the flag (lens-codex E9, `:513`). This is the sentence to get right in a screen: an interruption changes who has the floor; it does not by itself abort the work.
 
-**Maximum effective continuity for one feature over N runs:** 3 runs under default (sample floor); 3 runs with explicit domain stamping (because non-lane stages remain polluted); N runs if the audit's recommendations are implemented and η² confirms the signal exists.
+**Finding 3.6 ★ (2/4: lens-codex, lens-opus). A handoff after a progress update is treated as a bug.**
+The handoff-after-`ctx.update()` guard converts returning an `Agent` after a progress update into a `ToolError` (lens-codex E9, `tool_executor.py:428-440`). lens-opus's session-scoped versus activity-scoped tool distinction is the same design pressure from the other side: activity tools are cancelled or awaited on swap, `AsyncToolset` tools survive (lens-opus §4). The codex claim is code-anchored; the opus claim is at `a77605e` and is the weaker anchor.
 
-**Confidence:** High on the structural verdict (all 4 lenses converge on the read-site analysis). Medium on the operational "what users actually experience" because no lens measured real-world distribution of `MINI_ORK_OBJECTIVE_DOMAIN` values across prior runs.
+**Finding 3.7 ★ (2/4: lens-codex, lens-kimi). The framework ships a model-graded supervision layer over its own tool calls.**
+After a user turn, if the model did not call a tool, `DelegationDetector` asks a decision model (default `google/gemma-4-31b-it`) a single probability question built from a long policy prompt: did the caller ask for something only the backend can do, and has no tool call done it yet. A `grace_period` of 0.5 s lets the model delegate on its own first; `max_retry=0` because a late verdict is useless (lens-codex E12, `delegation.py:1-45`, `:73`, `:82`, `:67`; `decisions.py:29-62`). No surveyed peer does this; Pipecat leaves it to app code (lens-codex E12). lens-kimi's tool-reliability literature explains why a framework might: single-turn function calling is close to solved while memory, dynamic decision-making, and long-horizon reasoning remain weak (lens-kimi E7, BFCL).
 
----
-
-## 7. Source manifest (for the verifier)
-
-### From lens-glm (`lens-glm.md`)
-- File anchors: `mini_ork/lane_router.py:235-330` (write/read), `mini_ork/steering/decision_service.py:98-309` (decide), `mini_ork/trace_store.py:28-223` (reward), `lib/lane_router.sh:8-18,87-525` (bash mirror), `lib/decision_service.sh:80-460` (consume), `lib/process_reward.sh:99-100` (PRM bash), `mini_ork/learning/process_reward.py:55-124` (PRM python), `mini_ork/context_assembler.py:118,249` (gradient read), `lib/gradient_extractor.sh:57,97,383` (idempotent), `lib/reflection_pipeline.sh:266,396-437,494-506` (reflection chain), `bin/mini-ork-conductor:9,48,113,139,154,181,213,207-222,248-256` (header claim vs actual; predicted model), `bin/mini-ork-execute:289-319,352,1665-1737,1808-1866` (reward + region), `bin/mini-ork-classify:90,129,181-200,219,227,241` (classifier), `config/agents.yaml:16-57` (role/lens map), `config/providers.yaml:47-63` (model pins), `mini_ork/dispatch/providers.py:28-36,158-167,269-299` (provider/cwd), `mini_ork/cost_advisor.py:81-201` (advisor), `lib/pattern_store.sh:99,167-230` (patterns), `lib/context_assembler.sh:443-486` (prior runs context), `lib/topology.sh:127-136` (topology), `lib/rho_aggregator.sh:108-111` (rho), `lib/cw_por.sh`, `lib/adaptive_stability.sh`, `lib/krippendorff_alpha_gate.sh`, `lib/policy_store.sh` (gates/policy), `bin/mini-ork-conductor:204-222` (plasticity budget).
-
-### From lens-kimi (`lens-kimi.md`)
-- File anchors: `mini_ork/lane_router.py:286-330,195-199,270-279`; `mini_ork/steering/decision_service.py:98-309`; `mini_ork/trace_store.py:28-40,195-223`; `lib/lane_router.sh:8-18,173-187`; `bin/mini-ork-execute:453-509,753-754`; `mini_ork/optimize/gepa.py:55-91`; `mini_ork/web/routes/trajectory.py:170`; `run_detail.py:295,310,375`; `bin/mini-ork-reflect:184,301`; `bin/mini-ork-metrics:105`; `tests/unit/test_lane_router.sh:78`; `tests/test_gepa_wiring_py.py:215`; `mini_ork/dispatch/cost_pause.py:24-57`.
-- Papers (≥10 inline): [arxiv:2507.19457] GEPA; [arxiv:2402.03300] GRPO/DeepSeekMath; [arxiv:1707.06347] PPO; [arxiv:2402.14740] RLOO; [arxiv:2501.03262] REINFORCE++; [arxiv:2606.16733] first-principles PG; [arxiv:2603.01162] GRPO as U-statistic; [arxiv:2502.10985] Elo reliability; [arxiv:2503.12020] variance-dependent bandit regret; [arxiv:2502.05145] finite-horizon bandits; [arxiv:2310.03714] DSPy; [arxiv:2406.07496] TextGrad; [arxiv:2303.11366] Reflexion; [arxiv:2605.29463] reflexive confabulation. Plus classics: (Elo 1978), (Herbrich, Minka & Graepel 2007), (Williams 1992), (Auer, Cesa-Bianchi & Fischer 2002), (Langford & Zhang 2008).
-
-### From lens-codex (`lens-codex.md`)
-- Public framework repos (commit-pinned): [`langchain-ai/langgraph@1.2.9`](https://github.com/langchain-ai/langgraph/releases/tag/1.2.9); [`microsoft/autogen@027ecf0a`](https://github.com/microsoft/autogen/commit/027ecf0a379bcc1d09956d46d12d44a3ad9cee14); [`OpenHands/OpenHands@808eb06`](https://github.com/All-Hands-AI/OpenHands/commit/808eb06bb29f5ef5dbcfc1e7bc67565bc8d20b0f); [`SWE-agent/SWE-agent@1132b3e`](https://github.com/SWE-agent/SWE-agent/commit/1132b3e80a45487ce8423f75d0e180874bf84caa); [`FoundationAgents/MetaGPT@11cdf46`](https://github.com/geekan/MetaGPT/commit/11cdf466d042aece04fc6cfd13b28e1a70341b1f); [`Significant-Gravitas/AutoGPT@e2711b1`](https://github.com/Significant-Gravitas/AutoGPT/commit/e2711b1748bdc3fe702ab4e44c6a11df98458c53); [`letta-ai/letta@b76da90`](https://github.com/letta-ai/letta/commit/b76da9092518cbaa2d09042e52fdcbde69243e18); [`mem0ai/mem0@df9d5cc`](https://github.com/mem0ai/mem0/commit/df9d5cc4b151861304bb4f7ec1fdca6d54bbc45a); [`run-llama/llama_index@7fd33e0`](https://github.com/run-llama/llama_index/commit/7fd33e00a8947183327e75aef14687c499d5c150); [`agno-agi/agno@2b2081f`](https://github.com/agno-agi/agno/commit/2b2081fa8a5fa8a0825b381f29e49a3d738447d3); [`camel-ai/camel@c448d94`](https://github.com/camel-ai/camel/commit/c448d94b6268f6dcbba3f34cf36085066530a0d5).
-- Negative controls (excluded): Cursor Background Agents, Devin, CrewAI, Semantic Kernel.
-
-### From lens-opus (`lens-opus.md`)
-- File anchors: `bin/mini-ork-execute:289-295,352,660,651,1665-1737,1735,1808-1866`; `bin/mini-ork-spawn:113,123`; `recipes/doc-to-features-loop/lib/per_feature_dispatcher.py:422`; `lib/lane_router.sh:121,226,432,500,511-545`; `lib/decision_service.sh:121`; `lib/context_assembler.sh:443-486` (especially `:457-469`); `lib/topology.sh:127-136`; `lib/rho_aggregator.sh:108-111`; `lib/process_reward.sh:1-20`; `mini_ork/trace_store.py:125`; `lib/trace_store.sh:196`; `docs/architecture/techniques-compendium.md:121`; `db/migrations/0042_execution_traces_objective_aware_reward.sql:9`; `db/migrations/0043_lane_domain_advantage.sql`; `kickoffs/miniork-intelligence-audit.md:20-23`; `bin/mini-ork-usage-report:281`; `lib/recursive_orchestration.sh:143-155`; `bin/mini-ork-reflect:301`.
-- External citations: [arxiv:2210.03629] ReAct (Yao 2022); [arxiv:2310.08560] MemGPT (Packer 2023); [arxiv:2305.16291] Voyager (Wang 2023); [arxiv:2202.05780] meta-learning (Kirsch & Schmidhuber 2022); [arxiv:2304.11406] LaMP (Salemi 2024); [arxiv:2209.13085] reward hacking (Skalse 2022); LangGraph persistence overview; Efron & Morris 1975 (shrinkage); `internal-docs/research/2026-07-03-adding-eval-to-miniork-run-flow.md`.
-
-### Synthesis judgments (added in this doc)
-- Combines the four lenses; no new external citations introduced.
-- Recommendation #3 design follows Opus §5 exactly; #1 follows GLM-12 with Kimi §6 caveat applied; #5 follows Opus recommendations #1+#6 with Kimi-7 + Codex convergent pattern #1.
+**What the literature adds that the framework cannot absorb.** The tool error string is part of the API surface. Adding a terminal command to an expired-credentials error drove recovery from 82% down to 45% across five models; naming the available tool instead restored it to 84%; deleting the step and keeping the cause restored it to 82% (lens-kimi E8, arXiv:2609.35381). On rate limits, "Wait before retrying." produced 6% recovery while "Wait a few seconds and call tool again" produced 88% (lens-kimi E8). A framework that wraps tool exceptions can choose this text on the developer's behalf (lens-kimi E8). Async dispatch is also a measured latency win: 1.6x to 5.4x lower end-to-end latency for about 20 extra tokens, about 90 ms added latency, and 27.5 MB of KV cache on a 3B model (lens-kimi E9, arXiv:2412.07017).
 
 ---
 
-## Appendix A — INTELLIGENT (closed-loop) inventory
+### Q4. State: chat context, userdata, what survives a restart
 
-The full list of mechanisms that satisfy the write→read→decision criterion (Kimi §1 criteria 1+3+4; GLM Catalog B LIVE tags):
+**Finding 4.1 ★★ (3/4: lens-codex, lens-glm, lens-opus). `ChatContext` is a typed, in-memory item log.**
+`ChatContext` holds discriminated items: `message`, `function_call`, `function_call_output`, `agent_handoff`, `agent_config_update`. It can be copied with pruning (`exclude_image`, `exclude_audio`, `exclude_function_call`), serialized to a dict with the same exclusions, or converted to protobuf (lens-codex E10, `chat_context.py:407`, `:456`, `:494`, `:529`, `to_dict` `:773`, `from_dict` `:1056`, `to_proto` `:1061`). Nothing writes it to durable storage: it lives in memory on the `AgentSession`, and the process pool disposes the process after the job (lens-codex E10). lens-glm's secondary sources point the same way: the only public material on memory pushes persistence into Supabase or MongoDB, and reconnect behavior is a separate feature (lens-glm secondary list). lens-opus states it as "session state lives in memory" and "tasks do not persist" (lens-opus §2, §4). lens-kimi has no framework-level source, but its state-degradation work explains why this matters: long conversations fail mostly through unreliability, not incapacity (lens-kimi E10, E11).
 
-| # | mechanism | write site | read site | loop status |
-|---|-----------|------------|-----------|-------------|
-| 1 | GRPO lane routing | `mini_ork/lane_router.py:235-279` (`agent_performance_memory` UPSERT; `lane_*_advantage` UPSERT) | `mini_ork/lane_router.py:286-330` (`preferred_lane`); consumed at `mini_ork/steering/decision_service.py:284-287`, `lib/decision_service.sh:80-217` | **INTELLIGENT** (structure) / **EFFECTIVELY-STATIC** (reward starvation + floor noise) — Dispute 1 |
-| 2 | Gradient → context_assembler | `lib/gradient_extractor.sh:57,97,383` (`gradient_records` insert) | `mini_ork/context_assembler.py:118,249`; `lib/context_assembler.sh:143,374` (failure-mode injection) | **INTELLIGENT** (closed) |
-| 3 | Gradient → role-evolver | `lib/gradient_extractor.sh:57,97,383` | `lib/role_evolver.sh:114` (proposals) | **INTELLIGENT** (closed) |
-| 4 | Pattern → reflection chain | `lib/pattern_store.sh:99,167-230` (`pattern_records`) | `lib/reflection_pipeline.sh:320,494` (cluster→promotion summarizer) | **INTELLIGENT** (closed upstream of emergent_patterns) |
-| 5 | GEPA within-run | `mini_ork/optimize/gepa.py:62` (in-memory `ParetoFront._entries`) | `mini_ork/optimize/gepa.py:55-83` (`select`) | **INTELLIGENT (within-run) / AMNESIC (cross-run)** — no persistent archive |
-| 6 | Topology win-rate → conductor | `lib/topology.sh` (recipe-topology rollup) | `bin/mini-ork-conductor:139,154` (topology win_rate base for predicted score) | **INTELLIGENT** (single consumer) |
+**Finding 4.2 ★ (2/4: lens-codex, lens-opus). `userdata` is application state, deliberately outside the model's context.**
+`userdata` is typed generically and lives on `JobProcess` (`job.py:1033`). It is not the chat history and is not in `ChatContext` (lens-codex E3, E10). lens-opus treats the same split as a design principle: the session owns conversation state, the app owns application state (lens-opus §2). The codex anchor is decisive; opus is a same-family echo here only in framing, not in code.
 
----
+**Finding 4.3 ★★ (3/4: lens-codex, lens-glm, lens-opus). Nothing survives process death.**
+The process pool disposes the job process after the job, and no lens found a framework path that serializes `ChatContext` or `userdata` to durable storage (lens-codex E10; lens-glm gap 5; lens-opus §4). lens-glm is explicit that "what survives a restart is stated nowhere" and that the in-memory conclusion is inference from the negative space, not documentation (lens-glm gap 5). That inference is now code-corroborated by lens-codex, which is why the finding is stated as high confidence rather than as documentation. The honest formulation: as of 1.8.12, the framework has no durable session store; restart survival is the application's job.
 
-## Appendix B — NOT-INTELLIGENT inventory
+**Finding 4.4 ★ (2/4: lens-kimi, lens-codex). State representation is a framework lever, not only a model property.**
+On an identical 60-item state-tracking set, changing the output protocol moved accuracy from 31.7% to 88.0%; pooled core accuracy was 31.7% against 84.9% for single-step arithmetic (lens-kimi E11, arXiv:2603.27343). Multi-turn degradation is mostly unreliability: average performance fell 39% across six tasks, but the aptitude drop was about 16% and statistically insignificant while unreliability more than doubled (lens-kimi E10, arXiv:2505.06120). lens-codex's `ChatContext` design is the corresponding lever: typed items, pruning, and protobuf serialization are choices about what the model sees (lens-codex E10). The link between the two is synthesis judgment, not a claim either lens makes.
 
-### B.1 STATIC (config constants, no data input)
+**State table (lens-codex E10, E3; lens-opus §4; lens-glm gap 5):**
 
-54 entries in GLM Catalog A; key structural ones (file:line — what it is):
-
-- PRM weights `lib/process_reward.sh:99-100` / `mini_ork/learning/process_reward.py:55-61` — `0.40/0.20/0.10/0.15/0.10/0.05/0.15` linear blend, dual-source-of-truth
-- Verdict vocabulary `mini_ork/learning/process_reward.py:63` — frozen set `{"approve","approved","pass","success","ok"}`
-- GRPO hyperparameters `mini_ork/lane_router.py:35-38` / `lib/lane_router.sh:87-90` — `SHRINKAGE_K=5, DECAY_ALPHA=0.30, HALFLIFE_DAYS=14`
-- Sample floor `mini_ork/lane_router.py:291` / `lib/lane_router.sh:500` — `MO_LEARNING_MIN_SAMPLES=3`
-- Explore rate `lib/decision_service.sh:121` — `MO_LEARNING_EPSILON=0.10` constant, no decay
-- Default lane fallback `lib/decision_service.sh:105` — `route=$(decision_service_default_lane "$node_type")`
-- Family map `lib/decision_service.sh:263` — `LANE_TO_FAMILY={...}` hardcoded
-- Status→reward map `bin/mini-ork-execute:289-299` — 3-level step function `1.0/0.0/0.5`
-- Fallback chains `bin/mini-ork-execute:312-324` — `MO_FALLBACK_CODING`, `MO_FALLBACK_REVIEW`, `MO_FRONTIER_LANE`, `MO_CHEAP_LANE`
-- Reward anchor `bin/mini-ork-execute:1809` — `MO_REWARD_ANCHOR:-0.5`
-- Cost advisor tiers `mini_ork/cost_advisor.py:81-90` — model+context map, budget thresholds, default lane
-- Role→lane map `config/agents.yaml:16-31` — planner/researcher/implementer pinned
-- Lens→family map `config/agents.yaml:41-53` — 5-family panel pinned
-- Budget caps `config/agents.yaml:55-57` / `bin/mini-ork-conductor:48` / `lib/llm-dispatch.sh:1377` — `$50/day` triple-hardcoded
-- Classifier keywords `bin/mini-ork-classify:181-241` — `+1/+2/+3` word bonuses, no embedding
-- Plasticity budget `bin/mini-ork-conductor:204-222` — daily mutation cap `5`, predicted-score gain `0.3`
-- Error taxonomy `lib/llm-dispatch.sh:1279-1295,168-205` — frozen regex/keyword table
-- Gates `lib/cw_por.sh` / `lib/adaptive_stability.sh` / `lib/krippendorff_alpha_gate.sh` — fixed thresholds
-- Recursion/depth `mini_ork/steering/decision_service.py:265-275` — pure env read, no data input
-
-### B.2 WRITE-ONLY (rows produced and counted, no decision reads them)
-
-| # | table | write site | why it's not consulted |
-|---|-------|-----------|------------------------|
-| 1 | `emergent_patterns` | `lib/reflection_pipeline.sh:396-437` (status='proposed') | no `SELECT … emergent_patterns` in routing, decision, or context_assembler paths (GLM-12) |
-| 2 | `prompt_win_rates` | `lib/rho_aggregator.sh` / `mini_ork/learning/rho_aggregator.py` | only `rho_top_prompts` + lifetime reporting; `bin/mini-ork-conductor:9` *claims* to read it but body queries only `topology_win_rates` + `agent_performance_memory` (GLM-12, header is stale) |
-| 3 | `conductor_decisions.outcome` / `realized_score` | `bin/mini-ork-conductor:248-256` | only `scripts/smoke-learning-loops.sh:142` (asserts `success:1.0`); conductor's predicted-score model never regresses on it |
-| 4 | Reflection chain (w.r.t. routing) | `lib/gradient_extractor.sh:57`; `lib/reflection_pipeline.sh:266`; `bin/mini-ork-reflect:301,184`; `bin/mini-ork-metrics:105` | readers are UI counts (`mini_ork/web/routes/trajectory.py:170`, `run_detail.py:295,310,375`) + tests; no `decide()`/`lane_router` reader by key (Kimi-5) |
-| 5 | `bug_reports` (emission half) | `lib/bug_report.sh` + `bin/mini-ork-bug-collector` (regex/severity/confidence) | ingestion is LIVE; emission is regex heuristic (same shape as `mini_ork-classify`), precision bounded by hand-written patterns |
-
-### B.3 DEAD (write site exists, no in-repo reader found)
-
-| # | table | write site | why it's dead |
-|---|-------|-----------|---------------|
-| 1 | `run_artifact_edges` | insert site exists | grep across `*.sh` + `*.py` returned zero non-test readers (GLM-12); also absent from context_assembler, conductor, lane_router, web routes |
-
-### B.4 NOT-INTELLIGENT veneer (looks intelligent but isn't)
-
-| # | mechanism | file:line | why it isn't |
-|---|-----------|-----------|--------------|
-| 1 | `coalition_ok` field in `decide()` return | `mini_ork/steering/decision_service.py:123-197` | computed AFTER `route` is fixed at `:287`; output-only diagnostic, not a decision input |
-| 2 | `reward_summary` field in `decide()` return | `mini_ork/steering/decision_service.py:200-262` | same — computed after route is fixed; no external caller branches on it |
-| 3 | `cost_pause` sidecar | `mini_ork/dispatch/cost_pause.py:24-57` | self-read same run only; within-run accounting, not cross-run learning |
+| State | Where it lives | In model context? | Survives process death? |
+|---|---|---|---|
+| `ChatContext` | `AgentSession` memory | yes | no |
+| `userdata` | `JobProcess` | no | no |
+| tool dedupe state | session | no | no |
+| tasks | activity/session | as chat items | no |
+| external memory | app's store | via retrieval | yes, app-owned |
 
 ---
 
-## Appendix C — Top 5 highest-leverage changes (in order)
+### Q5. Handoffs and multi-agent composition
 
-Synthesizing across all 4 lenses, ranked by combined structural + operational payoff:
+**Finding 5.1 ★★ (3/4: lens-codex, lens-glm, lens-opus). A handoff is an in-session activity swap, not a new process.**
+`AgentSession.update_agent` rejects an agent already bound to another activity, sets `_new_turns_blocked` on the current activity immediately, then creates `_update_activity_task`, which drains the old activity, transfers reusable resources (STT/TTS streams where possible), and starts the new `AgentActivity` (lens-codex E11, `agent_session.py:1813`, `:1901`, `:1824`). `AgentTask` subclasses `Agent`, is awaitable, and can be completed or cancelled (lens-codex E11, `agent.py:890`). Resource reuse across activities avoids a second STT/TTS connect (lens-codex E11, `agent_activity.py:1111`). lens-glm's handoff guide describes the user-facing form: a triage agent's `@function_tool` returns a new `Agent` instance, which triggers automatic handoff, with context passed via `self.chat_ctx.copy(exclude_instructions=True)` (lens-glm S15). lens-opus states the same at the design level: a handoff drains the old activity and swaps the agent inside the live session rather than restarting anything (lens-opus §2).
 
-1. **Promote verified `emergent_patterns` into `context_assembler`'s failure-mode injection path.** Single biggest gap between "the system looks reflective" and "reflection changes routing." Pre-condition: build extract→distill→verify pipeline (Kimi §6 caveat). *(GLM-12 highest-leverage #2 + Kimi-5 + Opus-6 #4.)*
+**Finding 5.2 ★ (2/4: lens-glm, lens-codex). Tasks and task groups are the in-agent composition primitive, and they live under `beta`.**
+One supervisor `Agent` holds long-lived session control; Tasks are short-lived, focused units that run inside the agent, temporarily take the conversation, and return typed results (`AgentTask[TriageResult]`, `self.complete()`). There is no agent swap, no routing LLM hop, and no latency penalty; context flows via `chat_ctx` (lens-glm S14). `TaskGroup` (from `livekit.agents.beta.workflows`) chains sequential tasks with shared context: `task_group.add(lambda: TriageTask(...), id="triage")`, results via `results.task_results["triage"]` (lens-glm S14). The beta module path is the load-bearing detail: this surface is not stable API. lens-codex shows the same primitive from the inside as `AgentTask`, an awaitable `Agent` subclass (lens-codex E11).
 
-2. **Read `conductor_decisions.realized_score` back into the conductor's predicted-score model** (replace the fixed `0.3` gain with fitted/EMA coefficient). The meta-orchestrator currently cannot learn from its own prediction error. *(GLM-12 highest-leverage #1 + Opus Case A.)*
+**Finding 5.3 ★ (2/4: lens-glm, lens-codex). Warm human transfer is a task, not a handoff.**
+`WarmTransferTask` (from `livekit.agents.beta.workflows`) holds the caller, opens a private consultation room where the AI briefs the human, then hands over and disconnects the AIs (lens-glm S15). This is a task-shaped workflow rather than an `update_agent` swap, which is why it can hold a third party in a separate room while the original session stays alive. The codex survey does not cover `WarmTransferTask` specifically, so the star count is 2 but the second lens is only corroborating the task primitive, not this workflow.
 
-3. **Replace `_mo_reward_from_status` with a graded signal OR guarantee `reward_g` population via eval node.** Without this, the GRPO rail is starved; reward_g=NULL for most runs makes the lane router operate on a thin slice. *(GLM-12 highest-leverage #5 + Kimi-3 + Opus-6 #4.)*
+**Finding 5.4 ★ (2/4: lens-codex, lens-opus). Handoffs are asynchronous, with a drain window.**
+A handoff is asynchronous and leaves a window where the old activity is muted but still draining; code that assumes the swap is immediate will race (lens-codex E11). lens-opus names the operational consequence: tools attached to an `Agent` are activity-scoped and are cancelled or awaited during a handoff, while tools in an `AsyncToolset` are session-scoped and survive the swap (lens-opus §4). Put work that must survive a handoff in a session-scoped toolset (lens-opus §6 rec 5). The codex anchor is `_update_activity_task`; the opus claim is at `a77605e` and should be re-checked at `cbb5770` before quoting in the screen.
 
-4. **Document `MINI_ORK_OBJECTIVE_DOMAIN` as a feature-scoping lever and have the recursive spawn path inherit parent_run_id → objective_domain automatically.** Makes the lever opt-in-by-omission rather than opt-in-by-discipline. *(Opus-6 #1+#6 + Kimi-7 + Codex convergent pattern #1.)*
+**Finding 5.5 ★ (2/4: lens-kimi, lens-glm). The governance literature says a handoff guard needs its own evaluation.**
+Maat, a deterministic contract layer between agents, caught some handoff defects but produced a 37% false-alarm rate on governed halts, and when unattributed halts count as failed work the governed arm underperforms the ungoverned arm in four of six workflows; the paper withdrew its own v1 claim that gains held in all six (lens-kimi E12, arXiv:2609.34017). A deterministic, non-LLM validator is the only reproducible kind, and it still needs evaluation (lens-kimi E12). lens-glm's docs show LiveKit's own handoff machinery is exactly this kind of layer, with context copied and instructions excluded (lens-glm S15). The implication: if LiveKit adds stricter handoff validation, the false-alarm cost is a real design risk, not a hypothetical.
 
-5. **Run the Opus §5 η² experiment on existing `state.db` data** before investing in feature-scoping infrastructure. SQL-only, no code changes. Resolves the entire "is feature-isolation worth building" debate with data. *(Opus §5 + Kimi-7 + GLM-7.)*
+**Finding 5.6 ★ (2/4: lens-kimi, lens-opus). Communication, not task decomposition, is the organising problem.**
+The multi-agent survey separates system-level communication (architecture, goals, protocols) from internal communication (strategies, paradigms, objects, content) and concludes the field's benchmarks do not measure communication (lens-kimi E13, arXiv:2502.14321). lens-opus maps that onto the framework: task groups are system-level orchestration of concurrent tasks, transfers are internal communication between agents, and agent-to-agent communication is a floor-authority problem (lens-opus §6 rec 7). The vocabulary is the reusable artifact; it is a survey, one source, not a body of evidence (lens-kimi E13).
+
+---
+
+### Q6. Where the framework is thin: the three JD-named gaps
+
+**Finding 6.1 ★★ (3/4: lens-glm, lens-kimi, lens-opus; lens-codex silent). Text modality has no runtime.**
+v1 moved chat onto the `lk.chat` topic and transcriptions to `lk.transcription` text streams (lens-glm S2). The JD's "channels such as SMS" phrasing implies a multi-channel abstraction that no fetched docs page describes (lens-glm S17, gap 3). A text channel has no VAD, no audio clock, and minutes or hours between turns; tasks do not persist and session state is in memory, so an SMS thread is a different runtime, not a different transport, and process-per-call is a poor fit for a conversation that sleeps for an hour (lens-opus §4). The academic literature treats voice and text as separate modalities with separate evaluation cultures and barely compares them (lens-kimi §5). lens-codex did not survey a text path, which is itself consistent with the absence.
+
+**Finding 6.2 ★★★ (4/4: lens-glm, lens-codex, lens-kimi, lens-opus). Durable workflows have no shipped session lifecycle; one experimental plugin exists.**
+No docs page, blog post, or GitHub issue found in the breadth sweep describes how LiveKit Agents would persist or resume agent execution across process death; the only adjacent public material pushes persistence outside the framework (lens-glm gap 1). lens-codex found `livekit-durable`, a plugin that serializes a live generator or coroutine by reading its frame instruction pointer, stack, and block stack through a native extension, and validates a code hash on deserialize; nothing else in the survey does this, and it is unused by core (only its own tests import it), so it is an experiment, not a shipped answer (lens-codex divergent 2, `livekit-durable/livekit/durable/function.py:80-175`). lens-opus found the same package on PyPI at 0.1.0, published 2025-12-19, with integration depth undocumented (lens-opus §5). The systems literature supplies the two candidate mechanisms and says neither has been evaluated on an agent harness: event-log replay with deterministic execution (lens-kimi E14, arXiv:2103.00033) versus speculative execution with distributed rollback, which removes the determinism requirement at the cost of more aborted work and slower recovery (lens-kimi E15, arXiv:2412.13314). An LLM turn loop is hostile to deterministic replay unless every model call is pinned to a recorded result (lens-kimi E14, E15; lens-opus §3).
+
+**Finding 6.3 ★★★ (4/4: lens-glm, lens-codex, lens-kimi, lens-opus). Agent-to-agent communication stops at in-session handoff.**
+Everything public describes one session, one process, with handoffs and beta task groups inside it; no protocol for cross-room or cross-agent-system messaging appears in the fetched docs (lens-glm gap 2). lens-codex's `DelegationDetector` is in-session supervision, not inter-agent messaging, and the handoff primitive is an activity swap inside one session (lens-codex E12, E11). The literature is thin: one primary multi-agent study that retracts its headline claim, plus one survey (lens-kimi E12, E13, §5). lens-opus frames the gap as floor authority: the hard question is which agent holds the floor and how that authority transfers, not how bytes move between processes (lens-opus §6 rec 7).
+
+**Finding 6.4 ★ (2/4: lens-glm, lens-opus). The three gaps are posting-scoped, not a company-wide admission.**
+The Enlistar mirror of the posting quotes "Help define the text modality of the framework, enabling agents to interact with users across channels such as SMS", "Design abstractions for stateful and durable agentic workflows", and "Shape agent-to-agent communication and delegation patterns" (lens-glm S17). The currently-live senior variant on Ashby contains none of those phrases (lens-glm S18). Treat the three gaps as scoped to the posting being interviewed for, and verify which posting that is before leading with them (lens-glm dissent 4). lens-opus treats them as seams rather than missing features, which is compatible with either posting (lens-opus §6 rec 7).
+
+---
+
+## 4. Disputed findings
+
+No vote rule. Each dispute is reported with both sides, a judgment about why the lenses disagree, and the evidence that would settle it.
+
+### D1. What the shipped turn detector actually is
+
+**The disputed claim:** whether LiveKit's production end-of-turn model works from transcript text or from audio plus semantics.
+
+- **Side A (audio plus semantics, vendor primary).** TurnDetector v1 "abandons transcript-based detection": an audio encoder feeds a learned adapter and a fine-tuned LLM semantic branch, while a second encoder feeds a recurrent acoustic branch; the two are fused into one end-of-turn prediction, using only the current user turn and no chat context (lens-glm S6, 2026-06-17).
+- **Side B (text side).** lens-kimi's entry on text-side end-of-turn says "LiveKit's shipped turn detector is a text-side model", and lens-opus says "LiveKit's shipped model works on the transcript side", anchoring the claim in the December 2024 135M-parameter SmolLM v2 transformer over a sliding four-turn window (lens-kimi E2; lens-opus §1, §2).
+- **Side C (the code is ambiguous).** The plugin downloads a q8 ONNX model and runs `predict_end_of_turn` inside the shared inference subprocess (lens-codex E13). The starter template comment says the detector "listens to the user's audio directly, combining semantic understanding with acoustic cues", while core still carries a TODO for multimodal end-of-utterance at `agent_activity.py:2838` (`feat/AGT-2520-multimodal-EOU`); lens-codex says to treat the comment as a product claim, not an implementation fact (lens-codex E15).
+
+**Judgment: anachronism plus a real migration question, in that order.** There are at least three generations in play. The December 2024 model was text (SmolLM v2, 135M, four-turn window). A later text `MultilingualModel` (Qwen2.5-0.5B, 396 MB, 50 to 160 ms per turn, needs STT transcripts) is deprecated for removal in 2.0 (lens-glm S7). The June 2026 v1 is audio plus semantics (lens-glm S6). lens-kimi and lens-opus describe generation one or two; lens-glm describes generation three. That is a time-scale disagreement, not a factual one. What remains genuinely open is Side C: lens-codex's TODO is evidence that the core feature gate for multimodal EOU still exists at 1.8.12, so either the TODO is stale or the shipped ONNX is not the full described v1. No lens opened the model graph. **Do not assert either architecture in the screen without naming the version and the artifact you read.**
+
+**What would resolve it:** read `livekit-plugins-turn-detector` at `cbb5770`, inspect whether the ONNX inputs are audio features or token ids, and compare with the `livekit/turn-detector` model card; then ask the product lead which model 1.8.12 ships by default and whether the multimodal-EOU TODO is live.
+
+### D2. Endpointing defaults: 0.3/2.5 versus 0.5/3.0
+
+- **Side A:** with the audio detector, endpointing defaults move to `min_delay` 0.3 s and `max_delay` 2.5 s (lens-glm S7, docs rendered 2026-11-14).
+- **Side B:** the tuning docs recommend `inference.TurnDetector()` with fixed endpointing at 0.5 s minimum and 3.0 s maximum (lens-opus §2, page undated).
+
+**Judgment: different objects and possible page drift.** Side A describes the detector's own defaults; Side B describes a recommended starting configuration. The two can both be true. lens-glm's is the more specific and more recent claim, so use 0.3/2.5 for "what the framework does" and 0.5/3.0 only if the tuning page labels it as a recommendation. There is a second, quieter tension inside lens-glm: a February 2026 FAQ recommends STT endpointing as the default for most production agents, while the current docs make the audio TurnDetector the session default (lens-glm S8 vs S7). Both are LiveKit positions four months apart.
+
+**What would resolve it:** fetch the tuning page on a date and check whether 0.5/3.0 is labeled "default" or "recommended", and read the `DynamicEndpointing` constants at `cbb5770`.
+
+### D3. Cold start: spawn per dispatch versus pre-warmed pool
+
+- **Side A:** the agent server "boots a job subprocess which joins the room" when a dispatch request arrives (lens-opus §4, quoting the agents overview).
+- **Side B:** the process pool keeps `num_idle_processes` already-initialized processes; a job is handed to a warm process, and a new one is spawned only when none is available, with the log line "no warmed process available for job, waiting for one to be created" (lens-codex E2; lens-glm S16).
+
+**Judgment: a granularity difference, not a contradiction, and codex wins on internals.** The docs compress "assign a pre-warmed process" into "boots a subprocess", which is true of the process but misleading about the latency. The operational conclusion in Side A survives and is actually reinforced by Side B: cold start is real when the pool is empty or the plan scales to zero, and preemptive generation cannot help before a process exists. In the screen, use the codex mechanism and keep the opus warning.
+
+**What would resolve it:** trace `ProcPool.launch_job` at `cbb5770` with an empty warm queue and time the spawn, and check whether LiveKit Cloud's default plan pre-warms.
+
+### D4. Whether the three gaps are LiveKit's own admission
+
+- **Side A:** the Enlistar mirror names text modality, durable workflows, and agent-to-agent communication as the role's frontier (lens-glm S17).
+- **Side B:** the currently-live senior variant on Ashby names none of them (lens-glm S18).
+
+**Judgment: posting-scoped, not company-wide.** Both are LiveKit postings; only one names the gaps. Any sentence of the form "LiveKit admits X is missing" must be scoped to the specific posting. This is a qualification, not a contradiction, and it is the kind of thing a product lead will notice if you get it wrong.
+
+**What would resolve it:** confirm which posting the screen is for, and read that posting's exact text.
+
+### D5. Turn-detection benchmark superiority
+
+- **Side A:** LiveKit's v1 detector reaches 9.9% false-cutoff at a 300 ms budget, against Deepgram Flux at 12.9% and ultraVAD at 27.7%, and 543 ms mean latency at a 5% false-cutoff target (lens-glm S6, vendor benchmark on LiveKit's own `eot-bench`).
+- **Side B:** a WebRTC consultancy says the frameworks are "closer in practice than marketing implies" and advises prototyping both on your own audio (lens-glm S20); a practitioner thread reports open-source turn-taking models failing outside clean short sentences (lens-glm S19); FireRedChat's third-party measurement puts LiveKit's false barge-in at 33.4% against its own 10.2% and LiveKit's Chinese "unfinished" accuracy at 45.3% (lens-kimi E4).
+
+**Judgment: different metrics on different test sets, plus vendor-versus-third-party instrumentation.** Side A measures false cutoff at a latency budget on LiveKit's own benchmark. Side B measures false barge-in and per-language end-of-turn accuracy on other test sets. These are not one league table. The vendor benchmark is also unreplicated. The dispute is partly definitional and partly real: definitional because the metrics differ, real because the third-party numbers are worse than the marketing implies.
+
+**What would resolve it:** run both detectors on a common test set with a common protocol, and publish per-language "unfinished" accuracy next to false barge-in. Until then, quote each number with its test set and sample size.
+
+### D6. Cascade versus speech-to-speech
+
+- **Measured trade-off:** the cascade had the best turn-take rate (100%) and the worst latency (10.12 s); GPT-Realtime led Pass@1 at 0.600 with 6.89 s; Gemini Live 3.1 was fastest at 4.25 s but spoke on only 78% of turns (lens-kimi E1).
+- **Vendor position:** no universal winner; realtime has a structural latency edge and better voice quality, cascade wins control, modularity, debugging, per-layer cost, 8 kHz telephony, and EU residency; LiveKit supports hybrids (lens-glm S10).
+- **Practitioner dissent:** "STT to LLM to TTS is a dead end", countered in the same thread by auditability needs (lens-glm S19).
+- **Narrative reading:** the orchestration layer may be transitional, but a realtime model still needs a room, a job, a process boundary, a tool runtime, and a state model (lens-opus §3).
+
+**Judgment: genuinely unsettled, and the lenses agree on the unsettledness rather than on an outcome.** No paper isolates architecture from model, ASR, and TTS (lens-kimi §4). The honest screen answer is that the trade-off is measured per stack, not settled per architecture, and that LiveKit's own position is to support both.
+
+**What would resolve it:** a production turn-level ledger stratified by modality, as lens-opus proposes; or a controlled study that holds model, ASR, and TTS constant while varying only the architecture.
+
+### D7. Is the framework layer transitional?
+
+- **Dissent:** if the model owns turn-taking, VAD, endpointing, ASR, and TTS orchestration become compatibility shims, and durable value sits in the model vendor's weights (lens-opus §3, steel-manning Moshi and the Realtime API).
+- **Response:** control, observability, cost, vendor lock, tool execution, and transport do not come from the model, and value migrates from orchestration to lifecycle and state (lens-opus §3).
+
+**Judgment: a live hypothesis, not a finding.** No lens asserts the framework dies; lens-glm's vendor post explicitly refuses a verdict and ships both paths (lens-glm S10). Treat this as an open question with a clean falsifier: if realtime share passes 50% and keeps rising, the orchestration layer is transitional; if cascaded stays above 70% after two years of speech-to-speech models, the control argument wins (lens-opus §5).
+
+---
+
+## 5. Cross-lens gaps
+
+Items here are either absent from every lens or covered by only one lens and therefore fragile. The first four are genuine field gaps; the rest are coverage gaps that a screen could expose.
+
+1. **Durable workflows for a nondeterministic agent loop are unsolved in public.** No docs page, no architecture post, no GitHub issue describes how LiveKit Agents would persist or resume a session across process death (lens-glm gap 1). The only artifact is an experimental plugin not wired into core (lens-codex divergent 2; lens-opus §5). The systems literature offers replay and speculative rollback, and no published work evaluates either on an agent harness (lens-kimi §4). This is the single largest gap between what the JD says matters and what the public record documents.
+2. **Text modality as an architecture is absent.** No fetched docs page describes a multi-channel abstraction; the literature barely compares voice and text; lens-codex did not survey a text path (lens-glm gap 3; lens-kimi §5; lens-opus §4). The JD's SMS phrasing is the only signal (lens-glm S17).
+3. **Cross-process agent-to-agent communication has no protocol.** Everything public is one session, one process, with handoffs and beta task groups (lens-glm gap 2; lens-codex E11, E12). The literature is one retracting study plus one survey (lens-kimi E12, E13).
+4. **Restart survival semantics are stated nowhere in the docs.** The in-memory conclusion is inference from the negative space in lens-glm and code-corroborated by lens-codex, not documented behavior (lens-glm gap 5; lens-codex E10).
+5. **The worker registration handshake and process model have no prose source.** lens-glm S5 defers to sub-pages and S16 documents symptoms; lens-kimi says the literature does not cover it; only lens-codex answers it (lens-codex E1, E2; lens-glm gap 4; lens-kimi §5).
+6. **SDK 2.0 is undocumented at breadth level.** 2.0.0b1 exists on PyPI (2026-10-12) and the docs promise text-detector removal in 2.0, but no 2.0 announcement, migration guide, or changelog summary surfaced (lens-glm S13, S7, gap 6). No lens read 2.0 code.
+7. **Tool timeout and retry policy is unserved by both the framework docs and the literature.** lens-glm S11 says timeouts and retries are not covered; lens-kimi §5 says the same for the literature; lens-codex found error capture and cancellation but no timeout path (lens-codex E9).
+8. **No independent production postmortems of LiveKit Agents.** Case studies are vendor-published; the only independent operational signal is an HN thread about a system built without LiveKit (lens-glm gap 7, S19).
+9. **No third-party measurement of the framework's own overhead.** "Tens of ms" is vendor-supplied and echoed by a consultancy (lens-glm gap 8, S20).
+10. **The turn-taking literature is telephone-domain and systematically excludes overlap.** Entry 3 excludes active overlaps (40% English/Mandarin to 55% Japanese), entry 2 trains on segments with under 10% opposing-channel activity, and entry 5's automatic labels reach only 76.1% agreement on gaps (lens-kimi §4). WebRTC agent traffic is a different channel, and no paper in the lens evaluates on it.
+11. **Cross-session memory is an external-store pattern, not a framework primitive.** The only public material is blog posts about Supabase and MongoDB (lens-glm secondary list). No lens found a framework API for it.
+12. **Multi-tenant isolation is a consequence of process-per-job, not a designed feature.** One process per job gives good isolation but no shared cache and a cold start per conversation (lens-opus §4). No lens found a tenancy model beyond that.
+
+---
+
+## 6. Unverified: load-bearing claims no lens could source
+
+Everything below is stated as unverified. Do not present any of it as fact in the screen. Each item names what would settle it.
+
+1. **The internal architecture of the shipped turn-detector ONNX at 1.8.12.** lens-glm S6 describes the June 2026 v1 as audio plus semantic plus acoustic fused. lens-codex E13 shows the plugin runs `predict_end_of_turn` on a q8 ONNX. No lens inspected the model graph or confirmed which inputs the shipped artifact takes. **Unverified: whether the shipped ONNX is the full v1 architecture or a partial/text variant.**
+2. **The value and behavior of `ASSIGNMENT_TIMEOUT`.** lens-codex cites the constant and the wait path but not its value or what happens to the reservation when it expires. **Unverified: timeout duration and the decline/retry path.**
+3. **The exact `num_idle_processes` default formula.** lens-glm S16 says it is derived from CPU count; lens-codex does not state the formula. **Unverified: the exact expression and whether it is capped.**
+4. **What happens to an in-flight tool call when the user interrupts.** lens-glm S12 (1.8.7) says tools still running at an interruption timeout continue asynchronously and deliver deferred results; lens-codex E9 shows cancellation gated on `ToolFlag.CANCELLABLE` and errors returned as outputs. No lens traced the combined state machine for "interrupt during tool, tool raises, turn resumes". **Unverified: the exact ordering and whether a resumed turn can adopt a deferred result.**
+5. **Whether the framework ever serializes session state, for example on reconnect.** lens-codex E10 says nothing writes `ChatContext` to durable storage; lens-glm's reconnect post is title-only. No lens read the reconnect code path. **Unverified: whether any reconnect path persists or replays state.**
+6. **`livekit-durable` integration depth.** lens-codex says only its own tests import it; lens-opus says integration depth is undocumented. **Unverified: whether it works end to end with `AgentSession`, and whether it is supported.**
+7. **What 2.0.0b1 changes.** No lens read the 2.0 code, changelog, or migration guide. **Unverified: turn-detector architecture, tool API, and state model in 2.0.**
+8. **The framework's own latency and cost overhead.** No third-party measurement exists; the "tens of ms" figure is vendor-supplied and echoed (lens-glm gap 8). **Unverified: the framework's contribution to end-to-end latency.**
+9. **The `agent_name` mismatch failure path.** lens-glm S16 documents the symptom (agent never joins); lens-codex does not trace the registration and name-matching code. **Unverified: where the mismatch is detected and what the worker logs.**
+10. **`max_tool_steps` failure behavior.** lens-codex E3 cites `max_tool_steps=3`; lens-glm S12 says 1.8.6 enforced it on the realtime tool loop. Neither states what happens when the cap is hit (raise, stop, or a model-visible error). **Unverified: the cap's failure semantics.**
+11. **Whether the turn detector's `eot-bench` numbers replicate.** The benchmark is LiveKit's own, the numbers are unreplicated, and the vendor is the interested party (lens-glm S6). **Unverified: independent replication on the same test set.**
+12. **Whether the three JD gaps reflect the team's current roadmap or one posting's framing.** The two postings disagree (lens-glm S17, S18). **Unverified: which posting is current for the screen, and what the team actually plans to ship.**
+
+---
+
+## 7. Numbered falsifiable recommendations for the screen
+
+Each item is an action, the lens support, and the condition under which it would be wrong. "Falsifiable" here means a future reader can check it against a repo, a doc, or an experiment.
+
+1. **Say the version out loud before the first internals claim: "This is `livekit-agents` 1.8.12, commit `cbb5770`, unless we are talking about 2.0."**
+   Support: lens-codex header; lens-glm S13. Wrong if: the interview is explicitly about 2.0.0b1 or `main`, in which case the entire 1.8.x frame is the wrong frame.
+
+2. **Describe dispatch as a two-phase availability-then-assignment handshake over the worker websocket, with slot reservation before the user callback.**
+   Support: lens-codex E1; lens-glm S16. Wrong if: a later release replaces the websocket handshake, or the deployment uses a dispatch mode that bypasses the worker (check `request_fnc` and dispatch rules at the pinned ref).
+
+3. **Describe the process model as a pre-warmed pool with a forkserver preload, not as spawn-per-job.**
+   Support: lens-codex E2; lens-glm S16. Wrong if: the deployment runs with `num_idle_processes=0` or on a scale-to-zero plan, in which case the observable behavior is effectively spawn-per-job and cold start dominates.
+
+4. **Say "the framework commits the turn synchronously, and preemptive generation is speculative cascaded-LLM work cancelled on transcript drift" rather than "the framework predicts what the user will say".**
+   Support: lens-codex E4, E7; lens-glm S9. Wrong if: the deployment is realtime-only, where preemptive generation is skipped because the provider already streams (lens-codex E7).
+
+5. **Say "interruption changes who has the floor; it does not cancel the tool" and name `ToolFlag.CANCELLABLE` as the opt-in.**
+   Support: lens-glm S11; lens-codex E9. Wrong if: a later release makes cancellation the default on interruption (check releases after 1.8.12).
+
+6. **Say "errors are returned as `ToolError` outputs, duplicate detection is per-session and fails open, and there is no documented timeout or retry policy".**
+   Support: lens-codex E9; lens-glm S11; lens-opus §4. Wrong if: 1.8.x ships an idempotency ledger keyed by tool call id or a documented tool deadline (check `tool_executor.py` at a later ref).
+
+7. **Say "session state is in-memory `ChatContext` plus `JobProcess.userdata`; neither is durable; external stores are the documented pattern".**
+   Support: lens-codex E10, E3; lens-glm gap 5; lens-opus §4. Wrong if: `livekit-durable` is wired into core or a reconnect path serializes state (both currently unverified, Section 6 items 5 and 6).
+
+8. **Describe handoffs as an in-session activity swap that blocks new turns, drains, reuses STT/TTS, and swaps the activity, with tasks under `beta.workflows`.**
+   Support: lens-codex E11; lens-glm S14, S15; lens-opus §2. Wrong if: a future release makes agents independently addressable across processes or promotes `TaskGroup` out of `beta`.
+
+9. **Treat the three JD gaps as seams: text is a channel-and-durability problem, durable workflows are an effect-boundary problem, agent-to-agent communication is a floor-authority problem.**
+   Support: lens-opus §6 rec 7; lens-glm gaps 1 to 3; lens-kimi E14, E15. Wrong if: the product lead says any of the three is already solved; then ask for the design doc and the version it shipped in.
+
+10. **Quote the third-party turn-loop numbers with their test set and sample size, and never put eot-bench, TEN_Turn_Detection, and Full-Duplex-Bench in one table.**
+    Support: lens-kimi E4, §4; lens-glm S6, S20. Wrong if: you have re-run the detectors on a common test set with a common protocol (then you can compare, and you should say so).
+
+11. **Do not claim the detector is text-only or audio-only without naming the generation and the artifact you read.**
+    Support: lens-glm S6 versus lens-kimi E2 and lens-opus §2; lens-codex E13, E15. Wrong if: you have read the 1.8.12 ONNX inputs and the model card, in which case state what you found and the version.
+
+12. **Use the consensus-on-unsettledness framing for cascade versus speech-to-speech: the trade-off is measured per stack, not settled per architecture.**
+    Support: lens-kimi E1, §4; lens-glm S10; lens-opus §3. Wrong if: you assert a winner without a controlled study that holds model, ASR, and TTS constant.
+
+13. **Ask the product lead the version-frame question early: "which of these behaviors is 1.8.12, which is 2.0 beta, and which is only on main?"**
+    Support: lens-glm S13 (2.0.0b1 exists), S7 (2.0 removal promised); lens-codex pin. Wrong if: the role is scoped to one shipping line and 2.0 is out of scope; then the question is noise.
+
+14. **Do not claim exactly-once tool effects. Say the framework fails open and the tool body owns idempotency.**
+    Support: lens-codex E9; lens-opus §4. Wrong if: you can point at an idempotency key in the framework that survives session loss (none found).
+
+15. **When asked "what would you fix first", answer with the effect boundary, not the model: a durable session store keyed by session id plus an idempotency ledger keyed by tool call id.**
+    Support: synthesis judgment across lens-codex E10, lens-glm gap 1, lens-kimi E14/E15, lens-opus §6. Wrong if: the team's roadmap already has both, in which case ask what blocks them (likely model nondeterminism, per lens-kimi E14).
+
+---
+
+## 8. Source manifest
+
+Every URL cited across the four lenses and this synthesis, grouped by lens. Marked `[read]` where the lens reports fetching and reading the content, `[title]` where only the title and date were verified.
+
+### lens-glm (breadth, 21 primary entries plus secondary leads)
+
+Primary:
+- [read] https://livekit.com/blog/livekits-series-b
+- [read] https://docs.livekit.io/reference/migration-guides/v0-migration/python
+- [read] https://docs.livekit.io/agents
+- [read] https://docs.livekit.io/agents/logic
+- [read] https://docs.livekit.io/agents/server
+- [read] https://livekit.com/blog/solving-end-of-turn-detection
+- [read] https://docs.livekit.io/agents/logic/turns/turn-detector
+- [read] https://livekit.com/blog/turn-detection-voice-agents-vad-endpointing-model-based-detection
+- [read] https://livekit.com/blog/turn-detection-and-interruption-handling
+- [read] https://livekit.com/blog/realtime-vs-cascade
+- [read] https://livekit.com/blog/async-tools-voice-agents
+- [read] https://github.com/livekit/agents/releases
+- [read] https://pypi.org/project/livekit-agents/
+- [read] https://livekit.com/blog/supervisor-pattern-voice-agents
+- [read] https://livekit.com/blog/handoff-pattern-voice-agents
+- [read] https://livekit.com/blog/agent-join-latency
+- [read] https://app.enlistar.com/job-openings/6ad62f69f66c64482fc9b9f2
+- [read] https://jobs.ashbyhq.com/livekit/1757f49e-7e19-4c45-85f7-e4637dff66fb
+- [read] https://news.ycombinator.com/item?id=47224295
+- [read] https://rtcleague.com/blogs/livekit-vs-pipecat-ai-voice-agents
+- [read] https://livekit.com/blog/best-open-source-voice-and-video-ai-agent-frameworks
+
+Secondary leads (title and date verified, content not read):
+- [title] https://livekit.com/blog/supabase-voice-agent-memory
+- [title] https://livekit.com/blog/mongodb-voice-agent-memory
+- [title] https://livekit.com/blog/keep-your-agent-in-the-room-on-reconnect
+- [title] https://livekit.com/blog/diagnosing-blocked-event-loops
+- [title] https://livekit.com/blog/configuring-livekit-agents-at-dispatch-with-metadata
+- [title] https://livekit.com/blog/short-utterances
+- [title] https://livekit.com/blog/understand-and-improve-agent-latency
+- [title] https://livekit.com/blog/how-to-build-a-production-ready-ai-voice-agent
+- [title] https://livekit.com/blog/how-clerk-ai-scales-enterprise-voice-agents-with-livekit
+- [title] https://livekit.com/blog/retell-vs-vapi-vs-livekit
+- [title] https://livekit.com/blog?page=2
+- [title] https://livekit.com/blog?page=3
+
+### lens-kimi (literature, 15 entries)
+
+- [read] https://arxiv.org/abs/2503.04721 (Full-Duplex-Bench, ASRU 2025)
+- [read] https://arxiv.org/abs/2510.07838 (Full-Duplex-Bench v2, ACL 2026)
+- [read] https://arxiv.org/abs/2604.04847 (Full-Duplex-Bench v3)
+- [read] https://arxiv.org/abs/2609.11066 (Less can be More)
+- [read] https://arxiv.org/abs/2610.39755 (Multilingual EOT, frozen encoders)
+- [read] https://arxiv.org/abs/2509.06502 (FireRedChat)
+- [read] https://arxiv.org/abs/2503.23439 (SpeculativeETD, ACL 2026)
+- [read] https://arxiv.org/abs/2410.00037 (Moshi)
+- [read] https://arxiv.org/abs/2609.35381 (MCP error messages)
+- [read] https://arxiv.org/abs/2412.07017 (AsyncLM)
+- [read] https://arxiv.org/abs/2505.06120 (LLMs Get Lost in Multi-Turn Conversation)
+- [read] https://arxiv.org/abs/2603.27343 (WMIP)
+- [read] https://arxiv.org/abs/2609.34017 (Maat)
+- [read] https://arxiv.org/abs/2502.14321 (Beyond Self-Talk, FCS, review)
+- [read] https://arxiv.org/abs/2103.00033 (Netherite)
+- [read] https://arxiv.org/abs/2412.13314 (libDSE)
+- [read] https://arxiv.org/abs/2507.23159 (FDB v1.5, overlap handling)
+- [read] https://arxiv.org/abs/2602.06053 (PersonaPlex)
+- [read] https://arxiv.org/abs/2603.11394 (multi-turn reliability, clinical replication)
+- [read] https://arxiv.org/abs/2605.15077 (async function calling, execution layer)
+- [read] https://arxiv.org/abs/2512.14865 (Audio MultiChallenge)
+- [read] https://proceedings.mlr.press/v267/patil25a.html (BFCL, ICML 2025)
+- [read] https://daniellin94144.github.io/FDB-v3-demo/
+- [read] https://github.com/Lorelys/maat-benchmarks
+- [read] https://github.com/livekit/eot-bench
+- [read] https://huggingface.co/livekit/turn-detector
+- [title] https://openreview.net/forum?id=5vKnBgKmOV (browser verification wall)
+- [title] https://openreview.net/forum?id=2GmDdhBdDk (BFCL OpenReview forum)
+
+### lens-codex (code patterns, pinned at `cbb5770`, `0602125`, `228095c`)
+
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/worker.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/ipc/proc_pool.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/ipc/_preload.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/voice/agent_session.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/voice/audio_recognition.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/voice/agent_activity.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/voice/endpointing.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/voice/speech_handle.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/inference/interruption.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/llm/utils.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/llm/tool_context.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/voice/tool_executor.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/llm/chat_context.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/voice/agent.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/llm/delegation.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-agents/livekit/agents/llm/_realtime/openai.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-plugins/livekit-plugins-openai/livekit/plugins/openai/realtime/realtime_model.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-plugins/livekit-plugins-silero/livekit/plugins/silero/vad.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-plugins/livekit-plugins-turn-detector/livekit/plugins/turn_detector/base.py
+- [read] https://github.com/livekit/agents/blob/cbb5770c716c70009969cd7fa88e3c3662222ce9/livekit-plugins/livekit-durable/livekit/durable/function.py
+- [read] https://github.com/pipecat-ai/pipecat/blob/0602125e1d814ae49a7c4e6dc3f6f1b8b3d5ed0c/src/pipecat/frames/frames.py
+- [read] https://github.com/pipecat-ai/pipecat/blob/0602125e1d814ae49a7c4e6dc3f6f1b8b3d5ed0c/src/pipecat/turns/speculation_gate.py
+- [read] https://github.com/pipecat-ai/pipecat/blob/0602125e1d814ae49a7c4e6dc3f6f1b8b3d5ed0c/src/pipecat/turns/user_turn_controller.py
+- [read] https://github.com/livekit-examples/agent-starter-python/blob/228095c442fcb259c80e9786fc0d7c5534e6af46/src/agent.py
+- [read] https://api.github.com/repos/livekit/agents
+
+### lens-opus (narrative)
+
+- [read] https://livekit.com/blog/using-a-transformer-to-improve-end-of-turn-detection
+- [read] https://livekit.com/blog/livekits-series-b
+- [read] https://livekit.com/blog/turn-detection-and-interruption-handling
+- [read] https://docs.livekit.io/agents/logic/turns/tuning/
+- [read] https://docs.livekit.io/agents/
+- [read] https://docs.livekit.io/agents/logic/workflows/
+- [read] https://docs.livekit.io/reference/migration-guides/v0-migration/python/
+- [read] https://github.com/livekit/agents
+- [read] https://github.com/livekit/agents/releases
+- [read] https://arxiv.org/abs/2401.04868
+- [read] https://arxiv.org/abs/2410.00037
+- [read] https://techcrunch.com/2024/10/01/openais-devday-brings-realtime-api-and-other-treats-for-ai-app-developers/
+- [read] https://docs.pipecat.ai/overview/introduction
+- [read] https://temporal.io/how-it-works
+- [read] https://www.piwheels.org/project/livekit-durable/
+
+### Added by this synthesis
+
+No new LiveKit source and no new LiveKit internals claim. Every LiveKit assertion is anchored to a lens entry above, and every unsourced internals claim is quarantined in Section 6.
+
+One methodological citation is supplied by the recipe prompt rather than by a lens, and is flagged as such rather than treated as independently verified:
+
+- [recipe-supplied] https://arxiv.org/abs/2601.05114 (Nasser 2026, on vote-rule bias between same-conviction agents)
+
+---
+
+*End of synthesis. Verifier note: the load-bearing consensus findings are 3.2, 3.4, 4.1, 4.3, 5.1, and 6.2. The load-bearing disputes are D1 (detector architecture), D3 (cold start mechanism), and D5 (benchmark superiority). If the verifier finds any of those stated as fact without a lens anchor, that section failed the discipline rule.*
