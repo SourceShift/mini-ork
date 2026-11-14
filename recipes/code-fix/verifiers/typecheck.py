@@ -289,26 +289,62 @@ def _scoped_base(root: str) -> str:
     return ""
 
 
+def _shared_scope():
+    """``mini_ork.verify.touched_files`` from the ENGINE, or ``None``.
+
+    This file used to own the implementation that module was extracted from,
+    and the copy kept a quoting rule the shared one no longer has — two gates
+    disagreeing about which files a run touched. The shared module is the
+    single definition now; the local body below survives only for a fixture
+    that copies this verifier without the rest of the package.
+    """
+    try:
+        from mini_ork.verify import touched_files as scope  # type: ignore
+        return scope
+    except Exception:
+        pass
+    engine = str(Path(__file__).resolve().parent.parents[2])
+    if engine not in sys.path:
+        sys.path.insert(0, engine)
+    try:
+        from mini_ork.verify import touched_files as scope  # type: ignore
+        return scope
+    except Exception:
+        return None
+
+
 def touched_files(root: str) -> list[str]:
     """Repo-relative paths this run changed: working tree, untracked, and
     (when a base resolves) everything committed on top of it."""
+    shared = _shared_scope()
+    if shared is not None:
+        try:
+            return shared.touched_files(root)
+        except Exception:
+            # Fall through to the local copy rather than fail the gate on a
+            # change-surface error the run did not cause.
+            pass
     paths: set[str] = set()
-    rc, out = _git(root, "status", "--porcelain", "-uall")
+    rc, out = _git(root, "status", "--porcelain", "-z", "-uall")
     if rc == 0:
-        for line in out.splitlines():
-            if len(line) < 4:
+        records = out.split("\x00")
+        index = 0
+        while index < len(records):
+            record = records[index]
+            index += 1
+            if len(record) < 4:
                 continue
-            rest = line[3:]
-            if " -> " in rest:  # rename: keep the destination
-                rest = rest.split(" -> ", 1)[1]
-            path = rest.strip().strip('"')
-            if path:
-                paths.add(path)
+            rest = record[3:]
+            if record[0] in "RC":
+                index += 1
+            rest = rest.strip()
+            if rest:
+                paths.add(rest)
     base = _scoped_base(root)
     if base:
-        rc, out = _git(root, "diff", "--name-only", f"{base}...HEAD")
+        rc, out = _git(root, "diff", "--name-only", "-z", f"{base}...HEAD")
         if rc == 0:
-            paths.update(p.strip() for p in out.splitlines() if p.strip())
+            paths.update(p.strip() for p in out.split("\x00") if p.strip())
     return sorted(
         p for p in paths if p and not p.startswith(_NOISE_PREFIX)
     )

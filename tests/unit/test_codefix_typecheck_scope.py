@@ -261,3 +261,32 @@ def test_main_runs_an_operator_command_verbatim_and_exports_the_touch_set(
     err = capsys.readouterr().err
     assert "scoped" not in err
     assert "new-untracked.ts" in dump.read_text(encoding="utf-8")
+
+
+def test_touched_files_delegates_to_the_shared_scope_module(mod, tmp_path, monkeypatch):
+    """Two gates must not disagree about which files a run touched.
+
+    This file owned the implementation ``mini_ork.verify.touched_files`` was
+    extracted from, and the copy kept a quoting rule the shared one dropped: a
+    path with a space or a non-ASCII byte stayed quoted here, so the typecheck
+    gate narrowed to a filename that matches nothing and checked nothing.
+    """
+    class _Shared:
+        @staticmethod
+        def touched_files(root):
+            return ["sentinel.py"]
+
+    monkeypatch.setattr(mod, "_shared_scope", lambda: _Shared)
+    assert mod.touched_files(str(tmp_path)) == ["sentinel.py"]
+
+
+def test_touched_files_falls_back_when_the_shared_module_is_absent(
+    mod, tmp_path, monkeypatch,
+):
+    """A copied verifier without the package must still scope itself."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "odd ü.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "_shared_scope", lambda: None)
+
+    assert "odd ü.py" in mod.touched_files(str(repo))

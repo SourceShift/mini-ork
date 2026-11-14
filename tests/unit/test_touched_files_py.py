@@ -99,3 +99,33 @@ def test_noise_prefixes_are_excluded(repo):
 
 def test_not_a_git_worktree(tmp_path):
     assert tf.is_git_worktree(str(tmp_path)) is False
+
+
+@requires_git
+def test_committed_paths_are_reported_verbatim(repo, monkeypatch):
+    """``diff --name-only`` quotes too; a committed unicode file must survive."""
+    (repo / "committed ü.py").write_text("x = 1\n", encoding="utf-8")
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-qm", "add").returncode == 0
+
+    monkeypatch.setenv("MO_GOAL_SCOPED_BASE", "HEAD~1")
+    assert "committed ü.py" in tf.touched_files(str(repo))
+
+
+@requires_git
+def test_unresolvable_base_ref_falls_through(repo, monkeypatch):
+    """A base that does not resolve is worse than none: it hides the base.
+
+    Returning the bogus ref made every diff against it fail, so the surface was
+    only the dirty tree — committed work disappeared from every gate.
+    """
+    (repo / "committed.py").write_text("x = 1\n", encoding="utf-8")
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-qm", "add").returncode == 0
+
+    monkeypatch.setenv("MO_GOAL_SCOPED_BASE", "deadbeefdeadbeef")
+    base = tf.scoped_base(str(repo))
+    # The bogus ref is discarded, not passed on: a caller that diffs against it
+    # gets no diff at all, and every pre-existing import looks newly added.
+    assert base and base != "deadbeefdeadbeef"
+    assert _git(repo, "rev-parse", "--verify", base).returncode == 0

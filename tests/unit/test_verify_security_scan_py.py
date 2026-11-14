@@ -476,3 +476,21 @@ def test_verifier_sees_a_staged_change(tmp_path):
     assert proc.returncode == 1, proc.stdout + proc.stderr
     envelope = json.loads(proc.stdout.strip())
     assert envelope["failed_checks"] == ["aws-access-key"]
+
+
+@requires_git
+def test_verifier_abstains_when_a_changed_path_cannot_be_read(tmp_path):
+    """An unreadable path in the run's own surface was never scanned.
+
+    Reporting a pass would claim a coverage the gate does not have — and a
+    dangling symlink is a cheap way to produce one.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / "ghost.py").symlink_to(repo / "nowhere.py")
+
+    proc = _run_verifier(repo, touched="ghost.py")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    envelope = json.loads(proc.stdout.strip())
+    assert envelope["verdict"] == "abstain", envelope
+    assert envelope["failure_kind"] == "toolchain"
+    assert "could not be read" in envelope["error_summary"]

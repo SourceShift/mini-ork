@@ -269,6 +269,16 @@ def main() -> int:
         sys.stderr.write(f"[security] {len(findings)} finding(s)\n")
         return 1
 
+    if unreadable:
+        # A path in the run's own surface that the collector could not read was
+        # never scanned. Calling that a pass claims coverage the gate does not
+        # have — and a file made unreadable is a cheap way to get one.
+        _emit(_abstain(
+            f"{len(unreadable)} changed path(s) could not be read and were not "
+            "scanned: " + ", ".join(unreadable[:3])
+        ))
+        return 0
+
     _emit(_pass(detail))
     sys.stderr.write(f"[security] {detail}\n")
     return 0

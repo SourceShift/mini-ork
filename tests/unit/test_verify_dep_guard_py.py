@@ -535,3 +535,82 @@ def test_verifier_still_measures_when_the_package_is_shadowed(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["verdict"] == "fail"
     assert "squat-suspect" in payload["failed_checks"]
+
+
+def test_first_party_rejects_an_empty_directory(tmp_path):
+    """An empty ``requests/`` still shadows the dependency on ``sys.path``.
+
+    Namespace packages make any directory importable, so accepting a bare
+    directory let a repository claim a dependency's name — and with it silence
+    the gate for its own import — without shipping a line of Python.
+    """
+    (tmp_path / "requests").mkdir()
+    assert dep_guard.is_first_party(tmp_path, "requests") is False
+
+    (tmp_path / "requests" / "core.py").write_text("", encoding="utf-8")
+    assert dep_guard.is_first_party(tmp_path, "requests") is True
+
+
+def test_verifier_reports_a_finding_even_when_another_file_is_unparsable(tmp_path):
+    """Abstaining here would downgrade a real fail to "unmeasured".
+
+    The gate found a violation; that is a refutation of the patch whatever else
+    it could not read. Abstention would let the patch through.
+    """
+    repo = _git_repo(tmp_path)
+    (repo / "broken.py").write_text("def (:\n", encoding="utf-8")
+    (repo / "needs.py").write_text("import requets\n", encoding="utf-8")
+    allow = tmp_path / "allow.txt"
+    allow.write_text("requests\n", encoding="utf-8")
+    proc = _run_verifier(
+        repo, allowlist=allow, touched="broken.py\nneeds.py",
+    )
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "fail", payload
+    assert {f["rule"] for f in payload["findings"]} == {"squat-suspect"}
+    # The partial coverage is still disclosed.
+    assert "could not be parsed" in payload["error_summary"]
+
+
+def test_verifier_ignores_an_unresolvable_base_ref(tmp_path):
+    """A base that does not resolve must not turn every import into a new one.
+
+    Falling back to ``HEAD`` (the committed tree) keeps the measurement honest:
+    an import the baseline already had is not something this change added.
+    """
+    repo = _git_repo(tmp_path)
+    (repo / "needs.py").write_text("import requests\n", encoding="utf-8")
+    _commit(repo, "baseline import")
+    allow = tmp_path / "allow.txt"
+    allow.write_text("flask\n", encoding="utf-8")
+    proc = _run_verifier(
+        repo, allowlist=allow, touched="needs.py",
+        extra_env={"MO_GOAL_SCOPED_BASE": "deadbeefdeadbeef"},
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "pass", payload["findings"]
+
+
+def test_generator_records_the_installed_distribution_for_an_alias(
+    tmp_path, monkeypatch,
+):
+    """``import PIL`` is installed as ``pillow``; the hand table cannot list them all.
+
+    Driven through the installed-metadata path so the assertion does not depend
+    on which packages this host happens to have — the real metadata is read in
+    production, a known mapping here.
+    """
+    (tmp_path / "app.py").write_text("import PIL\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        dep_guard, "_installed_distributions", lambda: {"pil": {"pillow"}},
+    )
+    out = tmp_path / "allowlist.txt"
+    assert dep_guard._write_allowlist(out) == 0
+    body = {
+        line.strip() for line in out.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert {"pil", "pillow"} <= body

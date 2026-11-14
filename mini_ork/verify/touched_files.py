@@ -62,10 +62,21 @@ def run_dir_ref() -> str:
     return ref if _HEX_REF.fullmatch(ref) else ""
 
 
+def _resolves(root: str, ref: str) -> bool:
+    """True when ``ref`` names a commit in this repository.
+
+    A base that does not resolve is worse than no base: the caller then diffs
+    against nothing, and every pre-existing import or requirement in a touched
+    file is indistinguishable from one the change added.
+    """
+    rc, _ = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    return rc == 0
+
+
 def scoped_base(root: str) -> str:
     """The base the diff is taken against — the run's own start point first."""
     ref = run_dir_ref() or os.environ.get("MO_GOAL_SCOPED_BASE", "").strip()
-    if ref:
+    if ref and _resolves(root, ref):
         return ref
     for candidate in ("origin/main", "main"):
         rc, out = _git(root, "merge-base", "HEAD", candidate)
@@ -101,7 +112,10 @@ def touched_files(root: str) -> List[str]:
                 paths.add(rel)
     base = scoped_base(root)
     if base:
-        rc, out = _git(root, "diff", "--name-only", base + "...HEAD")
+        # ``-z`` for the same reason as ``status`` above: ``--name-only`` without
+        # it quotes a path holding a space or a non-ASCII byte, so a committed
+        # file would vanish from the surface while an uncommitted one survived.
+        rc, out = _git(root, "diff", "--name-only", "-z", base + "...HEAD")
         if rc == 0:
-            paths.update(p.strip() for p in out.splitlines() if p.strip())
+            paths.update(p.strip() for p in out.split("\x00") if p.strip())
     return sorted(p for p in paths if p and not p.startswith(_NOISE_PREFIX))

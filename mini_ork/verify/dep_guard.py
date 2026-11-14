@@ -301,8 +301,28 @@ def is_first_party(root_dir: Path, module: str) -> bool:
     base = Path(root_dir)
     for prefix in _SOURCE_DIRS:
         candidate = base / prefix if prefix else base
-        if (candidate / f"{root}.py").is_file() or (candidate / root).is_dir():
+        if (candidate / f"{root}.py").is_file():
             return True
+        package = candidate / root
+        # A bare directory is not evidence of first-party code by itself: an
+        # empty ``requests/`` on ``sys.path`` still shadows the real dependency
+        # as a namespace package, which is a way to serve a sitecustomize-style
+        # hijack. It has to contain Python to be this project's own module.
+        if package.is_dir() and _holds_python(package):
+            return True
+    return False
+
+
+def _holds_python(package: Path, depth: int = 2) -> bool:
+    """True when ``package`` contains at least one ``.py`` within ``depth``."""
+    try:
+        for entry in package.iterdir():
+            if entry.name.endswith(".py") and entry.is_file():
+                return True
+            if depth > 1 and entry.is_dir() and _holds_python(entry, depth - 1):
+                return True
+    except OSError:
+        return False
     return False
 
 
@@ -527,6 +547,30 @@ def _observed_imports(root: Path) -> set:
     return names
 
 
+def _installed_distributions() -> dict:
+    """Import name -> installed distribution names, from package metadata.
+
+    The hand-kept ``IMPORT_ALIASES`` table covers four names and will always be
+    incomplete (`import PIL` installs as ``pillow``). Python 3.10+ ships
+    ``packages_distributions()``, which reads the metadata that is already on
+    disk — so the generator records the name ``pip install`` would take, which
+    is the name a reviewer of this file needs to see. Absent metadata (or an
+    older interpreter) degrades to the table alone rather than failing.
+    """
+    try:
+        from importlib.metadata import packages_distributions  # type: ignore
+    except ImportError:
+        return {}
+    try:
+        raw = packages_distributions()
+    except Exception:  # fallback-guard: allow: metadata is an optional refinement
+        return {}
+    return {
+        norm(import_name): {norm(dist) for dist in distributions if dist}
+        for import_name, distributions in raw.items()
+    }
+
+
 def _write_allowlist(out_path: Path) -> int:
     # The generator runs from the repository root: a hermetic test writes a
     # pyproject in a tmp cwd, and the real one is invoked at the checkout root.
@@ -548,6 +592,7 @@ def _write_allowlist(out_path: Path) -> int:
     # dependency is often declared nowhere. The snapshot has to cover both or
     # the gate fails the run that adds `import pytest` to a test file.
     names |= _observed_imports(root)
+    installed = _installed_distributions()
     for name in list(names):
         for alias in IMPORT_ALIASES.get(name, ()):
             names.add(norm(alias))
@@ -557,6 +602,7 @@ def _write_allowlist(out_path: Path) -> int:
         for distribution, aliases in IMPORT_ALIASES.items():
             if name in {norm(alias) for alias in aliases}:
                 names.add(norm(distribution))
+        names.update(installed.get(name, ()))
 
     # Never drop an entry a human added by hand: the snapshot is also where a
     # dependency is declared *before* it is used, and a regeneration that

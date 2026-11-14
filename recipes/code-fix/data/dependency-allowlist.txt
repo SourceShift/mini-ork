@@ -22,6 +22,7 @@ modal
 pandas
 peft
 pil
+pillow
 pyautogui
 pydantic
 pymupdf

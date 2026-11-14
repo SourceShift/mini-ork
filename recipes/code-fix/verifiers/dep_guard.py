@@ -262,15 +262,24 @@ def _emit_abstain(reason: str) -> int:
 def _emit_result(findings, unparsed, requirements_checked, imports_checked) -> int:
     passed = not findings
     failed_checks = sorted({finding.rule for finding in findings})
+    coverage = (
+        f"{requirements_checked} requirements and "
+        f"{imports_checked} new imports checked"
+    )
     if passed:
-        summary = (
-            f"{requirements_checked} requirements and "
-            f"{imports_checked} new imports checked"
-        )
+        summary = coverage
         reasons = []
     else:
         summary = f"{len(findings)} dependency finding(s)"
         reasons = [f"{len(findings)} dependency finding(s); see findings"]
+    if unparsed:
+        # The fail stands, but a reader must know the check was partial.
+        uncovered = (
+            f"{len(unparsed)} touched file(s) could not be parsed and were not "
+            "checked: " + ", ".join(unparsed[:3])
+        )
+        summary = f"{summary}; {uncovered}"
+        reasons.append(uncovered)
     _emit({
         "verifier": "dep_guard",
         "pass": passed,
@@ -298,7 +307,11 @@ def _resolve_base(scope, root: str) -> str:
     """
     if scope is not None:
         base = scope.scoped_base(root)
-        if base:
+        # ``scoped_base`` already refuses a ref it cannot resolve, but the
+        # module may be an older copy (a run's engine is pinned), so the check
+        # that matters is made here too: a base that does not resolve makes
+        # every pre-existing import look newly added.
+        if base and _resolves(root, base):
             return base
     try:
         result = subprocess.run(
@@ -308,6 +321,18 @@ def _resolve_base(scope, root: str) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return "HEAD" if result.returncode == 0 else ""
+
+
+def _resolves(root: str, ref: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "--quiet",
+             f"{ref}^{{commit}}"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def main() -> int:
@@ -338,13 +363,16 @@ def main() -> int:
     findings, unparsed, requirements_checked, imports_checked = _scan(
         dep, root, touched, allowlist, base,
     )
-    if unparsed:
+    if unparsed and not findings:
         # A file the gate could not read or parse was not checked. Reporting the
         # run as passing would claim coverage it does not have.
         return _emit_abstain(
             f"{len(unparsed)} touched file(s) could not be parsed: "
             + ", ".join(unparsed[:3])
         )
+    # A violation the gate DID find is a refutation whatever else was unreadable:
+    # abstaining here would downgrade a real fail to "unmeasured" and let the
+    # patch through, which is the fail-open this gate exists to prevent.
     return _emit_result(findings, unparsed, requirements_checked, imports_checked)
 
 
