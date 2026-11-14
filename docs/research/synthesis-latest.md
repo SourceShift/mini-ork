@@ -1,362 +1,440 @@
-# R2 Synthesis: LiveKit, the company, the market, and the economics
+# R3 Synthesis: Text Modality, Durable Execution, and the Channel-Agnostic Session
 
-**Cluster:** R2 · **Run:** run-1794656961-44232 · **Research as-of:** 2026-11-14
-**Audience:** a staff engineer three days from a hiring-manager screen and a CTO conversation.
-**Inputs:** `lens-glm` (breadth, 21 sources), `lens-kimi` (depth, 22 sources), `lens-codex` (code and pricing, 18 sources), `lens-opus` (narrative, 16 sources). All four read in full before this document was written.
+**Run:** run-1794657974-8423 · **Synthesized:** 2026-11-14 · **Cluster:** R3
+**Inputs:** `lens-glm.md` (25 web sources), `lens-kimi.md` (15 core + 22 adjacent academic/standards sources), `lens-codex.md` (14 implementations read at pinned SHAs), `lens-opus.md` (6-section narrative, 17 cited sources)
+**Consumer:** a staff engineer writing the design chapters and preparing an API-critique round against a real framework's author.
 
-**Consensus scale:** ★ = 2 of 4 lenses · ★★ = 3 of 4 · ★★★ = all 4.
-A marker is a count of lenses, not a vote on truth. Where lenses disagree, Section 3 reports the disagreement and does not average it.
+## Citation key
+
+| Lens file | Prefix | What it is |
+|---|---|---|
+| `lens-glm.md` | `GLM-n` | breadth web sweep, vendor docs and CPaaS documentation |
+| `lens-kimi.md` | `Kimi-n` (core), `Kimi-An` (adjacent) | peer-reviewed papers, preprints, standards drafts |
+| `lens-codex.md` | `Codex-n` | code read at a pinned SHA, with file and symbol anchors |
+| `lens-opus.md` | `Opus-n` | narrative analysis and its cited sources |
+
+Consensus markers: ★ = 2 lenses, ★★ = 3 lenses, ★★★ = all 4. Markers count lenses that make the *claim*, not lenses that merely mention the topic. Where a lens supports a claim only indirectly, the note says so.
 
 ---
 
 ## 1. TL;DR
 
-1. **LiveKit is a 2021-founded open-core realtime infrastructure company**, not an "AI company" in the model sense. Russ d'Sa (CEO) and David Zhao (CTO) launched the open source project in July 2021 and have raised roughly $180M across five rounds, ending in a $100M Series C on 2026-01-22 led by Index Ventures at a $1B valuation. What it sells is an SFU plus SDKs plus a managed operational envelope (telephony, inference, observability, compliance). (lens-glm [source-1], [source-5]; lens-kimi §2.16; lens-opus §1; confidence **high** on the round and the founders, **medium** on the total.)
-
-2. **The free/paid line is drawn in code, not only on the pricing page.** Server and Agents framework are Apache-2.0, but the framework's default turn detector calls LiveKit's hosted inference (`agent_session.py:584`), and end-of-turn plus adaptive interruption are free for agents hosted on Cloud and metered for self-hosted ones. Published tiers are Build $0 (1,000 agent minutes, 5 concurrent), Ship from $50, Scale from $500, Enterprise custom; LiveKit's own worked example totals **$0.0479/min** all-in. (lens-codex §2 and §3; lens-glm [source-2]; lens-kimi §2.16(d); confidence **high as of 2026-11-14**, and the page carries no effective date.)
-
-3. **OpenAI is simultaneously the flagship customer and the most credible absorber.** ChatGPT Advanced Voice runs on LiveKit Cloud, and OpenAI now ships its own WebRTC transport inside the Realtime API. The relationship is the strongest proof of technical quality and the clearest concentration risk in the same fact. (lens-glm [source-3], [source-4], [source-13]; lens-kimi §2.16(c); lens-opus §3; confidence **high** on the customer fact, **medium** on what it implies.)
-
-4. **The absorption thesis is genuinely contested, and no source settles it.** A model vendor bought the framework-plus-transport layer on 2026-10-29 (Deepgram acquired Daily, the company behind Pipecat). Against that, the best voice-agent benchmark attributes 79 to 90 percent of failures to agent behaviour rather than to speech or transport, and a vendor-native realtime model posts a 13.5 percent interruption-avoidance rate against a perfect turn-take rate for a cascaded pipeline. (lens-glm [source-10]; lens-opus §3; lens-kimi §3.4; confidence **medium**.)
-
-5. **Nothing about LiveKit's money is public.** No ARR, no revenue, no paying-customer count, no self-hosted-to-Cloud conversion rate, no market share. The three research houses that size the adjacent market disagree by 36 percent on the 2025 base year and by a factor of 1.63 on growth. The safe move in every conversation is "not public" plus the structure, never a number. (lens-kimi §3.1 and §3.3; lens-glm §D; lens-opus §5; confidence **high**.)
+- **"Exactly-once" is four claims wearing one name, and the honest design target is at-least-once plus deduplication at an effect boundary you control.** Every lens arrives here independently: by definitional split (GLM, Kimi-7), by impossibility proof (Kimi-8), by code survey (Codex convergent-2: no implementation demonstrates end-to-end exactly-once), by narrative (Opus §2). Confidence: **high**.
+- **Text is not the audio modality with a cheaper transport, and no audio-first framework in the survey has a production text-only path.** LiveKit's own runtime only reaches `_text_only` under a simulation mode (Codex-1, `agent_session.py:2427`), Pipecat silently drops `TextFrame` on telephony (Codex-2, `serializers/twilio.py:147`), and OpenAI Realtime admits text output while keeping VAD in the session contract (Codex-4). Confidence: **high**.
+- **The text session is message-oriented, not stream-oriented: segment economics, a per-message status lifecycle, and no audio clock.** Buffer to turn boundaries, model the gateway's status enum as your state machine, and treat a "delivered" callback as ambiguous when a logical message spans segments (GLM-3, GLM-4, Opus §4). Confidence: **high** for the shape, **medium** for the specific status semantics (see D5).
+- **Durable execution's load-bearing move is recording the model's nondeterminism as an effect rather than replaying it as control flow, and that move is correct but not free.** The cost is a determinism tax on control flow plus replay-compatibility versioning on the artifact an agent team changes most often (Kimi Finding B, Opus §3, Codex-8 `explicit_recovery`). Confidence: **high** that the move is correct, **medium** that replay-based durability is the right default for agent workloads.
+- **No lens found a measured latency distribution for delivery receipts, a spec for inbound segment reassembly, a vendor fault-injection kit, or a cross-transport session contract.** These are the four holes the book cannot paper over with a citation (GLM §"What's NOT", Kimi §5, Codex §"could not establish", Opus §5). Confidence: **high** that the gap is real.
 
 ---
 
-## 2. Findings by kickoff question (consensus marked)
+## 2. Consensus findings
 
-### Q1. Founding, founders, funding through November 2026
+| # | Finding | Mark | n | Lenses |
+|---|---|---|---|---|
+| C1 | "Exactly-once" names at least three separable guarantees; every vendor claim is scoped and most are about journal completion, not HTTP effects | ★★★ | 4 | GLM dissent-1 · Kimi-7, Kimi-8 · Opus §2 · Codex conv-2 |
+| C2 | Text is a second-class modality in audio-first agent frameworks; disabling audio does not produce a correct text session | ★★★ | 4 | GLM-21, GLM-22 · Kimi Finding C · Opus §4 · Codex-1, Codex-2, Codex-4, conv-5 |
+| C3 | Inbound delivery is at-least-once and unordered on CPaaS; dedupe on the gateway message id before any model call | ★★★ | 4 | GLM-5, GLM dissent-2 · Kimi-8, Kimi-A12 · Opus §2, §4 · Codex-3, conv-2 |
+| C4 | Durable execution works by quarantining nondeterminism at one boundary; the boundary's location differs per product but its existence is universal | ★★★ | 4 | GLM-11, GLM-13 · Kimi Finding B · Opus §2 · Codex conv-3 |
+| C5 | Idempotency keys are the deduplication mechanism, are supplied by the application, and are opt-in on every product examined | ★★★ | 4 | GLM-14 · Kimi-11 · Opus rec-3 · Codex-8 |
+| C6 | Replay-based durability carries a real, specific cost for agent workloads, and checkpoint-and-rerun is a credible alternative | ★★★ | 4 | GLM-20 · Kimi-15, caveat-1 · Opus §3 · Codex-8 (divergent-1) |
+| C7 | Multi-segment messaging makes "delivered" ambiguous and forces turn-level buffering | ★★ | 3 | GLM-3, GLM-4 · Opus §4 · Codex-3 |
+| C8 | Session identity is an application-level key, never a connection | ★★ | 3 | Kimi-4 · Opus rec-7 · Codex conv-1 |
+| C9 | Hour-scale waits must be durable state, not an occupied process, and channel policy can invalidate a wait that the runtime survives | ★★ | 3 | GLM-14, GLM-6 · Opus §4 · Codex conv-4 |
+| C10 | Backpressure and throughput are policy the send API does not report | ★★ | 3 | GLM-8, GLM-9 · Opus rec-7 · Codex-3 |
+| C11 | Resume semantics are where frameworks diverge most, and re-firing an already-executed effect is the common failure | ★ | 2 | Kimi-9 · Codex-6 |
 
-**★★ (3/4) Founded 2021, open source project live July 2021, two founders: Russ d'Sa (CEO) and David Zhao (CTO).** TechCrunch's December 2021 piece has the company at five months old, 3 to 15 staff, ~2,000 GitHub stars, 100+ projects, zero revenue (lens-glm [source-5]; lens-opus §1). Bloomberg's Series C headline confirms founding in 2021 and names Zhao (lens-glm [source-7]). The Fortune press release names exactly the same two founders (lens-kimi §2.16(b)). **There is no third founder.** An early sweep hypothesis naming Weiwei Li was wrong, and lens-glm killed it explicitly (lens-glm §A1).
+### C1 ★★★ Exactly-once is a family, not a guarantee
 
-**Funding ladder, per lens:**
+Four independent routes reach the same conclusion.
 
-| Round | Amount | Date | Lead | Anchor quality | Lenses |
-|---|---|---|---|---|---|
-| Seed | $7M announced ($6.74M per Zhao's own table) | Dec 2021 | Redpoint Ventures | TechCrunch, fetched | ★ (lens-glm [source-5]; lens-opus §1) |
-| Seed 2 | $7.3M (one lens says $8M) | Sep 2022 | not established | secondary listing | ★, disputed amount |
-| Series A | $22M ($22.5M in one lens) | Jun 5, 2024 (one database says Mar 2024) | **not established** | Zhao round-table mirror | ★, disputed |
-| Series B | $45M | Apr 10-11, 2025 | Altimeter Capital | founder post + FinSMEs + TechCrunch; $345M post-money, ~$83M raised to date | ★ (lens-glm [source-6]; lens-opus §1) |
-| Series C | $100M | 2026-01-22 | Index Ventures | LiveKit's own post + Fortune press release + Bloomberg headline; $1B valuation; Salesforce Ventures new, Hanabi/Altimeter/Redpoint returning | ★★ (lens-glm [source-1]; lens-kimi §2.16(a)(b); lens-opus §1) |
+Trofimov et al. separate **delivery, consistency and determinism** and show that "exactly-once" as used in stream processing is not formally defined; the bundled term hides three properties with different obligations (Kimi-7). Andreakis proves that when two independent systems must both record a fact and no transaction spans them, **source-only recovery cannot deliver both no-duplicates and no-loss**; any policy keyed on the source side must duplicate in one reachable state or drop in the other (Kimi-8). The code survey finds that "no implementation in this survey demonstrates true end-to-end exactly-once" and that every product ships at-least-once plus an explicit ack (Codex conv-2). The narrative lens states the same thing in the language an API reviewer will use: what vendors sell is at-least-once plus deduplication at a boundary the application controls (Opus §2).
 
-**★ (2/4) Total raised ≈ $180M across five rounds.** lens-glm sums $7M + $7.3M + $22M + $45M + $100M to ~$182M; lens-opus states ~$183M; lens-kimi's search index carries Tech in Asia's "$181M+ across 5 rounds" but could not fetch it (lens-kimi §8.21). The three figures are the same arithmetic with different seed assumptions. Say "about $180M" and move on.
+The web lens supplies the concrete divergence that makes the point operational rather than philosophical. Restate says an invocation "runs exactly once regardless of failures," but duplicate requests are deduped **only if you add an idempotency key to the request headers** (GLM-14). Temporal and Azure both say out loud that activities execute at-least-once, which is why they must be idempotent: Microsoft's Durable Task Framework "guarantees that each called activity function will be executed at least once" (GLM-18), and Temporal's Python activities default to **unlimited** retry attempts with exponential backoff (GLM-12). DBOS is exactly-once only where the step's write and the checkpoint commit in the same Postgres transaction, and at-least-once everywhere else (GLM-16).
 
-**★★ (3/4) The Series C is the best-documented event in the company's history** and the one number that is safe to lead with, because three independent anchors exist: the company's own post, a Fortune press release, and a Bloomberg headline (lens-glm [source-1] [source-7]; lens-kimi §2.16; lens-opus §1).
+These claims do not contradict. They describe different boundaries. Restate's guarantee is about journal-mediated **invocation completion**; Microsoft's is about **activity execution**; DBOS's is about **effects that share a database transaction**. A synthesis that says "vendors claim exactly-once" without this split is wrong, and saying it in an API review will get you corrected by the person who wrote the SDK.
 
-### Q2. Product line: what is free, what is paid
+### C2 ★★★ No audio-first framework has a production text-only path
 
-**★★★ (4/4) Open core: the data plane is open, the managed control plane is closed.** lens-codex read the licences and the repos directly: `livekit/livekit` is Apache-2.0 Go, 22,204 stars, v1.13.11 released 2026-10-25; `livekit/agents` is Apache-2.0 Python with a parallel TypeScript package, 15,218 stars, shipping roughly weekly (1.8.12 on 2026-11-13). No cloud control-plane repo exists in the org listing (100 public repos inspected). lens-glm, lens-kimi and lens-opus all describe the same split from the vendor pages. (lens-codex §1, §2, §3; lens-glm §A3; lens-kimi §2.16; lens-opus §2.)
+This is the finding with the most code behind it, and it is the book's thesis.
 
-**★★★ (4/4) The tier structure.** Build $0/mo (1,000 agent session minutes, 5 concurrent agent sessions, no credit card), Ship from $50/mo (5,000 included, then $0.01/min), Scale from $500/mo (50,000 included, up to 600 concurrent), Enterprise custom (SSO, SLA, HIPAA, RBAC, region pinning, private links, on-prem through sales). All four lenses carry the same four tiers; the three that fetched the page independently reproduce the usage allowances line for line, which is what a same-day fetch of one page should look like. (lens-glm [source-2]; lens-kimi §2.16(d); lens-codex §3; lens-opus §2 and §4.)
+The documentation layer says text-only sessions are supported. LiveKit's multimodality page lists text as a capability that enables "text-only sessions or hybrid voice and text interactions," and places turn detection and interruptions in the **speech and audio** row, not the text row (GLM-21). That is a correct description of the capability.
 
-**★★ (3/4) Transport is priced as an afterthought: $0.0005/min on Ship, $0.0004/min on Scale.** All three pricing literacies agree, and lens-kimi draws the consequence: WebRTC media is roughly 1 percent of the customer's per-minute bill. (lens-glm [source-2]; lens-kimi §3.2; lens-codex §3.)
+The code says something narrower. `AgentSession` is one object owning STT, VAD, TTS, LLM, turn detection, tool calls and media I/O (`agent_session.py:391`); the text sink, `TextOutput`, has `capture_text` and `flush` and its contract is "text segment plus a segment boundary," not a message id (`io.py:515`, `:529`, `:533`) (Codex-1). `_text_only` returns true **only** when the job is a `SimulationMode.SIMULATION_MODE_TEXT` simulation (`agent_session.py:2427`), and that is the branch that nulls out `vad`, `stt` and `tts` (`agent_activity.py:5304`). `say()` raises `RuntimeError` when there is no TTS and audio output is enabled (`agent_activity.py:1744`, `:1760`). So the runtime's own text path is the transcript of a speech act, and the production path for text-only requires assembling behavior by hand: disable audio I/O, attach a custom `TextOutput`, and accept that the session's control surfaces still assume a speech act.
 
-**★★ (3/4) The worked example is $0.0479/min, and it is quotable only with the date.** Breakdown: agent session $0.0100, telephony $0.0100, observability $0.0100, TTS $0.0090, STT $0.0075, LLM $0.0014. Note that the platform take per minute ($0.01) is smaller than the models combined ($0.0179). (lens-glm [source-2]; lens-kimi §3.2; lens-codex §3.)
+Pipecat's leak is different and sharper. `TextFrame`'s own docstring lists its consumers as "LLM services, context aggregators, TTS services and more," a list that does not include transports (`frames.py:278`); the output transport dispatches audio, image, mixer and timed frames and never text (`base_output.py:284`, `:296`); and `TwilioFrameSerializer.serialize` returns `None` for anything it cannot represent (`serializers/twilio.py:147`). Text on a phone call vanishes as `None`, not as an exception (Codex-2). The only serializer that maps `TextFrame` to a wire type is protobuf (`serializers/protobuf.py:47`).
 
-**★★ (3/4) Turn detection is the visible open-core seam.** End-of-turn detection is $0.50 per 1,000 requests and adaptive interruption $1.20 per 1,000, free for agents hosted on LiveKit Cloud and metered after a development allowance for self-hosted agents (lens-glm [source-2]; lens-kimi §2.16(d); lens-codex §3).
+OpenAI Realtime is the half-step: `output_modalities` accepts `["text"]` (`realtime_session_create_request.py:93`) while `turn_detection` remains a field of the audio input config (`realtime_audio_config_input_param.py:65`) (Codex-4). The modality is configurable; the turn model is not.
 
-**Single-lens but code-anchored, and the sharpest finding in the corpus: the OSS framework's default turn detector is a Cloud product.** `livekit-agents/livekit/agents/voice/agent_session.py:584-586` reads `raw_turn_detection = turn_handling.get("turn_detection", inference.TurnDetector())`. Out-of-the-box conversation quality therefore depends on LiveKit Inference. That is the open-core boundary expressed as a Python default argument, and it is a better thing to say in an interview than any pricing table. (lens-codex §2.)
+The academic lens explains why this is inevitable rather than lazy. Turn timing is a human-side universal that the audio path inherits for free: across ten languages, turn transitions cluster at short gaps (Kimi-13). And even systems **with** audio mishandle it, interrupting too aggressively and rarely backchannelling (Kimi-A16). The text modality removes the timing problem and substitutes delivery, ordering and duration problems (Kimi Finding C). Copying the audio session contract into text does not produce a cheaper voice product; it produces a bad text product.
 
-**Single-lens: the Startup Program is the quantified conversion subsidy.** $10,000 in Cloud credits, one year on Scale (normally $500/mo), $7,000 in partner inference credits, "about $23,000 in total value", for companies under 50 employees that have raised under $5M, with no conversion commitment and credits that "roll over to standard rates". Nobody else publishes a number like this. (lens-kimi §2.16(e), §3.3.)
+### C3 ★★★ Inbound is at-least-once and unordered; dedupe before the model
 
-**★ (2/4) The enterprise surface is operational, not algorithmic:** SSO, SLA, dedicated solutions engineer, volume pricing, on-prem/private deployment via sales, HIPAA reports, region pinning, private links (lens-glm §A3; lens-kimi §2.16(d)). lens-codex adds that 99.99 percent uptime is advertised on every paid tier, which makes uptime table stakes rather than a differentiator.
+Twilio documents per-request webhook overrides for timeout, retry count and retry policy (GLM-5), and Event Streams "guarantees at-least-once delivery," can deliver events out of order, and instructs receivers to deduplicate on event id (Opus-12). The default webhook policy is short (connect timeout 5s, read timeout 15s, retry count 1) and Event Streams retries for up to four hours (Opus §4, Opus-18). A slow handler plus a retry yields a duplicate inbound message. That is the channel's **default** behavior.
 
-### Q3. Named customers and what each logo proves
+The code lens corroborates the shape without the numbers: Twilio's Python client has no session object at all, the unit is a `Message` resource, delivery is push-only through a callback, and "the caller must build its own correlation and dedup layer keyed on the message SID" (Codex-3, `message/__init__.py:105`, `:733`). The codex lens explicitly could not establish inbound ordering from the client library, which is itself the point: ordering is not expressible in the client's type surface.
 
-**★★ (3/4) OpenAI is the anchor customer: ChatGPT Advanced Voice runs on LiveKit Cloud.** The October 2024 partnership post says developers get "the same end-to-end technology powering ChatGPT's new Advanced Voice feature", with WebRTC on the client leg, WebSocket to the model, and a ~300ms conversational latency target (lens-glm [source-4]). The homepage says OpenAI "built ChatGPT's Advanced Voice on LiveKit Cloud, serving millions of users every day" (lens-kimi §2.16(c)). lens-opus draws the strategic conclusion: OpenAI bought the client-side media path rather than building it. (Confidence high on the fact.)
+The academic and standards support is the reason this is non-negotiable rather than merely advisable. The Standard Webhooks spec says the `webhook-id` header "is often used as an idempotency key, which lets a consumer ensure that they only process a specific event once," and requires producers to give consumers a way to list failed messages and manually replay them (Kimi-A12). Andreakis's theorem says the gateway's acceptance record and your session record are two independent systems with no transaction spanning them, so the dedup decision has to be anchored on an authoritative sink-side record and **the guarantee has a half-life you choose** (Kimi-8).
 
-**★ (2/4) The wider roster, and it is a logo wall with different provenance per logo.** SAP (Joule assistant) is on the customers page (lens-glm [source-3]). Salesforce Agentforce (customer support voice) and Tesla (sales, support, insurance, roadside voice) are named in the Series C post (lens-glm [source-1]; lens-kimi §2.16(a)). The Fortune press release names OpenAI, xAI, Salesforce, Coursera and Spotify (lens-kimi §2.16(b)). Verkada ("30,000+ organizations"), Skydio (drone teleoperation), Polymath Robotics, Nvidia, Oracle, Decagon, Cresta, Podium, Headspace, Deutsche Telekom and others fill out the wall (lens-glm [source-3]; lens-kimi §2.16(c)).
+Note the asymmetry that matters for design: the inbound side can be made effect-safe with a dedup table. The outbound side cannot, because "did the SMS send" is recorded by the carrier, not by you.
 
-**★ (2/4) Retell AI appears on LiveKit's customer wall and its CTO is quoted saying "We recently moved from a homegrown WebSocket stack to LiveKit Cloud."** A direct competitor in voice agents is a paying customer of the transport layer. This is the cleanest question the research surfaced. (lens-glm [source-3]; lens-kimi §2.16(c).)
+### C4 ★★★ Durable execution is the discipline of putting nondeterminism in exactly one place
 
-**★ (2/4) What a logo proves is that someone paid for something, and no more.** lens-glm makes the point sharply (a competitor and an open voice-model company both sit on the wall; one logo's alt text is unreadable "SpaceXAI"), and lens-opus calls the logo wall "a claim to attribute rather than a fact to assert". No lens found a single customer with a quantified contract, a duration, or a revenue share. (lens-glm §A4; lens-opus §2.)
+Temporal's rule is that workflow code must be deterministic because replay re-executes it, while activities "execute outside the replay path" and may be fully nondeterministic (GLM-11, Opus-6). The Python SDK enforces this with a workflow sandbox that restricts `datetime.now`, `random`, `uuid1/uuid4/uuid7`, threads and I/O at runtime (`_restrictions.py:619-623`, `:722-723`, `:796`) (Codex-7). Temporal's own agent rebuttal is that determinism "applies only to Workflow code at the orchestration layer" (Kimi-5), and its LLM integration page makes the pattern concrete: **one HTTP call per activity attempt**, so the activity retry policy is the only retry in play (GLM-13).
 
-**Note the two scale figures that are not customer counts:** "300,000+ developers" (homepage, November 2026) and "more than 200,000 developers and customers" (January 2026 press release). Different metrics, different dates, neither a paying-customer figure (lens-kimi §3.6).
+Restate draws the same line with a journal instead of an event history: every side-effecting step plus its result is recorded, replay skips forward rather than re-executing (GLM-14), and `ctx.run` is the wrapper that creates the journal entry (`context.py:482`) (Codex-8). DBOS draws it at `@step` (`_dbos.py:1586`), with the workflow body re-running on recovery (Codex-9, Kimi-3). LangGraph draws it at the checkpoint and resumes by re-executing the node from its start (`types.py:928`) (Codex-6).
 
-### Q4. The competitive set, placed precisely
+Four products, four different lines, one shared requirement: the author must separate repeatable logic from side effects, and the model call belongs on the effect side. Kimi's Finding B states the boundary precisely: this only holds **if the nondeterministic call is an effect, not a decision**. The moment a model output determines a branch that was not recorded, replay diverges.
 
-**★★★ (4/4) The market decomposes into three layers, and everyone is converging on the middle one:** transport/SFU (LiveKit server, mediasoup, Janus, Jitsi Videobridge, Agora RTC, Daily, Twilio), orchestration framework/runtime (LiveKit Agents, Pipecat, Pipecat Cloud, Vapi, Retell, Bland), and models/speech (OpenAI Realtime, Deepgram, ElevenLabs, AssemblyAI, Cartesia, open models). lens-kimi's AGI House taxonomy uses eight layers and reaches the same structural conclusion; lens-codex's pricing survey and lens-opus's history both land on the same split. (lens-kimi §2.5; lens-codex §3 and "Convergent patterns"; lens-opus §2; lens-glm §A5.)
+### C5 ★★★ Idempotency keys are the mechanism, and you supply them
 
-| Player | What it is | Overlap with LiveKit | The number to quote (as-of 2026-11-14) |
-|---|---|---|---|
-| **Pipecat** | BSD-2 Python frame-pipeline framework, maintained by Daily and the community, 17,253 stars, created 2023-12-27 | Direct framework competitor, **and lists LiveKit as a supported transport** | No platform fee of its own; the runtime is Pipecat Cloud |
-| **Pipecat Cloud (Daily)** | Closed hosted runtime, per-vCPU-minute pricing, unlimited concurrency | Same layer as LiveKit Cloud | $0.01 to $0.03/min active (agent-1x to 3x); Daily WebRTC $0.004/participant-min |
-| **Vapi** | Closed orchestration over borrowed transports (Daily WebRTC free); 66 public repos, none the server | Managed agent platform, one layer above LiveKit | Hosting $0.05/min, models at pass-through; Pro tier 10% of hosting with a $999/mo floor |
-| **Retell AI** | Closed voice-agent platform publishing a model-by-speed price matrix; 11 public repos, no server | Managed agent platform **and** a LiveKit Cloud customer | Infrastructure $0.055/min, their example $0.11/min total; $8/concurrency/month after 20 |
-| **OpenAI Realtime** | Hosted speech-to-speech, WebRTC recommended for browser and mobile; closed, no self-host | Model vendor that now ships its own transport | gpt-realtime-2.1 $32/1M audio in, $64/1M audio out, cached input $0.40/1M |
-| **Deepgram** | STT incumbent ($0.0048/min Nova-3 streaming) that climbed into agents ($0.075/min Voice Agent) | Supplier to LiveKit, Vapi and Retell **and** their competitor; bought Daily/Pipecat 2026-10-29 | 15x markup from STT component to assembled agent |
-| **ElevenLabs** | Voice vendor with an agent product | TTS line item inside everyone's bill, plus its own agent | Agents $0.08/min additional, burst $0.16/min |
-| **Agora** | CPaaS incumbent with a decade of edge build-out | Direct transport competitor with an installed base and a conversational-AI upsell | RTC $0.59 per 1,000 min; conversational AI from $0.10/min |
-| **Twilio** | Telephony incumbent | Number supplier underneath LiveKit, Vapi, Retell and Pipecat | ConversationRelay $0.07/min (page states "current as of October 2026") |
-| **Bland** | All-in bundled platform, telephony excluded | Same buyer, opposite pricing philosophy | $0.12 to $0.14/min |
-| **HF speech-to-speech** | Apache-2.0 fully local pipeline, 13,693 stars | The "you need none of this" existence proof | No commercial runtime |
+Restate's dedup is opt-in via a request header (GLM-14); the SDK exposes `idempotency_key` on the call and send surface, not the transport (`context.py:292`, `:306`) (Codex-8). The IETF draft fixes the contract: the key MUST be unique, MUST NOT be reused with a different payload, a duplicate retry after completion returns the completed response, and a **concurrent** retry gets a conflict (Kimi-11). The normative status codes are the useful part: 400 when a required header is absent, 422 when a key is reused with a different payload, 409 when a retry arrives while the original is still in flight. The 409 case is the one agents get wrong, because the natural agent behavior on a timeout is to try again.
 
-All price and repo figures above are lens-codex §1 to §16, fetched 2026-11-14, except the Vapi Series B, which is ★ (lens-glm [source-8] [source-9]; lens-opus §4).
+The narrative lens makes this a design rule rather than a library feature: an idempotency key on every tool call and outbound send, committed with the checkpoint (Opus rec-3). Nothing in any client library invents an application-level key for you (Codex conv-6).
 
-**Single-lens, code-anchored, and strategically load-bearing: Pipecat supports LiveKit as a transport.** Choosing Pipecat does not mean choosing against LiveKit Cloud. The competition is at the framework and runtime layer, not the SFU. (lens-codex §5.)
+### C6 ★★★ Replay is not free, and checkpoint-and-rerun is a real alternative
 
-**★ (2/4) Platform take is converging while model cost is not.** The platform fee band is roughly $0.01 to $0.06/min (LiveKit $0.0100, Pipecat Cloud $0.01 to $0.03, Vapi $0.05, Retell $0.055); the model stack is $0.04 to $0.10/min. The margin is in bundling and inference, not in transport. (lens-codex §3 and "Convergent patterns" 6; lens-kimi §3.2 corroborates the direction from LiveKit's own cost stack.)
+The dissent has three forms and they are all documented.
 
-**★ (2/4) Stars say the framework race is close, not won.** Pipecat at 17,253 stars is ahead of `livekit/agents` at 15,218; `livekit/livekit` at 22,204 is the largest asset and its `sip` service has 497. Development attention in the ecosystem is on the agent-facing surface, not the media plumbing. (lens-codex §4 and "Stack-rank"; lens-glm [source-3] publishes the same 22.2K/15.2K from the customers page.)
+**Cost shape.** Durable engines were tuned for high concurrency and low compute per task, where each step takes milliseconds. An agent spends 45 seconds on a single LLM call, makes 40 calls at $0.05 to $5 each, and runs ten of them rather than a hundred thousand (Opus-13). The bottleneck is token spend, not workflow throughput.
 
-### Q5. The open-source-plus-hosted-cloud tension against model vendors
+**Determinism tax.** Every clock read, random value, ad hoc HTTP call and environment lookup in orchestration code must route through a durable-step API, and a missed one produces an error that is hard to debug and impossible to search for (Opus-14). Temporal's SDK makes this visible rather than hidden: `patched(id)` exists purely so authors can change workflow code safely against old histories (`_context.py:810`), and `wait_condition`'s docstring warns that changing `timeout=None` later "constitutes a nondeterministic change to workflow code" (`:1028`) (Codex-7). Most products hide this problem; Temporal makes the versioning primitive public.
 
-**★★★ (4/4) The structure is real and the split is not public.** Every lens independently establishes that the media server and framework are free and the managed control plane is the paid product, and every lens independently reports that no revenue split, conversion rate, or self-hosted fleet size is published. lens-codex proves the closed control plane by absence in the org listing. This is the most solid block of the research. (lens-glm §D; lens-kimi §3.3; lens-codex §3; lens-opus §2.)
+**Operational limits.** Temporal's default history limit is 50MB with a 2MB per-payload limit, and each activity transition costs roughly 50 to 100ms (Opus-15). A 100-step agent emitting 500KB per step hits the ceiling.
 
-**★★★ (4/4) The absorption thesis is contested, and presenting it as settled is the single most likely way to sound naive.** The question, in lens-kimi's citation of AGI House: "whether this layer stays independent or is absorbed into model vendors' realtime APIs", in a document that also says "Model vendors are moving up-stack" and "Independent orchestrators remain model-neutral". lens-opus steel-mans the dissent and concludes it is "right about direction and wrong about speed". lens-glm found the raw events but no settled interpretation. lens-codex supplies the structural detail: OpenAI "owns the transport inside its own product and still does not own the phone network". (lens-kimi §3.4; lens-opus §3; lens-glm §C7; lens-codex §9.)
+**The vendor's own admission.** Restate ships `explicit_recovery` (preview), which runs the handler again from the start and tells the author to supply stable idempotency keys instead of replaying the journal (`object.py:205`) (Codex-8). That is a durable execution system offering an opt-out from durability's central mechanism, which is the strongest available evidence that replay and nondeterministic handlers are an awkward fit.
 
-**Evidence on each side, both sourced:**
+The counter-case is also real and should not be dismissed: replay is semantically fine for dynamic agents, since determinism does not forbid dynamic control flow (Kimi-5), and OpenAI Codex and Replit Agent 3 are cited as production users (though that claim is Temporal's own marketing and was not independently verified, per Kimi caveat-5). The disagreement is about fit, not feasibility.
 
-| Absorption side | Counter side |
-|---|---|
-| OpenAI added WebRTC to the Realtime API (lens-glm [source-13] [source-14], dated 2024-12-17) | OpenAI bought the client leg rather than building it; it ran on LiveKit's SDK and Cloud first (lens-glm [source-4]) |
-| Deepgram acquired Daily/Pipecat on 2026-10-29, folding model, transport and framework into one company (lens-glm [source-10] [source-11]; lens-opus §3) | Pipecat stays BSD-2 and vendor-neutral after the deal (lens-glm [source-10]) |
-| A speech-to-speech model removes the STT/LLM/TTS loop the framework exists to manage; cascaded pipelines are roughly 1.6s or more before audio against 800 to 2,000ms end-to-end (lens-kimi §3.4, from AssemblyAI's own figures) | 79 to 90 percent of voice-agent failures are agent behaviour, not speech or transport; voice agents retain 30 to 45 percent of text-mode performance (lens-kimi §2.13, arXiv:2603.13686) |
-| Model vendors appear in the orchestration layer of the taxonomy, not only the model layers (lens-kimi §3.4) | GPT-Realtime's interruption-avoidance rate is 13.5 percent; a cascaded Whisper to GPT-4o to TTS pipeline has a perfect turn-take rate (lens-kimi §2.14, arXiv:2604.04847) |
-| The Deepgram deal shows a framework vendor accepting acquisition (lens-glm [source-10]) | A competitor's framework (Pipecat) lists LiveKit's Cloud as a supported transport, and an STT vendor (AssemblyAI) publishes a guide saying the loop stays with a framework (lens-codex §5; lens-kimi §2.15) |
+### C7 ★★ Segments make "delivered" ambiguous
 
-**★★ (3/4) Transport is the commoditising layer; orchestration and observability are where the margin is.** lens-kimi's evidence is the pricing sheet (WebRTC at $0.0005/min against $0.01 for the session and $0.01 for observability) plus the SFU scaling literature: stream count grows as N squared, mediasoup hit 100 percent CPU at roughly 80 participants on a 40-core Xeon, and the media data plane is being pushed into programmable hardware. lens-codex reaches the same conclusion from competitor pricing. lens-opus reaches it from the historical argument that infra gets absorbed and the operational envelope does not. (lens-kimi §3.5; lens-codex §3; lens-opus §2.)
+GSM-7 gives 160 characters per segment and UCS-2 gives 70; concatenated messages carry a UDH so segments hold 153 or 67 characters, and billing is per segment (GLM-3). Concatenation is supported up to 1,600 characters, ten segments (GLM-4). Twilio reports status **per Message resource, not per segment**, so "delivered" does not mean the handset reassembled every segment (Opus §4, Opus-16). A single emoji drops a 140-character message to UCS-2 and doubles segment count and cost.
 
-**★ (2/4) The open-core precedent has a named failure mode, and it predates the model-vendor threat by six years.** a16z in 2019: cloud hosting creates the risk that "public clouds will choose to take your open source code and compete", and over-proprietarising invites a fork. Sentry is the closest observable analogue, with 90 percent of users self-hosting on the free plan as of May 2024 while revenue "more than tripled in just over two years". (lens-kimi §3.3, §2.7, §2.10; lens-opus §2 describes the same design logic without the precedent.)
+The code lens shows the same fact as a billing field: `num_segments` is `0` until a sender is assigned for Messaging Service sends, long bodies are segmented and charged per segment, and `validity_period` (1 to 36,000 seconds, default 36,000) sits on the same flat create call as `content_sid` (Codex-3, `message/__init__.py:74`, `:105`, `:738`, `:761`). SMS-only and WhatsApp/template-only options share one namespace, and the caller is left to know which apply.
 
-### Q6. What this means for what an engineer says in a CTO conversation
+Consequence: a transport that streams tokens into SMS produces dozens of billed segments and a reply that can arrive interleaved with its own predecessor. Buffering to a turn is a correctness requirement, not an optimization.
 
-This question is not a fact to verify; it is the payload. The lenses converge on a shape rather than a script, and the shape is:
+### C8 ★★ The session key is an application-level string, not a connection
 
-**Lead with structure, not with numbers.** The four things that are actually verifiable are the funding ladder with dates and leads, the open/paid boundary, the per-minute cost stack, and the customer roster with its provenance. Everything else is either undisclosed (revenue, conversion, concentration) or contested (market size, competitor traction, the absorption thesis). (Synthesis judgment across all four; anchors throughout Sections 2 and 3.)
+LangGraph keys a run by `thread_id` in config (`checkpoint/base/__init__.py:213`), Stream by `cid` as `type:id` (`channel.py:25`), OpenAI Agents by `session_id` (`session.py:77`), Restate by virtual-object key (`context.py:812`), LiveKit by room participant plus the `lk.chat` topic (`room_io.py:99`) (Codex conv-1). The transport connection is disposable; the key is not. Restate's virtual object is the clearest statement of the shape the kickoff asks about: keyed, stateful, serialized per key, transport-agnostic, with transport-specific capabilities handled by separate typed side channels (durable promises, timers, queues) rather than by widening the core object (Kimi-4).
 
-**The two questions only an insider can answer are also the two questions that prove you did the work:** the speech-to-speech versus cascaded minute mix on LiveKit Cloud, and the OSS-to-Cloud conversion cohort with net revenue retention. Neither is public, and asking for them is a demonstration of judgement rather than a gap. (lens-opus §5; lens-kimi §3.6 reaches the same opening from the developer-count funnel.)
+Opus rec-7 draws the design consequence: encode channel capability as **data the session consults**, not branches scattered through it.
 
-**The defensible sentence about strategy is modest and hard to disprove:** LiveKit is the neutral, deployable, multi-party media and operational layer that survives model churn, and the orchestration seam above it is closing. That is a better sentence than "we are the AI infrastructure layer", which is a market-share claim nobody can support. (lens-opus §6; lens-kimi §7.4.)
+### C9 ★★ Long waits are durable state, and channel policy can still kill them
+
+Every durable product treats a long wait as a timer rather than an occupied process: Temporal `sleep` and `wait_condition` (`_context.py:1003`, `:1028`), Restate `ctx.sleep` (`context.py:645`), DBOS recovery of pending workflows (`_recovery.py:14`), LangGraph `interrupt` (`types.py:913`) (Codex conv-4). Restate adds the FaaS-specific version: handlers can suspend while waiting for an external event, for example a user approving an order, without paying for wait time (GLM-14).
+
+The channel adds a constraint the runtime cannot see. WhatsApp opens a 24-hour customer service window from the last inbound user message; inside it free-form messages are allowed, outside it only pre-approved templates (GLM-6, GLM-7, Opus-17). A workflow that sleeps twelve hours and replies is fine. One that sleeps twenty-five fails **at send time**, not at design time. The runtime survived; the channel did not.
+
+### C10 ★★ Throughput is policy the API does not report
+
+Throughput is a function of number class and account standing: short codes around 100 MPS, toll-free and long codes far lower (GLM-8), and US 10DLC throughput scales with Brand Trust Score and campaign registration from a few messages per day to thousands (GLM-9). No send-API response exposes remaining capacity (GLM §"What's NOT", item 6). Vapi's SMS product makes 10DLC approval an onboarding step before the first message (GLM-25), which confirms the policy shapes the agent before any code runs.
+
+Design consequence, stated in Opus rec-7: the capability object must carry throughput and free-form window alongside segment length and encoding, because the framework has to model backpressure the channel refuses to report. Codex-3 shows what happens when it does not: channel-specific fields leak into the common create call and the caller is left to know which apply.
+
+### C11 ★ Resume is where effects re-fire
+
+Khan's conformance probe measures this directly: LangGraph 1.2.9 is "exactly-once across interrupts and at-least-once across crashes on one API," and **consume-once fails under concurrent delivery**, with k processes resuming one parked interrupt firing the gated effect k times at saturation 1.0 in 36 of 40 cells, crossing hosts (Kimi-9). The code lens documents the mechanism that makes re-execution possible: LangGraph restores the checkpoint and re-runs the node body from the start (`types.py:928`), and multiple interrupts are matched to stored resume values **by order** (`:930`), so inserting an `interrupt()` call silently changes the meaning of payloads already stored (Codex-6).
+
+The same shape appears in a different form in LiveKit: `room_io.py:545` spawns `asyncio.create_task(_read_text())` per inbound stream with no ordering barrier, so two near-simultaneous sends are two tasks with no sequencer (Codex-1). The codex lens did not run a race to confirm observable behavior, so treat the ordering consequence as untested and the concurrency exposure as structural.
 
 ---
 
 ## 3. Disputed findings
 
-Per Nasser 2026 (arXiv:2601.05114), same-conviction agents that vote amplify bias rather than averaging it. These are reported, not resolved by majority.
+Per Nasser 2026 (arxiv:2601.05114), voting between same-conviction agents amplifies bias rather than averaging it. These are reported, not resolved by count.
 
-### D1. Does OpenAI's Realtime API support SIP telephony? (direct contradiction, 2 lenses against 1)
+### D1. Is durable execution the right primitive for agents?
 
-- **For SIP:** lens-opus states OpenAI added "native SIP telephony to the Realtime API at GA in August 2025", citing 36Kr and iThome (both August 2025 secondary coverage). lens-glm's OpenAI docs entry says WebRTC "plus WebSocket and SIP per Azure's mirror" (lens-glm [source-13]).
-- **Against:** lens-codex fetched `developers.openai.com/api/docs/guides/realtime-webrtc` on 2026-11-14 and reports the page "documents WebRTC and WebSocket only; it does not document SIP or telephony", and builds a strategic conclusion on it ("OpenAI owns the transport inside its own product and still does not own the phone network").
-- **Why they disagree:** almost certainly scope, not fact. lens-codex read one guide page (the WebRTC transport guide) and generalised to "the docs". lens-opus read August 2025 trade coverage of a GA announcement. Both can be true: SIP can be supported and documented on a different page from the WebRTC guide. lens-glm's "per Azure's mirror" hedge suggests it did not confirm on OpenAI's own docs either.
-- **What would resolve it:** open `developers.openai.com/api/docs/guides/realtime` (the main guide, not the WebRTC sub-page) and search for SIP; check the OpenAI changelog for an August 2025 entry. Until then, assert neither. This is a live trap because the strategic argument on each side depends on it.
+**Pro (feasible and in use).** Temporal's determinism requirement applies only to orchestration code; activities are free to be nondeterministic; dynamic agents are supported (Kimi-5, GLM-11, GLM-13). Restate's journal makes replay skip-forward (GLM-14). DBOS makes durability a library over Postgres (Kimi-3). Khan's probe finds DBOS 2.27.0 conformant in all probed cells and OpenAI Agents SDK 0.18.2 holding effect exactly-once across session restore (Kimi-9). The narrative lens's conventional-wisdom section states the mainstream position fairly: an agent is a workflow whose steps call a model (Opus §2).
 
-### D2. Retell AI's traction: $100M run rate or ~$60M ARR?
+**Con (wrong primitive).** The cost model is inverted for agents (Opus-13), the determinism tax lands on the artifact that changes most often (Opus-14), history and payload limits bite at realistic agent sizes (Opus-15), and replay is not the same as a safe retry of an external provider call embedded in the workflow (GLM-20). The strongest structural evidence is Restate shipping `explicit_recovery` to skip replay entirely (`object.py:205`, Codex-8).
 
-- **lens-glm:** "Retell AI announced a $100M annualized run rate with only $4.6M new funding (~$5.1M total raised)", November 2026, company-claimed, days old, no independent grounding.
-- **lens-opus:** "Retell reportedly reached ~$60M ARR on a very small team, both figures low confidence and disputed across sources."
-- **Why they disagree:** run rate and ARR are different metrics, and the two figures are weeks apart in time. A $100M annualised run rate can coexist with $60M trailing ARR during fast growth. Neither figure has a primary filing.
-- **What would resolve it:** a Retell disclosure with a definition, or a funding announcement with an investor-confirmed number. Do not quote either.
+**Why they disagree.** Three separate axes are being conflated. (1) **Definition of fit:** the pro side answers "is replay semantically possible for agents," which is yes; the con side answers "is replay the cheapest way to get crash recovery for this workload shape," which is often no. (2) **Workload assumption:** microservice-shaped steps of milliseconds versus agent-shaped steps of tens of seconds and large payloads. (3) **Change rate:** a payment workflow is stable for years; an agent graph changes weekly, and replay compatibility turns the graph into a versioned API surface. No lens is factually wrong here. Opus §3 is explicit that Temporal's rebuttal is correct on its own terms and that "feasibility is not fit."
 
-### D3. Series A: who led it, how much, and when?
+**What would resolve it.** Opus §5 specifies the experiment: a 40-step research agent with 500KB tool outputs and three human approval gates, implemented twice (Temporal workflow with activities; top-level rerun caching literal step returns in an artifact store), crashed at step 20 and again during an approval wait. Measure tokens re-spent per crash, p50/p99 end-to-end latency, engineering hours to add one step and to change the prompt mid-run, count of nondeterminism errors, and recovery success rate. Opus predicts token re-spend collapses toward zero for **both** because both journal the expensive result, and the difference shows up in operational surface and change cost. Two supporting numbers: the fraction of real agent steps producing payloads above 2MB (decides whether history limits are theoretical), and the rate of status-callback inversions and duplicate inbound events per 10,000 messages (decides how much of the session layer must be order-tolerant by construction).
 
-- **lens-opus:** "$22.5M Series A led by Altimeter in June 2024", sourced to Wikipedia.
-- **lens-glm:** $22M, June 5 2024 per a mirror of David Zhao's own round table, with a second database saying March 2024, and **"the Series A lead investor is not named in anything fetched this run. Do not assert one."**
-- **Why they disagree, and my judgment:** lens-opus's Altimeter attribution looks like a conflation with the Series B, where Altimeter is confirmed by three sources. Wikipedia is tertiary and its Series A detail is weak. The Zhao-table mirror is founder-adjacent and is the better source for amount and date. Treat the lead as unknown.
-- **What would resolve it:** the original Series A announcement or the investor's own portfolio post.
+### D2. What does Restate's "runs exactly once" actually cover?
 
-### D4. The second seed round: $7.3M or $8M?
+**Restate's side.** An invocation "runs exactly once regardless of failures"; every side-effecting step and its result is journalled; replay skips forward (GLM-14, Kimi-4).
 
-lens-glm has "$7.3M, September 2022" from a funding listing; lens-opus has "an $8M additional seed in 2022" from Wikipedia. Both are secondary, one round apart in precision, and neither is a primary announcement. It matters only because it changes the "total raised" arithmetic by about $1M. Report the ladder and skip the reconciliation.
+**The academic side.** Source-only recovery cannot deliver both no-duplicates and no-loss across a dual write, and the outbox pattern does not save you because relay delivery and checkpointing remain separate durable operations (Kimi-8). "Exactly-once" is not formally defined in the stream-processing literature and bundles delivery, consistency and determinism (Kimi-7).
 
-### D5. Paying-customer count: 500+ or not public?
+**The code side.** No implementation in the survey demonstrates true end-to-end exactly-once (Codex conv-2), and Restate's journal has a finite configured retention window (`journal_retention`, `idempotency_retention` at `object.py:62-66`) (Codex-8).
 
-lens-opus cites TechCrunch (2025-04-10) reporting "500+ paying customers". lens-glm (§D1) and lens-kimi (§3.6) both state that **no paying-customer count is published**, and neither found the TechCrunch figure. This is not a logical contradiction (a journalist can report a number the company does not publish), but it is a single-source, 19-month-stale figure that the other three lenses did not corroborate. Treat as single-lens, not as fact.
+**Why they disagree.** They are not measuring the same thing. Restate's guarantee is about **invocation completion inside the journal**: the handler's control flow observes each recorded step once. It is not a claim that your outbound HTTP call to Twilio landed once, and it cannot be, because Twilio's acceptance record is in another system (Kimi-8). The vendor's own fine print says dedup requires an opt-in idempotency key (GLM-14). Both statements are true; the marketing sentence omits the scope.
 
-### D6. Is xAI a named customer?
+**What would resolve it.** Two checks a staff engineer can run before the API review: (a) read the journal-mismatch and retention documentation for the version under review, and (b) kill the process between the external effect inside `ctx.run` and the journal write, then restart and observe whether the effect repeats. If it repeats, the guarantee is invocation-scoped, as the theory predicts. Also worth noting: Huang and Garcia-Molina defined a **relaxed** exactly-once tier for limited-capability endpoints 25 years ago (Kimi-10), which is the academic precedent for advertising a weaker guarantee on a constrained channel rather than one guarantee everywhere.
 
-lens-kimi's Fortune press release read names "OpenAI, xAI, Salesforce, Coursera, Spotify". lens-glm, working from the logo wall, found one logo whose alt text reads "SpaceXAI" with the file `x-ai.svg` and explicitly declined to quote either name. The press release is the stronger source, so "xAI is named in the Series C press release" is defensible; "xAI is on the customer wall" is not something lens-glm could confirm.
+### D3. Does LiveKit support text-only sessions in production, or only in simulation?
 
-### D7. Market size: three houses, three answers
+**Docs side.** The multimodality page says text enables "text-only sessions or hybrid voice and text interactions," and assigns turn detection and interruption to the speech and audio row (GLM-21). Taken alone, this reads as a supported production modality.
 
-Not a lens-versus-lens dispute but the most consequential external disagreement in the corpus, and it belongs here because a reader will otherwise average it:
+**Code side.** `_text_only` returns true only under `SimulationMode.SIMULATION_MODE_TEXT` (`agent_session.py:2427`), that branch is what nulls VAD/STT/TTS (`agent_activity.py:5304`), and `say()` raises without TTS when audio output is enabled (`agent_activity.py:1760`) (Codex-1). Text output's contract is a segment plus a boundary, with no delivery receipt, no retry and no per-message acknowledgement, "because audio has none of those" (Codex-1, `io.py:515`).
 
-| House | 2025 base | 2026 | Forecast | CAGR | Horizon |
-|---|---|---|---|---|---|
-| Grand View Research (Jun 2026) | $2.5B | $3.5B | $35.2B (2033) | 39.0% | 2026-2033 |
-| SNS Insider (upd. 2026-09-29) | $2.75B | $3.70B | $55.55B (2035) | 35.13% | 2026-2035 |
-| Meticulous Research (Oct 2026) | $3.40B | $5.10B | $43.83B (2036) | 24.0% | 2026-2036 |
+**Why they disagree.** They describe different layers, and both are accurate at their layer. The docs describe what the session **can be configured to do**; the code describes what the runtime's own text path **is**. The gap is not a documentation bug. It is the exact place where an audio-first design shows through: the text path exists as a sink for speech, not as a first-class message channel, and the supported way to build text-only is to disable audio I/O and supply your own `TextOutput` (`room_io/types.py:113-117`).
 
-36 percent spread on the base year, 1.63x on the CAGR, deliberately staggered horizons, no disclosed method in any of the three, and Meticulous's later horizon lands *below* SNS's earlier one. The dispersion is the finding. (lens-kimi §3.1.)
+**What would resolve it.** Construct a text-only `AgentSession` in a non-simulation job, attach a `TextOutput`, and drive two inbound `lk.chat` streams concurrently. Observe (a) whether `say()` is reachable, (b) whether the two streams interleave, given the per-stream `asyncio.create_task` with no sequencer (`room_io.py:545`), and (c) what the framework reports as delivery status. This is also the highest-value question for the API-critique round, because it is answerable by the API's author and it is not an accusation.
 
-### D8. Series B date: September 2024 or April 2025?
+### D4. What does "resume" mean? Three answers, one word
 
-lens-opus flags that "several widely copied comparison posts date the Series B to September 2024 at roughly a $300M valuation" and treats it as an error against FinSMEs and TechCrunch's April 2025 coverage. lens-glm independently has April 10-11, 2025 with a $345M post-money. Two lenses against the copied posts. Treat April 2025 as correct, and be aware the wrong date is common enough that saying it would be an unforced error.
+**Docs impression.** `interrupt()` pauses graph execution and `Command(resume=...)` continues "from the last checkpoint" (GLM-23), which reads as continuation.
 
-### D9. Headquarters
+**Code fact.** "The graph resumes from the start of the node, re-executing all logic" (`types.py:928`), and interrupts are matched by order (`:930`) (Codex-6).
 
-One funding-database snippet says San Jose, CA; LinkedIn and a podcast place d'Sa in San Francisco (lens-glm §C4). Low stakes and unresolved. Say "Bay Area" if it comes up.
+**Measurement.** LangGraph 1.2.9 is exactly-once across interrupts and at-least-once across crashes on the same API (Kimi-9).
 
-### Single-lens findings with no cross-check (explicitly no consensus)
+**Why they disagree.** "Checkpoint" is a superstep boundary, not an instruction pointer. Restoring the checkpoint and re-running the node body is continuation **of the graph** and re-execution **of the node**. The three sources are compatible once that distinction is made, and the disagreement is really about whether a user reading "resume" will infer the second meaning. Khan's framing is the one to carry: a framework that persists execution state must decide what resume means **for effects that already happened**, and six named properties (prefix continuation, effect exactly-once, fork determinism, checkpoint validity, consume-once, recovery determinism) are the vocabulary for that decision (Kimi-9).
 
-These are not disputes. They are findings only one lens produced, reported so the reader can see where the cross-checking stopped:
+**What would resolve it.** Put a side effect before the `interrupt()` in one node, resume, and count the effects. The paper's own probe is the template; a five-line test settles it per framework and per version.
 
-- **OpenAI's traffic or revenue share of LiveKit.** No lens quantifies it. It is the single most load-bearing unknown for Q5 (lens-glm §D2).
-- **The 79 to 90 percent agent-behaviour failure attribution and the 30 to 45 percent retention of text-mode performance.** Only lens-kimi, from arXiv:2603.13686. Peer-reviewed but a single benchmark suite with a simulator decoupled from wall-clock time.
-- **The interruption-avoidance 13.5 percent and 4.25 second latency figures.** Only lens-kimi, from arXiv:2604.04847, which is labelled "work in progress" on arXiv.
-- **"90 percent of Sentry users self-host on the free plan" and the a16z 5 percent conversion heuristic.** Only lens-kimi; both are weak instruments, described in Section 5.
-- **The Startup Program's $23,000 figure.** Only lens-kimi.
-- **Every competitor price in the Q4 table except Vapi's round.** Only lens-codex, all fetched same day from vendor pages with no effective dates.
-- **The `agent_session.py:584` default turn-detector finding.** Only lens-codex, but it is a file and line, which is the strongest form of single-lens evidence in this run.
-- **The French government Visio deployment.** Only lens-opus, sourced to Wikipedia (tertiary). Useful as an illustration of sovereignty, not as a fact to lean on.
-- **"500+ paying customers."** Only lens-opus (see D5).
+### D5. How reliable is a "delivered" status callback, and how late can it be?
+
+**What is documented.** The status lifecycle (`queued`, `sent`, `delivered`, `undelivered`, `failed`) and the callback payload (GLM-2); a `read` status after `delivered` on channels that support it (Opus-16); platform-specific caveats, including Vonage documenting status callbacks up to 30 days after send on its Messages API (GLM-10).
+
+**What is not.** No source states how late a `delivered` or `undelivered` callback may arrive before it should be treated as lost, and Twilio reports status per Message resource rather than per segment (Opus-16, Opus §5). The web lens flags this as a gap, the narrative lens flags it as a gap, and the code lens could not extract ordering or retry semantics from the generated resource model at all (Codex §"could not establish").
+
+**Why this is a dispute rather than a gap.** The lenses disagree on whether the status stream is a usable state machine or a hint. GLM treats the enum as "the text-modality replacement for the audio clock" (GLM-2). Opus treats the callback as unreliable by default and recommends a second verification path. Kimi supplies the precedent for the second path: a real-time webhook plus a scheduled polling fallback with idempotent upserts (Kimi-A14), and the Standard Webhooks requirement that producers let consumers list failed messages and replay manually (Kimi-A12).
+
+**What would resolve it.** A measured distribution: for a large traffic sample, the p50/p95/p99 delay from send to `delivered`, and the rate of status inversions (a `delivered` followed by `undelivered`) per 10,000 messages. No lens found this published. Until it exists, design for the second path.
 
 ---
 
-## 4. Cross-lens gaps: what no source covers
+## 4. Cross-lens gaps
 
-Aggregated from lens-glm §D (9 items), lens-kimi §3.3 and §6 (17 methodological items), lens-codex ("Do not assert"), and lens-opus §5. Deduplicated, ordered by how much they matter for the two conversations.
+Aggregated from GLM §"What's NOT in the recent literature," Kimi §5, Codex §"What this lens could not establish from code," and Opus §5. These are candidates for the book's "what nobody has measured" passages, and for out-of-distribution questions.
 
-1. **LiveKit revenue, ARR, gross margin, or any financial disclosure.** Zero primary sources. The only circulating numbers come from secondary-market listings (Hiive, share price around $3.96, one snippet estimating ~$3.7M for 2025) and aggregators. All four lenses converge on the absence, which makes the absence itself the finding.
-2. **OpenAI's share of LiveKit's traffic or revenue.** The lede of every funding story and the flagship logo, with no quantification anywhere. This is the load-bearing unknown for the concentration-risk argument.
-3. **The speech-to-speech versus cascaded minute mix on LiveKit Cloud.** Suggested by lens-opus as the single measurement that would settle the absorption thesis. Not published, and not estimable from outside.
-4. **OSS-to-Cloud conversion rate, by deployment size, with net revenue retention.** Nobody publishes it, including LiveKit. Every public analogue is either stale (Sentry, May 2024), unsourced (a16z, 2019), or vendor-interested (Logz.io, 2022).
-5. **Self-hosted fleet size.** Lens-codex's repo activity suggests a large self-hosted population but cannot size it. 22,204 stars on the server and 497 on the SIP service is an interest signal, not a deployment count.
-6. **Current headcount.** The last grounded figure is 15 people in December 2021 (lens-glm [source-5]). Five years and four rounds later, nothing. This matters for the "staff engineer's span of influence" question that Amir should ask about.
-7. **Cloud infrastructure unit economics.** Edge network cost, gross margin per minute, egress cost. Nothing public. The $0.0479/min customer-facing example is the only cost anchor, and it is a seller's calculator, not a measured average.
-8. **The Series A primary announcement and its lead investor.** Every funding database papers over this differently (see D3).
-9. **Any independent sizing of "realtime AI infrastructure" as a category.** No analyst taxonomy isolates transport, SFU, orchestration or telephony. Grand View explicitly has no separately quantified infrastructure segment. The size of LiveKit's actual addressable market is not in any public report.
-10. **Whether a platform competitor renting LiveKit's transport (Retell) is durable or transitional.** The cleanest strategic question the research surfaced, and nothing examines it.
-11. **Churn, retention, or contract structure for OpenAI, SAP, Tesla-sized accounts.** Zero coverage.
-12. **The precise licence and terms of service for each LiveKit component.** Partly closed by lens-codex (Apache-2.0 for server and agents, separate "LiveKit Model License" for turn-detection models), but the Cloud terms, the trademark policy, and the open-core boundary in writing are unexamined.
-13. **Peer-reviewed literature on this market.** Lens-kimi found zero papers studying realtime AI infrastructure as a market and zero on open-core conversion in realtime media. Everything peer-reviewed in the corpus is adjacent and labelled as extrapolation.
-14. **Late-2026 entrants and announcements.** The sweep covers Deepgram/Daily (Oct 2026) and a Retell claim from days before the research date, but there is no systematic entrant watch. Treat "and any newer entrant" from the kickoff as partially answered at best.
-15. **Board composition, governance, and what Index Ventures' lead implies about the next 18 months.** All four lenses silent.
+**G1. No measured delivery-receipt latency or inversion rate.** Twilio enumerates the states but publishes no latency budget; no CPaaS source promises ordered or exactly-once inbound delivery (GLM gap-1, Opus §5, Codex gap). Every design either over-provisions or under-provisions the status layer without this number.
 
----
+**G2. Inbound segment reassembly is undocumented.** Outbound concatenation is specified precisely (160/153, 70/67, 1,600-character ceiling). How inbound multi-segment messages arrive at webhooks (how many posts, in what order, what a partial failure looks like) appears in no CPaaS doc found (GLM gap-2), and there is no paper (Kimi gap-3).
 
-## 5. Claims an engineer should not make
+**G3. No cross-transport session abstraction has been studied.** LiveKit names text as a capability, Pipecat documents transports one carrier at a time, Vapi ships SMS as a product feature, and none documents one session abstraction spanning chat SDK, telephony and MQ client (GLM gap-3). The academic version: the question has been asked in the transactional-dataflow world (Apiary, Stateful Entities, Styx) and **not** in the agent world (Kimi gap-6). The code lens found only per-library evidence, never a shared contract (Codex, all entries).
 
-Numbered, with the reason the support is weak. These are the sentences that would survive a friendly conversation and die in a CTO's follow-up question.
+**G4. No vendor publishes a fault-injection or conformance kit, and testing guidance is missing everywhere.** No durable-execution vendor publishes a reproducible suite (kill worker mid-activity, duplicate webhook delivery, partition during journal write); no CPaaS vendor publishes a webhook conformance kit (GLM gap-4). The evidence that this matters is ArrivalBench: single-execution grading certifies 86 to 100 percent of agent-generated pipelines that are **7.0 to 79.2 percent silently wrong** under late, duplicated, out-of-order and retried delivery (Kimi-A1). That is a replication failure of an entire evaluation methodology, not a bug.
 
-1. **Any LiveKit ARR or revenue figure**, including "around $10M" or "$3.7M for 2025". *Why weak:* not disclosed in the Series C post, the Fortune press release, the homepage, or the pricing page. The only numbers are a secondary-market listing and aggregator estimates with no primary backing.
-2. **"The voice AI market is worth $X"** or **"growing 39 percent a year".** *Why weak:* three research houses give $2.5B, $2.75B and $3.40B for 2025 and CAGRs of 39.0, 35.13 and 24.0, none discloses a method, and the spread on the base year (36 percent) is larger than any year-over-year growth worth quoting.
-3. **"LiveKit's market is the voice AI agent market."** *Why weak:* the published category is applications plus platforms. No analyst taxonomy isolates the infrastructure layer. Grand View explicitly has no separately quantified infrastructure or platform segment, so the number is measuring someone else's business.
-4. **"LiveKit has X percent market share."** *Why weak:* no report in the corpus names LiveKit in a share table at all. There is no denominator in public form.
-5. **"Open source converts about 5 percent to paid."** *Why weak:* an a16z rule of thumb from 2019 with no source, never independently validated, and routinely confused with Sentry's 90 percent self-host *occupancy* figure, which is a different metric measured 19 months ago on an undefined denominator.
-6. **"300,000 developers, so roughly 15,000 paying customers."** *Why weak:* a chain of three unverified links. 300,000 is a developer figure from the homepage; the January 2026 press release says "more than 200,000 developers and customers", a different metric; no conversion rate is published. This is the exact arithmetic an interviewer enjoys taking apart.
-7. **"500+ paying customers" as a current fact.** *Why weak:* single lens (lens-opus citing TechCrunch, April 2025), 19 months stale, and explicitly contradicted on availability by the two lenses that looked for a customer count and found none.
-8. **"Model vendors will absorb the framework layer", stated as settled.** *Why weak:* it is the single most likely way to sound naive. The best available brief frames it as an open question, the benchmark evidence points the other way (79 to 90 percent of failures are agent behaviour; 13.5 percent interruption avoidance for a vendor-native model), and the counter-evidence is structural (sovereignty, multi-party, telephony, physical AI). Present it as a debate with named evidence on both sides.
-9. **"OpenAI uses LiveKit, so LiveKit is the standard"** or **"OpenAI endorses the Agents framework".** *Why weak:* OpenAI uses LiveKit Cloud as transport for ChatGPT Advanced Voice. That is a statement about infrastructure and about substitutability, not about the framework and not about model neutrality.
-10. **"SFU transport is LiveKit's moat."** *Why weak:* transport is $0.0005/min, about 1 percent of LiveKit's own worked example. SFU work scales as N squared streams, mediasoup saturates a 40-core Xeon near 80 participants, and the media data plane is moving into programmable hardware. The moat claim belongs one layer up, in orchestration, observability and compliance.
-11. **"LiveKit is Apache-2.0" as a blanket statement.** *Why weak:* Apache-2.0 is confirmed for `livekit/livekit` and `livekit/agents`, but the agents README states the turn-detection models carry a separate "LiveKit Model License", the Cloud control plane is proprietary, and the Cloud terms of service were not read by any lens.
-12. **Vendor traction claims repeated as fact:** Vapi's "1 billion calls" and "a million developers", Retell's "$100M run rate", Deepgram's "first complete, production-ready, open stack". *Why weak:* all company self-claims. Retell's figure is days old, uncorroborated, and conflicts with the other lens's ~$60M ARR. Attribute or omit.
-13. **Any per-minute price without an as-of date**, including LiveKit's own $0.0479/min. *Why weak:* the pricing page carries no effective date; the only internal dates are model identifiers (Cartesia Sonic 3.6, 2026-08-27), which bound its currency from below. Say "as of mid-November 2026, check the page."
-14. **"OpenAI's Realtime API has no SIP support"** or **"has SIP support".** *Why weak:* the lenses directly contradict each other (D1) and the disagreement is scoped to which page each read. Do not assert either direction until you have opened the current main Realtime guide.
-15. **"The Series A was led by Altimeter."** *Why weak:* one lens says so via Wikipedia; the lens that tried hardest to ground it says the lead is not established in anything fetched, and Altimeter is confirmed for the Series B, which is the likely source of the conflation.
-16. **"LiveKit was founded by three people", or naming Weiwei Li as a founder.** *Why weak:* TechCrunch, the Fortune press release, Bloomberg and LinkedIn all name exactly two founders. It is an error that was already killed once in this research and could easily come back.
-17. **"Total raised was exactly $182M"** (or $183M, or $181M). *Why weak:* it is an arithmetic sum over sources that disagree about the seed structure. Say "about $180M across five rounds".
+**G5. Typing indicators and read receipts, text's analog of barge-in, appear in no agent framework doc and no paper.** GLM looked and found the likely primary outside its sweep (GLM gap-5); Kimi found nothing treating "the status callback arrived 40 minutes late and out of order" as a research problem (Kimi gap-2); Opus argues the mapping is wrong anyway, because cancelling an in-flight turn cancels a reply the user never saw (Opus §4). The design primitive (turn boundary plus supersede rule) is asserted, not measured.
+
+**G6. Hour-spanning human-in-the-loop waits are unmeasured.** The workflow literature has durable timers and signals; the agent literature has interrupts and HITL. Nothing measures the combination, and nothing measures what a session looks like after four hours of dormancy (Kimi gap-4). Restate's suspend-on-FaaS claim is the only first-party statement and it is vendor-authored (GLM-14).
+
+**G7. Concurrency anomalies in agent runtimes have one formal source and one measurement.** Four anomalies formalized in TLA+ (stale-generation, phantom-tool, causal-cascade, tool-effect reordering) with a reproduction of a lost update in ByteDance's deer-flow and a reordering issue in LangGraph's `ToolNode` (Kimi-A3), plus consume-once saturation of 1.0 in 36 of 40 cells (Kimi-9). One source is not a literature (Kimi gap-5), and the code lens found the structural exposure (per-stream tasks with no sequencer, order-based interrupt matching) without running a race (Codex-1, Codex-6).
+
+**G8. The replay-versus-checkpoint-and-rerun bake-off does not exist.** Opus §5 specifies it and predicts the outcome; nobody has run it. Until someone does, "durable execution fits agents" and "durable execution is the wrong primitive" are both positions without a decisive measurement.
+
+**G9. Twilio's create-time idempotency is unresolved.** The IETF draft defines the header and its 409/422/400 semantics (Kimi-11); no such parameter appears in `MessageList.create` (`message/__init__.py:810-905`), which the codex lens correctly labels "weak evidence of absence, not proof" (Codex-3). If Twilio does not accept one, outbound dedup is local-only, which is precisely Andreakis's dual-write hole (Kimi-8). This is a one-question resolution: ask Twilio, or send the same create twice and count.
+
+**Also unmeasured, lower priority:** the fraction of agent steps producing payloads above 2MB (Opus §5); Ably's subscriber-side delivery guarantee (Codex-13); Stream's offline delivery and unread semantics (Codex-14); LiveKit text ordering across concurrent `lk.chat` streams (Codex-1); and the two classic papers the academic lens could not obtain in primary form (Henderson and Terlevich 1994; a Restate arXiv paper, which Kimi's arXiv API search confirms does not exist).
 
 ---
 
-## 6. Recommendations
+## 5. Recommendations
 
-Each one names the lens that supports it and the condition under which it would be wrong.
+Each is phrased as an action, with its support and the condition under which it would be wrong.
 
-1. **Lead with the funding ladder as a ladder, never a single number.** $7M seed (Redpoint, Dec 2021), $22M Series A (Jun 2024), $45M Series B (Altimeter, Apr 2025, $345M post), $100M Series C (Index Ventures, 2026-01-22, $1B). *Supported by:* lens-glm [source-1] [source-5] [source-6], lens-opus §1. *Wrong if:* a new round, secondary sale or tender offer lands before the interview. Re-check the week of.
-2. **Say "not public" for revenue and never repeat a marketplace number.** *Supported by:* lens-glm §D1, lens-kimi §3.3, lens-opus §5 (three lenses independently found no disclosure). *Wrong if:* LiveKit or a filing discloses ARR, in which case the disclosure supersedes everything here.
-3. **Describe the business as an open data plane plus a paid operational envelope**, and name the envelope: telephony, inference routing, observability, compliance, concurrency, region pinning. *Supported by:* all four lenses, and by the `agent_session.py:584` default. *Wrong if:* the Cloud control plane is open-sourced, or the current pitch has re-centred on Agents-as-the-product. Check the most recent keynote before saying it.
-4. **Quote the $0.0479/min worked example instead of any competitor's headline rate**, and never put a platform fee next to an all-in rate. Vapi's $0.05 excludes models; Bland's $0.14 excludes telephony; they are not comparable. *Supported by:* lens-codex §3 and "Do not assert", lens-kimi §3.2. *Wrong if:* the pricing page changes, which it does without notice.
-5. **Present the absorption thesis as a live debate with named evidence on both sides.** *Supported by:* lens-kimi §3.4, lens-opus §3, lens-glm §C7, lens-codex §9 (four lenses, no settled interpretation). *Wrong if:* the CTO concedes the layer and describes a pivot. Then the useful conversation is about the pivot and you should drop the debate frame immediately.
-6. **Ask for the speech-to-speech versus cascaded minute mix, and the OSS-to-Cloud conversion cohort with NRR.** *Supported by:* lens-opus §5 (the measurement argument), lens-kimi §3.6 (the funnel opening), lens-glm §D (the absence). *Wrong if:* they say the metric is not tracked. That is itself an answer about how the business is run, and the correct response is curiosity, not a follow-up lecture.
-7. **Say "validation and concentration risk" about OpenAI in the same breath, with no percentage.** *Supported by:* lens-glm §D2, lens-kimi §4.7, lens-opus §3. *Wrong if:* they volunteer a diversified revenue mix. Then lead with diversification and let the concentration point go.
-8. **Give market size as a range with the disagreement named, or skip it.** "Three research houses put the 2025 AI voice agent market between $2.5B and $3.4B and disagree by 36 percent; none of them isolates the infrastructure layer" is a stronger sentence than any single figure. *Supported by:* lens-kimi §3.1 (single lens, but methodologically the most careful passage in the corpus). *Wrong if:* a bottom-up, methodologically disclosed sizing appears, which is the only kind that would beat this framing.
-9. **Place competitors by layer, not by name.** Pipecat is a framework that supports LiveKit as a transport; Vapi and Retell are managed agent platforms; Deepgram and ElevenLabs are model suppliers who also sell agents; Twilio and Agora own telephony and transport distribution. *Supported by:* lens-codex §5 and §13 to §15, lens-kimi §2.5. *Wrong if:* a vendor's current product page shows materially different bundling, which for this market means re-check within weeks.
-10. **Treat GitHub stars, "1M downloads/month" and "3B calls/year" as activity and marketing signals, not adoption.** Point at release cadence instead (LiveKit server and agents ship roughly weekly; Pipecat ships weekly) if you want a real health signal. *Supported by:* lens-codex "Stack-rank" caveat, lens-glm §C5, lens-kimi §7.10. *Wrong under:* essentially no condition; this one is a discipline, not a forecast.
-11. **If you must cite one competitive fact that lands, use the Pipecat-supports-LiveKit-transport one.** It reframes the competition from "framework war" to "layer ownership", and it is checkable in a public repo. *Supported by:* lens-codex §5 (single lens, code-anchored). *Wrong if:* Pipecat drops the LiveKit transport, which is a one-line check on the day.
+**R1. Model the text session as message-oriented, not stream-oriented. Buffer to a turn boundary before any send.**
+Support: GLM-3, GLM-4, Opus rec-1, Codex-3 (`num_segments` as a billing field). Wrong if the transport is a true streaming chat channel where partial output is meaningful to the reader, as in LiveKit text streams where `interim_stream` and `final_stream` share a `segment_id` and partial output is the product (Opus §4, Opus-19).
+
+**R2. Dedupe inbound on the gateway message id, and persist that id in the same transaction as the session event it produces.**
+Support: GLM-5, Opus-12, Opus rec-2, Codex-3, Kimi-8, Kimi-A12. Wrong only if the channel provides exactly-once inbound delivery, which no CPaaS vendor in the sweep does.
+
+**R3. Put exactly-once at the effect boundary: an idempotency key on every tool call and every outbound send, committed with the checkpoint. Expose 409 on concurrent retry, 422 on payload-changing reuse, 400 on missing required key.**
+Support: Kimi-11 (normative), Opus rec-3, Codex-8 (`idempotency_key` on the call surface), GLM-14. Wrong if the downstream API exposes a stable transactional id that genuinely deduplicates across sessions; then you can delegate rather than duplicate the mechanism.
+
+**R4. Put the durable boundary around orchestration and record the model result as the step output. Never replay the model call.**
+Support: GLM-11, GLM-13, Kimi Finding B, Opus rec-4, Codex conv-3. Wrong if the agent is a single model call with no orchestration, where there is nothing durable to protect.
+
+**R5. Treat "exactly-once" in any API review as four questions: which of delivery, consistency and determinism; over what boundary; with what retention; and what happens on a concurrent retry.**
+Support: Kimi-7 (the three properties), Kimi-8 (retention as a chosen half-life), Codex-8 (`journal_retention`, `idempotency_retention`), GLM dissent-1. Wrong never, but it is unhelpful if used as a rhetorical weapon rather than a clarifying question. Ask it of your own design first.
+
+**R6. Do not ship an audio-first session with audio disabled as your text product. Build a session whose primary object is the message, and consult a capability object for everything transport-specific.**
+Support: GLM-21, Codex-1 (`_text_only` only in simulation), Codex-2 (`TextFrame` dropped as `None`), Codex-4 (VAD in the session contract), Kimi Finding C, Opus rec-7. Wrong if you will support exactly one channel forever and never add a second, in which case the capability object is pure indirection.
+
+**R7. The capability object should carry, at minimum: maximum segment length, encoding, read-receipt support, typing support, free-form window, delivery-order guarantee, and throughput class.**
+Support: GLM-3 (length/encoding), Opus-16 (read receipts), GLM-6/GLM-7 (24-hour window), GLM-8/GLM-9 (throughput), Opus rec-7, Codex-3 (the leak that happens without it). Wrong if the values are static per deployment and never vary at runtime; then constants are simpler and the object is ceremony.
+
+**R8. Choose replay-based durability for sub-second resume, high fan-out or strict audit; choose checkpoint-and-rerun for expensive, low-concurrency, frequently changing agent graphs. Set the dedup retention deliberately, as a product decision, not a default.**
+Support: Opus rec-5, Opus-13, Opus-15, Kimi-15, Codex-8 (`explicit_recovery`), Kimi-8 (bounded dedup state limits the guarantee's lifetime). Wrong for payment or ledger workloads, where millisecond steps and strict ordering invert the economics.
+
+**R9. Externalize large step payloads and journal a reference, not the blob.**
+Support: Opus-15 (2MB per payload, 50MB history), Opus rec-6, Kimi-15 (model requests as the cut that cannot be replayed). Wrong if steps are bounded and small, where the extra indirection buys nothing.
+
+**R10. Test the failure matrix deterministically, not with integration luck: duplicate inbound, out-of-order and inverted status, crash between effect and checkpoint, two workers resuming one parked interrupt, the 24-hour window boundary, and inbound segment reassembly.**
+Support: Opus rec-8, Opus-12, Kimi-9 (consume-once fails under concurrent delivery at saturation 1.0 in 36 of 40 cells), Kimi-A1 (single-execution grading misses 7 to 79 percent silent wrongness), GLM gap-4. Wrong if you own both ends of a single in-order WebSocket, in which case most of the matrix is inapplicable.
+
+**R11. Before publishing a durability claim, state its boundary and its retention in the same sentence, and put the retention value in the config the user can see.**
+Support: Kimi-8, Codex-8, GLM-14, Opus rec-3. Wrong if the guarantee is genuinely unbounded, which no source in this synthesis demonstrates.
+
+---
+
+## 6. Mapping to the whiteboard and the API-critique round
+
+The kickoff's success criterion is that a staff engineer could defend these decisions on a whiteboard and in an API review with the API's author. This section is the bridge.
+
+### 6.1 The whiteboard scenario
+
+Design a channel-agnostic agent session that serves SMS, WhatsApp and a websocket chat client. Draw it in five boxes and defend each.
+
+1. **Ingress dedupe, before anything else.** Key on the gateway's message id (`MessageSid` on Twilio, `webhook-id` on the Standard Webhooks pattern). Write the dedupe record and the session event in one transaction. Defend with C3 and R2. The reviewer's likely objection is "that is a distributed transaction"; the answer is that it is not, because both records are yours, and the only cross-system record is the carrier's acceptance, which is why the dedupe key is the carrier's id rather than yours (Kimi-8).
+2. **Session envelope versus per-transport capability object.** The envelope holds session id, conversation key, turn boundaries, durable state reference. The capability object holds segment length, encoding, read-receipt and typing support, free-form window, ordering guarantee, throughput class. Defend with C8, C10, R6, R7. The reviewer's objection is "why not just branch on channel type"; the answer is that the branch is the same information stored in the wrong place, and Codex-3 shows what happens when channel-specific fields share one flat namespace.
+3. **Turn assembler.** Inbound segments reassemble to a turn; outbound turns buffer before send. Defend with C7, R1. Acknowledge the gap: inbound reassembly has no spec (G2), so the design is defensive, not derived.
+4. **Durable orchestration boundary.** The model call is an activity or a journalled step; its result is recorded; the control flow that consumes it is deterministic. Defend with C4, R4. Name the retained decision: replay versus checkpoint-and-rerun (D1, R8), and say which workload shape you are optimizing for rather than claiming one is universally right.
+5. **Effect boundary with idempotency keys.** Every tool call and every outbound send carries a key; concurrent retries get 409. Defend with C5, R3.
+
+Then draw the failure matrix as a second diagram: six injected faults, each pointing at the box that absorbs it. If a fault has no owner, that is the honest finding, and it goes in the design doc rather than being hidden.
+
+### 6.2 The API-critique round
+
+The goal is not to win. It is to demonstrate that you read the code, understand the design's trade-offs, and can name the leak without insulting the person who chose it. Use questions, and let the author confirm.
+
+**Ask these, in this order.**
+
+1. "`_text_only` returns true only under a simulation mode, and that branch is what nulls VAD, STT and TTS. What is the supported production path for a text-only session: disable audio I/O and supply a `TextOutput`, or is there a runtime path I missed?" (Codex-1, D3). This is the single highest-value question in the round, and it is answerable.
+2. "`TextOutput`'s contract is a segment plus a boundary, with no message id and no delivery receipt. Is that because the audio modality has no such concept, or because text delivery is considered out of scope for the session?" (Codex-1, `io.py:515`). The answer tells you whether text is a modality or a transcript.
+3. "`room_io.py:545` spawns a task per inbound stream with no sequencer. Are two near-simultaneous `lk.chat` sends ordered anywhere above that, or is ordering left to the application?" (Codex-1, C11). Volunteer that you did not run the race.
+4. "If I resume a parked interrupt on two workers, how many times does the gated effect fire?" (Kimi-9, C11). Ask it of any framework, not just LiveKit. The measured answer in the literature is k times.
+5. "When the docs say text-only sessions are supported and the audio row owns turn detection, is the text session's turn boundary supplied by the application or inferred by the runtime?" (GLM-21, C2).
+
+**Assert these, with the citation in your pocket.**
+
+- "Exactly-once here is invocation-scoped, not effect-scoped." Then state the boundary you think it covers and ask for correction. Do not assert it as a gotcha (D2, C1, R5).
+- "A 1,600-character logical message is ten billed segments and one status callback, so `delivered` is ambiguous at the segment level." (GLM-3, GLM-4, C7).
+- "WhatsApp's 24-hour window means a durable wait can outlive the channel's permission to send." (GLM-6, C9). This one is usually new to the room and lands well because it is a runtime-plus-policy interaction, not a runtime bug.
+
+**Do not assert these.**
+
+- That Temporal, Restate or DBOS "guarantee exactly-once" without the scope (C1, R5).
+- That OpenAI Codex and Replit Agent 3 run on Temporal. That is Temporal's own marketing, unverified in this run (Kimi caveat-5).
+- That replay is unsafe for LLM calls. The defensible claim is narrower: replay is safe when the model call is an effect and its result is recorded; it diverges when a model output drives an unrecorded branch (Kimi Finding B, D1).
+- Any rate, latency or inversion figure for delivery receipts. None exists in any lens (G1).
+
+**Close with the constructive version.** "The design I would defend is: message-oriented text session, capability object for transport differences, dedupe on the carrier's id before the model, idempotency keys at the effect boundary, durable orchestration with the model result recorded rather than replayed, and a deterministic fault matrix in CI. The parts I cannot cite are the receipt latency distribution and inbound segment reassembly, and I would instrument both rather than assume them."
+
+That closing is the whole synthesis in one paragraph, and every clause has a lens behind it.
 
 ---
 
 ## 7. Source manifest
 
-Deduplicated across the four lenses. Everything below was fetched or read by the lens that cites it on 2026-11-14 unless marked otherwise. `[lookup: ...]` entries are lens-declared gaps where no canonical URL was confirmed.
+Every URL, arXiv id and repository cited across the four lenses and this synthesis, grouped by source lens. Canonical publisher URLs as the lens recorded them.
 
-### LiveKit primary documents
-- LiveKit, "LiveKit's Series C: towards the voice-driven era of computing", 2026-01-22. https://livekit.com/blog/livekit-series-c
-- LiveKit Series C press release via Fortune Press Releases, 2026-01-22. https://fortune.com/press-releases/livekit-raises-100m-1b-valuation-voice-first-computing-2026-01-22/
-- LiveKit homepage, fetched 2026-11-14. https://livekit.com/
-- LiveKit pricing page, fetched 2026-11-14. https://livekit.com/pricing (livekit.io/pricing 308-redirects here)
-- LiveKit customers page, fetched 2026-11-14. https://livekit.com/customers
-- LiveKit, "OpenAI and LiveKit partner to turn Advanced Voice into an API", 2024-10-03. https://livekit.com/blog/openai-livekit-partnership-advanced-voice-realtime-api
-- LiveKit (Brian Blumenfeld), "Introducing the LiveKit Startup Program", 2026-09-16. https://livekit.com/blog/introducing-livekit-startups
-- LiveKit docs: agents, cloud, quotas and limits. https://docs.livekit.io/agents/ · https://docs.livekit.io/home/cloud/ · https://docs.livekit.io/deploy/admin/quotas-and-limits
+### 7.1 From `lens-glm.md` (25 sources)
 
-### Founding and funding coverage
-- TechCrunch (Christine Hall), "LiveKit co-founder believes the metaverse needs open infrastructure", 2021-12-13. https://techcrunch.com/2021/12/13/livekit-metaverse-open-infrastructure
-- Bloomberg, "LiveKit, Seller of Voice Tools to OpenAI, Raises $100 Million", 2026-01-22 (headline-level; body paywalled). https://www.bloomberg.com/news/articles/2026-01-22/livekit-seller-of-voice-tools-to-openai-raises-100-million
-- Russ d'Sa, Series B and Agents 1.0 announcement, 2025-04-10/11. https://x.com/dsa/status/1910381256543789288
-- TechCrunch, "LiveKit's tools help power real-time communications", 2025-04-10. https://techcrunch.com/2025/04/10/livekits-tools-help-power-real-time-communications/
-- FinSMEs, "LiveKit Raises $45M in Series B at $345M Valuation", 2025-04. https://www.finsmes.com/2025/04/livekit-raises-45m-in-series-b-at-a-345m-valuation.html
-- FinSMEs, "LiveKit Raises $100M in Series C Funding at a $1 Billion Valuation", 2026-01-23. https://www.finsmes.com/2026/01/livekit-raises-100m-in-series-c-funding-at-a-1-billion-valuation.html
-- Tech in Asia, "Voice AI platform LiveKit nets $100m series C at $1b valuation" (not fetched). https://www.techinasia.com/news/voice-ai-platform-livekit-nets-100m-series-c-at-1b-valuation
-- David Zhao, co-founder and CTO. https://www.linkedin.com/in/davidzhao
-- SFELC podcast with Russ d'Sa. https://sfelc.com/podcasts/the-product-paradigm-shift-how-livekit-navigated-high-stakes-scaling-challenges-to-build-the-future-of-voice-first-ai-interfaces-russ-dsa-livekit
-- Index Ventures, "See, Hear, Speak: Investing in LiveKit". https://www.indexventures.com/perspectives/see-hear-speak-investing-in-livekit-and-the-future-of-realtime-applications/
-- `[lookup: LiveKit funding history every round investor valuation 2026]` (Zhao round-table mirror; funding databases)
-- `[lookup: Hiive LiveKit stock share price]` (secondary-market listing; low confidence, cited only to explain why a revenue figure exists in circulation)
+- Twilio, Track the Message Status of Outbound Messages: https://www.twilio.com/docs/messaging/guides/track-outbound-message-status
+- Twilio, Outbound Message Status in Status Callbacks: https://www.twilio.com/docs/messaging/guides/outbound-message-status-in-status-callbacks
+- Twilio, What SMS Character Limit: https://www.twilio.com/docs/glossary/what-sms-character-limit
+- Twilio Help, Concatenated SMS over 160 characters: https://help.twilio.com/articles/223181508-Does-Twilio-support-concatenated-SMS-messages-or-messages-over-160-characters-
+- Twilio, Webhook connection overrides: https://www.twilio.com/docs/usage/webhooks/webhooks-connection-overrides
+- Twilio, WhatsApp Key Concepts: https://www.twilio.com/docs/whatsapp/key-concepts
+- Meta for Developers, WhatsApp send messages (service messages): https://developers.facebook.com/documentation/business-messaging/whatsapp/messages/send-messages
+- Twilio, Account Based Throughput Overview: https://www.twilio.com/docs/messaging/guides/account-based-throughput-overview
+- Twilio Help, Message throughput (MPS) and Trust Scores for A2P 10DLC: https://help.twilio.com/articles/1260803225669-Message-throughput-MPS-and-Trust-Scores-for-A2P-10DLC-in-the-US
+- Vonage, SMS Delivery Receipts API Guide: https://developer.vonage.com/en/messaging/sms/guides/delivery-receipts
+- Temporal, Workflow: https://docs.temporal.io/workflows
+- Temporal, Error handling, Python SDK best practices: https://docs.temporal.io/develop/python/best-practices/error-handling
+- Temporal, OpenRouter integration, Python SDK: https://docs.temporal.io/develop/python/integrations/openrouter
+- Restate, Key Concepts: https://docs.restate.dev/foundations/key-concepts
+- Restate, What is Durable Execution: https://restate.dev/what-is-durable-execution
+- DBOS, Why You Should Build Durable Workflows With Postgres: https://www.dbos.dev/blog/why-postgres-durable-execution
+- Microsoft Learn, Durable Functions overview: https://learn.microsoft.com/en-us/azure/durable-task/durable-functions/durable-functions-overview
+- Microsoft Q&A, Azure durable function at least once execution: https://learn.microsoft.com/en-us/answers/questions/1351212/azure-durable-function-at-least-once-execution-and
+- Trigger.dev, Trigger.dev vs Inngest: https://trigger.dev/vs/inngest
+- SwytchCode, Best Durable Execution Platforms for AI Agents: https://www.swytchcode.com/content/best-durable-execution-platforms
+- LiveKit, Multimodality overview: https://docs.livekit.io/agents/multimodality
+- Pipecat, Twilio WebSocket Integration: https://docs.pipecat.ai/pipecat/telephony/twilio-websockets
+- LangChain, Interrupts (LangGraph): https://docs.langchain.com/oss/python/langgraph/interrupts
+- LangChain, Human-in-the-loop (middleware): https://docs.langchain.com/oss/python/langchain/human-in-the-loop
+- Vapi, SMS chat: https://docs.vapi.ai/chat/sms-chat
 
-### Market sizing and structure
-- Grand View Research, "AI Voice Agents Market Size, Share & Trends Analysis, 2026-2033", June 2026. https://www.grandviewresearch.com/industry-analysis/ai-voice-agents-market-report
-- Meticulous Research, "Voice AI Agents Market (2026-2036)", October 2026. https://www.meticulousresearch.com/product/voice-ai-agents-market-6938
-- SNS Insider, "AI Voice Agents Market Size, Share & Trends Analysis", updated 2026-09-29. https://www.snsinsider.com/reports/ai-voice-agent-market-11242
-- Menlo Ventures, "2025: The State of Generative AI in the Enterprise", 2025-12-09. https://menlovc.com/perspective/2025-the-state-of-generative-ai-in-the-enterprise/
-- AGI House (Jessica Chen), "Voice Agents Research Brief: The Technical Stack Behind Realtime Conversation", 2026-07-30. https://blog.agihouse.org/posts/voice-agents-research-brief
-- AssemblyAI (Kelsey Foster), "The voice AI stack for building agents in 2026", 2026-10-28. https://www.assemblyai.com/blog/the-voice-ai-stack-for-building-agents
+### 7.2 From `lens-kimi.md` (15 core, plus adjacent used here)
 
-### Peer-reviewed and preprint
-- Michel, Sengupta, Kim, Netravali, Rexford, "Scalable Video Conferencing Using SDN Principles", arXiv:2503.11649, 2025-03-14. https://arxiv.org/abs/2503.11649 · https://arxiv.org/html/2503.11649v1
-- Ray, Dhandhania, Barres, Narasimhan, "τ-Voice: Benchmarking Full-Duplex Voice Agents on Real-World Domains", arXiv:2603.13686, 2026-03-14. https://arxiv.org/abs/2603.13686
-- Lin, Chen, Chen, Lee, "Full-Duplex-Bench-v3", arXiv:2604.04847, 2026-04-06 (arXiv comment: "Work in progress"). https://arxiv.org/abs/2604.04847
-- Duparc, Möller, Jussen, Stachon, Algac, Otto, "Archetypes of open-source business models", *Electronic Markets*, 2022, DOI 10.1007/s12525-022-00557-9. https://link.springer.com/article/10.1007/s12525-022-00557-9
-- Kshetri, "Economics of Open Source Software and AI Models", *Computer* 58(1):134-141, 2025-01, DOI 10.1109/MC.2024.3488974 (**not readable in this run; cited as a pointer only**). https://www.computer.org/csdl/magazine/co/2025/01/10834152/23lk3Uc21eE · https://dl.acm.org/doi/abs/10.1109/MC.2024.3488974
-- Ashby Institute (Sidney Scott), "Via Negativa: The AI Economy by Elimination", v4.1, 2026-10-02, working paper TAI-WP-2026-02 (**no arXiv ID assigned**; author discloses financial conflicts). https://theashbyinstitute.org/publications/via-negativa · https://theashbyinstitute.org/manus-storage/ViaNegativaarXivv3_58458eb4.pdf
-- Notably absent: any peer-reviewed work on realtime AI infrastructure as a market. lens-kimi found none.
+Core:
+- Garcia-Molina and Salem (1987), Sagas, DOI https://doi.org/10.1145/38713.38742 · https://www.cs.princeton.edu/techreports/1987/070.pdf
+- Fischer, Lynch and Paterson (1985), FLP, DOI https://doi.org/10.1145/3149.214121
+- Li et al. (2022), DBOS progress report, CIDR: https://www.cidrdb.org/cidr2022/papers/p26-li.pdf
+- Restate, Building a Modern Durable Execution Engine: https://restate.dev/blog/building-a-modern-durable-execution-engine-from-first-principles · https://restate.dev/what-is-durable-execution · https://docs.restate.dev/foundations/key-concepts
+- Temporal (2025), Of course you can build dynamic AI agents with Temporal: https://temporal.io/blog/of-course-you-can-build-dynamic-ai-agents-with-temporal
+- Carbone et al. (2015), Lightweight Asynchronous Snapshots: https://arxiv.org/abs/1506.08603
+- Trofimov et al. (2019), Delivery, consistency, and determinism: https://arxiv.org/abs/1907.06250
+- Andreakis (2026), Machine-Checked Dual-Write Recovery from a Commit Log: https://arxiv.org/abs/2608.00501 · https://doi.org/10.5281/zenodo.22700396
+- Khan (2026), Resume Means Resume: https://arxiv.org/abs/2608.03836
+- Huang and Garcia-Molina (2001), Exactly-once semantics in a replicated messaging system: https://doi.org/10.1109/icde.2001.914808 · abstract via https://api.openalex.org/works/doi:10.1109/icde.2001.914808
+- Jena, Dalal and Tishkin (2026), The Idempotency-Key HTTP Header Field: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/
+- Cho et al. (2022), CheckDST: https://arxiv.org/abs/2112.08321
+- Stivers et al. (2009), Turn-taking: https://doi.org/10.1073/pnas.0903616106
+- Overeem et al. (2021), Event sourced systems and schema evolution: https://arxiv.org/abs/2104.01146 · https://doi.org/10.1016/j.jss.2021.110970
+- Nakajima (2026), Replay Is a Family of Assertions: https://arxiv.org/abs/2611.06924 · https://github.com/yoheinakajima/agent-runtime-laws
 
-### Open-core and business-model economics
-- a16z (Peter Levine, Jennifer Li), "Open Source: From Community to Commercialization", 2019-10-04. https://a16z.com/open-source-from-community-to-commercialization/
-- Contrary Research (Vardan Sawhney), "Sentry: Business Breakdown & Founding Story", updated 2026-10-22. https://research.contrary.com/company/sentry
-- Logz.io (Charlie Klein), "The Open Source Observability Adoption and Migration Curve", 2022-10-19. https://logz.io/blog/open-source-observability-adoption-migration-curve/
+Adjacent, cited above:
+- ArrivalBench: https://arxiv.org/abs/2610.02363
+- Deterministic Replay for AI Agent Systems: https://arxiv.org/abs/2607.16200
+- Concurrency Anomalies in Multi-Agent LLM Systems: https://arxiv.org/abs/2606.17182
+- Agent Mesh, Reliability Primitives for Non-Idempotent Agent Delegation: https://arxiv.org/abs/2608.26225
+- Alvaro, Rosen and Hellerstein (2015), Lineage-driven Fault Injection: https://doi.org/10.1145/2723372.2723711
+- CheckMate: https://arxiv.org/abs/2403.13629
+- LogPlayer: https://arxiv.org/abs/1911.11286
+- Nakajima (2026), The Log is the Agent: https://arxiv.org/abs/2605.21997
+- ESAA: https://arxiv.org/abs/2602.23193
+- Stateless Decision Memory for Enterprise AI Agents: https://arxiv.org/abs/2604.20158
+- Fowler, Event Sourcing: https://martinfowler.com/eaaDev/EventSourcing.html · CQRS: https://martinfowler.com/bliki/CQRS.html
+- Standard Webhooks specification: https://raw.githubusercontent.com/standard-webhooks/standard-webhooks/main/spec/standard-webhooks.md
+- Kafka design documentation: https://kafka.apache.org/documentation/#design · KIP-98: https://cwiki.apache.org/confluence/display/KIP/KIP-98%3A+Exactly+once+delivery+and+transactional+messaging
+- Gupta (2026), Two-Path Status Verification: https://arxiv.org/abs/2607.15529
+- CloudEvents: https://cloudevents.io/
+- Arora et al. (2025), Talking Turns: https://arxiv.org/abs/2503.01174
+- Feng et al. (2023), LLM-driven DST: https://arxiv.org/abs/2310.14970
+- Mitra et al. (2026), Adaptive Turn-Taking: https://arxiv.org/abs/2606.13544
+- MultiWOZ: https://arxiv.org/abs/1810.00278
+- Styx: https://arxiv.org/abs/2312.06893 · https://doi.org/10.1145/3725363
+- Stateful Entities: https://arxiv.org/abs/2112.00710 · https://doi.org/10.48786/edbt.2024.02
+- Apiary: https://arxiv.org/abs/2208.13068
+- DBOS architecture: https://docs.dbos.dev/architecture
 
-### Repositories (metadata via GitHub REST API, 2026-11-14)
-- https://github.com/livekit/livekit (Apache-2.0, Go; 22,204 stars; v1.13.11, 2026-10-25)
-- https://github.com/livekit/agents (Apache-2.0 Python + agents-js; 15,218 stars; livekit-agents@1.8.12, 2026-11-13; turn-detection models under a separate "LiveKit Model License")
-- https://github.com/livekit/egress · https://github.com/livekit/sip · https://github.com/livekit/ingress
-- https://github.com/pipecat-ai/pipecat (BSD-2-Clause, Python; 17,253 stars; created 2023-12-27)
-- https://github.com/versatica/mediasoup (ISC; 7,419 stars) · https://github.com/jitsi/jitsi-videobridge (Apache-2.0; 3,109 stars) · https://github.com/meetecho/janus-gateway (GPL-3.0; 9,203 stars)
-- https://github.com/huggingface/speech-to-speech (Apache-2.0; 13,693 stars)
-- https://github.com/fixie-ai/ultravox (4,589 stars; last push 2025-12-12) · https://github.com/kyutai-labs/moshi (last push 2026-09-09)
-- Org listings: https://api.github.com/orgs/livekit/repos · https://api.github.com/orgs/VapiAI/repos · https://api.github.com/orgs/RetellAI/repos · https://api.github.com/repos/{owner}/{repo}
+### 7.3 From `lens-codex.md` (14 implementations, pinned)
 
-### Competitor pricing and product pages (all fetched 2026-11-14; none carries a stable effective date)
-- https://www.daily.co/pricing/pipecat-cloud/
-- https://vapi.ai/pricing · Vapi Series B post: https://vapi.ai/blog/series-b · https://finance.yahoo.com/sectors/technology/articles/vapi-raises-50m-series-b-130000518.html
-- https://www.retellai.com/pricing · https://www.retellai.com · https://www.ycombinator.com/companies/retell-ai
-- https://developers.openai.com/api/docs/pricing · https://developers.openai.com/api/docs/guides/realtime · https://developers.openai.com/api/docs/guides/realtime-webrtc
-- https://deepgram.com/pricing · https://deepgram.com/blog/daily-pipecat-deepgram · https://techcrunch.com/2026/10/29/deepgram-acquires-pipecat-maker-daily-to-bolster-its-voice-ai-infrastructure · https://dealroom.co/news/168036-deepgram-buys-pipecat-maker-daily-to-own-more-of-the-voice-ai-stack/ · https://github.com/orgs/deepgram/discussions/1710
-- https://elevenlabs.io/pricing · https://elevenlabs.io/pricing/agents
-- https://www.bland.ai/pricing · https://www.agora.io/en/pricing/ · https://www.twilio.com/en-us/voice/pricing
-- `[lookup: OpenAI Realtime API WebRTC update December 17 2024 announcement]` (original openai.com URL migrated; date multi-confirmed, canonical URL not pinned)
+- livekit/agents: https://github.com/livekit/agents (HEAD `cbb5770c716c`; local snapshot)
+- pipecat-ai/pipecat: https://github.com/pipecat-ai/pipecat (local clone `6eed6ff7793c`, upstream `0602125e1d81`)
+- twilio/twilio-python: https://github.com/twilio/twilio-python (`7e3ca781178d`)
+- openai/openai-python: https://github.com/openai/openai-python (`3dae6090cc31`)
+- openai/openai-agents-python: https://github.com/openai/openai-agents-python (`64fbde5d02b4`)
+- langchain-ai/langgraph: https://github.com/langchain-ai/langgraph (`08a201695378`)
+- temporalio/sdk-python: https://github.com/temporalio/sdk-python (`968c3c9dcf50`)
+- restatedev/sdk-python: https://github.com/restatedev/sdk-python (`ee674cc00a53`)
+- dbos-inc/dbos-transact-py: https://github.com/dbos-inc/dbos-transact-py (`81aa7eea4e5b`)
+- nats-io/nats.py: https://github.com/nats-io/nats.py (`f42260fad14c`)
+- aio-libs/aiokafka: https://github.com/aio-libs/aiokafka (`8f7357470cbb`)
+- pika/pika: https://github.com/pika/pika (`06b5a03926ac`)
+- ably/ably-pubsub-python: https://github.com/ably/ably-pubsub-python (`d4e3e5dd6190`)
+- GetStream/stream-py: https://github.com/GetStream/stream-py (`7140b6911e2b`)
 
-### History and WebRTC background
-- Alvestrand, "Google release of WebRTC source code", W3C public-webrtc list, 2011-06-01. https://lists.w3.org/Archives/Public/public-webrtc/2011May/0022.html
-- Wikipedia, "WebRTC", accessed 2026-11-14. https://en.wikipedia.org/wiki/WebRTC
-- Wikipedia, "LiveKit", accessed 2026-11-14. https://en.wikipedia.org/wiki/LiveKit (tertiary; the source of the French Visio claim and one of the disputed Series A details)
-- InfoQ, "OpenAI Launches Public Beta of Realtime API", 2024-10. https://www.infoq.com/news/2024/10/realtime-api-openai/
-- 36Kr, "OpenAI enters voice model battle with GPT-Realtime", 2025-08. https://eu.36kr.com/en/p/3443307829794176
-- iThome, "OpenAI gpt-realtime and Realtime API SIP support", 2025-08. https://www.ithome.com.tw/news/170913
-- Fora Soft, "WebRTC architecture guide: P2P, SFU, MCU", 2026. https://www.forasoft.com/blog/article/webrtc-architecture-guide-for-business-2026
+### 7.4 From `lens-opus.md` (plus sources cited by this synthesis)
 
-### Method and citation-chain references
-- Nasser, attribution-bias argument for not vote-ruling disputed findings, arXiv:2601.05114 (2026), as specified in the synthesis recipe.
-- METR, "Measuring the Impact of Early-2025 AI on Experienced Open-Source Developer Productivity", arXiv:2507.09089 · METR, "Measuring AI Ability to Complete Long Software Tasks", arXiv:2503.14499v4 · Xie et al., OSWorld, arXiv:2404.07972 · Xu et al., TheAgentCompany, arXiv:2412.14161 · Villalobos et al., "Will We Run Out of Data?", arXiv:2211.04325 · Acemoglu, "The Simple Macroeconomics of AI", NBER WP 32487 (2024) · Shumailov et al., *Nature* 631 (2024) (all cited within the Via Negativa working paper's backtest spine, not read independently here)
+- Twilio, How long can a message be: https://www.twilio.com/docs/glossary/what-sms-character-limit
+- Twilio, Outbound Message Status in Status Callbacks: https://www.twilio.com/docs/messaging/guides/outbound-message-status-in-status-callbacks
+- Twilio, Event delivery retries and duplication: https://www.twilio.com/docs/events/event-delivery-and-duplication
+- Twilio, Webhooks connection overrides: https://www.twilio.com/docs/usage/webhooks/webhooks-connection-overrides
+- Meta, WhatsApp send messages: https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages
+- Meta, WhatsApp messaging limits: https://developers.facebook.com/docs/whatsapp/messaging-limits/
+- Temporal, Workflow Definition: https://docs.temporal.io/workflow-definition
+- Temporal, Activities: https://docs.temporal.io/activities
+- Temporal, Human-in-the-loop AI agent: https://docs.temporal.io/ai/cookbook/human-in-the-loop-python
+- Temporal, Of course you can build dynamic AI agents with Temporal: https://temporal.io/blog/of-course-you-can-build-dynamic-ai-agents-with-temporal
+- Restate, Key Concepts: https://docs.restate.dev/foundations/key-concepts
+- Restate, Architecture: https://docs.restate.dev/references/architecture
+- DBOS: https://www.dbos.dev/
+- AWS, What is Step Functions: https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html
+- Microsoft Learn, Durable orchestrator code constraints: https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-code-constraints
+- Apache Kafka, KIP-98: https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=67641670
+- LiveKit, Text and transcriptions: https://docs.livekit.io/agents/multimodality/text
+- Martin Fowler, Event Sourcing: https://martinfowler.com/eaaDev/EventSourcing.html
+- Garcia-Molina and Salem, Sagas: https://www.cs.princeton.edu/research/techreps/598
+- ZenML, Your Agents Are Not Microservices: https://www.zenml.io/blog/agents-are-not-microservices
+- ZenML, Why Kitaru Doesn't Use Journal Replay: https://www.zenml.io/blog/no-journal-replay
+- befailproof, Why Temporal Breaks When You Put an AI Agent Inside It: https://befailproof.ai/blog/why-temporal-breaks-with-ai-agents/
+- GSMA, IR.75 SMS Hubbing Architecture: https://www.gsma.com/newsroom/wp-content/uploads//IR.75-v2.0.pdf
+- Aspnes, Distributed Systems, Chapter 8 (coordinated attack): https://ac.informatik.uni-freiburg.de/teaching/ss_23/ds_lectures/pdf/Aspnes_chapter8.pdf
+
+### 7.5 Cited by this synthesis only
+
+- Nasser (2026), on voting between same-conviction agents: https://arxiv.org/abs/2601.05114 (referenced in the recipe prompt; not independently verified in this run)
 
 ---
 
-## 8. Method note and limits
-
-- **What this document is.** A composition of four lens reports written in the same run. It adds cross-checking, consensus counting and dispute adjudication. It adds no new sources, and no fact appears here that is not in at least one lens.
-- **What it is not.** Independent verification. Where a lens says it fetched a page, this document trusts that; nobody re-fetched anything for the synthesis. The two places that would most benefit from a re-fetch are the OpenAI Realtime guide (D1) and the LiveKit pricing page (which has no effective date).
-- **Stale-by-construction risks.** Prices and product tiers move monthly. The $0.0479/min example and every competitor rate are good for 2026-11-14 only. Funding rounds move quarterly. The absorption debate moves with each model release.
-- **The single strongest and single weakest inputs.** Strongest: lens-codex's file-and-line evidence (`agent_session.py:584`, the `Router` interface, the org-listing absence of a control plane), because it is checkable. Weakest: the market-sizing triads, because none of the three houses discloses a method and their spread exceeds any growth rate worth quoting.
-- **What would change the picture most.** One number: LiveKit's speech-to-speech versus cascaded minute mix. A second: OSS-to-Cloud conversion with NRR. Neither is public, and both are named in the gaps section rather than guessed at.
+*Composed from the four lens reports in this run directory. No fact appears here that is absent from a lens; where lenses disagree on a fact, it is reported under Section 3 rather than resolved by count. Where a claim rests on a vendor's own statement about its own product, the entry says so.*
