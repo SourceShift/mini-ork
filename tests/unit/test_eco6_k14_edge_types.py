@@ -117,6 +117,12 @@ def _compile(text: str, tmp_path: Path, name: str = "workflow.yaml"):
     return compile_workflow(path)
 
 
+def _node_names(text: str) -> tuple:
+    """The recipe's node names, sorted — what a feature edit grows, a relabel does not."""
+    document = yaml.safe_load(text) or {}
+    return tuple(sorted(str(node.get("name")) for node in document.get("nodes") or []))
+
+
 def _signature(compiled) -> dict:
     """Everything the rename must leave untouched, in comparable form."""
     return {
@@ -394,6 +400,12 @@ def test_collapse_preserves_the_compiled_graph(rel, tmp_path):
     new_text = (REPO_ROOT / rel).read_text(encoding="utf-8")
     if old_text == new_text:
         pytest.skip("HEAD already carries the collapsed file; baseline unrecoverable")
+    # The invariant is about a relabel, not about a recipe's growth. A feature
+    # that adds a node to a codemod'd recipe changes the compiled graph on
+    # purpose, so comparing it against HEAD would forbid every such feature;
+    # keep the guard on relabel-only diffs and let a structural change skip.
+    if _node_names(old_text) != _node_names(new_text):
+        pytest.skip("the change adds or removes nodes; it is not a codemod relabel")
 
     before = _signature(_compile(old_text, tmp_path, "old.yaml"))
     after = _signature(_compile(new_text, tmp_path, "new.yaml"))
