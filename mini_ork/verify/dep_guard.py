@@ -162,9 +162,17 @@ def check_name(name: str, *, allowlist: frozenset, path: str, line: int) -> list
         return []
     close = sorted(entry for entry in allowlist if _squat_apart(normalized, entry))
     if close:
+        # Name the distance that actually matched: a transposition is the
+        # archetypal typo-squat and calling it "one edit" misstates the evidence
+        # a reviewer reads before deciding whether the name was deliberate.
+        distance = (
+            "one adjacent transposition from"
+            if _single_transposition(normalized, close[0])
+            else "one edit from"
+        )
         return [Finding(
             path, line, "squat-suspect", name,
-            f"one edit from allowlisted '{close[0]}'",
+            f"{distance} allowlisted '{close[0]}'",
         )]
     return [Finding(
         path, line, "unknown-dependency", name, "not in the vendored allowlist",
@@ -321,6 +329,18 @@ def new_imports(old: frozenset, new: frozenset) -> list:
     return sorted(new - old)
 
 
+def new_requirements(old, new) -> list:
+    """Requirement entries the change introduces, compared without line numbers.
+
+    A requirement's identity is ``(name, spec)``. Line numbers move whenever
+    anything above them is edited, so comparing whole entries would report every
+    requirement in a touched file as new the moment one line is inserted — and
+    a pre-existing ``>=`` range elsewhere in the file would fail the run.
+    """
+    seen = {(name, spec) for _lineno, name, spec in old}
+    return [entry for entry in new if (entry[1], entry[2]) not in seen]
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -341,9 +361,9 @@ def _toml_loads(text: str):
     return tomllib.loads(text)
 
 
-def _read_pyproject_entries(path: Path) -> list:
-    """``(0, name, spec)`` for every declared project requirement."""
-    data = _toml_loads(Path(path).read_text(encoding="utf-8"))
+def parse_pyproject(text: str) -> list:
+    """``(0, name, spec)`` for every declared project requirement in ``text``."""
+    data = _toml_loads(text)
     project = data.get("project", {}) or {}
     groups = [project.get("dependencies", []) or []]
     groups.extend((project.get("optional-dependencies", {}) or {}).values())
@@ -353,6 +373,11 @@ def _read_pyproject_entries(path: Path) -> list:
             for _lineno, name, spec in parse_requirements(str(item) + "\n"):
                 entries.append((0, name, spec))
     return entries
+
+
+def _read_pyproject_entries(path: Path) -> list:
+    """``(0, name, spec)`` for every declared project requirement."""
+    return parse_pyproject(Path(path).read_text(encoding="utf-8"))
 
 
 def _allowlist_path(root: Path) -> Path:
@@ -409,19 +434,81 @@ def _walk_targets(root: Path) -> list:
     return sorted(targets)
 
 
-def _write_allowlist(out_path: Path) -> int:
-    # Read pyproject.toml from the working directory: the generator is run from
-    # the repo root, and a hermetic test writes one in a tmp cwd.
-    pyproject = Path.cwd() / "pyproject.toml"
-    entries = _read_pyproject_entries(pyproject)
+def _repo_modules(root: Path) -> frozenset:
+    """Every module name this repository defines itself.
+
+    ``is_first_party`` answers "is this one of the known application roots".
+    The generator needs the wider question, because recipe verifiers, scripts
+    and fixtures import their neighbours by bare name (``_stage``, ``calc``,
+    ``verifier_replay``) from directories no root list would enumerate.
+    """
+    skip = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mini-ork"}
     names = set()
-    for _lineno, name, _spec in entries:
-        normalized = norm(name)
-        if normalized:
-            names.add(normalized)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for filename in filenames:
+            # A package is named by its DIRECTORY, and ``__init__.py`` ends with
+            # ``.py``, so the package test has to come first or the repository's
+            # own packages are recorded as a module called ``__init__``.
+            if filename == "__init__.py":
+                names.add(Path(dirpath).name)
+            elif filename.endswith(".py"):
+                names.add(Path(dirpath, filename).stem)
+    return frozenset(names)
+
+
+def _observed_imports(root: Path) -> set:
+    """Normalized third-party roots this tree actually imports."""
+    skip = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mini-ork"}
+    defined = _repo_modules(root)
+    names = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = Path(dirpath) / filename
+            try:
+                modules = parse_imports(
+                    path.read_text(encoding="utf-8", errors="replace")
+                )
+            except (OSError, ValueError):
+                continue
+            for module in modules:
+                top = module.split(".")[0]
+                if _is_stdlib(top) or is_first_party(root, top):
+                    continue
+                if top in defined:
+                    continue
+                names.add(norm(top))
+    return names
+
+
+def _write_allowlist(out_path: Path) -> int:
+    # The generator runs from the repository root: a hermetic test writes a
+    # pyproject in a tmp cwd, and the real one is invoked at the checkout root.
+    root = Path.cwd()
+    names = set()
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            entries = parse_pyproject(pyproject.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            entries = []
+        for _lineno, name, _spec in entries:
+            normalized = norm(name)
+            if normalized:
+                names.add(normalized)
+
+    # A declared dependency is not necessarily an imported one, and a dev/test
+    # dependency is often declared nowhere. The snapshot has to cover both or
+    # the gate fails the run that adds `import pytest` to a test file.
+    names |= _observed_imports(root)
     for name in list(names):
         for alias in IMPORT_ALIASES.get(name, ()):
             names.add(norm(alias))
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         "\n".join([*ALLOWLIST_HEADER, *sorted(names)]) + "\n", encoding="utf-8",

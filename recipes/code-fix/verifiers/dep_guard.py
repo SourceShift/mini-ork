@@ -89,11 +89,19 @@ def _touched(root: str):
 
 
 def _allowlist_path(dep, root: str) -> Path:
+    """The snapshot comes from the ENGINE, never from the scanned repo.
+
+    A repository under audit that ships its own allowlist is a repository that
+    can add itself to it — the gate would be checking a list its target wrote.
+    The engine is this file's own tree, which for a self-edit run is the run's
+    copy of the framework; ``MO_DEP_ALLOWLIST`` stays an explicit operator
+    override (a missing value there still abstains, never passes).
+    """
     override = os.environ.get("MO_DEP_ALLOWLIST", "").strip()
     if override:
         candidate = Path(override)
         return candidate if candidate.is_absolute() else Path(root) / candidate
-    return Path(root) / dep.ALLOWLIST_DEFAULT
+    return HERE.parents[2] / dep.ALLOWLIST_DEFAULT
 
 
 def _read(path: Path):
@@ -104,38 +112,45 @@ def _read(path: Path):
 
 
 def _pyproject_entries(dep, text: str) -> list:
-    import tomllib
-
-    data = tomllib.loads(text)
-    project = data.get("project", {}) or {}
-    groups = [project.get("dependencies", []) or []]
-    groups.extend((project.get("optional-dependencies", {}) or {}).values())
-    entries = []
-    for group in groups:
-        for item in group or []:
-            for _lineno, name, spec in dep.parse_requirements(str(item) + "\n"):
-                entries.append((0, name, spec))
-    return entries
+    # The parser lives in the rule module: it already carries the tomllib /
+    # tomli fallback, and a second bare `import tomllib` here would crash the
+    # verifier on a host without one instead of abstaining.
+    return dep.parse_pyproject(text)
 
 
-def _base_imports(dep, root: str, base: str, rel: str) -> frozenset:
-    """Imports in the base version of ``rel``; empty when there is no base."""
+def _base_text(root: str, base: str, rel: str):
+    """The base version of ``rel``; ``None`` when it did not exist then."""
     try:
         result = subprocess.run(
             ["git", "-C", root, "show", f"{base}:{rel}"],
             capture_output=True, text=True, timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return frozenset()
+        return None
     if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _base_imports(dep, root: str, base: str, rel: str) -> frozenset:
+    """Imports in the base version of ``rel``; empty when there is no base."""
+    text = _base_text(root, base, rel)
+    if text is None:
         return frozenset()
     try:
-        return dep.parse_imports(result.stdout)
+        return dep.parse_imports(text)
     except ValueError:
         return frozenset()
 
 
 def _scan(dep, root: str, touched: list, allowlist: frozenset, base: str):
+    """Check the entries the change ADDS, never the whole of a touched file.
+
+    Whole-file scanning reddens a run for a requirement or requirement-range it
+    never wrote: editing anything in ``requirements.txt`` would re-fail every
+    pre-existing ``>=`` in it. The base version of each file supplies what was
+    already there, exactly as it does for imports.
+    """
     findings = []
     unparsed = []
     requirements_checked = 0
@@ -150,24 +165,35 @@ def _scan(dep, root: str, touched: list, allowlist: frozenset, base: str):
         if text is None:
             unparsed.append(rel_posix)
             continue
+        base_text = _base_text(root, base, rel_posix)
         if dep.REQUIREMENTS_RE.search(rel_posix):
-            entries = dep.parse_requirements(text)
-            requirements_checked += len(entries)
+            try:
+                added = dep.new_requirements(
+                    dep.parse_requirements(base_text or ""),
+                    dep.parse_requirements(text),
+                )
+            except ValueError:
+                unparsed.append(rel_posix)
+                continue
+            requirements_checked += len(added)
             findings.extend(dep.check_requirements(
-                entries, allowlist=allowlist, path=rel_posix,
+                added, allowlist=allowlist, path=rel_posix,
             ))
         elif Path(rel_posix).name == "pyproject.toml":
             try:
-                entries = _pyproject_entries(dep, text)
+                added = dep.new_requirements(
+                    _pyproject_entries(dep, base_text) if base_text else [],
+                    _pyproject_entries(dep, text),
+                )
             except (ValueError, OSError):
                 unparsed.append(rel_posix)
                 continue
-            requirements_checked += len(entries)
+            requirements_checked += len(added)
             findings.extend(dep.check_requirements(
-                entries, allowlist=allowlist, path=rel_posix,
+                added, allowlist=allowlist, path=rel_posix,
             ))
         elif rel_posix.endswith(".py"):
-            old = _base_imports(dep, root, base, rel_posix) if base else frozenset()
+            old = _base_imports(dep, root, base, rel_posix)
             try:
                 new = dep.parse_imports(text)
             except ValueError:
@@ -251,6 +277,28 @@ def _emit_result(findings, unparsed, requirements_checked, imports_checked) -> i
     return 0 if passed else 1
 
 
+def _resolve_base(scope, root: str) -> str:
+    """The revision the run's change is measured against.
+
+    The run's own start point first; otherwise ``HEAD``, because ``git diff``
+    with no revision compares the worktree to the INDEX and cannot see a staged
+    edit — a run that stages its work before the gate runs would otherwise
+    measure as having changed nothing.
+    """
+    if scope is not None:
+        base = scope.scoped_base(root)
+        if base:
+            return base
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "HEAD"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "HEAD" if result.returncode == 0 else ""
+
+
 def main() -> int:
     root = os.environ.get("MO_TARGET_CWD", "").strip() or os.getcwd()
     dep = _import("mini_ork.verify.dep_guard")
@@ -270,7 +318,12 @@ def main() -> int:
         return _emit_abstain("cannot attribute the run's change surface")
 
     scope = _import("mini_ork.verify.touched_files")
-    base = scope.scoped_base(root) if scope is not None else ""
+    base = _resolve_base(scope, root)
+    if not base:
+        # Without a revision every import and requirement in a touched file is
+        # indistinguishable from one the change added, so the gate would report
+        # pre-existing dependencies as new ones. That is not a refutation.
+        return _emit_abstain("no base revision to measure the change against")
     findings, unparsed, requirements_checked, imports_checked = _scan(
         dep, root, touched, allowlist, base,
     )

@@ -108,7 +108,7 @@ def test_requirements_rules():
         path="requirements.txt",
     )
     assert [f.rule for f in squat] == ["squat-suspect"]
-    assert squat[0].why == "one edit from allowlisted 'requests'"
+    assert squat[0].why == "one adjacent transposition from allowlisted 'requests'"
 
 
 @pytest.mark.parametrize("line", [
@@ -258,7 +258,8 @@ def _git_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _run_verifier(repo: Path, *, allowlist: Path, touched: str, pythonpath=None):
+def _run_verifier(repo: Path, *, allowlist: Path, touched: str,
+                  pythonpath=None, extra_env=None):
     env = _clean_env()
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
@@ -267,6 +268,7 @@ def _run_verifier(repo: Path, *, allowlist: Path, touched: str, pythonpath=None)
         "MO_DEP_ALLOWLIST": str(allowlist),
         "MINI_ORK_TOUCHED_FILES": touched,
     })
+    env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, str(SCRIPT)],
         cwd=str(repo), env=env, capture_output=True, text=True, timeout=120,
@@ -331,3 +333,119 @@ def test_verifier_missing_allowlist_abstains(tmp_path):
     assert payload["pass"] is False
     assert payload["status"] == "unverified"
     assert payload["failure_kind"] == "toolchain"
+
+
+# ── the gate must measure the CHANGE, not the touched file ──────────────────
+
+
+def _commit(repo: Path, message: str) -> None:
+    for cmd in (["git", "-C", str(repo), "add", "."],
+                ["git", "-C", str(repo), "commit", "-qm", message]):
+        subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+
+
+def test_new_requirements_ignores_line_numbers():
+    old = dep_guard.parse_requirements("# moved down\nrequests>=2.0\n")
+    new = dep_guard.parse_requirements("# moved down\n\n\nrequests>=2.0\nflask==2.0\n")
+    assert dep_guard.new_requirements(old, new) == [
+        (5, "flask", "==2.0"),
+    ]
+
+
+def test_pre_existing_unpinned_requirement_in_a_touched_file_is_not_a_finding(tmp_path):
+    """Touching requirements.txt must not fail the run for lines it never wrote."""
+    repo = _git_repo(tmp_path)
+    (repo / "requirements.txt").write_text("requests>=2.0\n", encoding="utf-8")
+    _commit(repo, "pre-existing range pin")
+    (repo / "requirements.txt").write_text(
+        "requests>=2.0\nflask==2.0\n", encoding="utf-8",
+    )
+    allow = tmp_path / "allow.txt"
+    allow.write_text("requests\nflask\n", encoding="utf-8")
+    proc = _run_verifier(repo, allowlist=allow, touched="requirements.txt")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "pass", payload["findings"]
+    assert re.search(r"1 requirements", proc.stdout)
+
+
+def test_added_unpinned_requirement_is_a_finding(tmp_path):
+    repo = _git_repo(tmp_path)
+    (repo / "requirements.txt").write_text("flask==2.0\n", encoding="utf-8")
+    _commit(repo, "pinned baseline")
+    (repo / "requirements.txt").write_text(
+        "flask==2.0\nrequests>=2.0\n", encoding="utf-8",
+    )
+    allow = tmp_path / "allow.txt"
+    allow.write_text("flask\nrequests\n", encoding="utf-8")
+    proc = _run_verifier(repo, allowlist=allow, touched="requirements.txt")
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert [f["rule"] for f in payload["findings"]] == ["unpinned-dependency"]
+    assert payload["findings"][0]["name"] == "requests"
+
+
+def test_verifier_abstains_without_a_base_revision(tmp_path):
+    """With no revision, every import looks new — that is not a refutation."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True,
+                   capture_output=True, timeout=60)
+    (repo / "needs.py").write_text("import requets\n", encoding="utf-8")
+    allow = tmp_path / "allow.txt"
+    allow.write_text("requests\n", encoding="utf-8")
+    proc = _run_verifier(repo, allowlist=allow, touched="needs.py")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "abstain"
+    assert payload["failure_kind"] == "toolchain"
+    assert "base revision" in payload["error_summary"]
+
+
+def test_verifier_ignores_a_repo_local_allowlist(tmp_path):
+    """A repository under audit must not be able to allowlist its own import."""
+    repo = _git_repo(tmp_path)
+    local = repo / "recipes" / "code-fix" / "data"
+    local.mkdir(parents=True)
+    (local / "dependency-allowlist.txt").write_text("requets\n", encoding="utf-8")
+    (repo / "needs.py").write_text("import requets\n", encoding="utf-8")
+    proc = _run_verifier(
+        repo, allowlist=tmp_path / "absent.txt", touched="needs.py",
+        extra_env={"MO_DEP_ALLOWLIST": ""},
+    )
+    payload = json.loads(proc.stdout)
+    # The repo's own allowlist says `requets` is fine. If it were consulted the
+    # run would pass; the engine snapshot is consulted instead, and it does not
+    # contain the name.
+    assert payload["verdict"] == "fail", payload
+    assert "unknown-dependency" in payload["failed_checks"]
+    engine = REPO_ROOT / "recipes" / "code-fix" / "data" / "dependency-allowlist.txt"
+    assert "requets" not in engine.read_text(encoding="utf-8").split()
+
+
+def test_shipped_allowlist_covers_the_test_frameworks():
+    """The gate must not fail its own delivery: tests import pytest."""
+    engine = REPO_ROOT / "recipes" / "code-fix" / "data" / "dependency-allowlist.txt"
+    names = dep_guard.load_allowlist(engine)
+    assert dep_guard.norm("pytest") in names
+    assert dep_guard.norm("pytest_asyncio") in names
+
+
+def test_generator_covers_declared_and_observed_dependencies(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\n'
+        'dependencies = ["PyYAML>=6.0"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text("import requests\nimport helper\n",
+                                     encoding="utf-8")
+    (tmp_path / "helper.py").write_text("", encoding="utf-8")
+    out = tmp_path / "allowlist.txt"
+    proc = _run_module(["--write-allowlist", str(out)], cwd=tmp_path)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    body = {
+        line.strip() for line in out.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert {"pyyaml", "yaml", "requests"} <= body
+    assert "helper" not in body
