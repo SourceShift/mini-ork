@@ -89,29 +89,40 @@ def _resolves(root: str, ref: str) -> bool:
 
 
 def _resolve_base(scope, root: str) -> str:
+    """The base revision to measure against, or ``""`` when there is none.
+
+    There is deliberately NO ``HEAD`` fallback: ``HEAD`` is the fix's own tree,
+    so the pair would compare the fix with itself — the exploit could only ever
+    "fail on base" by failing on head too, and the gate would refute every
+    security change it could not measure instead of reporting it unmeasured.
+    """
     if scope is not None:
         base = scope.scoped_base(root)
         if base and _resolves(root, base):
             return base
-    try:
-        result = subprocess.run(
-            ["git", "-C", root, "rev-parse", "--verify", "HEAD"],
-            capture_output=True, text=True, timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return "HEAD" if result.returncode == 0 else ""
+    return ""
 
 
 def _envelope(status: str, checks: list, reason: str) -> dict:
+    """One envelope for all four outcomes.
+
+    ``status`` is the load-bearing field and the two contracts are different: a
+    NODE verifier whose evidence says ``status: unverified`` makes the executor
+    return :data:`mini_ork.verify.levels.ABSTAIN_RC`, which marks the node
+    ``abstained`` and withholds the publish. So only a real abstention (the
+    oracle could not measure) may carry it. A vacuous verdict — the ordinary
+    case, every non-security change — must exit the node green while claiming
+    nothing: it emits no ``status``, keeps ``error_summary`` (the level gate's
+    declared-skip key, so nothing is minted PROVEN from it) and one NON-GATING
+    check recording that no relation ran.
+    """
     failed = sorted(
         check.name for check in checks if check.gating and not check.passed
     )
-    return {
+    payload = {
         "verifier": "security_oracle",
         "pass": status in ("pass", "vacuous"),
         "verdict": status,
-        "status": "unverified" if status in ("abstain", "vacuous") else "verified",
         "failure_kind": "toolchain" if status == "abstain" else None,
         "evidence_path": None,
         "checks_run": [check.name for check in checks],
@@ -130,6 +141,18 @@ def _envelope(status: str, checks: list, reason: str) -> dict:
         "error_summary": reason,
         "findings": [],
     }
+    if status == "abstain":
+        payload["status"] = "unverified"
+    elif status == "vacuous":
+        payload["checks"] = [{
+            "name": "security-oracle",
+            "pass": True,
+            "gating": False,
+            "detail": reason,
+        }]
+    else:
+        payload["status"] = "verified"
+    return payload
 
 
 def _emit(payload: dict) -> None:

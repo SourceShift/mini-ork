@@ -73,6 +73,11 @@ nodes:
   # change, an independently supplied reproduction test must fail on the base
   # revision and pass on the head revision, with the functional command green on
   # both. Vacuous when no security relevance; abstains when it cannot measure.
+  # Nothing in the engine PRODUCES the oracle yet: the label is
+  # MO_SECURITY_FIX, the exploit paths are MINI_ORK_EXPLOIT_TESTS or
+  # ${MINI_ORK_RUN_DIR}/exploit-tests, and the functional command is
+  # MO_SECURITY_ORACLE_FUNCTIONAL_CMD or MINI_ORK_TEST_CMD. Until a kickoff or
+  # a caller supplies them the node is inert — vacuous, never a false refusal.
   - name: security_oracle
     type: verifier
     prompt_ref: null

@@ -9,13 +9,12 @@ throwaway ``git worktree`` that this module creates and itself removes.
 
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import Iterable, NamedTuple, Optional
 
 SECURITY_LABEL_ENV = "MO_SECURITY_FIX"
 EXPLOIT_ENV = "MINI_ORK_EXPLOIT_TESTS"
@@ -25,11 +24,26 @@ FALLBACK_FUNCTIONAL_ENV = "MINI_ORK_TEST_CMD"
 TIMEOUT_ENV = "MO_SECURITY_ORACLE_TIMEOUT"
 DEFAULT_TIMEOUT = 900
 
+# A path segment that names a security concern. The lookahead after the
+# keyword group stops ``authors.py`` / ``tokenizer.py`` from reading as
+# ``auth`` / ``token``: only a plural ``s``, a separator, a slash or the end of
+# the segment may follow. Over-matching is the safe direction (an unlabelled
+# change with no exploit files is vacuous either way) but a wrong match makes
+# the oracle run against files that are not security code.
 SECURITY_PATH_RE = re.compile(
-    r"(^|/)(auth|authn|authz|login|logout|session|credential|secret|token|"
-    r"crypto|password|permission|acl)([^/]*)(/|$)",
+    r"(^|/)(authori[sz]ation|authentication|authn|authz|auth|credential|secret|"
+    r"token|session|login|logout|crypto|cryptograph[a-z]*|password|passwd|"
+    r"permission|privilege|acl|rbac|oauth|jwt|tls|ssl)(s)?([._-][^/]*)?(/|$)",
     re.I,
 )
+
+# pytest's exit codes. Only ``1`` means "the tests ran and some failed", which
+# is the one outcome that proves an exploit reproduced the bug. ``2``/``3``/``4``
+# interrupt, internal error and usage error all mean the tests never ran, and
+# ``5`` means nothing was collected — reading any of them as a reproduction
+# would certify a fix nothing measured.
+PYTEST_TESTS_FAILED = 1
+PYTEST_DID_NOT_RUN = frozenset({2, 3, 4, 5})
 
 EXPLOIT_BASE_CHECK = "exploit-fails-on-base"
 EXPLOIT_HEAD_CHECK = "exploit-passes-on-head"
@@ -151,6 +165,33 @@ def _run(cwd: str, argv: list, timeout: int) -> tuple:
     return proc.returncode, combined[-400:]
 
 
+def _run_shell(cwd: str, command: str, timeout: int) -> tuple:
+    """Run an operator-supplied command through the shell; ``(rc|None, tail)``.
+
+    A shell, because ``MINI_ORK_TEST_CMD`` is a shell command everywhere else
+    it is honoured (``scripts/mini_ork_worktree.py`` runs the green gate with
+    ``shell=True``). Splitting it with :mod:`shlex` silently mis-runs the
+    ordinary ``cd x && pytest ...`` and ``-k "a or b"`` forms and would read
+    the syntax error as a functional failure.
+    """
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timed out after %ss" % timeout
+    except OSError as exc:
+        return None, "could not run %r: %s" % (command, exc)
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, combined[-400:]
+
+
 def run_files(root: str, files: list, timeout: int) -> tuple:
     """Run the listed test files with pytest; return ``(rc | None, tail)``."""
     argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *files]
@@ -176,50 +217,81 @@ def _first_missing(root: str, exploit_files: Iterable[str]) -> str:
     return ""
 
 
-def _relative_to_root(root: str, path: str) -> Path:
+def _relative_to_root(root: str, path: str) -> Optional[Path]:
+    """``path`` as a root-relative path, or ``None`` when it escapes ``root``.
+
+    ``None`` is a refusal, not a fallback: a path outside the tree is copied
+    nowhere and measured nowhere, and it must never reach the base worktree as
+    an escape (``../`` or an absolute path outside the root).
+    """
+    root_resolved = Path(root).resolve()
     candidate = Path(path)
-    if candidate.is_absolute():
-        try:
-            return candidate.resolve().relative_to(Path(root).resolve())
-        except ValueError:
-            return Path(candidate.name)
-    return candidate
+    try:
+        resolved = candidate.resolve() if candidate.is_absolute() else (
+            root_resolved / candidate
+        ).resolve()
+        return resolved.relative_to(root_resolved)
+    except (OSError, ValueError):
+        return None
 
 
-def _copy_exploits(root: str, dest: str, exploit_files: Iterable[str]) -> list:
-    """Copy the SAME exploit bytes into the base tree, at the same paths."""
+def _copy_exploits(root: str, dest: str, relatives: Iterable[Path]) -> list:
+    """Copy the SAME exploit bytes into the base tree, at the same paths.
+
+    Returns ``(target, original_bytes_or_None)`` pairs so cleanup can restore a
+    file the base commit already tracked instead of deleting it — the base tree
+    a later functional run measures must be the tree as committed.
+    """
     copied = []
-    for path in exploit_files:
-        relative = _relative_to_root(root, path)
+    for relative in relatives:
+        source = Path(root) / relative
         target = Path(dest) / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(Path(root) / relative, target)
-        copied.append(target)
+        saved = target.read_bytes() if target.exists() else None
+        shutil.copy2(source, target)
+        copied.append((target, saved))
     return copied
 
 
-def _remove_copied(copied: Iterable[Path]) -> None:
-    for target in copied:
+def _restore_copied(copied: Iterable[tuple]) -> None:
+    """Undo :func:`_copy_exploits`: rewrite the saved bytes, else unlink."""
+    for target, saved in copied:
         try:
-            target.unlink()
+            if saved is None:
+                target.unlink()
+            else:
+                target.write_bytes(saved)
         except OSError:
             continue
 
 
 def _functional_checks(
     base_dest: str, root: str, functional_cmd: str, timeout: int
-) -> list:
+) -> tuple:
+    """``(checks, abstain_reason)`` — a timeout is unmeasured, not a refutation.
+
+    Both trees run the SAME command; only a real exit code is a verdict. A run
+    that timed out says nothing about the code, so it withholds the odour of
+    judgement rather than rejecting the change on the runner's speed.
+    """
     if not (functional_cmd or "").strip():
         return [
             Check(FUNCTIONAL_BASE_CHECK, True, NO_FUNCTIONAL_DETAIL, False),
             Check(FUNCTIONAL_HEAD_CHECK, True, NO_FUNCTIONAL_DETAIL, False),
-        ]
-    argv = shlex.split(functional_cmd)
-    rc, tail = _run(base_dest, argv, timeout)
-    checks = [Check(FUNCTIONAL_BASE_CHECK, rc == 0, tail, True)]
-    rc, tail = _run(root, argv, timeout)
-    checks.append(Check(FUNCTIONAL_HEAD_CHECK, rc == 0, tail, True))
-    return checks
+        ], ""
+    checks = []
+    for label, cwd in (
+        (FUNCTIONAL_BASE_CHECK, base_dest),
+        (FUNCTIONAL_HEAD_CHECK, root),
+    ):
+        rc, tail = _run_shell(cwd, functional_cmd, timeout)
+        if rc is None:
+            checks.append(Check(label, False, tail, True))
+            return checks, "functional command on the %s tree did not finish" % (
+                "base" if cwd == base_dest else "head",
+            )
+        checks.append(Check(label, rc == 0, tail, True))
+    return checks, ""
 
 
 def evaluate(
@@ -258,6 +330,13 @@ def evaluate(
     if missing:
         return "abstain", [], "exploit test not found: %s" % missing
 
+    relatives = []
+    for path in exploit_files:
+        relative = _relative_to_root(root, path)
+        if relative is None:
+            return "abstain", [], "exploit test outside the tree: %s" % path
+        relatives.append(relative)
+
     timeout = _timeout()
     parent = tempfile.mkdtemp(prefix="mo-security-oracle-")
     dest = os.path.join(parent, "base")
@@ -270,19 +349,34 @@ def evaluate(
 
         copied = []
         try:
-            copied = _copy_exploits(root, dest, exploit_files)
-            rc, tail = run_files(dest, exploit_files, timeout)
+            copied = _copy_exploits(root, dest, relatives)
+            # The base run names the RELATIVE paths: an absolute path would
+            # point back into the head tree and measure the fixed bytes as if
+            # they were the base's.
+            rc, tail = run_files(dest, [str(r) for r in relatives], timeout)
             if rc is None:
                 return (
                     "abstain",
                     [Check(EXPLOIT_BASE_CHECK, False, tail, True)],
                     "exploit run on the base tree timed out",
                 )
-            checks.append(
-                Check(EXPLOIT_BASE_CHECK, rc not in (0, None), tail, True)
-            )
+            if rc in PYTEST_DID_NOT_RUN:
+                return (
+                    "abstain",
+                    [Check(
+                        EXPLOIT_BASE_CHECK, False,
+                        "pytest exit %s: %s" % (rc, tail), True,
+                    )],
+                    "the exploit did not run on the base tree (pytest exit %s) "
+                    "— a collection or usage error is not a reproduction" % rc,
+                )
+            # Only "tests ran and failed" counts as a reproduction; a green base
+            # means the exploit does not discriminate and the fix is unproven.
+            checks.append(Check(
+                EXPLOIT_BASE_CHECK, rc == PYTEST_TESTS_FAILED, tail, True,
+            ))
 
-            rc, tail = run_files(root, exploit_files, timeout)
+            rc, tail = run_files(root, [str(r) for r in relatives], timeout)
             if rc is None:
                 checks.append(Check(EXPLOIT_HEAD_CHECK, False, tail, True))
                 return (
@@ -292,11 +386,16 @@ def evaluate(
                 )
             checks.append(Check(EXPLOIT_HEAD_CHECK, rc == 0, tail, True))
         finally:
-            # The functional measurement must see the pristine base tree, so the
-            # copies live only for the exploit run.
-            _remove_copied(copied)
+            # The functional measurement must see the base tree as committed,
+            # so the copies are restored (or removed) once the exploit ran.
+            _restore_copied(copied)
 
-        checks.extend(_functional_checks(dest, root, functional_cmd, timeout))
+        functional, abstain = _functional_checks(
+            dest, root, functional_cmd, timeout
+        )
+        checks.extend(functional)
+        if abstain:
+            return "abstain", checks, abstain
     finally:
         drop_base(root, dest)
         shutil.rmtree(parent, ignore_errors=True)
