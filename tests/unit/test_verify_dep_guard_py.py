@@ -258,8 +258,10 @@ def _git_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _run_verifier(repo: Path, *, allowlist: Path, touched: str):
+def _run_verifier(repo: Path, *, allowlist: Path, touched: str, pythonpath=None):
     env = _clean_env()
+    if pythonpath is not None:
+        env["PYTHONPATH"] = pythonpath
     env.update({
         "MO_TARGET_CWD": str(repo),
         "MO_DEP_ALLOWLIST": str(allowlist),
@@ -269,6 +271,27 @@ def _run_verifier(repo: Path, *, allowlist: Path, touched: str):
         [sys.executable, str(SCRIPT)],
         cwd=str(repo), env=env, capture_output=True, text=True, timeout=120,
     )
+
+
+def test_verifier_loads_the_rule_module_by_path_when_the_package_is_not_importable(tmp_path):
+    """The file-load fallback must find the ENGINE, not the scanned repo.
+
+    A verifier runs as a bare script with no package installed, so the path
+    fallback is the only thing standing between an unimportable engine and a
+    silent abstention. Resolving it against the target repo instead would let a
+    repository under audit supply its own rules.
+    """
+    repo = _git_repo(tmp_path)
+    allow = tmp_path / "allow.txt"
+    allow.write_text("yaml\nrequests\n", encoding="utf-8")
+    (repo / "needs.py").write_text("import requets\n", encoding="utf-8")
+    proc = _run_verifier(
+        repo, allowlist=allow, touched="needs.py", pythonpath="",
+    )
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "fail", payload
+    assert "squat-suspect" in payload["failed_checks"]
 
 
 def test_verifier_squat_fails(tmp_path):
