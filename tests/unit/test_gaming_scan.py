@@ -481,3 +481,40 @@ def test_scanner_never_scans_its_own_source():
         '+PROBE = re.compile(r"PYTEST_CURRENT_TEST")\n'
     )
     assert gs.scan_diff(diff, read_file=lambda _p: None) == []
+
+
+# ---------------------------------------------------------------------------
+# quoted paths
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("printed,expected", [
+    ("b/plain.py", "b/plain.py"),
+    ('"b/odd name.py"', "b/odd name.py"),
+    ('"b/odd\\303\\274.py"', "b/oddü.py"),
+    ('"b/quote\\"d.py"', 'b/quote"d.py'),
+    ('"b/back\\\\slash.py"', "b/back\\slash.py"),
+    ('"b/tab\\there.py"', "b/tab\there.py"),
+    ('"/dev/null"', "/dev/null"),
+])
+def test_unquote_git_path_round_trips(printed, expected):
+    assert gs.unquote_git_path(printed) == expected
+
+
+def test_added_lines_decodes_a_quoted_header():
+    """A quoted path must key the same file the run actually touched.
+
+    Git quotes the header for any path holding a space or a non-ASCII byte. If
+    the key keeps the quotes and the octal escapes it matches no real path, so
+    every added line under it is dropped and a scan over that diff finds
+    nothing — the anti-gaming scan and the security gate share this parser.
+    """
+    diff = (
+        'diff --git "a/odd\\303\\274.py" "b/odd\\303\\274.py"\n'
+        '--- "a/odd\\303\\274.py"\n'
+        '+++ "b/odd\\303\\274.py"\n'
+        "@@ -1,0 +1,1 @@\n"
+        '+if os.environ.get("PYTEST_CURRENT_TEST"):\n'
+    )
+    added = gs.added_lines(diff)
+    assert list(added) == ["oddü.py"]
+    assert added["oddü.py"] == {1: 'if os.environ.get("PYTEST_CURRENT_TEST"):'}

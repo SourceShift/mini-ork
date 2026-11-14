@@ -78,15 +78,25 @@ def touched_files(root: str) -> List[str]:
     """Repo-relative paths this run changed: working tree, untracked, and
     (when a base resolves) everything committed on top of it."""
     paths = set()
-    rc, out = _git(root, "status", "--porcelain", "-uall")
+    # ``-z`` is what makes a path with a space, a quote or a non-ASCII byte come
+    # back verbatim. Without it git quotes such a path and C-escapes the content,
+    # and stripping the quotes yields a name that matches no file — so the
+    # surface a gate intersects against would silently omit the run's own file.
+    rc, out = _git(root, "status", "--porcelain", "-z", "-uall")
     if rc == 0:
-        for line in out.splitlines():
-            if len(line) < 4:
+        records = out.split("\x00")
+        index = 0
+        while index < len(records):
+            record = records[index]
+            index += 1
+            if len(record) < 4:
                 continue
-            rest = line[3:]
-            if " -> " in rest:  # rename: keep the destination
-                rest = rest.split(" -> ", 1)[1]
-            rel = rest.strip().strip('"')
+            rel = record[3:]
+            if record[0] in "RC":
+                # A rename/copy is followed by its source path as its own
+                # record; the destination is the one this run touched.
+                index += 1
+            rel = rel.strip()
             if rel:
                 paths.add(rel)
     base = scoped_base(root)

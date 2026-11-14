@@ -55,6 +55,48 @@ class Finding:
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
+#: Git's C-style escapes for a quoted path. Octal is how it encodes any byte
+#: outside printable ASCII, which is how a UTF-8 filename survives the round trip.
+_C_ESCAPES = {
+    "a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13,
+    '"': 34, "\\": 92,
+}
+
+
+def unquote_git_path(target: str) -> str:
+    """Decode a path as git printed it, quoted or not.
+
+    Git quotes a path in a diff header when it holds a space, a quote, a
+    backslash or a non-ASCII byte, and escapes the content
+    (``+++ "b/odd\\303\\274.py"``). Taking that token literally produces a key
+    that matches no file on disk, so every added line in that file is dropped —
+    and a gate keyed on those paths then passes work it never looked at.
+    """
+    if len(target) < 2 or target[0] != '"' or target[-1] != '"':
+        return target
+    inner = target[1:-1]
+    out = bytearray()
+    index = 0
+    while index < len(inner):
+        char = inner[index]
+        if char != "\\" or index + 1 >= len(inner):
+            out.extend(char.encode("utf-8", "replace"))
+            index += 1
+            continue
+        octal = inner[index + 1:index + 4]
+        if len(octal) == 3 and all(digit in "01234567" for digit in octal):
+            out.append(int(octal, 8))
+            index += 4
+            continue
+        escaped = _C_ESCAPES.get(inner[index + 1])
+        if escaped is not None:
+            out.append(escaped)
+            index += 2
+            continue
+        out.extend(char.encode("utf-8", "replace"))
+        index += 1
+    return out.decode("utf-8", "replace")
+
 
 def added_lines(diff_text: str) -> dict[str, dict[int, str]]:
     """Return ``{path: {new_lineno: text}}`` for every added line in a diff."""
@@ -73,7 +115,7 @@ def added_lines(diff_text: str) -> dict[str, dict[int, str]]:
 
         if new_line is None:
             if raw.startswith("+++ "):
-                target = raw[4:].strip()
+                target = unquote_git_path(raw[4:].strip())
                 if target == "/dev/null":
                     path = None
                 else:

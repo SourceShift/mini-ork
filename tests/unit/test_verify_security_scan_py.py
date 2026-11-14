@@ -439,3 +439,40 @@ def test_verifier_abstains_when_the_operator_turns_it_off(tmp_path):
     assert envelope["status"] == "unverified"
     assert envelope["failure_kind"] == "toolchain"
     assert envelope["reasons"]
+
+
+@requires_git
+def test_verifier_scans_a_tracked_file_git_would_quote(tmp_path):
+    """A non-ASCII filename must not be dropped between the surface and the diff.
+
+    Git quotes the ``+++`` header for such a path. If the parser keeps the
+    quotes, the added lines land under a key the touched-file surface never
+    names, the intersection is empty, and the gate passes a file it never read.
+    """
+    repo = _make_repo(tmp_path)
+    odd = repo / "odd name ü.py"
+    odd.write_text("x = 1\n", encoding="utf-8")
+    _commit_all(repo, "clean fixture")
+    odd.write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+
+    proc = _run_verifier(repo, touched="odd name ü.py")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    envelope = json.loads(proc.stdout.strip())
+    assert envelope["failed_checks"] == ["aws-access-key"]
+    assert envelope["findings"][0]["path"] == "odd name ü.py"
+
+
+@requires_git
+def test_verifier_sees_a_staged_change(tmp_path):
+    """The publisher stages before committing; `git diff` alone cannot see it."""
+    repo = _make_repo(tmp_path)
+    (repo / "leaky.py").write_text("x = 1\n", encoding="utf-8")
+    _commit_all(repo, "clean fixture")
+    (repo / "leaky.py").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+    _commit_all_staged_only = _git(repo, "add", "leaky.py")
+    assert _commit_all_staged_only.returncode == 0
+
+    proc = _run_verifier(repo, touched="leaky.py")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    envelope = json.loads(proc.stdout.strip())
+    assert envelope["failed_checks"] == ["aws-access-key"]

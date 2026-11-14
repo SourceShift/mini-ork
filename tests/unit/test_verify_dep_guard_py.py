@@ -449,3 +449,89 @@ def test_generator_covers_declared_and_observed_dependencies(tmp_path):
     }
     assert {"pyyaml", "yaml", "requests"} <= body
     assert "helper" not in body
+
+
+# ── first-party detection, sources, and honest coverage ─────────────────────
+
+
+def test_first_party_covers_src_layout_and_namespace_packages(tmp_path):
+    """A src-layout or namespace-package project's own code is not a dependency."""
+    src = tmp_path / "src" / "myapp"
+    src.mkdir(parents=True)
+    (src / "core.py").write_text("", encoding="utf-8")  # no __init__.py
+    (tmp_path / "src" / "flat.py").write_text("", encoding="utf-8")
+
+    assert dep_guard.is_first_party(tmp_path, "myapp") is True
+    assert dep_guard.is_first_party(tmp_path, "flat") is True
+    assert dep_guard.is_first_party(tmp_path, "requests") is False
+
+
+@pytest.mark.parametrize("line", [
+    "pkg @ file:///tmp/p.whl",
+    "pkg@https://evil.example/p.whl",
+    "pkg @ ssh://git@host/p.git",
+    "pkg @ git+ssh://git@host/p.git",
+    "-e file:///tmp/pkg",
+])
+def test_untrusted_source_schemes(line):
+    findings = dep_guard.check_requirements(
+        dep_guard.parse_requirements(line + "\n"),
+        allowlist=frozenset({"pkg"}), path="requirements.txt",
+    )
+    assert "untrusted-source" in {f.rule for f in findings}
+
+
+def test_verifier_abstains_when_a_touched_file_cannot_be_parsed(tmp_path):
+    """A file the gate could not read was not checked — that is not a pass."""
+    repo = _git_repo(tmp_path)
+    (repo / "broken.py").write_text("def (:\n", encoding="utf-8")
+    allow = tmp_path / "allow.txt"
+    allow.write_text("yaml\n", encoding="utf-8")
+    proc = _run_verifier(repo, allowlist=allow, touched="broken.py")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "abstain"
+    assert "could not be parsed" in payload["error_summary"]
+
+
+def test_write_allowlist_keeps_hand_added_entries(tmp_path):
+    """Regenerating must not forget a dependency declared before it is used."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\n'
+        'dependencies = ["PyYAML>=6.0"]\n',
+        encoding="utf-8",
+    )
+    out = tmp_path / "allowlist.txt"
+    out.write_text("# hand-added\nhandpicked\n", encoding="utf-8")
+    proc = _run_module(["--write-allowlist", str(out)], cwd=tmp_path)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    body = {
+        line.strip() for line in out.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert {"handpicked", "pyyaml", "yaml"} <= body
+
+
+def test_verifier_still_measures_when_the_package_is_shadowed(tmp_path):
+    """The engine root goes on sys.path — never the repo being scanned.
+
+    A shadowing module that raises ImportError stands in for any host where
+    `mini_ork` cannot be imported directly: the gate must rescue itself from
+    its own tree and still measure, not abstain on a diff it could check.
+    """
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "mini_ork.py").write_text(
+        'raise ImportError("shadowed")\n', encoding="utf-8",
+    )
+    repo = _git_repo(tmp_path)
+    (repo / "needs.py").write_text("import requets\n", encoding="utf-8")
+    allow = tmp_path / "allow.txt"
+    allow.write_text("requests\n", encoding="utf-8")
+    proc = _run_verifier(
+        repo, allowlist=allow, touched="needs.py", pythonpath=str(shadow),
+    )
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "fail"
+    assert "squat-suspect" in payload["failed_checks"]

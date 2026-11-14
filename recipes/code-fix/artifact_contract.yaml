@@ -5,6 +5,12 @@ success_verifiers:
   - verifiers/typecheck.py
   # Deterministic no-silent-fallback gate over the touched files (AST walk).
   - verifiers/fallback_guard.py
+  # Credentials and dangerous APIs on the lines the run added. Abstains (never
+  # passes) when the scanner or the change surface cannot be resolved.
+  - verifiers/security.py
+  # New imports/requirements against the vendored snapshot, pinned and from an
+  # index. The snapshot is read from the engine, not the repo under audit.
+  - verifiers/dep_guard.py
   - verifiers/test.py
   # Layer 2, gold-free: fires whenever a metamorphic spec exists (MO_METAMORPHIC_SPEC,
   # MO_METAMORPHIC_SPEC_JSON, or ${MINI_ORK_RUN_DIR}/metamorphic-spec.json). With no

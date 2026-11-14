@@ -222,17 +222,32 @@ def parse_requirements(text: str) -> list:
     return entries
 
 
+#: A scheme that does not come from an index. ``file://`` and ``ssh://`` are as
+#: reachable as ``https://`` and were missed by an earlier substring test.
+_URL_SCHEME_RE = re.compile(r"\b(?:https?|ftp|file|ssh|git|hg|svn|bzr)://", re.IGNORECASE)
+#: VCS pseudo-scheme: ``git+https://``, ``git+ssh://``, ``hg+file://``.
+_VCS_SCHEME_RE = re.compile(r"\b(?:git|hg|svn|bzr)\+", re.IGNORECASE)
+
+
+def _untrusted(spec: str) -> bool:
+    """True when the requirement does not resolve from the configured index.
+
+    A direct reference (``pkg @ url``) admits a URL with or without spaces
+    around the ``@``, and pip accepts several schemes: matching one spelling of
+    one of them lets ``pkg @ file:///tmp/x.whl`` through unremarked.
+    """
+    if _VCS_SCHEME_RE.search(spec) or _URL_SCHEME_RE.search(spec):
+        return True
+    if spec.startswith(("-e ", "-e=")):
+        return True
+    return spec.startswith(("--index-url", "--extra-index-url"))
+
+
 def check_requirements(entries, *, allowlist: frozenset, path: str) -> list:
     """Apply source, pinning, and name rules to parsed requirement entries."""
     findings = []
     for lineno, name, spec in entries:
-        lowered = spec.lower()
-        untrusted = (
-            "git+" in lowered
-            or " @ http" in lowered
-            or spec.startswith(("-e ", "-e="))
-            or spec.startswith(("--index-url", "--extra-index-url"))
-        )
+        untrusted = _untrusted(spec)
         if untrusted:
             findings.append(Finding(
                 path, lineno, "untrusted-source", name,
@@ -268,13 +283,27 @@ def parse_imports(source: str) -> frozenset:
     return frozenset(modules)
 
 
+#: Source roots a project may keep its own code under (``src/`` layout).
+_SOURCE_DIRS = ("", "src")
+
+
 def is_first_party(root_dir: Path, module: str) -> bool:
-    """True for this project's own modules (a known root, a file, or a package)."""
+    """True for this project's own modules (a known root, a file, or a package).
+
+    Both a module file and a bare package directory count, because a namespace
+    package has no ``__init__.py``; and both the checkout root and ``src/`` are
+    searched, because a src-layout project's own code is otherwise reported as
+    an unknown dependency — the gate would fail every run in such a repo.
+    """
     root = module.split(".")[0]
     if root in FIRST_PARTY_ROOTS:
         return True
     base = Path(root_dir)
-    return (base / f"{root}.py").is_file() or (base / root / "__init__.py").is_file()
+    for prefix in _SOURCE_DIRS:
+        candidate = base / prefix if prefix else base
+        if (candidate / f"{root}.py").is_file() or (candidate / root).is_dir():
+            return True
+    return False
 
 
 def _is_stdlib(root: str) -> bool:
@@ -298,13 +327,27 @@ def _is_stdlib(root: str) -> bool:
         return True
     if not spec.has_location or not origin:
         return False
-    stdlib_dir = sysconfig.get_paths().get("stdlib") or ""
+    paths = sysconfig.get_paths()
+    stdlib_dir = paths.get("stdlib") or ""
     if not stdlib_dir:
         return False
+    resolved = Path(origin).resolve()
     try:
-        Path(origin).resolve().relative_to(Path(stdlib_dir).resolve())
+        resolved.relative_to(Path(stdlib_dir).resolve())
     except (OSError, ValueError):
         return False
+    # ``site-packages`` lives under the stdlib directory, so containment alone
+    # calls every installed package standard library — which is the one answer
+    # this function must never give for a third-party import.
+    for key in ("purelib", "platlib"):
+        site_dir = paths.get(key) or ""
+        if not site_dir:
+            continue
+        try:
+            resolved.relative_to(Path(site_dir).resolve())
+            return False
+        except (OSError, ValueError):
+            continue
     return True
 
 
@@ -508,6 +551,20 @@ def _write_allowlist(out_path: Path) -> int:
     for name in list(names):
         for alias in IMPORT_ALIASES.get(name, ()):
             names.add(norm(alias))
+        # The reverse direction too: an import proves the distribution is
+        # installed, and a reader of this file should see the name they would
+        # write in `pip install`, not only the alias the code uses.
+        for distribution, aliases in IMPORT_ALIASES.items():
+            if name in {norm(alias) for alias in aliases}:
+                names.add(norm(distribution))
+
+    # Never drop an entry a human added by hand: the snapshot is also where a
+    # dependency is declared *before* it is used, and a regeneration that
+    # silently forgot those would re-open the hole it was added to close.
+    try:
+        names |= load_allowlist(out_path)
+    except OSError:
+        pass
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(

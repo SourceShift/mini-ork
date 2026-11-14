@@ -59,6 +59,17 @@ def _import(name: str):
         return importlib.import_module(name)
     except ImportError:
         pass
+    # The engine root, not the target: the module may import its own package
+    # siblings (`touched_files` is loaded the same way), and a bare file load
+    # gives it no package context. Inserting the ENGINE is safe in a way
+    # inserting the scanned repo is not — the engine is the code doing the check.
+    engine = str(HERE.parents[2])
+    if engine not in sys.path:
+        sys.path.insert(0, engine)
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pass
     candidate = HERE.parents[2].joinpath(*name.split(".")).with_suffix(".py")
     if not candidate.is_file():
         return None
@@ -327,6 +338,13 @@ def main() -> int:
     findings, unparsed, requirements_checked, imports_checked = _scan(
         dep, root, touched, allowlist, base,
     )
+    if unparsed:
+        # A file the gate could not read or parse was not checked. Reporting the
+        # run as passing would claim coverage it does not have.
+        return _emit_abstain(
+            f"{len(unparsed)} touched file(s) could not be parsed: "
+            + ", ".join(unparsed[:3])
+        )
     return _emit_result(findings, unparsed, requirements_checked, imports_checked)
 
 

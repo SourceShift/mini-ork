@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -191,6 +192,29 @@ def _emit(payload: dict) -> None:
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
 
+def _resolve_base(scope, root: str) -> str:
+    """The revision the run's added lines are measured from.
+
+    The run's own start point when there is one; otherwise ``HEAD``. That
+    fallback is load-bearing: ``git diff`` with no revision compares the
+    worktree to the INDEX, so a run that stages its edits (the publisher does)
+    would show the gate nothing and scan as clean. With no commits at all there
+    is nothing to diff against and the untracked-file harvest is the surface.
+    """
+    if scope is not None:
+        base = scope.scoped_base(root)
+        if base:
+            return base
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "HEAD"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "HEAD" if result.returncode == 0 else ""
+
+
 def main() -> int:
     root = os.environ.get("MO_TARGET_CWD", "").strip() or os.getcwd()
 
@@ -214,7 +238,7 @@ def main() -> int:
     # it can skip untracked paths outright instead of reading a whole run-record
     # tree to then throw the lines away.
     allowed = set(touched)
-    base = scope.scoped_base(root) if scope is not None else ""
+    base = _resolve_base(scope, root)
     added, unreadable, measured = scanner.collect_added(root, base, only=allowed)
     if not measured:
         _emit(_abstain("git could not produce a diff — not checked"))
