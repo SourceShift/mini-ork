@@ -102,11 +102,13 @@ def _dedupe(items: Iterable[str]) -> list:
     return ordered
 
 
-def exploit_tests(run_dir: str, env_value: str) -> list:
+def exploit_tests(run_dir: str, env_value: str, root: str = "") -> list:
     """The exploit test paths, explicit env first, else the run-dir file.
 
-    A newline in the env value is a deliberate one-path-per-line list, so a
-    path containing a space survives it; a single line is whitespace-split.
+    A newline in the env value is a deliberate one-path-per-line list, and a
+    single-line value naming an existing file under ``root`` is taken whole —
+    both keep a path containing a space intact. Otherwise the value is
+    whitespace-split.
     """
     value = (env_value or "").strip()
     if value:
@@ -115,6 +117,8 @@ def exploit_tests(run_dir: str, env_value: str) -> list:
                 line.strip() for line in value.splitlines() if line.strip()
             ]
             return _dedupe(entries)
+        if " " in value and root and (Path(root) / value).exists():
+            return [value]
         return _dedupe(value.split())
     try:
         text = (Path(run_dir) / RUN_DIR_FILE).read_text(encoding="utf-8")
@@ -250,7 +254,7 @@ def _relative_to_root(root: str, path: str) -> Optional[Path]:
             root_resolved / candidate
         ).resolve()
         return resolved.relative_to(root_resolved)
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return None
 
 
@@ -271,10 +275,21 @@ def _copy_exploits(root: str, dest: str, relatives: Iterable[Path]) -> list:
     for relative in relatives:
         source = Path(root) / relative
         target = Path(dest) / relative
+        # Contain BEFORE creating anything: ``mkdir(parents=True)`` through a
+        # symlinked parent already writes outside the base tree. ``resolve``
+        # also raises RuntimeError on a symlink LOOP (Python 3.9; 3.13 makes it
+        # OSError), so both exceptions are a refusal, not a crash.
+        try:
+            target.parent.resolve().relative_to(dest_resolved)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise OSError(
+                "refusing to stage %s: its parent resolves outside the base "
+                "tree (%s)" % (relative, exc)
+            ) from exc
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             target.resolve().relative_to(dest_resolved)
-        except ValueError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             raise OSError(
                 "refusing to stage %s: it resolves outside the base tree (%s)"
                 % (relative, exc)
@@ -412,6 +427,18 @@ def evaluate(
                     [Check(EXPLOIT_BASE_CHECK, False, tail, True)],
                     "exploit run on the base tree timed out",
                 )
+            if rc is not None and rc < 0:
+                # Killed by a signal (OOM, a supervisor): the tests never
+                # finished, which is unmeasured — not a refutation.
+                return (
+                    "abstain",
+                    [Check(
+                        EXPLOIT_BASE_CHECK, False,
+                        "killed by signal %s: %s" % (-rc, tail), True,
+                    )],
+                    "the exploit run on the base tree was killed by signal %s"
+                    % (-rc),
+                )
             if rc in PYTEST_DID_NOT_RUN:
                 return (
                     "abstain",
@@ -447,6 +474,19 @@ def evaluate(
                     "abstain",
                     checks,
                     "exploit run on the head tree timed out",
+                )
+            if rc < 0 or rc in PYTEST_DID_NOT_RUN or (
+                rc == PYTEST_TESTS_FAILED
+                and not _TEST_FAILURE_RE.search(tail)
+            ):
+                # Same discriminator as the base run, for symmetry: a head run
+                # that never executed the tests (killed, a collection error, or
+                # pytest unimportable) refutes nothing.
+                checks.append(Check(EXPLOIT_HEAD_CHECK, False, tail, True))
+                return (
+                    "abstain",
+                    checks,
+                    "the exploit did not run on the head tree (exit %s)" % rc,
                 )
             checks.append(Check(EXPLOIT_HEAD_CHECK, rc == 0, tail, True))
         finally:

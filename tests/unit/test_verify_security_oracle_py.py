@@ -354,7 +354,41 @@ def test_copy_refuses_a_symlinked_parent_that_escapes_the_base(tmp_path):
     (dest / "link").symlink_to(outside)
     with pytest.raises(OSError):
         so._copy_exploits(root, str(dest), [Path("link/test_exploit.py")])
+    # Containment is checked BEFORE mkdir: no directory was created outside.
     assert not (outside / "test_exploit.py").exists()
+    assert list(outside.iterdir()) == []
+
+
+@requires_git
+def test_copy_refuses_a_symlink_loop(tmp_path):
+    # Python 3.9 raises RuntimeError (not OSError) on a symlink loop, and a
+    # crash here would read as a node failure instead of an abstention.
+    root = tmp_path / "head"
+    dest = tmp_path / "base"
+    (root / "loop").mkdir(parents=True)
+    dest.mkdir()
+    (root / "loop" / "test_exploit.py").write_text(EXPLOIT, encoding="utf-8")
+    (dest / "loop").symlink_to(dest / "loop")
+    with pytest.raises(OSError):
+        so._copy_exploits(root, str(dest), [Path("loop/test_exploit.py")])
+
+
+def test_exploit_tests_single_path_with_spaces_that_exists(tmp_path):
+    spaced = tmp_path / "my tests"
+    spaced.mkdir()
+    (spaced / "x.py").write_text("", encoding="utf-8")
+    assert so.exploit_tests("/nonexistent", "my tests/x.py", str(tmp_path)) == [
+        "my tests/x.py"]
+
+
+@requires_git
+def test_evaluate_duplicate_spellings_of_one_exploit_pass(tmp_path):
+    repo = build_repo(tmp_path)
+    status, checks, _ = so.evaluate(
+        str(repo), "HEAD~1", ["src/auth/login.py"], "1",
+        ["test_exploit.py", "./test_exploit.py"], "")
+    assert status == "pass"
+    assert set(_checks_by_name(checks)) == CHECK_NAMES
 
 
 @requires_git

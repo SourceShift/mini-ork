@@ -179,7 +179,7 @@ def main() -> int:
 
     run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
     exploit_files = oracle.exploit_tests(
-        run_dir, os.environ.get(oracle.EXPLOIT_ENV, "")
+        run_dir, os.environ.get(oracle.EXPLOIT_ENV, ""), root
     )
     functional_cmd = (
         os.environ.get(oracle.FUNCTIONAL_ENV, "").strip()
