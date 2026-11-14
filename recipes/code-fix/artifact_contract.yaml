@@ -11,6 +11,9 @@ success_verifiers:
   # New imports/requirements against the vendored snapshot, pinned and from an
   # index. The snapshot is read from the engine, not the repo under audit.
   - verifiers/dep_guard.py
+  # Paired exploit-and-functional oracle for security-labelled changes: the
+  # exploit must fail on base and pass on head, and is vacuous otherwise.
+  - verifiers/security_oracle.py
   - verifiers/test.py
   # Layer 2, gold-free: fires whenever a metamorphic spec exists (MO_METAMORPHIC_SPEC,
   # MO_METAMORPHIC_SPEC_JSON, or ${MINI_ORK_RUN_DIR}/metamorphic-spec.json). With no
