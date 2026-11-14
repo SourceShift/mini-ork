@@ -19,11 +19,14 @@ Exit: 0 pass, 1 fail, 0 abstain (the envelope carries ``verdict``).
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
 
 CHECKS_RUN = [
     "no-unpinned-dependency",
@@ -41,18 +44,35 @@ _CHECK_RULES = {
 }
 
 
-def _import(name: str, root: str):
-    """Import a framework module, with the target root on ``sys.path``.
+def _import(name: str):
+    """Load a framework module from the ENGINE, never from the scanned repo.
 
-    Deferred on purpose: a verifier copied into a fixture (or a target tree that
-    carries no ``mini_ork``) must abstain, not traceback.
+    Prepending the target to ``sys.path`` would let a repository under audit
+    ship its own ``mini_ork/verify/dep_guard.py`` that finds nothing, or a
+    ``touched_files`` that reports an empty surface — the gate would be bypassed
+    by the content it exists to check. The engine is this file's own tree
+    (``HERE.parents[2]``), which for a self-edit run is the run's copy of the
+    framework. Deferred on purpose: an unimportable gate must abstain, not
+    traceback.
     """
-    if root and root not in sys.path:
-        sys.path.insert(0, root)
     try:
         return importlib.import_module(name)
-    except Exception:  # fallback-guard: allow: an unimportable gate must abstain, never crash the run
+    except ImportError:
+        pass
+    candidate = HERE.parents[2].joinpath(*name.split(".")).with_suffix(".py")
+    if not candidate.is_file():
         return None
+    spec = importlib.util.spec_from_file_location(f"_mo_{name.rsplit('.', 1)[-1]}", candidate)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # fallback-guard: allow: an unloadable gate must abstain, never crash the run
+        sys.modules.pop(spec.name, None)
+        return None
+    return module
 
 
 def _touched(root: str):
@@ -60,7 +80,7 @@ def _touched(root: str):
     explicit = os.environ.get("MINI_ORK_TOUCHED_FILES", "").strip()
     if explicit:
         return [line for line in explicit.splitlines() if line.strip()]
-    scope = _import("mini_ork.verify.touched_files", root)
+    scope = _import("mini_ork.verify.touched_files")
     if scope is None:
         return None
     if not scope.is_git_worktree(root):
@@ -233,7 +253,7 @@ def _emit_result(findings, unparsed, requirements_checked, imports_checked) -> i
 
 def main() -> int:
     root = os.environ.get("MO_TARGET_CWD", "").strip() or os.getcwd()
-    dep = _import("mini_ork.verify.dep_guard", root)
+    dep = _import("mini_ork.verify.dep_guard")
     if dep is None:
         return _emit_abstain("dependency gate module is not importable")
 
@@ -249,7 +269,7 @@ def main() -> int:
     if touched is None:
         return _emit_abstain("cannot attribute the run's change surface")
 
-    scope = _import("mini_ork.verify.touched_files", root)
+    scope = _import("mini_ork.verify.touched_files")
     base = scope.scoped_base(root) if scope is not None else ""
     findings, unparsed, requirements_checked, imports_checked = _scan(
         dep, root, touched, allowlist, base,
