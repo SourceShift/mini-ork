@@ -614,3 +614,27 @@ def test_generator_records_the_installed_distribution_for_an_alias(
         if line.strip() and not line.strip().startswith("#")
     }
     assert {"pil", "pillow"} <= body
+
+
+def test_verifier_flags_a_squat_added_on_top_of_a_resolvable_base(tmp_path):
+    """The true-positive direction over a real base: only the NEW import counts.
+
+    Every other verifier test either has no baseline (untracked file) or an
+    empty diff, so this is the one that proves ``_base_imports`` narrows the
+    check to what the change added rather than to the whole file.
+    """
+    repo = _git_repo(tmp_path)
+    (repo / "needs.py").write_text("import requests\n", encoding="utf-8")
+    _commit(repo, "baseline import")
+    (repo / "needs.py").write_text(
+        "import requests\nimport requets\n", encoding="utf-8",
+    )
+    allow = tmp_path / "allow.txt"
+    allow.write_text("requests\n", encoding="utf-8")
+
+    proc = _run_verifier(repo, allowlist=allow, touched="needs.py")
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert [f["rule"] for f in payload["findings"]] == ["squat-suspect"]
+    assert payload["findings"][0]["name"] == "requets"
+    assert re.search(r"1 new imports", proc.stdout), proc.stdout

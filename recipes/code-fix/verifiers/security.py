@@ -192,6 +192,19 @@ def _emit(payload: dict) -> None:
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
 
+def _resolves(root: str, ref: str) -> bool:
+    """True when ``ref`` names a commit in the repository at ``root``."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "--quiet",
+             f"{ref}^{{commit}}"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _resolve_base(scope, root: str) -> str:
     """The revision the run's added lines are measured from.
 
@@ -203,7 +216,10 @@ def _resolve_base(scope, root: str) -> str:
     """
     if scope is not None:
         base = scope.scoped_base(root)
-        if base:
+        # The scope module may be an older copy (a run's engine is pinned), so
+        # the ref is re-checked here: a base that does not resolve makes the
+        # diff fail silently and the gate scan nothing.
+        if base and _resolves(root, base):
             return base
     try:
         result = subprocess.run(

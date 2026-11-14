@@ -85,10 +85,34 @@ def scoped_base(root: str) -> str:
     return ""
 
 
+def repo_prefix(root: str) -> str:
+    """``root``'s path inside its repo, with no trailing slash (``""`` at root).
+
+    Git reports paths from the REPOSITORY root even when ``-C`` points at a
+    subdirectory, so a caller whose root is ``pkg/sub`` would join
+    ``pkg/sub/a.py`` onto ``pkg/sub`` and stat a file that does not exist —
+    every gate would then silently scan nothing. The prefix is what has to come
+    off, and ``git status`` has no ``--relative`` to do it for us.
+    """
+    rc, out = _git(root, "rev-parse", "--show-prefix")
+    return out.strip().rstrip("/") if rc == 0 else ""
+
+
+def _within(prefix: str, path: str) -> str | None:
+    """``path`` relative to ``prefix``, or ``None`` when it is outside it."""
+    if not prefix:
+        return path
+    head = prefix + "/"
+    if not path.startswith(head):
+        return None
+    return path[len(head):]
+
+
 def touched_files(root: str) -> List[str]:
-    """Repo-relative paths this run changed: working tree, untracked, and
-    (when a base resolves) everything committed on top of it."""
+    """Paths this run changed, relative to ``root``: working tree, untracked,
+    and (when a base resolves) everything committed on top of it."""
     paths = set()
+    prefix = repo_prefix(root)
     # ``-z`` is what makes a path with a space, a quote or a non-ASCII byte come
     # back verbatim. Without it git quotes such a path and C-escapes the content,
     # and stripping the quotes yields a name that matches no file — so the
@@ -107,7 +131,7 @@ def touched_files(root: str) -> List[str]:
                 # A rename/copy is followed by its source path as its own
                 # record; the destination is the one this run touched.
                 index += 1
-            rel = rel.strip()
+            rel = _within(prefix, rel.strip())
             if rel:
                 paths.add(rel)
     base = scoped_base(root)
@@ -115,7 +139,10 @@ def touched_files(root: str) -> List[str]:
         # ``-z`` for the same reason as ``status`` above: ``--name-only`` without
         # it quotes a path holding a space or a non-ASCII byte, so a committed
         # file would vanish from the surface while an uncommitted one survived.
-        rc, out = _git(root, "diff", "--name-only", "-z", base + "...HEAD")
+        # ``--relative`` does here what the prefix strip does above.
+        rc, out = _git(
+            root, "diff", "--name-only", "--relative", "-z", base + "...HEAD",
+        )
         if rc == 0:
             paths.update(p.strip() for p in out.split("\x00") if p.strip())
     return sorted(p for p in paths if p and not p.startswith(_NOISE_PREFIX))

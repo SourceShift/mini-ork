@@ -270,6 +270,12 @@ def _run_dir_ref() -> str:
     return ref if _HEX_REF.fullmatch(ref) else ""
 
 
+def _resolves(root: str, ref: str) -> bool:
+    """True when ``ref`` names a commit in the repository at ``root``."""
+    rc, _ = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    return rc == 0
+
+
 def _scoped_base(root: str) -> str:
     """The base the diff is taken against — the run's own start point first.
 
@@ -280,7 +286,10 @@ def _scoped_base(root: str) -> str:
     run dir (the goal-loop binding's contract).
     """
     ref = _run_dir_ref() or os.environ.get("MO_GOAL_SCOPED_BASE", "").strip()
-    if ref:
+    # A ref that does not resolve is worse than none: the diff against it fails,
+    # the committed part of the run's work disappears, and the tool then checks
+    # less than the run changed without saying so.
+    if ref and _resolves(root, ref):
         return ref
     for candidate in ("origin/main", "main"):
         rc, out = _git(root, "merge-base", "HEAD", candidate)

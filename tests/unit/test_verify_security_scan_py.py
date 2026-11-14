@@ -494,3 +494,44 @@ def test_verifier_abstains_when_a_changed_path_cannot_be_read(tmp_path):
     assert envelope["verdict"] == "abstain", envelope
     assert envelope["failure_kind"] == "toolchain"
     assert "could not be read" in envelope["error_summary"]
+
+
+@requires_git
+def test_collect_added_translates_paths_under_a_subdirectory_root(tmp_path):
+    """A gate rooted below the repo root must still read the changed file.
+
+    ``git -C <sub>`` reports repo-root paths, so without stripping the prefix
+    the untracked harvest stats ``pkg/sub/a.py`` under ``pkg/sub`` and calls the
+    file unreadable — no line is ever scanned.
+    """
+    repo = _make_repo(tmp_path)
+    sub = repo / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (sub / "leaky.py").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+
+    added, unreadable, measured = ss.collect_added(str(sub), "")
+
+    assert measured is True
+    assert unreadable == []
+    assert "leaky.py" in added
+    assert [f.rule for f in ss.scan_added(added)] == ["aws-access-key"]
+
+
+@requires_git
+def test_verifier_discards_an_unresolvable_scoped_base(tmp_path):
+    """A base nobody can resolve must not blind the gate.
+
+    Diffing against a bogus ref fails, ``measured`` goes False, and the gate
+    abstains — so a seeded credential would go unreported. The ref is therefore
+    dropped in favour of ``HEAD``, and the credential is found.
+    """
+    repo = _make_repo(tmp_path)  # already committed
+    (repo / "base.txt").write_text(f'key = "{AWS_KEY}"\n', encoding="utf-8")
+
+    proc = _run_verifier(
+        repo, touched="base.txt",
+        extra_env={"MO_GOAL_SCOPED_BASE": "deadbeefdeadbeef"},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    envelope = json.loads(proc.stdout.strip())
+    assert envelope["failed_checks"] == ["aws-access-key"], envelope

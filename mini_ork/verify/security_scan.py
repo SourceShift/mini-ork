@@ -92,8 +92,20 @@ def _git(root: str, *args: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout or ""
 
 
-def _untracked_paths(status_text: str) -> list[str]:
-    """Repo-relative, forward-slashed paths for ``??`` entries in porcelain.
+def _repo_prefix(root: str) -> str:
+    """``root``'s path inside its repository, without a trailing slash.
+
+    Git reports paths from the repository root even under ``-C <subdir>``, so a
+    gate rooted at a subdirectory would join ``pkg/sub/a.py`` onto ``pkg/sub``
+    and read a path that does not exist — every changed file becomes
+    "unreadable" and nothing is scanned.
+    """
+    rc, out = _git(root, "rev-parse", "--show-prefix")
+    return out.strip().rstrip("/") if rc == 0 else ""
+
+
+def _untracked_paths(status_text: str, prefix: str = "") -> list[str]:
+    """Root-relative, forward-slashed paths for ``??`` entries in porcelain.
 
     ``status -z`` is required, not cosmetic: without it git quotes any path that
     contains a space, a quote or a non-ASCII byte and C-escapes the contents
@@ -107,8 +119,15 @@ def _untracked_paths(status_text: str) -> list[str]:
         if not record.startswith("?? "):
             continue
         rel = record[3:].strip()
-        if rel:
-            paths.append(rel.replace("\\", "/"))
+        if not rel:
+            continue
+        rel = rel.replace("\\", "/")
+        if prefix:
+            head = prefix + "/"
+            if not rel.startswith(head):
+                continue  # outside the gate's root
+            rel = rel[len(head):]
+        paths.append(rel)
     return paths
 
 
@@ -127,7 +146,11 @@ def collect_added(
     # repo-controlled config and attributes, so a repository being audited could
     # otherwise make its own diff render empty and pass the gate by hiding the
     # lines it added.
-    diff_args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-U0"]
+    # ``--relative`` makes the diff speak the same coordinates as the surface:
+    # paths relative to the gate's root, even when the root is a subdirectory.
+    diff_args = [
+        "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--relative", "-U0",
+    ]
     if base:
         diff_args.append(base)
     rc, diff_text = _git(root, *diff_args)
@@ -145,7 +168,8 @@ def collect_added(
     }
 
     unreadable: list[str] = []
-    for rel in _untracked_paths(status_text):
+    prefix = _repo_prefix(root)
+    for rel in _untracked_paths(status_text, prefix):
         if rel in added:
             continue
         if surface is not None and rel not in surface:

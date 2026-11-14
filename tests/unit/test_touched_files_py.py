@@ -33,7 +33,9 @@ def repo(tmp_path):
         pytest.skip("git is not installed")
     root = tmp_path / "repo"
     root.mkdir()
-    assert _git(root, "init", "-q").returncode == 0
+    # Pinned: `scoped_base` falls back to `merge-base HEAD main`, and the
+    # host's default-branch setting would otherwise decide the test.
+    assert _git(root, "init", "-q", "-b", "main").returncode == 0
     assert _git(root, "config", "user.email", "t@example.invalid").returncode == 0
     assert _git(root, "config", "user.name", "Test").returncode == 0
     (root / "seed.txt").write_text("seed\n", encoding="utf-8")
@@ -129,3 +131,23 @@ def test_unresolvable_base_ref_falls_through(repo, monkeypatch):
     # gets no diff at all, and every pre-existing import looks newly added.
     assert base and base != "deadbeefdeadbeef"
     assert _git(repo, "rev-parse", "--verify", base).returncode == 0
+
+
+@requires_git
+def test_subdirectory_root_reports_root_relative_paths(repo):
+    """``git -C sub`` still speaks repo-root paths; the gate must translate.
+
+    Joining ``pkg/sub/a.py`` onto a root of ``pkg/sub`` stats a file that does
+    not exist, so every gate rooted at a subdirectory scanned nothing while
+    reporting a clean pass.
+    """
+    sub = repo / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (sub / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "outside.py").write_text("x = 1\n", encoding="utf-8")
+
+    surface = tf.touched_files(str(sub))
+
+    assert "a.py" in surface
+    assert "outside.py" not in surface
+    assert tf.repo_prefix(str(sub)) == "pkg/sub"

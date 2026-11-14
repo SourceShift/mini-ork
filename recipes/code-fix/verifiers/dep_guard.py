@@ -270,7 +270,9 @@ def _emit_result(findings, unparsed, requirements_checked, imports_checked) -> i
         summary = coverage
         reasons = []
     else:
-        summary = f"{len(findings)} dependency finding(s)"
+        # The coverage belongs in the fail path too: "1 finding" alone cannot
+        # tell a reviewer whether the gate looked at one file or a thousand.
+        summary = f"{len(findings)} dependency finding(s); {coverage}"
         reasons = [f"{len(findings)} dependency finding(s); see findings"]
     if unparsed:
         # The fail stands, but a reader must know the check was partial.

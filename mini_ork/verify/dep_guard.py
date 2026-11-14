@@ -290,10 +290,16 @@ _SOURCE_DIRS = ("", "src")
 def is_first_party(root_dir: Path, module: str) -> bool:
     """True for this project's own modules (a known root, a file, or a package).
 
-    Both a module file and a bare package directory count, because a namespace
+    Both a module file and a package directory count, because a namespace
     package has no ``__init__.py``; and both the checkout root and ``src/`` are
     searched, because a src-layout project's own code is otherwise reported as
     an unknown dependency — the gate would fail every run in such a repo.
+
+    A directory that ships Python IS the project's code, even when its name
+    matches a dependency: importing it really does run the local package. The
+    gate is a dependency-existence check, not a package-name authority, so this
+    is not treated as a violation — a reviewer sees the new directory in the
+    diff, which a name rule cannot substitute for.
     """
     root = module.split(".")[0]
     if root in FIRST_PARTY_ROOTS:
@@ -313,17 +319,18 @@ def is_first_party(root_dir: Path, module: str) -> bool:
     return False
 
 
-def _holds_python(package: Path, depth: int = 2) -> bool:
-    """True when ``package`` contains at least one ``.py`` within ``depth``."""
+def _holds_python(package: Path) -> bool:
+    """True when ``package`` contains Python anywhere beneath it.
+
+    Any depth, because a namespace package nests its modules as deep as the
+    project likes (``src/acme/services/billing/impl.py``) and a depth limit
+    turns the project's own code into an "unknown dependency". The walk stops at
+    the first hit, so the cost is one directory listing in the common case.
+    """
     try:
-        for entry in package.iterdir():
-            if entry.name.endswith(".py") and entry.is_file():
-                return True
-            if depth > 1 and entry.is_dir() and _holds_python(entry, depth - 1):
-                return True
+        return next(package.rglob("*.py"), None) is not None
     except OSError:
         return False
-    return False
 
 
 def _is_stdlib(root: str) -> bool:
