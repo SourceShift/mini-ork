@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""verifiers/dep_guard.py — the offline dependency gate, as a recipe verifier.
+
+``mini_ork/verify/dep_guard.py`` holds the rule; this script applies it to the
+run's change surface and emits the single-line verifier envelope. A *new* import
+or a *declared* requirement in a touched file must resolve against the vendored
+allowlist, carry an exact ``==`` pin, and not come from a URL/VCS source.
+
+Scope is the run's own change surface (``MINI_ORK_TOUCHED_FILES`` else
+``mini_ork.verify.touched_files``), exactly like ``verifiers/fallback_guard.py``:
+a pre-existing bad requirement elsewhere in the tree is not this patch's
+failure. Whole current file content is scanned (not a diff), and for ``.py``
+files only the imports the change *adds* are checked.
+
+Env: MO_TARGET_CWD?, MO_DEP_ALLOWLIST?, MINI_ORK_TOUCHED_FILES?
+Output: one line of JSON on stdout.
+Exit: 0 pass, 1 fail, 0 abstain (the envelope carries ``verdict``).
+"""
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+CHECKS_RUN = [
+    "no-unpinned-dependency",
+    "no-untrusted-source",
+    "no-unknown-dependency",
+]
+
+#: Which name-rule findings fail which check. ``squat-suspect`` is an unknown
+#: dependency that is one edit from an allowlisted one, so it rides the
+#: unknown-dependency check while still appearing in ``failed_checks``.
+_CHECK_RULES = {
+    "no-unpinned-dependency": {"unpinned-dependency"},
+    "no-untrusted-source": {"untrusted-source"},
+    "no-unknown-dependency": {"unknown-dependency", "squat-suspect"},
+}
+
+
+def _import(name: str, root: str):
+    """Import a framework module, with the target root on ``sys.path``.
+
+    Deferred on purpose: a verifier copied into a fixture (or a target tree that
+    carries no ``mini_ork``) must abstain, not traceback.
+    """
+    if root and root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        return importlib.import_module(name)
+    except Exception:  # fallback-guard: allow: an unimportable gate must abstain, never crash the run
+        return None
+
+
+def _touched(root: str):
+    """The run's change surface, or ``None`` when it cannot be attributed."""
+    explicit = os.environ.get("MINI_ORK_TOUCHED_FILES", "").strip()
+    if explicit:
+        return [line for line in explicit.splitlines() if line.strip()]
+    scope = _import("mini_ork.verify.touched_files", root)
+    if scope is None:
+        return None
+    if not scope.is_git_worktree(root):
+        return None
+    return scope.touched_files(root)
+
+
+def _allowlist_path(dep, root: str) -> Path:
+    override = os.environ.get("MO_DEP_ALLOWLIST", "").strip()
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.is_absolute() else Path(root) / candidate
+    return Path(root) / dep.ALLOWLIST_DEFAULT
+
+
+def _read(path: Path):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _pyproject_entries(dep, text: str) -> list:
+    import tomllib
+
+    data = tomllib.loads(text)
+    project = data.get("project", {}) or {}
+    groups = [project.get("dependencies", []) or []]
+    groups.extend((project.get("optional-dependencies", {}) or {}).values())
+    entries = []
+    for group in groups:
+        for item in group or []:
+            for _lineno, name, spec in dep.parse_requirements(str(item) + "\n"):
+                entries.append((0, name, spec))
+    return entries
+
+
+def _base_imports(dep, root: str, base: str, rel: str) -> frozenset:
+    """Imports in the base version of ``rel``; empty when there is no base."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "show", f"{base}:{rel}"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return frozenset()
+    if result.returncode != 0:
+        return frozenset()
+    try:
+        return dep.parse_imports(result.stdout)
+    except ValueError:
+        return frozenset()
+
+
+def _scan(dep, root: str, touched: list, allowlist: frozenset, base: str):
+    findings = []
+    unparsed = []
+    requirements_checked = 0
+    imports_checked = 0
+    root_path = Path(root)
+    for rel in touched:
+        rel_posix = rel.replace(os.sep, "/")
+        path = root_path / rel
+        if not path.is_file():
+            continue
+        text = _read(path)
+        if text is None:
+            unparsed.append(rel_posix)
+            continue
+        if dep.REQUIREMENTS_RE.search(rel_posix):
+            entries = dep.parse_requirements(text)
+            requirements_checked += len(entries)
+            findings.extend(dep.check_requirements(
+                entries, allowlist=allowlist, path=rel_posix,
+            ))
+        elif Path(rel_posix).name == "pyproject.toml":
+            try:
+                entries = _pyproject_entries(dep, text)
+            except (ValueError, OSError):
+                unparsed.append(rel_posix)
+                continue
+            requirements_checked += len(entries)
+            findings.extend(dep.check_requirements(
+                entries, allowlist=allowlist, path=rel_posix,
+            ))
+        elif rel_posix.endswith(".py"):
+            old = _base_imports(dep, root, base, rel_posix) if base else frozenset()
+            try:
+                new = dep.parse_imports(text)
+            except ValueError:
+                unparsed.append(rel_posix)
+                continue
+            added = dep.new_imports(old, new)
+            imports_checked += len(added)
+            findings.extend(dep.check_imports(
+                added, allowlist=allowlist, root_dir=root_path, path=rel_posix,
+            ))
+    return findings, unparsed, requirements_checked, imports_checked
+
+
+def _checks(findings, gating: bool) -> list:
+    failed = {finding.rule for finding in findings}
+    checks = []
+    for name in CHECKS_RUN:
+        ok = not (_CHECK_RULES[name] & failed)
+        checks.append({
+            "name": name,
+            "pass": ok,
+            "gating": gating,
+            "detail": "clear" if ok else "see findings",
+        })
+    return checks
+
+
+def _emit(payload: dict) -> None:
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+
+
+def _emit_abstain(reason: str) -> int:
+    _emit({
+        "verifier": "dep_guard",
+        "pass": False,
+        "verdict": "abstain",
+        "status": "unverified",
+        "failure_kind": "toolchain",
+        "evidence_path": None,
+        "checks_run": list(CHECKS_RUN),
+        "failed_checks": [],
+        "checks": [
+            {"name": name, "pass": False, "gating": False, "detail": reason}
+            for name in CHECKS_RUN
+        ],
+        "reasons": [reason],
+        "checked_criteria": list(CHECKS_RUN),
+        "error_summary": reason,
+        "findings": [],
+        "unparsed": [],
+    })
+    return 0
+
+
+def _emit_result(findings, unparsed, requirements_checked, imports_checked) -> int:
+    passed = not findings
+    failed_checks = sorted({finding.rule for finding in findings})
+    if passed:
+        summary = (
+            f"{requirements_checked} requirements and "
+            f"{imports_checked} new imports checked"
+        )
+        reasons = []
+    else:
+        summary = f"{len(findings)} dependency finding(s)"
+        reasons = [f"{len(findings)} dependency finding(s); see findings"]
+    _emit({
+        "verifier": "dep_guard",
+        "pass": passed,
+        "verdict": "pass" if passed else "fail",
+        "evidence_path": None,
+        "checks_run": list(CHECKS_RUN),
+        "failed_checks": failed_checks,
+        "checks": _checks(findings, gating=True),
+        "reasons": reasons,
+        "checked_criteria": list(CHECKS_RUN),
+        "error_summary": summary,
+        "findings": [finding.as_dict() for finding in findings],
+        "unparsed": unparsed,
+    })
+    return 0 if passed else 1
+
+
+def main() -> int:
+    root = os.environ.get("MO_TARGET_CWD", "").strip() or os.getcwd()
+    dep = _import("mini_ork.verify.dep_guard", root)
+    if dep is None:
+        return _emit_abstain("dependency gate module is not importable")
+
+    allow_path = _allowlist_path(dep, root)
+    try:
+        allowlist = dep.load_allowlist(allow_path)
+    except OSError as exc:
+        return _emit_abstain(
+            f"allowlist snapshot unavailable at {allow_path}: {exc}"
+        )
+
+    touched = _touched(root)
+    if touched is None:
+        return _emit_abstain("cannot attribute the run's change surface")
+
+    scope = _import("mini_ork.verify.touched_files", root)
+    base = scope.scoped_base(root) if scope is not None else ""
+    findings, unparsed, requirements_checked, imports_checked = _scan(
+        dep, root, touched, allowlist, base,
+    )
+    return _emit_result(findings, unparsed, requirements_checked, imports_checked)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

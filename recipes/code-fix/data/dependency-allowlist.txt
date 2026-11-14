@@ -1,0 +1,21 @@
+# Vendored dependency allowlist for the code-fix dep gate.
+# One normalized name per line: a distribution name or an import name.
+# Regenerate: python3 -m mini_ork.verify.dep_guard --write-allowlist \
+#   recipes/code-fix/data/dependency-allowlist.txt
+# A new dependency is a deliberate, reviewable line in this file — never a
+# silent side effect of an implementer's import. Snapshot date: 2026-11-14.
+acp
+agent_client_protocol
+cryptography
+daytona
+e2b
+fastapi
+fitz
+gepa
+jsonschema
+modal
+pymupdf
+pyyaml
+uvicorn
+verifiers
+yaml

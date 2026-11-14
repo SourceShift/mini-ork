@@ -1,6 +1,6 @@
 version: "0.1.0"
 task_class: code_fix
-description: "Single-patch code fix with typecheck, fallback-guard, security, test, and reviewer gates"
+description: "Single-patch code fix with typecheck, fallback-guard, security, test, dependency, and reviewer gates"
 
 nodes:
   # Reference capability profiles — enforced hermetically by
@@ -58,6 +58,15 @@ nodes:
     type: verifier
     prompt_ref: null
     verifier_ref: verifiers/test.py
+    dispatch_mode: serial
+
+  # SEC-G01-T03: offline dependency gate — a new import or requirement must
+  # exist in the vendored allowlist, carry an exact pin, and not come from a
+  # URL/VCS source. Abstains (never passes) without its allowlist snapshot.
+  - name: dependencies
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/dep_guard.py
     dispatch_mode: serial
 
   - name: reviewer
@@ -118,6 +127,10 @@ edges:
   - { from: security,    to: rollback,   edge_type: escalates_to    }
   - { from: security,    to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: test,        to: implementer, edge_type: retries, max_rounds: 2 }
+  - { from: implementer, to: dependencies, edge_type: depends_on      }
+  - { from: dependencies, to: reviewer,    edge_type: depends_on      }
+  - { from: dependencies, to: rollback,    edge_type: escalates_to    }
+  - { from: dependencies, to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: reviewer,    to: implementer, edge_type: retries, max_rounds: 2 }
 
 rollback_strategy: revert_branch
