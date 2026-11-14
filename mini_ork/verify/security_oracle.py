@@ -22,7 +22,11 @@ RUN_DIR_FILE = "exploit-tests"
 FUNCTIONAL_ENV = "MO_SECURITY_ORACLE_FUNCTIONAL_CMD"
 FALLBACK_FUNCTIONAL_ENV = "MINI_ORK_TEST_CMD"
 TIMEOUT_ENV = "MO_SECURITY_ORACLE_TIMEOUT"
-DEFAULT_TIMEOUT = 900
+# The functional command runs TWICE (base + head), and this repo's own full
+# suite takes 10-17 minutes on 11 cores. 900 s per run would time out the
+# second one on a full-suite MINI_ORK_TEST_CMD and abstain the security change
+# for no reason; callers with a known-slow suite scope the command instead.
+DEFAULT_TIMEOUT = 1800
 
 # A path segment that names a security concern. The lookahead after the
 # keyword group stops ``authors.py`` / ``tokenizer.py`` from reading as
@@ -44,6 +48,12 @@ SECURITY_PATH_RE = re.compile(
 # would certify a fix nothing measured.
 PYTEST_TESTS_FAILED = 1
 PYTEST_DID_NOT_RUN = frozenset({2, 3, 4, 5})
+
+# ``python -m pytest`` exits 1 both when a test fails and when pytest itself
+# cannot be imported ("No module named pytest"), so exit 1 alone is not proof a
+# test ran. pytest's own failure summary is the discriminator; absent it, the
+# base failure is unmeasured rather than reproduced.
+_TEST_FAILURE_RE = re.compile(r"(^|\n)FAILED |\b\d+ (?:failed|error)", re.I)
 
 EXPLOIT_BASE_CHECK = "exploit-fails-on-base"
 EXPLOIT_HEAD_CHECK = "exploit-passes-on-head"
@@ -93,9 +103,18 @@ def _dedupe(items: Iterable[str]) -> list:
 
 
 def exploit_tests(run_dir: str, env_value: str) -> list:
-    """The exploit test paths, explicit env first, else the run-dir file."""
+    """The exploit test paths, explicit env first, else the run-dir file.
+
+    A newline in the env value is a deliberate one-path-per-line list, so a
+    path containing a space survives it; a single line is whitespace-split.
+    """
     value = (env_value or "").strip()
     if value:
+        if "\n" in value:
+            entries = [
+                line.strip() for line in value.splitlines() if line.strip()
+            ]
+            return _dedupe(entries)
         return _dedupe(value.split())
     try:
         text = (Path(run_dir) / RUN_DIR_FILE).read_text(encoding="utf-8")
@@ -241,12 +260,25 @@ def _copy_exploits(root: str, dest: str, relatives: Iterable[Path]) -> list:
     Returns ``(target, original_bytes_or_None)`` pairs so cleanup can restore a
     file the base commit already tracked instead of deleting it — the base tree
     a later functional run measures must be the tree as committed.
+
+    Raises ``OSError`` when the copy cannot be staged: a base tree is a git
+    checkout, so a TRACKED symlink can point its parent outside ``dest`` and
+    copying through it would write into the head tree. The containment check
+    runs on the resolved target, after ``mkdir``, before any bytes move.
     """
+    dest_resolved = Path(dest).resolve()
     copied = []
     for relative in relatives:
         source = Path(root) / relative
         target = Path(dest) / relative
         target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.resolve().relative_to(dest_resolved)
+        except ValueError as exc:
+            raise OSError(
+                "refusing to stage %s: it resolves outside the base tree (%s)"
+                % (relative, exc)
+            ) from exc
         saved = target.read_bytes() if target.exists() else None
         shutil.copy2(source, target)
         copied.append((target, saved))
@@ -291,6 +323,17 @@ def _functional_checks(
                 "base" if cwd == base_dest else "head",
             )
         checks.append(Check(label, rc == 0, tail, True))
+        if label == FUNCTIONAL_BASE_CHECK and rc != 0:
+            # A detached worktree is a checkout: it has no untracked build
+            # state (venv, node_modules) that the head tree relies on, so a red
+            # base says as much about the environment as about the code. And it
+            # is the reason the base is measured at all — if the base is not
+            # functional, an exploit failing there proves nothing. Unmeasured,
+            # not refuted.
+            return checks, (
+                "the base tree is not functional, so an exploit failing there "
+                "proves nothing (functional-passes-on-base exited %s)" % rc
+            )
     return checks, ""
 
 
@@ -335,7 +378,11 @@ def evaluate(
         relative = _relative_to_root(root, path)
         if relative is None:
             return "abstain", [], "exploit test outside the tree: %s" % path
-        relatives.append(relative)
+        # Dedupe on the RESOLVED path: ``a/../a/x.py`` and ``x.py`` are one
+        # target, and staging it twice saves the first copy's bytes as the
+        # "original" — so cleanup would write head bytes into the base tree.
+        if relative not in relatives:
+            relatives.append(relative)
 
     timeout = _timeout()
     parent = tempfile.mkdtemp(prefix="mo-security-oracle-")
@@ -349,7 +396,12 @@ def evaluate(
 
         copied = []
         try:
-            copied = _copy_exploits(root, dest, relatives)
+            try:
+                copied = _copy_exploits(root, dest, relatives)
+            except OSError as exc:
+                # Staging failed (permissions, a symlinked parent): the oracle
+                # cannot be built, so it is unmeasured — never a refusal.
+                return "abstain", [], str(exc)
             # The base run names the RELATIVE paths: an absolute path would
             # point back into the head tree and measure the fixed bytes as if
             # they were the base's.
@@ -369,6 +421,18 @@ def evaluate(
                     )],
                     "the exploit did not run on the base tree (pytest exit %s) "
                     "— a collection or usage error is not a reproduction" % rc,
+                )
+            if rc == PYTEST_TESTS_FAILED and not _TEST_FAILURE_RE.search(tail):
+                # exit 1 with no failure summary: pytest itself did not run
+                # (``No module named pytest``), so the bug was not reproduced.
+                return (
+                    "abstain",
+                    [Check(
+                        EXPLOIT_BASE_CHECK, False,
+                        "pytest exit 1 without a failure summary: %s" % tail, True,
+                    )],
+                    "the exploit did not run on the base tree (pytest exited 1 "
+                    "without reporting a test failure) — not a reproduction",
                 )
             # Only "tests ran and failed" counts as a reproduction; a green base
             # means the exploit does not discriminate and the fix is unproven.

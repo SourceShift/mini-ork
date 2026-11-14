@@ -180,18 +180,36 @@ def test_evaluate_functional_green_only_patch_is_rejected(tmp_path):
 
 
 @requires_git
-def test_evaluate_functional_command_must_pass_on_both_trees(tmp_path):
+def test_evaluate_red_base_is_unmeasured_not_refuted(tmp_path):
+    # A detached worktree carries no untracked build state, so a red base may
+    # say nothing about the code — and an exploit failing on a non-functional
+    # base proves nothing. Abstain, never refute.
     repo = build_repo(tmp_path)
     cmd = '"%s" -c "import sys; sys.exit(3)"' % sys.executable
     status, checks, reason = so.evaluate(
         str(repo), "HEAD~1", ["src/auth/login.py"], "1",
         ["test_exploit.py"], cmd)
+    assert status == "abstain"
+    assert "base tree is not functional" in reason
+    by_name = _checks_by_name(checks)
+    assert by_name["functional-passes-on-base"].passed is False
+
+
+@requires_git
+def test_evaluate_functional_failure_on_head_refutes(tmp_path):
+    # Base still contains the buggy line, head does not: the functional command
+    # exits 0 on base and 1 on head, which is a real refutation.
+    repo = build_repo(tmp_path)
+    cmd = "grep -q 'return a - b' calc.py"
+    status, checks, reason = so.evaluate(
+        str(repo), "HEAD~1", ["src/auth/login.py"], "1",
+        ["test_exploit.py"], cmd)
     assert status == "fail"
     by_name = _checks_by_name(checks)
-    for name in ("functional-passes-on-base", "functional-passes-on-head"):
-        assert by_name[name].passed is False and by_name[name].gating is True
-        assert name in reason
-    assert "2 of 4" in reason
+    assert by_name["functional-passes-on-base"].passed is True
+    assert by_name["functional-passes-on-head"].passed is False
+    assert "functional-passes-on-head" in reason
+    assert "1 of 4" in reason
 
 
 @requires_git
@@ -300,6 +318,43 @@ def test_copy_and_restore_keeps_a_file_the_base_already_tracks(tmp_path):
     so._restore_copied(copied)
     assert (dest / "test_exploit.py").read_text(encoding="utf-8") == (
         "# base had its own copy\n")
+
+
+def test_exploit_tests_newline_form_keeps_a_path_with_spaces():
+    assert so.exploit_tests("/nonexistent", "my tests/x.py\ny.py") == [
+        "my tests/x.py", "y.py"]
+    assert so.exploit_tests("/nonexistent", "a.py b.py") == ["a.py", "b.py"]
+
+
+def test_pytest_exit_one_without_a_failure_summary_is_not_a_reproduction():
+    # ``python -m pytest`` exits 1 both for a failing test and for pytest
+    # itself being unimportable; only the summary proves a test ran.
+    assert so._TEST_FAILURE_RE.search("1 failed in 0.05s")
+    assert so._TEST_FAILURE_RE.search("FAILED test_exploit.py::test_exploit")
+    assert not so._TEST_FAILURE_RE.search("/usr/bin/python3: No module named pytest")
+    assert not so._TEST_FAILURE_RE.search("ERROR: file or directory not found: x.py")
+
+
+@requires_git
+def test_relative_paths_that_name_one_file_dedupe_to_one_target(tmp_path):
+    (tmp_path / "test_exploit.py").write_text(EXPLOIT, encoding="utf-8")
+    assert so._relative_to_root(str(tmp_path), "test_exploit.py") == (
+        so._relative_to_root(str(tmp_path), "./test_exploit.py"))
+
+
+@requires_git
+def test_copy_refuses_a_symlinked_parent_that_escapes_the_base(tmp_path):
+    root = tmp_path / "head"
+    dest = tmp_path / "base"
+    outside = tmp_path / "outside"
+    (root / "link").mkdir(parents=True)
+    dest.mkdir()
+    outside.mkdir()
+    (root / "link" / "test_exploit.py").write_text(EXPLOIT, encoding="utf-8")
+    (dest / "link").symlink_to(outside)
+    with pytest.raises(OSError):
+        so._copy_exploits(root, str(dest), [Path("link/test_exploit.py")])
+    assert not (outside / "test_exploit.py").exists()
 
 
 @requires_git
