@@ -14,6 +14,9 @@ success_verifiers:
   # Paired exploit-and-functional oracle for security-labelled changes: the
   # exploit must fail on base and pass on head, and is vacuous otherwise.
   - verifiers/security_oracle.py
+  # Deterministic deception classification of the repair from a base-vs-head
+  # scan of the touched surface; abstains when the run names no target.
+  - verifiers/deception.py
   - verifiers/test.py
   # Layer 2, gold-free: fires whenever a metamorphic spec exists (MO_METAMORPHIC_SPEC,
   # MO_METAMORPHIC_SPEC_JSON, or ${MINI_ORK_RUN_DIR}/metamorphic-spec.json). With no
