@@ -583,6 +583,29 @@ def test_node_is_vacuous_without_target(tmp_path):
     assert payload["error_summary"]
 
 
+def test_node_abstains_when_the_named_target_is_absent_at_base(tmp_path):
+    """A named target the base revision never had must not exit green.
+
+    The caller asked for a verdict on that finding; the layer cannot see it. That
+    is a measurement failure, not inapplicability — going vacuous would credit a
+    repair for something nobody verified.
+    """
+    proc = _run_node(
+        tmp_path / "target-absent",
+        base_calc="value = 1\n",
+        head_calc="value = 1\n",
+        target="%s:%s" % (T_OFF, CALC),
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    payload = _payload(proc)
+    assert payload["verdict"] == "abstain"
+    assert payload["pass"] is False
+    assert payload["status"] == "unverified"
+    assert payload["failure_kind"] == "toolchain"
+    assert payload["classification"] == dc.UNMEASURED
+    assert "not present at the base revision" in payload["error_summary"]
+
+
 def test_node_vacuous_envelope_has_no_status_key(tmp_path):
     proc = _run_node(
         tmp_path / "vacuous",

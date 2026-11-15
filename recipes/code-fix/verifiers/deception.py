@@ -178,9 +178,16 @@ def main() -> int:
     # failed to measure. Abstaining here would fail every ordinary run and
     # withhold its publish (a dispatched node's ``status: unverified`` is a hard
     # abstention), and the node is meant to be inert until a producer names a
-    # target. Only a genuine inability to measure — no base revision, an
-    # unloadable engine, an unattributable change surface — stays an abstention.
-    if status == "abstain" and report.get("classification") == engine.UNMEASURED:
+    # target. A target that WAS named but does not exist at the base revision is
+    # not that case: the caller asked for a verdict on a finding the layer cannot
+    # see, so it must abstain rather than exit green. Only a genuine inability to
+    # measure — no target named, no base revision, an unloadable engine, an
+    # unattributable change surface — either stays inert or abstains.
+    if (
+        status == "abstain"
+        and report.get("classification") == engine.UNMEASURED
+        and report.get("target") is None
+    ):
         status = "vacuous"
     _emit(_envelope(status, report))
     detail = report.get("detail") or report.get("reason") or ""

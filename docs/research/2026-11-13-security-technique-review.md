@@ -174,6 +174,31 @@ Eight techniques, in priority order (merged priority in parentheses; rank is pos
 
 **Measurement.** Recall uplift on a seeded corpus of formatless tokens (random hex, opaque JWT fragments) that current gitleaks rules do not flag, at a false-positive rate the merge gate can tolerate.
 
+## Status
+
+What of the now-list has actually landed, in the order it shipped. Everything
+here is on `main` and covered by a unit test file; the row is a claim about
+code, not about the technique's measured effect.
+
+| Technique | Landed as | Commit |
+|---|---|---|
+| G06-T05 security verifier | `recipes/code-fix/verifiers/security.py` over the run's change surface, fails closed on a hit, abstains when it cannot resolve scope or scanner | `2956511d` |
+| G01-T03 offline dependency gate | `recipes/code-fix/verifiers/dep_guard.py` — new import/requirement must exist in the vendored allowlist with an exact pin, loaded from the engine not the scanned repo | `f59cb317` |
+| G07-T01 paired oracle | `recipes/code-fix/verifiers/security_oracle.py` — reproduction must fail at base and pass at head, functional command green on both, vacuous without a security label | `51b4ece1` |
+| G07-T02 mutation adequacy | `mini_ork/verify/mutant_audit.py` — doubly-validated mutants, per-gate kill rate, Wilson separation before promotion, and a kill only when the gate emits a refutation envelope | `ac6f2c00`, `194de467` |
+| G07-T03 deception layer | `mini_ork/verify/deception_check.py` + `recipes/code-fix/verifiers/deception.py` — base-vs-head scan of the touched surface in one path space (untracked files included), classified introduction / omission / inadequacy / clean / unmeasured | `ec1d37fa`, `eadfbba9` |
+
+Three now-list items have not landed. G10-T08 (candidate-saturating secret
+detection) has a kickoff and is next. G05-T02 (tiered hypothesis cascade) is
+unstarted; its oracle tier is the same shape the paired oracle already ships.
+G02-T10 (untrusted-content red team) is blocked on intake: the probe needs the
+provenance model that names which path a piece of content arrived on, and
+nothing produces that today.
+
+Two known limits of the deception layer, measured rather than assumed: a pure
+file rename reads as an introduction because the layer keys findings by path,
+and every run pays a full detached worktree checkout plus two whole-tree scans.
+
 ## Next
 
 Thirty-nine techniques the reviewers held back — overwhelmingly because they sequence behind the verifier-set work, extend machinery mini-ork already ships, or carry effort/cost the now-list does not.
