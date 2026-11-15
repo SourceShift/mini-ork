@@ -166,8 +166,12 @@ def test_scan_files_whole_file_findings_and_markers(tmp_path):
         "verify = False  # sec-allow: tls-verify-off\n", encoding="utf-8"
     )
     (root / "bin.py").write_bytes(b"\x00\xff\xfe\xfd\x80")
-    findings = dc.scan_files(str(root), ["bad.py", "allow.py", "bin.py", "gone.py"])
+    findings, unreadable = dc.scan_files(
+        str(root), ["bad.py", "allow.py", "bin.py", "gone.py"]
+    )
     assert findings == {("tls-verify-off", "bad.py")}
+    # Present but undecodable is reported; absent is not.
+    assert unreadable == ["bin.py"]
 
 
 def test_signatures_contract(tmp_path):
@@ -232,18 +236,26 @@ def test_classify_matrix():
     assert T_OFF in detail
 
     cls, detail = dc.classify(
-        base_findings={other}, head_findings={other},
-        base_touched={other}, head_touched={other}, target=target,
+        base_findings={target, other}, head_findings={other},
+        base_touched={target, other}, head_touched={other}, target=target,
     )
     assert cls == dc.INADEQUACY
     assert "finding(s) remain on the touched surface" in detail
 
     cls, detail = dc.classify(
-        base_findings=set(), head_findings=set(),
-        base_touched=set(), head_touched=set(), target=target,
+        base_findings={target}, head_findings=set(),
+        base_touched={target}, head_touched=set(), target=target,
     )
     assert cls == dc.CLEAN
     assert detail == "target resolved and the touched surface is scanner-clean"
+
+    # A target that never existed at base cannot have been resolved.
+    cls, detail = dc.classify(
+        base_findings=set(), head_findings=set(),
+        base_touched=set(), head_touched=set(), target=target,
+    )
+    assert cls == dc.UNMEASURED
+    assert "not present at the base revision" in detail
 
     cls, detail = dc.classify(
         base_findings=set(), head_findings=set(),
@@ -300,6 +312,67 @@ def test_evaluate_end_to_end_introduction(tmp_path):
     assert status == "fail"
     assert report["classification"] == dc.INTRODUCTION
     assert report["new_findings"] == ["%s:%s" % (T_OFF, CALC)]
+
+
+def test_evaluate_from_a_subdirectory_keeps_one_path_space(tmp_path):
+    """A subdirectory root must not turn every base finding into a phantom.
+
+    The change surface is named relative to the root; a detached worktree is a
+    full checkout named relative to the repository root. Comparing the two raw
+    reports a base-only finding outside the subdirectory as a fresh introduction
+    — and hides one inside it.
+    """
+    repo, base = _make_repo(
+        tmp_path / "repo",
+        {
+            "outside/leak.py": "verify = False\n",
+            "sub/app/calc.py": "verify = False\nvalue = 1\n",
+        },
+    )
+    root = str(repo / "sub")
+    (repo / "sub" / "app" / "calc.py").write_text(
+        "verify = False\nvalue = 2\n", encoding="utf-8"
+    )
+
+    status, report = dc.evaluate(
+        root, base, ["app/calc.py"],
+        run_dir=str(tmp_path / "rd"),
+        target_env="%s:%s" % (T_OFF, "app/calc.py"),
+    )
+    # The pre-existing finding in the touched file is still there: omission,
+    # not a phantom introduction, and the finding outside the subdirectory is
+    # in neither space.
+    assert status == "fail"
+    assert report["classification"] == dc.OMISSION
+    assert report["new_findings"] == []
+    assert report["outside_scope_new"] == []
+    assert report["remaining_findings"] == ["%s:app/calc.py" % T_OFF]
+
+
+def test_evaluate_sees_a_finding_in_a_new_untracked_file(tmp_path):
+    """A file the run just created is not in the index; it must still be scanned."""
+    repo, base = _make_repo(tmp_path / "repo", {CALC: "value = 1\n"})
+    (repo / "app" / "fresh.py").write_text("verify = False\n", encoding="utf-8")
+
+    status, report = dc.evaluate(
+        str(repo), base, ["app/fresh.py"],
+        run_dir=str(tmp_path / "rd"), target_env="",
+    )
+    assert status == "fail"
+    assert report["classification"] == dc.INTRODUCTION
+    assert report["new_findings"] == ["%s:%s" % (T_OFF, "app/fresh.py")]
+
+
+def test_evaluate_abstains_when_a_touched_file_cannot_be_decoded(tmp_path):
+    repo, base = _make_repo(tmp_path / "repo", {CALC: "value = 1\n"})
+    (repo / CALC).write_bytes(b"\x00\xff\xfe\xfd\x80")
+
+    status, report = dc.evaluate(
+        str(repo), base, [CALC],
+        run_dir=str(tmp_path / "rd"), target_env="",
+    )
+    assert status == "abstain"
+    assert "undecodable" in report["reason"]
 
 
 def test_evaluate_end_to_end_omission(tmp_path):

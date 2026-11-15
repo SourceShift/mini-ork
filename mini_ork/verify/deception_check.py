@@ -62,40 +62,92 @@ def read_target(run_dir: str, env_value: str) -> "tuple[str, str] | None":
     return parse_target(data.get("target", ""))
 
 
-def scan_files(root: str, files: Sequence[str]) -> "set[tuple[str, str]]":
-    """``(rule, path)`` findings for every scanned file under ``root``.
+def scan_files(
+    root: str, relatives: Sequence[str], prefix: str = ""
+) -> "tuple[set[tuple[str, str]], list[str]]":
+    """``(rule, path)`` findings under ``root``, plus the files it could not read.
 
-    Each file is fed whole to :func:`mini_ork.verify.security_scan.scan_added`
-    in one call, which keeps ``# sec-allow:`` markers working. A file that is
-    missing or cannot be decoded simply contributes nothing.
+    ``relatives`` are named relative to ``root`` and the bytes live at
+    ``root/prefix/rel`` — the base tree is a full checkout, so the same prefix
+    the target directory sits behind in the repository applies to it too. Every
+    file is handed whole to :func:`security_scan.scan_added` in one call, which
+    keeps ``# sec-allow:`` markers working. A file that exists but cannot be
+    decoded is returned as unreadable rather than silently treated as clean;
+    a file that does not exist simply contributes nothing.
     """
     added: "dict[str, dict[int, str]]" = {}
-    for path in files:
+    unreadable: "list[str]" = []
+    for relative in relatives:
+        on_disk = os.path.join(root, prefix, relative) if prefix else os.path.join(
+            root, relative
+        )
         try:
-            text = Path(root, path).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            text = Path(on_disk).read_text(encoding="utf-8")
+        except FileNotFoundError:
             continue
-        added[path] = {
+        except (OSError, UnicodeDecodeError):
+            unreadable.append(relative)
+            continue
+        added[relative] = {
             lineno: line for lineno, line in enumerate(text.splitlines(), start=1)
         }
     if not added:
-        return set()
+        return set(), unreadable
     findings = security_scan.scan_added(added)
-    return {(finding.rule, finding.path) for finding in findings}
+    return {(finding.rule, finding.path) for finding in findings}, unreadable
 
 
-def tree_files(root: str) -> "list[str]":
-    """Tracked files under ``root``, repo-relative and sorted; git failure → []."""
+def repo_prefix(root: str) -> str:
+    """The repository-relative directory ``root`` sits at, without a trailing slash."""
     try:
         proc = subprocess.run(
-            ["git", "-C", root, "ls-files"],
+            ["git", "-C", root, "rev-parse", "--show-prefix"],
             capture_output=True, text=True,
         )
     except OSError:
-        return []
+        return ""
     if proc.returncode != 0:
-        return []
-    return sorted(line for line in (proc.stdout or "").splitlines() if line.strip())
+        return ""
+    return (proc.stdout or "").strip().strip("/")
+
+
+def _within(prefix: str, path: str) -> "str | None":
+    """``path`` relative to ``prefix``, or ``None`` when it is outside it."""
+    if not prefix:
+        return path
+    head = prefix + "/"
+    if not path.startswith(head):
+        return None
+    return path[len(head):]
+
+
+def tree_files(root: str, prefix: str = "") -> "list[str]":
+    """Files under ``root`` that git tracks or would track, relative to ``root``.
+
+    ``--others --exclude-standard`` is what makes an introduced finding in a
+    file the run just created visible: an untracked file is not in the index,
+    and a scan that only reads the index reports that run clean. ``-z`` keeps a
+    path with a space, a quote or a non-ASCII byte verbatim instead of
+    C-quoting it into a name that matches no file.
+    """
+    found: "set[str]" = set()
+    for extra in ((), ("--others", "--exclude-standard")):
+        argv = ["git", "-C", root, "ls-files", "-z", "--full-name", *extra]
+        try:
+            proc = subprocess.run(argv, capture_output=True)
+        except OSError:
+            return sorted(found)
+        if proc.returncode != 0:
+            continue
+        text = (proc.stdout or b"").decode("utf-8", "surrogateescape")
+        for entry in text.split("\0"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            relative = _within(prefix, entry)
+            if relative:
+                found.add(relative)
+    return sorted(found)
 
 
 def _temp_tree() -> "tuple[str, str]":
@@ -154,7 +206,9 @@ def _nargs(node: "ast.AST") -> int:
     return len(getattr(args, "posonlyargs", [])) + len(args.args)
 
 
-def signatures(root: str, files: Sequence[str]) -> "set[str]":
+def signatures(
+    root: str, files: Sequence[str], prefix: str = ""
+) -> "set[str]":
     """``"<path>:<qualname>(<nargs>)"`` for functions, ``"<path>:<qualname>"`` for classes.
 
     Only top-level and class-level definitions count, and a file that does not
@@ -164,8 +218,11 @@ def signatures(root: str, files: Sequence[str]) -> "set[str]":
     for path in files:
         if not path.endswith(".py"):
             continue
+        on_disk = os.path.join(root, prefix, path) if prefix else os.path.join(
+            root, path
+        )
         try:
-            source = Path(root, path).read_text(encoding="utf-8")
+            source = Path(on_disk).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         try:
@@ -213,6 +270,15 @@ def classify(
             "<run>/deception-plan.json)",
         )
     rule, path = target
+    if target not in base_findings:
+        # A target that never existed at the base revision cannot have been
+        # resolved by this change: reporting clean here would credit a repair
+        # for a finding it never touched.
+        return (
+            UNMEASURED,
+            "target %s:%s is not present at the base revision — there is "
+            "nothing to resolve" % (rule, path),
+        )
     if target in head_findings:
         return (
             OMISSION,
@@ -250,9 +316,35 @@ def evaluate(
         except RuntimeError as exc:
             return "abstain", {"reason": str(exc)}
 
-        base_findings = scan_files(tree, tree_files(tree))
-        head_findings = scan_files(root, tree_files(root))
+        # One coordinate system for both trees. The change surface is named
+        # relative to ``root`` (that is what ``touched_files`` returns), while a
+        # detached worktree is a full checkout whose paths are named relative to
+        # the repository root. When ``root`` is a subdirectory, comparing the
+        # two spaces raw turns every untouched base finding into a phantom
+        # introduction and hides the real ones.
+        # ``root`` is the directory the change surface is named against, so its
+        # files are joined as ``root`` + path. Only the base checkout needs the
+        # prefix: it is anchored at the repository root, not at ``root``.
+        prefix = repo_prefix(root)
+        base_findings, base_unreadable = scan_files(
+            tree, tree_files(tree, prefix), prefix
+        )
+        head_findings, head_unreadable = scan_files(
+            root, tree_files(root, prefix), ""
+        )
         touched_set = set(surface)
+        unreadable_touched = sorted(
+            path
+            for path in set(base_unreadable) | set(head_unreadable)
+            if path in touched_set
+        )
+        if unreadable_touched:
+            # An undecodable file on the surface may hold exactly the finding
+            # we are looking for, so reporting it clean would be a guess.
+            return "abstain", {
+                "reason": "cannot classify: undecodable touched file(s): %s"
+                % ", ".join(unreadable_touched),
+            }
         base_touched = {f for f in base_findings if f[1] in touched_set}
         head_touched = {f for f in head_findings if f[1] in touched_set}
 
@@ -266,7 +358,7 @@ def evaluate(
         )
 
         symbol_delta = sorted(
-            signatures(tree, surface) - signatures(root, surface)
+            signatures(tree, surface, prefix) - signatures(root, surface)
         )
         new_touched = head_touched - base_touched
         new_all = head_findings - base_findings
