@@ -101,7 +101,11 @@ def load_mutants(directory: str) -> tuple[list[Mutant], list[str]]:
         if kind not in KINDS:
             problems.append(f"{entry.name}: unknown kind {kind!r}")
             continue
-        mutants.append(Mutant(entry.name, kind, patch, witness))
+        # Absolute paths: ``git -C <tree> apply`` resolves a relative patch
+        # against the throwaway tree, where the mutant directory does not exist.
+        mutants.append(
+            Mutant(entry.name, kind, patch.resolve(), witness.resolve())
+        )
     return mutants, problems
 
 
@@ -141,7 +145,11 @@ def _capture(
     timeout: int,
     env: dict[str, str] | None = None,
 ) -> tuple[int | None, str, str, str | None]:
-    """Run ``argv``, returning ``(returncode, stdout, stderr, error)``."""
+    """Run ``argv``, returning ``(returncode, stdout, stderr, error)``.
+
+    Known limitation: a timeout kills the direct child only. A gate that spawns
+    its own subprocesses can leave them running until they exit on their own.
+    """
     child_env = _child_env() if env is None else env
     try:
         proc = subprocess.run(
@@ -149,6 +157,8 @@ def _capture(
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=child_env,
             timeout=timeout,
         )
@@ -243,6 +253,11 @@ def validate(tree: str, mutant: Mutant, timeout: int) -> str:
         return f"patch does not apply: {apply_proc.stderr.strip()}"
 
     rc, tail = run_witness(tree, witness_copy, timeout)
+    # The witness must not survive into the gate runs. A gate that collects the
+    # whole suite would otherwise kill the mutant by running the witness, and
+    # that kill would measure the mutant — which we already know fails — rather
+    # than the gate.
+    witness_copy.unlink(missing_ok=True)
     if rc != 1 or "failed" not in tail:
         return f"witness does not trigger on the mutant: {tail}"
     return ""
@@ -274,18 +289,21 @@ def run_gate(
     rc, stdout, stderr, error = _capture([sys.executable, gate], tree, timeout, env)
     tail = error if error is not None else (stdout + stderr).strip()[-_TAIL_CHARS:]
 
-    if rc == 1:
-        return KILLED, tail
-    if rc == 0:
-        envelope = _last_json_dict(stdout)
-        if envelope is None:
-            return GATE_ERROR, _NO_ENVELOPE_DETAIL
-        if envelope.get("status") in _ABSTAIN_STATUSES or envelope.get(
-            "verdict"
-        ) in _ABSTAIN_VERDICTS:
-            return GATE_ERROR, _ABSTAIN_DETAIL
-        return SURVIVED, tail
-    return GATE_ERROR, tail
+    if rc not in (0, 1):
+        return GATE_ERROR, tail
+    envelope = _last_json_dict(stdout)
+    if envelope is None:
+        # Exit 1 with no envelope is how an unhandled exception leaves a
+        # verifier. Counting it as a kill would let a crashing gate score a
+        # perfect kill rate without ever examining the mutant.
+        return GATE_ERROR, _NO_ENVELOPE_DETAIL
+    if envelope.get("status") in _ABSTAIN_STATUSES or envelope.get(
+        "verdict"
+    ) in _ABSTAIN_VERDICTS:
+        return GATE_ERROR, _ABSTAIN_DETAIL
+    if rc == 1 and envelope.get("pass") is True:
+        return GATE_ERROR, "verifier exited 1 while declaring pass — contradiction"
+    return (KILLED if rc == 1 else SURVIVED), tail
 
 
 def score(outcomes: list[GateOutcome]) -> list[GateScore]:
@@ -398,6 +416,9 @@ def audit(
 ) -> dict:
     """Run every gate against every admissible mutant in a throwaway tree."""
     mutants, problems = load_mutants(mutants_dir)
+    # A relative gate path would otherwise resolve against the throwaway tree,
+    # running whatever copy happens to sit at that path in the base revision.
+    gates = [str(Path(gate).resolve()) for gate in gates]
 
     try:
         tree, parent = stage(repo, base)
@@ -513,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(report, indent=2))
     else:
+        for problem in report["problems"]:
+            print(f"problem: {problem}")
         for item in report["gates"]:
             print(
                 f"{item['gate']}: tpr={item['security_kills']}/"

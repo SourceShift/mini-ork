@@ -47,7 +47,8 @@ BEN_WITNESS = (
 )
 PASS_ANYWHERE_WITNESS = "def test_ok():\n    assert True\n"
 
-BLANKET_GATE = "import sys\nsys.exit(1)\n"
+KILL_ENVELOPE = "print('{\"pass\": false, \"verdict\": \"fail\"}')\nsys.exit(1)\n"
+BLANKET_GATE = "import sys\n" + KILL_ENVELOPE
 ABSTAIN_GATE = (
     "import sys\n"
     "print('{\"pass\": false, \"status\": \"unverified\"}')\n"
@@ -59,6 +60,7 @@ DISCRIMINATING_GATE = textwrap.dedent(
     from pathlib import Path
     src = Path('app/calc.py').read_text()
     if 'return a - b' in src:
+        print('{"pass": false, "verdict": "fail"}')
         sys.exit(1)
     print('{"pass": true}')
     sys.exit(0)
@@ -399,9 +401,10 @@ def test_validate_admits_triggering_mutant_and_leaves_mutation(tmp_path):
         mutant = ma.Mutant("sec.01-x", "security", patch, witness)
         assert ma.validate(tree, mutant, 60) == ""
 
-        safe_copy = Path(tree, "test_mutant_sec_01_x.py")
-        assert safe_copy.is_file()
-        assert safe_copy.read_text() == SEC_WITNESS
+        # The witness must not survive into the gate runs: a gate that collects
+        # the whole suite would kill the mutant by running it, which measures
+        # nothing about the gate.
+        assert not Path(tree, "test_mutant_sec_01_x.py").exists()
         assert "return a - b" in Path(tree, "app", "calc.py").read_text()
     finally:
         subprocess.run(
@@ -455,9 +458,34 @@ def test_run_gate_classifies_killed_survived_and_errors(tmp_path):
     killer = _write_gate(
         gates,
         "killer.py",
-        "import sys\nprint('{\"status\": \"unverified\"}')\nsys.exit(1)\n",
+        "import sys\nprint('{\"pass\": false, \"verdict\": \"fail\"}')\nsys.exit(1)\n",
     )
     assert ma.run_gate(str(killer), str(tree), [], 60)[0] == ma.KILLED
+
+    # A kill must be attributable: exit 1 alone, without a refutation
+    # envelope, is how an unhandled exception leaves a verifier.
+    said_abstain = _write_gate(
+        gates,
+        "said_abstain.py",
+        "import sys\nprint('{\"status\": \"unverified\"}')\nsys.exit(1)\n",
+    )
+    status, detail = ma.run_gate(str(said_abstain), str(tree), [], 60)
+    assert status == ma.GATE_ERROR
+    assert "abstention is not a kill" in detail
+
+    quiet_kill = _write_gate(gates, "quiet_kill.py", "import sys\nsys.exit(1)\n")
+    status, detail = ma.run_gate(str(quiet_kill), str(tree), [], 60)
+    assert status == ma.GATE_ERROR
+    assert "no JSON envelope" in detail
+
+    contradictory = _write_gate(
+        gates,
+        "contradictory.py",
+        "import sys\nprint('{\"pass\": true}')\nsys.exit(1)\n",
+    )
+    status, detail = ma.run_gate(str(contradictory), str(tree), [], 60)
+    assert status == ma.GATE_ERROR
+    assert "contradiction" in detail
 
     sparer = _write_gate(
         gates, "sparer.py", "import sys\nprint('{\"pass\": true}')\nsys.exit(0)\n"
@@ -555,6 +583,45 @@ def test_audit_separates_blanket_from_discriminating(tmp_path):
     assert discriminating_score["promotion"] == "eligible"
 
     assert report["demonstrated_gates"] == [str(discriminating)]
+
+
+@requires_git
+def test_audit_does_not_let_the_witness_inflate_the_kill_rate(tmp_path):
+    """A gate that runs the suite must not kill by collecting our witness."""
+    repo = _make_repo(tmp_path)
+    mutants = tmp_path / "mutants"
+    _write_mutant(
+        mutants, "sec-01", "security", _make_diff(
+            "app/calc.py", BASE_CALC, SEC_CALC
+        ), SEC_WITNESS
+    )
+    _write_mutant(
+        mutants, "ben-01", "benign", _make_diff(
+            "app/calc.py", BASE_CALC, BEN_CALC
+        ), BEN_WITNESS
+    )
+    contaminated = _write_gate(
+        tmp_path / "gates",
+        "suite.py",
+        "import sys\n"
+        "from pathlib import Path\n"
+        "if list(Path('.').glob('test_mutant_*.py')):\n"
+        "    print('{\"pass\": false, \"verdict\": \"fail\"}')\n"
+        "    sys.exit(1)\n"
+        "print('{\"pass\": true}')\n"
+        "sys.exit(0)\n",
+    )
+
+    report = ma.audit(
+        str(repo), "HEAD", str(mutants), [str(contaminated)], timeout=120
+    )
+
+    assert [outcome["status"] for outcome in report["outcomes"]] == [
+        ma.SURVIVED,
+        ma.SURVIVED,
+    ]
+    score = _score_for(report, str(contaminated))
+    assert score["security_kills"] == 0 and score["benign_kills"] == 0
 
 
 @requires_git
