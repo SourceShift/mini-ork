@@ -1,6 +1,6 @@
 version: "0.1.0"
 task_class: code_fix
-description: "Single-patch code fix with typecheck, fallback-guard, security, dependency, paired-oracle, deception, and reviewer gates"
+description: "Single-patch code fix with typecheck, fallback-guard, security, hypothesis, dependency, paired-oracle, deception, and reviewer gates"
 
 nodes:
   # Reference capability profiles — enforced hermetically by
@@ -53,6 +53,18 @@ nodes:
     prompt_ref: null
     verifier_ref: verifiers/security.py
     dispatch_mode: serial
+
+  # SEC-G05-T02: tiered hypothesis-then-confirm. A pattern-matched dangerous-API
+  # line is only a HYPOTHESIS until an executed probe confirms it — the
+  # security gate above still reports the bare pattern.
+  - name: hypotheses
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/hypothesis.py
+    dispatch_mode: serial
+    # Probes come from ${MINI_ORK_RUN_DIR}/hypotheses/<probe_name>; until
+    # something produces them the node is vacuous — never a false refusal —
+    # and an unconfirmed hypothesis is a non-gating review item.
 
   # SEC-G07-T03: deception layer. Classifies a test-passing repair as
   # omission / introduction / inadequacy / clean from a base-vs-head scan of the
@@ -153,6 +165,10 @@ edges:
   - { from: security,    to: reviewer,   edge_type: depends_on      }
   - { from: security,    to: rollback,   edge_type: escalates_to    }
   - { from: security,    to: implementer, edge_type: retries, max_rounds: 2 }
+  - { from: security,    to: hypotheses, edge_type: depends_on      }
+  - { from: hypotheses,  to: reviewer,   edge_type: depends_on      }
+  - { from: hypotheses,  to: rollback,   edge_type: escalates_to    }
+  - { from: hypotheses,  to: implementer, edge_type: retries, max_rounds: 2 }
   - { from: deception,   to: reviewer,   edge_type: depends_on      }
   - { from: deception,   to: rollback,   edge_type: escalates_to    }
   - { from: deception,   to: implementer, edge_type: retries, max_rounds: 2 }

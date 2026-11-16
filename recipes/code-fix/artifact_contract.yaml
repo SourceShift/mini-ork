@@ -8,6 +8,10 @@ success_verifiers:
   # Credentials and dangerous APIs on the lines the run added. Abstains (never
   # passes) when the scanner or the change surface cannot be resolved.
   - verifiers/security.py
+  # Tiered hypothesis-then-confirm: a pattern-matched dangerous-API line fails
+  # only when an executed probe under ${MINI_ORK_RUN_DIR}/hypotheses/ confirms
+  # it; with no probe it is vacuous or a non-gating review item.
+  - verifiers/hypothesis.py
   # New imports/requirements against the vendored snapshot, pinned and from an
   # index. The snapshot is read from the engine, not the repo under audit.
   - verifiers/dep_guard.py
