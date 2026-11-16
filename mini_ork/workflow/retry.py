@@ -420,15 +420,34 @@ def mark_retry_error(
                     con.execute(
                         "SELECT attempt_no FROM node_attempts LIMIT 0",
                     )
+                    # 0093 adds move_kind. A ledger without the column must
+                    # still record the row exactly as before — an un-migrated
+                    # DB losing every retry-exhausted attempt would be a
+                    # regression in the very ledger the label belongs to.
+                    has_move = any(
+                        len(col) > 1 and col[1] == "move_kind"
+                        for col in con.execute(
+                            "PRAGMA table_info(node_attempts)").fetchall()
+                    )
                     now = int(time.time())
+                    columns = [
+                        "run_id", "node_id", "attempt_no", "node_type",
+                        "started_at", "ended_at", "result", "failure_class",
+                        "checkpoint_used", "checkpoint_produced", "initiator",
+                    ]
+                    values = [run_id, row.node_id, row.attempt, "", now, now,
+                              "failure", "retry_exhausted", 0, 0,
+                              "retry-policy"]
+                    if has_move:
+                        # This row exists because the retry policy gave up on
+                        # a node that never got new information — a retry, not
+                        # a revision.
+                        columns.append("move_kind")
+                        values.append("retry")
                     con.execute(
-                        "INSERT INTO node_attempts ("
-                        " run_id, node_id, attempt_no, node_type,"
-                        " started_at, ended_at, result, failure_class,"
-                        " checkpoint_used, checkpoint_produced, initiator"
-                        ") VALUES (?, ?, ?, ?, ?, ?, 'failure',"
-                        " 'retry_exhausted', 0, 0, 'retry-policy')",
-                        (run_id, row.node_id, row.attempt, "", now, now),
+                        f"INSERT INTO node_attempts ({', '.join(columns)})"
+                        f" VALUES ({', '.join('?' * len(columns))})",
+                        tuple(values),
                     )
                     con.commit()
                     out["attempt_row"] = str(db)

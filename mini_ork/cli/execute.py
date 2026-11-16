@@ -5063,6 +5063,14 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
         # row through ``append_node_attempt`` instead.
         if status not in ("success", "failure", "skipped", "error"):
             return
+        # 0093 ``move_kind``: the ledger infers initial/retry/revise from the
+        # attempt number and the previous row's failure class. A process
+        # resuming an interrupted run is the one case it cannot see, because
+        # it is a property of THIS process rather than of the ledger —
+        # ``MO_RECOVER_OF`` is set for the whole recovered run, so every
+        # attempt it makes is a recovery move, first attempts included.
+        move_kind = (mc.MOVE_RECOVER
+                     if os.environ.get("MO_RECOVER_OF", "").strip() else None)
         # Close the effect record at node end, BEFORE the success/output_file
         # split below: the publisher takes the append_node_attempt branch and
         # never reaches the checkpoint branch, so a flip inside the artifact
@@ -5088,7 +5096,7 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
                 db, run_id, node_id, status=status,
                 node_type=node_type or "", started_at=attempt_started,
                 ended_at=now, failure_class=failure_class,
-                cost_usd=cost_usd, initiator="python",
+                cost_usd=cost_usd, initiator="python", move_kind=move_kind,
             )
             if append_rc == 0:
                 _cost_floor = max(_cost_floor, max_call_id)
@@ -5133,7 +5141,7 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
             # (1 + MAX), not from a per-process counter, so a revise-round
             # dispatch continues where the previous round stopped.
             attempt=mc.next_attempt_no(db, run_id, node_id),
-            cost_usd=cost_usd, failure_class=None,
+            cost_usd=cost_usd, failure_class=None, move_kind=move_kind,
         )
         if ckpt_rc == 0:
             _cost_floor = max(_cost_floor, max_call_id)

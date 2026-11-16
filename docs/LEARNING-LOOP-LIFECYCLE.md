@@ -283,6 +283,48 @@ is byte-for-byte what it was: `_exploration(0, 0) = sqrt(ln 1 / 1) = 0`, so an
 unmeasured ledger adds nothing to the score. The term reorders lesson selection;
 it never prunes, retires, or rewrites a lesson.
 
+### 4.4 Attempt move kinds (`node_attempts.move_kind`, migration 0093)
+
+`node_attempts` could already say *that* a node ran again; it could not say
+*why*. Redoing work the infrastructure ate, taking reviewer feedback, and
+deliberately trying a different idea were one indistinguishable row, so a cost
+review could not separate convergence spend from waste spend from the spend
+that is supposed to buy a better idea.
+
+`move_kind` labels the attempt. It is resolved once, in
+`mini_ork.stores.checkpoints._insert_node_attempt` — the single INSERT both
+writers go through — so the success path (`write_checkpoint`) and the
+every-end path (`append_node_attempt`) cannot disagree.
+
+| Kind | How it is decided | What it means |
+|---|---|---|
+| `initial` | `attempt_no <= 1` | the node's first attempt in this run |
+| `recover` | `MO_RECOVER_OF` set, declared by `_cp` | a resuming process re-executing interrupted work, first attempts included |
+| `retry` | previous attempt's class is `provider_limit` / `infra_interrupt` / `input_required` / `retry_exhausted`, or initiator `retry-policy` | re-ran with no new information |
+| `revise` | everything else with `attempt_no > 1` | came back because the work measured short |
+| `explore` | **declared only**, never inferred | a dispatcher chose a different idea |
+
+`explore` has no inference path on purpose. The ledger cannot tell a new idea
+from a better patch, so only the code that dispatched the attempt may claim it —
+a caller passes `move_kind=MOVE_EXPLORE` to `append_node_attempt` /
+`write_checkpoint`. Nothing does yet; until something does the column reports
+`0`, which means "nobody claimed one", not "none was possible".
+
+Two details that are easy to get wrong:
+
+- The classifier reads the **previous** row's `failure_class`, not the attempt's
+  own. The class of the attempt now ending explains the move that comes *after*
+  it, so using it here would shift the whole ledger by one attempt.
+- The column is written only when it exists (`PRAGMA table_info` probe). An
+  un-migrated `state.db` must keep recording attempts exactly as before: the
+  INSERT is shared with `write_checkpoint`, and a column-count error there would
+  cost every checkpoint, not one label.
+
+`mini-ork metrics explore` reports attempts, successes, success rate, share of
+attempts and share of cost per `(task class, move kind)`, plus a headline. It
+prints `unclassified` for pre-0093 rows rather than dropping them, so a mostly
+NULL table reads as "not measured yet" instead of as a small revise share.
+
 ---
 
 ## 5. Defaults: why "always" is true now

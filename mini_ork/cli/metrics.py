@@ -164,6 +164,7 @@ def _usage() -> str:
         "  --format json        JSON array (pipeable, e.g. mini-ork metrics --format json | jq ...)\n"
         "  revise               Rounds-to-pass distribution (see mini-ork metrics revise --help)\n"
         "  lessons              Per-lesson node outcomes (see mini-ork metrics lessons --help)\n"
+        "  explore              Attempt spend by move kind (see mini-ork metrics explore --help)\n"
         "  --help               This message\n"
         "\n"
         "Phase C deliverable. Trajectory measurement enables the framework's\n"
@@ -223,6 +224,9 @@ def main(argv=None, *, stdout=None, stderr=None) -> int:
     if args[:1] == ["revise"]:  # `mini-ork metrics revise` — rounds-to-pass
         from mini_ork.cli import metrics_revise  # noqa: PLC0415
         return metrics_revise.main(args[1:], stdout=out, stderr=err)
+    if args[:1] == ["explore"]:  # `mini-ork metrics explore` — attempt move kinds
+        from mini_ork.cli import metrics_explore  # noqa: PLC0415
+        return metrics_explore.main(args[1:], stdout=out, stderr=err)
     if args[:1] == ["lessons"]:  # `mini-ork metrics lessons` — per-lesson node outcomes
         from mini_ork.cli import metrics_lessons  # noqa: PLC0415
         return metrics_lessons.main(args[1:], stdout=out, stderr=err)

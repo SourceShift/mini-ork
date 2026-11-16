@@ -69,6 +69,14 @@ __all__ = [
     "is_node_reusable",
     "hash_file",
     "compute_artifact_manifest",
+    # attempt ledger (move_kind, migration 0093)
+    "MOVE_INITIAL",
+    "MOVE_RETRY",
+    "MOVE_REVISE",
+    "MOVE_RECOVER",
+    "MOVE_EXPLORE",
+    "MOVE_KINDS",
+    "classify_move",
     # three-state resume (durable/three-state-resume)
     "IRREVERSIBLE_NODE_TYPES",
     "effect_class_for_node_type",
@@ -111,6 +119,77 @@ _FINISH_REASON_FAILURE_CLASS = {
 
 # A finish reason that means the node completed; never a failure class.
 _SUCCESS_FINISH_REASONS = frozenset({"", "done", "success", "ok", "pass"})
+
+# ``node_attempts.move_kind`` (migration 0093): what KIND of move an attempt
+# was, as opposed to whether it worked. The ledger could already say "this node
+# ran a fourth time"; it could not say whether that fourth attempt redid work
+# the infrastructure ate, took reviewer feedback, or tried a different idea —
+# which is the difference between spending on convergence and spending on
+# exploration, and the only way to measure either.
+MOVE_INITIAL = "initial"
+MOVE_RETRY = "retry"
+MOVE_REVISE = "revise"
+MOVE_RECOVER = "recover"
+MOVE_EXPLORE = "explore"
+MOVE_KINDS = (MOVE_INITIAL, MOVE_RETRY, MOVE_REVISE, MOVE_RECOVER,
+              MOVE_EXPLORE)
+
+# Re-attempts that followed one of these carried NO new information about the
+# work: the previous attempt died on infrastructure, waited on a human, or
+# exhausted the retry policy. Bucketing those as "revise" would credit the
+# model with feedback it never received.
+_REWORK_FREE_FAILURE_CLASSES = frozenset({
+    "provider_limit", "infra_interrupt", "input_required", "retry_exhausted",
+})
+
+
+def classify_move(
+    *,
+    attempt_no: int,
+    initiator: str = "",
+    previous_failure_class: str | None = None,
+    declared: str | None = None,
+) -> str:
+    """Return the ``move_kind`` for an attempt that is ending.
+
+    ``declared`` wins when it names a real kind — the code that dispatched the
+    attempt is the only party that knows an attempt was a deliberate change of
+    idea, so ``explore`` exists solely through this argument. An unrecognised
+    ``declared`` value is logged and ignored rather than stored: a kind the
+    metrics cannot bucket is worse than the honest inference.
+
+    Everything else is inferred in this order:
+
+    1. ``attempt_no <= 1`` → ``initial``. A node's first attempt is not a move.
+    2. ``initiator`` starting with ``recover`` → ``recover``. A resuming
+       process re-executing interrupted work says so about itself.
+    3. a previous attempt that ended in :data:`_REWORK_FREE_FAILURE_CLASSES`
+       → ``retry``.
+    4. ``initiator == 'retry-policy'`` → ``retry``.
+    5. otherwise → ``revise``: the node came back because the work measured
+       short, which is the one remaining reason a node re-runs.
+
+    The caller must pass the PREVIOUS row's failure class, not this attempt's:
+    the class of the attempt now ending explains the NEXT move, not this one.
+    """
+    if declared:
+        kind = str(declared).strip().lower()
+        if kind in MOVE_KINDS:
+            return kind
+        _log_err(f"classify_move: ignoring unknown move_kind {declared!r}")
+    try:
+        n = int(attempt_no)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 1:
+        return MOVE_INITIAL
+    if str(initiator or "").strip().lower().startswith("recover"):
+        return MOVE_RECOVER
+    if str(previous_failure_class or "").strip().lower() in _REWORK_FREE_FAILURE_CLASSES:
+        return MOVE_RETRY
+    if str(initiator or "").strip().lower() == "retry-policy":
+        return MOVE_RETRY
+    return MOVE_REVISE
 
 
 def failure_class_for_finish_reason(finish_reason: str | None) -> str | None:
@@ -257,6 +336,7 @@ class CheckpointRecord:
     failure_class: str | None = None
     attempt: int | None = None
     owner_token: str | None = None
+    move_kind: str | None = None
 
 
 # Sentinel distinguishing "caller did not pass this kwarg" from an
@@ -275,6 +355,45 @@ _ATTEMPT_COLUMNS = (
     "cost_usd, provider_session_id, initiator"
 )
 
+# 0093 adds ``move_kind``. It is written only when the column exists: an
+# un-migrated state.db must keep recording attempts exactly as it does today.
+# Binding an extra value unconditionally would fail the INSERT with a
+# column-count error — and through ``write_checkpoint`` that would take every
+# checkpoint down with it, which is a far worse outcome than one missing label.
+_MOVE_KIND_COLUMN = "move_kind"
+
+
+def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
+    """True when ``table`` in this connection's DB has ``column``."""
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return False
+    return any(len(row) > 1 and row[1] == column for row in rows)
+
+
+def _previous_failure_class(
+    con: sqlite3.Connection, run_id: str, node_id: str, attempt_no: int
+) -> str | None:
+    """The class the node's highest earlier attempt ended with, if any.
+
+    ``classify_move`` needs the PREVIOUS row's class: the attempt being written
+    now is the consequence of the last one, so its own ``failure_class``
+    explains the move that comes after it. Returns ``None`` on a legacy DB or
+    any read error — the classifier then falls through to its own default,
+    which is never a fabricated ``retry``.
+    """
+    try:
+        row = con.execute(
+            "SELECT failure_class FROM node_attempts"
+            " WHERE run_id = ? AND node_id = ? AND attempt_no < ?"
+            " ORDER BY attempt_no DESC LIMIT 1",
+            (run_id, node_id, int(attempt_no)),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
 
 def _insert_node_attempt(
     con: sqlite3.Connection,
@@ -292,14 +411,37 @@ def _insert_node_attempt(
     cost_usd: float | None = None,
     provider_session_id: str | None = None,
     initiator: str = "python",
+    move_kind: str | None = None,
 ) -> None:
+    """The one INSERT shape both attempt writers share.
+
+    ``move_kind`` is resolved HERE, at the single choke point every attempt
+    row passes through, so the success path (``write_checkpoint``) and the
+    every-end path (``append_node_attempt``) cannot disagree about what a
+    move was. ``None`` means "infer"; a caller that dispatched a deliberate
+    change of idea passes ``MOVE_EXPLORE``.
+    """
+    kind = classify_move(
+        attempt_no=attempt_no,
+        initiator=initiator or "python",
+        previous_failure_class=_previous_failure_class(
+            con, run_id, node_id, attempt_no),
+        declared=move_kind,
+    )
+    columns = _ATTEMPT_COLUMNS
+    values: list = [
+        run_id, node_id, attempt_no, node_type or "", started_at,
+        ended_at, result, failure_class, checkpoint_used,
+        checkpoint_produced, cost_usd,
+        provider_session_id or None, initiator or "python",
+    ]
+    if _has_column(con, "node_attempts", _MOVE_KIND_COLUMN):
+        columns = f"{_ATTEMPT_COLUMNS}, {_MOVE_KIND_COLUMN}"
+        values.append(kind)
+    placeholders = ", ".join(["?"] * len(values))
     con.execute(
-        f"INSERT INTO node_attempts ({_ATTEMPT_COLUMNS}) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (run_id, node_id, attempt_no, node_type or "", started_at,
-         ended_at, result, failure_class, checkpoint_used,
-         checkpoint_produced, cost_usd,
-         provider_session_id or None, initiator or "python"),
+        f"INSERT INTO node_attempts ({columns}) VALUES ({placeholders})",
+        values,
     )
 
 
@@ -373,6 +515,7 @@ def append_node_attempt(
     cost_usd: float | None = None,
     provider_session_id: str | None = None,
     initiator: str = "python",
+    move_kind: str | None = None,
 ) -> int:
     """Append one ledger row for a node END of ANY result.
 
@@ -382,6 +525,11 @@ def append_node_attempt(
     ``attempt`` defaults to ``1 + MAX(attempt_no)`` so retries and revise
     rounds keep counting. ``checkpoint_produced`` stays 0 unless the caller
     actually wrote a checkpoint.
+
+    ``move_kind`` is optional: leave it ``None`` and
+    :func:`classify_move` infers ``initial``/``retry``/``revise``/``recover``
+    from the attempt number, the initiator and the previous row's class. Pass
+    ``MOVE_EXPLORE`` only when the dispatcher actually chose a different idea.
 
     Best-effort like the rest of this module: returns 0 on success, non-zero
     on any error, never raises. A DB without migration 0050 is a silent
@@ -427,6 +575,7 @@ def append_node_attempt(
             cost_usd=cost_usd,
             provider_session_id=provider_session_id,
             initiator=initiator,
+            move_kind=move_kind,
         )
         con.execute("COMMIT")
         committed = True
@@ -472,6 +621,7 @@ def write_checkpoint(
     failure_class=_UNSET,
     attempt=_UNSET,
     owner_token=_UNSET,
+    move_kind=_UNSET,
 ) -> int:
     """Crash-safe per-node checkpoint publication. Returns 0 on success.
 
@@ -525,6 +675,7 @@ def write_checkpoint(
         "failure_class": failure_class,
         "attempt": attempt,
         "owner_token": owner_token,
+        "move_kind": move_kind,
     }
     explicit = {k: v for k, v in supplied.items() if v is not _UNSET}
     if record is not None:
@@ -650,6 +801,7 @@ def write_checkpoint(
                 cost_usd=rec.cost_usd,
                 provider_session_id=rec.provider_session_id or None,
                 initiator=rec.initiator or "python",
+                move_kind=rec.move_kind,
             )
             con.execute("COMMIT")
         finally:
