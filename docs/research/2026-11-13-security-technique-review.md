@@ -190,9 +190,17 @@ code, not about the technique's measured effect.
 | G10-T08 candidate-saturating secret detection | `mini_ork/verify/secret_candidates.py` — every literal at or above twelve characters is scored on a fixed formula; the review band and an unreadable surface exit 3; reports are masked unless `--show-literal` | `0310dbd6`, `d1692cd7`, `d7856ffc` |
 | G05-T02 tiered hypothesis cascade | `mini_ork/verify/hypothesis_cascade.py` + `recipes/code-fix/verifiers/hypothesis.py` — added sink lines become hypotheses, a deterministic signal rank caps the oracle tier at twenty, and only an executed probe confirms one; no probe or a timeout abstains (exit 3), a git failure is an abstention rather than an empty clean surface | `38cb3e28` |
 
-One now-list item has not landed. G02-T10 (untrusted-content red team) is
-blocked on intake: the probe needs the provenance model that names which path a
-piece of content arrived on, and nothing produces that today.
+| G02-T10 untrusted-content red team (first slice) | `mini_ork/verify/untrusted_content.py` — a provenance record names the channel and locator each input arrived on, `MO-CANARY-*` tokens are derived from that triple, and a canary appearing in the input of a privileged tool call (push, network egress, credential read, destructive command, write outside the run's trees) is a finding read off the run's `agent-*.live.jsonl` trace | `122cb764` |
+
+Every now-list item now has shipped code. G02-T10's slice is the harness, not
+the measurement: nothing plants canaries inside a live run yet, so the scan runs
+when an operator or a probe plants them, and its credit is coverage of the
+mechanism rather than an attack-success rate. A literal canary also measures
+reach, not obedience — a model that paraphrases the instruction drops the token,
+which is exactly why the cited fragmented-payload work defeats stateless
+filters. And the trusted-channel table is a first-slice judgement: `repo_tracked`
+counts as trusted, which is false for a stranger's pull request, so a real probe
+has to record per-locator trust rather than per-channel.
 
 Known limits, measured rather than assumed. The deception layer reads a pure
 file rename as an introduction because it keys findings by path, and every run
