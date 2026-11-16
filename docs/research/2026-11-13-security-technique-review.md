@@ -186,18 +186,23 @@ code, not about the technique's measured effect.
 | G01-T03 offline dependency gate | `recipes/code-fix/verifiers/dep_guard.py` — new import/requirement must exist in the vendored allowlist with an exact pin, loaded from the engine not the scanned repo | `f59cb317` |
 | G07-T01 paired oracle | `recipes/code-fix/verifiers/security_oracle.py` — reproduction must fail at base and pass at head, functional command green on both, vacuous without a security label | `51b4ece1` |
 | G07-T02 mutation adequacy | `mini_ork/verify/mutant_audit.py` — doubly-validated mutants, per-gate kill rate, Wilson separation before promotion, and a kill only when the gate emits a refutation envelope | `ac6f2c00`, `194de467` |
-| G07-T03 deception layer | `mini_ork/verify/deception_check.py` + `recipes/code-fix/verifiers/deception.py` — base-vs-head scan of the touched surface in one path space (untracked files included), classified introduction / omission / inadequacy / clean / unmeasured | `ec1d37fa`, `eadfbba9` |
+| G07-T03 deception layer | `mini_ork/verify/deception_check.py` + `recipes/code-fix/verifiers/deception.py` — base-vs-head scan of the touched surface in one path space (untracked files included), classified introduction / omission / inadequacy / clean / unmeasured | `ec1d37fa`, `eadfbba9`, `223dcd0f` |
+| G10-T08 candidate-saturating secret detection | `mini_ork/verify/secret_candidates.py` — every literal at or above twelve characters is scored on a fixed formula; the review band and an unreadable surface exit 3; reports are masked unless `--show-literal` | `0310dbd6`, `d1692cd7`, `d7856ffc` |
 
-Three now-list items have not landed. G10-T08 (candidate-saturating secret
-detection) has a kickoff and is next. G05-T02 (tiered hypothesis cascade) is
-unstarted; its oracle tier is the same shape the paired oracle already ships.
+Two now-list items have not landed. G05-T02 (tiered hypothesis cascade) has a
+kickoff; its oracle tier is the same shape the paired oracle already ships.
 G02-T10 (untrusted-content red team) is blocked on intake: the probe needs the
 provenance model that names which path a piece of content arrived on, and
 nothing produces that today.
 
-Two known limits of the deception layer, measured rather than assumed: a pure
-file rename reads as an introduction because the layer keys findings by path,
-and every run pays a full detached worktree checkout plus two whole-tree scans.
+Known limits, measured rather than assumed. The deception layer reads a pure
+file rename as an introduction because it keys findings by path, and every run
+pays a full detached worktree checkout plus two whole-tree scans. The
+candidate scanner demotes a literal that starts with `/` as path-like, so a
+base64 token whose first character happens to be `/` is missed; it also ships
+as a library and a CLI next to gitleaks, not yet as a `code-fix` node, because
+a node that flags every long literal in a test fixture would refuse ordinary
+runs.
 
 ## Next
 
