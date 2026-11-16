@@ -188,12 +188,11 @@ code, not about the technique's measured effect.
 | G07-T02 mutation adequacy | `mini_ork/verify/mutant_audit.py` — doubly-validated mutants, per-gate kill rate, Wilson separation before promotion, and a kill only when the gate emits a refutation envelope | `ac6f2c00`, `194de467` |
 | G07-T03 deception layer | `mini_ork/verify/deception_check.py` + `recipes/code-fix/verifiers/deception.py` — base-vs-head scan of the touched surface in one path space (untracked files included), classified introduction / omission / inadequacy / clean / unmeasured | `ec1d37fa`, `eadfbba9`, `223dcd0f` |
 | G10-T08 candidate-saturating secret detection | `mini_ork/verify/secret_candidates.py` — every literal at or above twelve characters is scored on a fixed formula; the review band and an unreadable surface exit 3; reports are masked unless `--show-literal` | `0310dbd6`, `d1692cd7`, `d7856ffc` |
+| G05-T02 tiered hypothesis cascade | `mini_ork/verify/hypothesis_cascade.py` + `recipes/code-fix/verifiers/hypothesis.py` — added sink lines become hypotheses, a deterministic signal rank caps the oracle tier at twenty, and only an executed probe confirms one; no probe or a timeout abstains (exit 3), a git failure is an abstention rather than an empty clean surface | `38cb3e28` |
 
-Two now-list items have not landed. G05-T02 (tiered hypothesis cascade) has a
-kickoff; its oracle tier is the same shape the paired oracle already ships.
-G02-T10 (untrusted-content red team) is blocked on intake: the probe needs the
-provenance model that names which path a piece of content arrived on, and
-nothing produces that today.
+One now-list item has not landed. G02-T10 (untrusted-content red team) is
+blocked on intake: the probe needs the provenance model that names which path a
+piece of content arrived on, and nothing produces that today.
 
 Known limits, measured rather than assumed. The deception layer reads a pure
 file rename as an introduction because it keys findings by path, and every run
@@ -203,6 +202,18 @@ base64 token whose first character happens to be `/` is missed; it also ships
 as a library and a CLI next to gitleaks, not yet as a `code-fix` node, because
 a node that flags every long literal in a test fixture would refuse ordinary
 runs.
+
+The hypothesis cascade's oracle is only as good as the probe a run drops into
+`<run_dir>/hypotheses/`, and four limits follow from that. Every nonzero exit
+confirms, so a probe that fails to parse or import — python exiting 2 on a
+syntax error — reads as CONFIRMED: it fails closed rather than clearing a real
+line, but a broken oracle becomes a false finding. Probes execute with the
+verifier's own environment, cwd at the target root, out of an agent-writable
+directory, so a probe is trusted code by construction. Hypotheses past
+`TIER3_CAP` are reported as `deferred` and never probed, and deferred entries do
+not move the exit code, so a surface with more than twenty sinks passes with a
+count nobody gates on. And `probe_name` maps `/` to `~`, so `a/b.py` and a file
+literally named `a~b.py` share one probe file.
 
 ## Next
 
@@ -214,7 +225,7 @@ Thirty-nine techniques the reviewers held back — overwhelmingly because they s
 | G04-T06 | Oracle-integrity invariants and known-answer controls | code-fix verifier set | Hardens the gates this cycle adds; lands with the security verifier, not before |
 | G08-T04 | Repository, intake, and runtime-feedback poisoning of coding agents (caution) | kickoff and intake guard | Buildable residue (untrusted labeling at intake) lands with G02-T10; rest is caution evidence |
 | G10-T04 | Honeytokens and canary-linked exfiltration tripwires | vault + publish gate | Cheap and near-zero-FP but guards rather than fills the named holes; glm scored it implement-now |
-| G02-T01 | Execution-witness validation of AI security findings | code-fix verifier set + evidence ledger | Fold into G05-T02/G07-T01 as their accept condition — only 65/338 LLM exploits pass validation |
+| G02-T01 | Execution-witness validation of AI security findings | code-fix verifier set + evidence ledger | G05-T02 now ships the probe accept rule and G07-T01 the base-fails/head-passes shape, so this is wiring, not new machinery — only 65/338 LLM exploits pass validation |
 | G05-T10 | Mutation-based self-testing of shipped detectors (secret-scanner battery) | secret scan | Protects the gitleaks tier G10-T08 extends; ships beside it |
 | G05-T03 | Verifier-checkable, site-citing security findings | evidence ledger and traces | Citation format + checker is cheap, but a property of verdicts rather than the missing check itself |
 | G09-T08 | Label-blind audit of failed attacks: ignored is not refused | gaming scan | Scoring rule that keeps G02-T10's probe honest; lands with the probe |
