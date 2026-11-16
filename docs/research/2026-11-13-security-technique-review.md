@@ -213,9 +213,11 @@ runs.
 
 The hypothesis cascade's oracle is only as good as the probe a run drops into
 `<run_dir>/hypotheses/`, and four limits follow from that. Every nonzero exit
-confirms, so a probe that fails to parse or import — python exiting 2 on a
+confirms, so a probe that fails to parse or import — python exits 1 on a
 syntax error — reads as CONFIRMED: it fails closed rather than clearing a real
-line, but a broken oracle becomes a false finding. Probes execute with the
+line, but a broken oracle becomes a false finding. A probe file that is simply
+missing is caught before the run (`confirm` checks `isfile` first), so python's
+exit 2 there never reaches the accept rule. Probes execute with the
 verifier's own environment, cwd at the target root, out of an agent-writable
 directory, so a probe is trusted code by construction. Hypotheses past
 `TIER3_CAP` are reported as `deferred` and never probed, and deferred entries do
