@@ -242,7 +242,7 @@ Makefile.
 Run each and require exit 0:
 
 1. `python3 -m pytest -q -p no:asyncio tests/unit/test_verify_hypothesis_cascade_py.py`
-2. `python3 -m pytest -q -p no:asyncio tests/unit/test_verify_deception_py.py tests/unit/test_verify_security_oracle_py.py`
+2. `python3 -m pytest -q -p no:asyncio tests/unit/test_verify_deception_py.py tests/unit/test_verify_security_oracle_py.py tests/unit/test_eco6_k14_edge_types.py tests/unit/test_verify_vacuous_verifier.py tests/unit/test_tool_grants_py.py`
 3. `python3 -m ruff check --select F,E9 mini_ork/verify/hypothesis_cascade.py recipes/code-fix/verifiers/hypothesis.py tests/unit/test_verify_hypothesis_cascade_py.py`
 4. `python3 -m mini_ork.verify.hypothesis_cascade --help`
 
