@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,7 @@ _PATH_PREFIXES = ("/", "./", "../", "~/")
 _STRING_LITERAL_RE = re.compile(r"""(["'])((?:\\.|(?!\1).)*)\1""")
 _NUL_SCAN_BYTES = 4096
 _CONTEXT_LIMIT = 200
+_WINDOWS_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:")
 
 
 class Candidate(NamedTuple):
@@ -49,6 +51,21 @@ class Candidate(NamedTuple):
     score: float
     band: str
     reasons: tuple[str, ...]
+
+
+class ScanResult(NamedTuple):
+    """Candidates, plus what was not measured and what was deliberately skipped.
+
+    The two note lists are not the same thing. ``unreadable`` is a measurement
+    failure — a file we were asked about and could not read, or a path that
+    escaped the root — so the caller must not report that surface clean.
+    ``skipped`` is a deliberate non-carrier (binary, oversized, NUL-bearing) and
+    is reported for the operator without changing the verdict.
+    """
+
+    candidates: list
+    unreadable: list
+    skipped: list
 
 
 def shannon(text: str) -> float:
@@ -129,6 +146,21 @@ def band(score: float) -> str:
     return CLEAN
 
 
+def mask(literal: str) -> str:
+    """A triage-safe rendering: the ends, the length and a digest, not the secret.
+
+    A candidate is not a verdict, but a candidate IS a copy of the literal, so
+    printing it in full puts the very string this pass exists to catch into a
+    terminal, a log or a run record. The digest is what lets two reports agree
+    that they saw the same string.
+    """
+    digest = hashlib.sha256(literal.encode("utf-8", "replace")).hexdigest()[:12]
+    shown = literal if len(literal) <= 8 else ""
+    if shown:
+        return "%s len=%d sha256=%s" % (shown, len(literal), digest)
+    return "%s..%s len=%d sha256=%s" % (literal[:3], literal[-2:], len(literal), digest)
+
+
 def _context_for(lines: list[str], lineno: int, column: int) -> str:
     """The line before plus the line prefix, truncated to the last 200 chars."""
     pieces: list[str] = []
@@ -152,7 +184,11 @@ def _extract_literals_regex(text: str) -> list[tuple[int, int, str]]:
 
 
 def extract_literals(text: str) -> list[tuple[int, int, str]]:
-    """``(lineno, column, literal)`` triples at or above ``LITERAL_MIN``."""
+    """``(lineno, column, literal)`` triples at or above ``LITERAL_MIN``.
+
+    Bytes literals count: ``b"..."`` is how a credential reaches a request body
+    or an HMAC call as often as a ``str`` does.
+    """
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
@@ -160,8 +196,11 @@ def extract_literals(text: str) -> list[tuple[int, int, str]]:
 
     triples: list[tuple[int, int, str]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            literal = node.value
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            if isinstance(node.value, bytes):
+                literal = node.value.decode("utf-8", "replace")
+            else:
+                literal = node.value
             if len(literal) >= LITERAL_MIN:
                 triples.append((node.lineno, node.col_offset, literal))
     triples.sort(key=lambda triple: (triple[0], triple[1]))
@@ -181,49 +220,105 @@ def scan_text(path: str, text: str) -> list[Candidate]:
     return candidates
 
 
-def scan_file(root: str, rel: str) -> list[Candidate]:
-    """Candidates for one file, skipping missing, binary and oversized paths."""
-    path = os.path.join(root, rel)
-    if not os.path.exists(path) or not os.path.isfile(path):
-        return []
+def on_disk(root: str, rel: str) -> "str | None":
+    """The path for ``rel`` under ``root``, or ``None`` when it escapes the root.
+
+    ``rel`` comes from a diff or from ``MINI_ORK_TOUCHED_FILES``, and both are
+    strings this module did not author. An absolute path, a ``..`` segment or a
+    symlink pointing outside the root would otherwise make the report describe a
+    file the caller never asked about — and, worse, publish its contents as
+    "clean".
+    """
+    if not rel or rel.startswith(("/", "\\")) or _WINDOWS_ABSOLUTE_RE.match(rel):
+        return None
+    base = os.path.realpath(root)
+    candidate = os.path.realpath(os.path.join(base, rel))
+    if candidate == base or not candidate.startswith(base + os.sep):
+        return None
+    return candidate
+
+
+def _read(root: str, rel: str) -> tuple[bytes | None, str]:
+    """``(data, "")`` when the file is scannable, else ``(None, reason)``."""
+    path = on_disk(root, rel)
+    if path is None:
+        return None, "escapes root"
+    if not os.path.exists(path):
+        # A change surface names deleted files too, so absence is ordinary. It
+        # is still reported: nobody should read "0 candidates" as "this path was
+        # scanned and found clean" when the file is not there.
+        return None, "skipped: missing"
+    if not os.path.isfile(path):
+        return None, "skipped: not a regular file"
     try:
         if os.path.getsize(path) > MAX_FILE_BYTES:
-            return []
+            return None, "skipped: larger than %d bytes" % MAX_FILE_BYTES
         if os.path.splitext(rel)[1].lower() in BINARY_EXTENSIONS:
-            return []
+            return None, "skipped: binary extension"
         with open(path, "rb") as handle:
             data = handle.read()
-    except OSError:
-        return []
+    except OSError as exc:
+        return None, "unreadable: %s" % exc.strerror
     if b"\x00" in data[:_NUL_SCAN_BYTES]:
-        return []
-    return scan_text(rel, data.decode("utf-8", errors="replace"))
+        return None, "skipped: contains NUL bytes"
+    return data, ""
 
 
-def scan(root: str, paths: list[str]) -> list[Candidate]:
-    """Every candidate across ``paths``, sorted by ``(path, line)``."""
+def scan_file(root: str, rel: str) -> tuple[list[Candidate], str]:
+    """Candidates for one file plus the reason it was not measured (``""``=ok)."""
+    data, reason = _read(root, rel)
+    if data is None:
+        return [], reason
+    return scan_text(rel, data.decode("utf-8", errors="replace")), ""
+
+
+def scan(root: str, paths: list[str]) -> ScanResult:
+    """Every candidate across ``paths``, ordered, with what was not measured.
+
+    Duplicates are collapsed first: the same path listed twice would otherwise
+    double-count its candidates and make the summary lie about how many
+    distinct literals were seen.
+    """
     candidates: list[Candidate] = []
-    for rel in paths:
-        candidates.extend(scan_file(root, rel))
+    unreadable: list[str] = []
+    skipped: list[str] = []
+    for rel in dict.fromkeys(paths):
+        found, reason = scan_file(root, rel)
+        candidates.extend(found)
+        if reason.startswith("unreadable") or reason == "escapes root":
+            unreadable.append("%s: %s" % (rel, reason))
+        elif reason:
+            skipped.append("%s: %s" % (rel, reason))
     candidates.sort(key=lambda candidate: (candidate.path, candidate.line))
-    return candidates
+    return ScanResult(candidates, unreadable, skipped)
 
 
-def summarize(candidates: list[Candidate]) -> dict:
-    """Band counts plus each candidate, with the literal reported in full."""
+def summarize(
+    result: ScanResult,
+    *,
+    show_literal: bool = False,
+) -> dict:
+    """Band counts plus each candidate, masked unless the caller opted in."""
     counts: dict[str, int] = {name: 0 for name in BANDS}
     entries: list[dict] = []
-    for candidate in candidates:
+    for candidate in result.candidates:
         counts[candidate.band] = counts.get(candidate.band, 0) + 1
         entries.append({
             "path": candidate.path,
             "line": candidate.line,
-            "literal": candidate.literal,
+            "literal": (
+                candidate.literal if show_literal else mask(candidate.literal)
+            ),
             "score": candidate.score,
             "band": candidate.band,
             "reasons": list(candidate.reasons),
         })
-    return {"counts": counts, "candidates": entries}
+    return {
+        "counts": counts,
+        "candidates": entries,
+        "unreadable": list(result.unreadable),
+        "skipped": list(result.skipped),
+    }
 
 
 def _split_paths(raw: str) -> list[str]:
@@ -231,7 +326,12 @@ def _split_paths(raw: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Exit ``1`` when flagged, ``3`` when only the review band abstains, else 0."""
+    """Exit ``1`` when flagged, ``3`` when nothing is proven clean, else 0.
+
+    The review band and an unreadable surface both exit ``3``: an uncertain
+    literal and a file we could not open are both "not measured", and a scanner
+    that calls them clean is the failure mode this pass exists to remove.
+    """
     parser = argparse.ArgumentParser(
         description="Promote string literals to secret candidates and score them."
     )
@@ -242,6 +342,11 @@ def main(argv: list[str] | None = None) -> int:
         help="comma- or newline-separated paths; defaults to MINI_ORK_TOUCHED_FILES",
     )
     parser.add_argument("--json", action="store_true", help="emit a JSON summary")
+    parser.add_argument(
+        "--show-literal",
+        action="store_true",
+        help="print candidate literals in full instead of the masked form",
+    )
     args = parser.parse_args(argv)
 
     raw = args.paths
@@ -251,35 +356,35 @@ def main(argv: list[str] | None = None) -> int:
     if not paths:
         parser.error("no paths to scan: pass --paths or set MINI_ORK_TOUCHED_FILES")
 
-    candidates = scan(args.root, paths)
+    result = scan(args.root, paths)
     counts: dict[str, int] = {name: 0 for name in BANDS}
-    for candidate in candidates:
+    for candidate in result.candidates:
         counts[candidate.band] = counts.get(candidate.band, 0) + 1
 
     if args.json:
-        print(json.dumps(summarize(candidates), indent=2))
+        print(json.dumps(summarize(result, show_literal=args.show_literal), indent=2))
     else:
-        for candidate in candidates:
+        for candidate in result.candidates:
             if candidate.band == CLEAN:
                 continue
+            literal = (
+                candidate.literal if args.show_literal else mask(candidate.literal)
+            )
             print(
                 "%s:%d %s %s %s"
-                % (
-                    candidate.path,
-                    candidate.line,
-                    candidate.band,
-                    candidate.score,
-                    candidate.literal,
-                )
+                % (candidate.path, candidate.line, candidate.band,
+                   candidate.score, literal)
             )
+        for note in result.unreadable:
+            print("unreadable %s" % note)
         print(
-            "secret-candidates: %d flagged, %d review, %d clean"
-            % (counts[FLAGGED], counts[REVIEW], counts[CLEAN])
+            "secret-candidates: %d flagged, %d review, %d clean, %d unreadable"
+            % (counts[FLAGGED], counts[REVIEW], counts[CLEAN], len(result.unreadable))
         )
 
     if counts[FLAGGED]:
         return 1
-    if counts[REVIEW]:
+    if counts[REVIEW] or result.unreadable:
         return 3
     return 0
 

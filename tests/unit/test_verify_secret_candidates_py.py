@@ -241,37 +241,115 @@ def test_scan_file_skips_missing_directory_binary_nul_and_oversize(tmp_path):
     (tmp_path / "logo.png").write_text('k = "opaque_token_value_1"')
     (tmp_path / "nul.py").write_bytes(b'k = "opaque_token_value_1"\x00\n')
 
-    assert sc.scan_file(str(tmp_path), "ghost.py") == []
-    assert sc.scan_file(str(tmp_path), "adir") == []
-    assert sc.scan_file(str(tmp_path), "big.py") == []
-    assert sc.scan_file(str(tmp_path), "logo.png") == []
-    assert sc.scan_file(str(tmp_path), "nul.py") == []
+    for rel, reason in (
+        ("ghost.py", "skipped: missing"),
+        ("adir", "skipped: not a regular file"),
+        ("big.py", "skipped: larger than %d bytes" % sc.MAX_FILE_BYTES),
+        ("logo.png", "skipped: binary extension"),
+        ("nul.py", "skipped: contains NUL bytes"),
+    ):
+        found, said = sc.scan_file(str(tmp_path), rel)
+        assert found == [], rel
+        assert said == reason, (rel, said)
 
 
 def test_scan_reports_a_tests_fixture(tmp_path):
     _write(tmp_path, "tests/fixture.py", FLAG_LINE + "\n")
-    candidates = sc.scan(str(tmp_path), ["tests/fixture.py"])
-    assert candidates and candidates[0].literal == TOKEN
+    result = sc.scan(str(tmp_path), ["tests/fixture.py"])
+    assert result.candidates and result.candidates[0].literal == TOKEN
+    assert result.unreadable == [] and result.skipped == []
 
 
 def test_scan_sorts_by_path_then_line(tmp_path):
     _write(tmp_path, "zeta.py", 'a = "%s"\n' % TOKEN)
     _write(tmp_path, "alpha.py", 'a = "%s"\n' % TOKEN)
-    candidates = sc.scan(str(tmp_path), ["zeta.py", "alpha.py"])
-    assert [c.path for c in candidates] == ["alpha.py", "zeta.py"]
+    result = sc.scan(str(tmp_path), ["zeta.py", "alpha.py"])
+    assert [c.path for c in result.candidates] == ["alpha.py", "zeta.py"]
 
 
-def test_summarize_counts_and_full_literal():
-    candidates = [
-        sc.Candidate("app/x.py", 3, TOKEN, 1.0, sc.FLAGGED, ("context",)),
-        sc.Candidate("app/y.py", 1, "a sentence here", 0.0, sc.CLEAN, ("contains whitespace",)),
-    ]
-    out = sc.summarize(candidates)
+def test_scan_collapses_duplicate_paths_so_counts_are_of_distinct_literals(tmp_path):
+    _write(tmp_path, "app/x.py", FLAG_LINE + "\n")
+    result = sc.scan(str(tmp_path), ["app/x.py", "app/x.py"])
+    assert len(result.candidates) == 1
+
+
+def test_a_path_that_escapes_the_root_is_unreadable_not_clean(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text(FLAG_LINE + "\n", encoding="utf-8")
+    (root / "link.py").symlink_to(outside)
+
+    for rel in ("../outside.py", str(outside), "link.py"):
+        found, reason = sc.scan_file(str(root), rel)
+        assert found == [], rel
+        assert reason == "escapes root", (rel, reason)
+
+    result = sc.scan(str(root), ["../outside.py"])
+    assert result.candidates == []
+    assert result.unreadable == ["../outside.py: escapes root"]
+
+
+def test_an_unreadable_file_is_never_counted_clean(tmp_path, capsys):
+    root = tmp_path / "root"
+    _write(root, "app/x.py", FLAG_LINE + "\n")
+    (root / "locked.py").write_text(FLAG_LINE + "\n", encoding="utf-8")
+    (root / "locked.py").chmod(0o000)
+    try:
+        code = _run_main(
+            ["--root", str(root), "--paths", "locked.py", "--json"]
+        )
+    finally:
+        (root / "locked.py").chmod(0o644)
+    assert code == 3, "an unreadable file must abstain, not pass"
+    payload = _payload(capsys.readouterr().out)
+    assert payload["counts"] == {"flagged": 0, "review": 0, "clean": 0}
+    assert payload["unreadable"]
+
+
+def test_extract_literals_sees_bytes_literals():
+    text = 'key = b"%s"\n' % TOKEN
+    triples = sc.extract_literals(text)
+    assert [literal for _line, _col, literal in triples] == [TOKEN]
+
+
+def test_mask_hides_the_middle_but_keeps_a_stable_digest():
+    masked = sc.mask(TOKEN)
+    assert TOKEN not in masked
+    assert masked.startswith("%s..%s " % (TOKEN[:3], TOKEN[-2:]))
+    assert "len=%d" % len(TOKEN) in masked
+    assert re.search(r"sha256=[0-9a-f]{12}$", masked)
+    assert sc.mask(TOKEN) == masked, "the digest must be deterministic"
+    assert sc.mask(TOKEN) != sc.mask(TOKEN + "x")
+
+
+def test_summarize_counts_and_masks_by_default():
+    result = sc.ScanResult(
+        [
+            sc.Candidate("app/x.py", 3, TOKEN, 1.0, sc.FLAGGED, ("context",)),
+            sc.Candidate(
+                "app/y.py", 1, "a sentence here", 0.0, sc.CLEAN,
+                ("contains whitespace",),
+            ),
+        ],
+        ["app/z.py: unreadable: Permission denied"],
+        ["logo.png: skipped: binary extension"],
+    )
+    out = sc.summarize(result)
     assert out["counts"] == {"flagged": 1, "review": 0, "clean": 1}
     assert len(out["candidates"]) == 2
     for entry in out["candidates"]:
         assert set(entry) == {"path", "line", "literal", "score", "band", "reasons"}
-    assert out["candidates"][0]["literal"] == TOKEN
+    assert out["candidates"][0]["literal"] == sc.mask(TOKEN)
+    assert out["unreadable"] == ["app/z.py: unreadable: Permission denied"]
+    assert out["skipped"] == ["logo.png: skipped: binary extension"]
+
+
+def test_summarize_shows_the_literal_only_when_asked():
+    result = sc.ScanResult(
+        [sc.Candidate("app/x.py", 3, TOKEN, 1.0, sc.FLAGGED, ("context",))], [], []
+    )
+    assert sc.summarize(result, show_literal=True)["candidates"][0]["literal"] == TOKEN
 
 
 def test_cli_flags_with_exit_one_and_json(tmp_path, capsys):
@@ -330,8 +408,23 @@ def test_cli_text_mode_line_and_summary(tmp_path, capsys):
     code = _run_main(["--root", str(tmp_path), "--paths", "app/x.py"])
     assert code == 1
     out = capsys.readouterr().out
-    assert re.search(r"app/x\.py:1 flagged \d+(?:\.\d+)? %s" % TOKEN, out)
+    assert re.search(
+        r"app/x\.py:1 flagged \d+(?:\.\d+)? \S+\.\.\S+ len=%d " % len(TOKEN), out
+    )
+    assert TOKEN not in out, "the literal must not reach the terminal by default"
     summary = re.search(
-        r"secret-candidates: (\d+) flagged, (\d+) review, (\d+) clean", out
+        r"secret-candidates: (\d+) flagged, (\d+) review, (\d+) clean,"
+        r" (\d+) unreadable",
+        out,
     )
     assert summary and int(summary.group(1)) == 1
+    assert int(summary.group(4)) == 0
+
+
+def test_cli_show_literal_opts_into_the_full_string(tmp_path, capsys):
+    _write(tmp_path, "app/x.py", FLAG_LINE + "\n")
+    code = _run_main(
+        ["--root", str(tmp_path), "--paths", "app/x.py", "--show-literal"]
+    )
+    assert code == 1
+    assert TOKEN in capsys.readouterr().out
