@@ -6,6 +6,7 @@ Hermetic: every fixture is a ``tmp_path`` file; no network and no git.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import pytest
@@ -290,6 +291,14 @@ def test_a_path_that_escapes_the_root_is_unreadable_not_clean(tmp_path):
     assert result.unreadable == ["../outside.py: escapes root"]
 
 
+def test_containment_still_works_when_the_root_is_a_filesystem_root(tmp_path):
+    """``/`` already ends in a separator; a second one would reject everything."""
+    root = tmp_path / "root"
+    _write(root, "app/x.py", FLAG_LINE + "\n")
+    assert sc.on_disk(str(root) + "/", "app/x.py") is not None
+    assert sc.on_disk(os.sep, "tmp") is not None
+
+
 def test_an_unreadable_file_is_never_counted_clean(tmp_path, capsys):
     root = tmp_path / "root"
     _write(root, "app/x.py", FLAG_LINE + "\n")
@@ -321,6 +330,16 @@ def test_mask_hides_the_middle_but_keeps_a_stable_digest():
     assert re.search(r"sha256=[0-9a-f]{12}$", masked)
     assert sc.mask(TOKEN) == masked, "the digest must be deterministic"
     assert sc.mask(TOKEN) != sc.mask(TOKEN + "x")
+
+
+def test_mask_reveals_nothing_for_a_short_literal():
+    """Five characters of a twelve-character literal is a third of the secret."""
+    for literal in ("abcdefghijkl", "shortsecret1", "0123456789abcdef"):
+        masked = sc.mask(literal)
+        assert not masked.startswith(literal[:3]), literal
+        assert literal[-2:] not in masked.split(" sha256=")[0], literal
+        assert "len=%d" % len(literal) in masked
+    assert sc.mask("x").startswith("len=1 ")
 
 
 def test_summarize_counts_and_masks_by_default():

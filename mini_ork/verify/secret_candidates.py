@@ -155,9 +155,10 @@ def mask(literal: str) -> str:
     that they saw the same string.
     """
     digest = hashlib.sha256(literal.encode("utf-8", "replace")).hexdigest()[:12]
-    shown = literal if len(literal) <= 8 else ""
-    if shown:
-        return "%s len=%d sha256=%s" % (shown, len(literal), digest)
+    if len(literal) <= 16:
+        # A short literal has no middle to hide: three leading and two trailing
+        # characters would be a third of it, so show none of it.
+        return "len=%d sha256=%s" % (len(literal), digest)
     return "%s..%s len=%d sha256=%s" % (literal[:3], literal[-2:], len(literal), digest)
 
 
@@ -233,7 +234,10 @@ def on_disk(root: str, rel: str) -> "str | None":
         return None
     base = os.path.realpath(root)
     candidate = os.path.realpath(os.path.join(base, rel))
-    if candidate == base or not candidate.startswith(base + os.sep):
+    # ``"/"`` is already a separator, so appending another one would make the
+    # prefix ``"//"`` and reject every path under a filesystem-root scan.
+    prefix = base if base.endswith(os.sep) else base + os.sep
+    if candidate == base or not candidate.startswith(prefix):
         return None
     return candidate
 

@@ -112,18 +112,25 @@ column, literal)` triples with `len(literal) >= LITERAL_MIN`:
 extracted literal: score it, attach `band`, drop candidates below
 `LITERAL_MIN`, sort by `(line, column)`.
 
-**`scan_file(root: str, rel: str) -> list[Candidate]`** — skip (return `[]`) when
-the path does not exist, is not a regular file, exceeds `MAX_FILE_BYTES`, has a
-`BINARY_EXTENSIONS` suffix, or its first 4 KiB contain a NUL byte; decode as
-UTF-8 with `errors="replace"`.
+**`scan_file(root: str, rel: str) -> tuple[list[Candidate], str]`** — `(found,
+"")` on success; otherwise `([], reason)` where the reason starts `skipped:` for
+a path that does not exist, is not a regular file, exceeds `MAX_FILE_BYTES`, has
+a `BINARY_EXTENSIONS` suffix, or carries a NUL byte in its first 4 KiB, and
+`unreadable:` (or `escapes root`) when the file exists under `root` and could
+not be read. Decode as UTF-8 with `errors="replace"`.
 
-**`scan(root: str, paths: list[str]) -> list[Candidate]`** — `scan_file` for
-each path, concatenated, sorted by `(path, line)`.
+**`scan(root: str, paths: list[str]) -> ScanResult`** — candidates for each
+path, deduplicated, sorted by `(path, line)`, plus two note lists:
+`unreadable` (a file that exists and could not be read, or a path that escapes
+`root`) and `skipped` (missing, non-regular, binary, oversized, NUL-bearing).
+The split matters: an unreadable surface must never be reported clean.
 
-**`summarize(candidates: list[Candidate]) -> dict`** — `{"counts": {band: n},
-"candidates": [...]}` with the candidate dicts `{"path", "line", "literal",
-"score", "band", "reasons"}`. The literal is reported in full: this is a
-candidate, not a verdict, and the operator has to see it to judge it.
+**`summarize(result: ScanResult, *, show_literal: bool = False) -> dict`** —
+`{"counts": {band: n}, "candidates": [...], "unreadable": [...], "skipped":
+[...]}` with the candidate dicts `{"path", "line", "literal", "score", "band",
+"reasons"}`. The literal is masked by default — ends, length and a digest — so a
+report never republishes the string this pass exists to catch; `--show-literal`
+opts back in when an operator is triaging one candidate by hand.
 
 **`main(argv=None) -> int`** — argparse `--root` (default `.`), `--paths`
 (comma- or newline-separated; when omitted read `MINI_ORK_TOUCHED_FILES`;
@@ -131,9 +138,10 @@ empty → usage error 2), `--json`.
 
 Exit codes: `1` when at least one candidate is `FLAGGED`; `3` when none is
 flagged but at least one is `REVIEW` (the uncertain band abstains — it is not a
-pass); `0` only when every candidate is `CLEAN`. Text mode prints
-`<path>:<line> <band> <score> <literal>` per non-clean candidate and a final
-`secret-candidates: <n> flagged, <m> review, <k> clean`.
+pass) **or** anything on the surface was unreadable; `0` only when every
+candidate is `CLEAN` and the surface was fully measured. Text mode prints
+`<path>:<line> <band> <score> <masked literal>` per non-clean candidate and a
+final `secret-candidates: <n> flagged, <m> review, <k> clean, <u> unreadable`.
 
 ### 2. `tests/unit/test_verify_secret_candidates_py.py` (new)
 
