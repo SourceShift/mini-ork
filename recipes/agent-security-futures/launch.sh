@@ -16,9 +16,21 @@ RECOVER_FROM="${MO_SEC_RECOVER_FROM:-}"
 HOME_DIR="${MINI_ORK_HOME:-$PWD/.mini-ork}"
 RUN_DIR="$HOME_DIR/runs/$RUN_ID"
 mkdir -p "$RUN_DIR/config"
+
+# Config base: the family-wide lane/provider templates. Absent on a checkout
+# that never ran `mini-ork init`, so say what to do instead of letting YAML
+# open() the missing path with a traceback three frames deep.
+CONFIG_SRC="${MINI_ORK_CONFIG_SRC:-$HOME_DIR/config}"
+for f in agents.yaml providers.yaml; do
+  [ -f "$CONFIG_SRC/$f" ] || {
+    echo "launch: no $CONFIG_SRC/$f — run 'bin/mini-ork init' first, or set MINI_ORK_HOME / MINI_ORK_CONFIG_SRC" >&2
+    exit 2
+  }
+done
+
 if [ -z "$RECOVER_FROM" ]; then
 
-python3 - "$HOME_DIR/config" "$RUN_DIR/config" <<'PY'
+python3 - "$CONFIG_SRC" "$RUN_DIR/config" <<'PY'
 import sys, yaml
 src, dst = sys.argv[1], sys.argv[2]
 agents = yaml.safe_load(open(f"{src}/agents.yaml"))
@@ -37,14 +49,35 @@ print("lanes:", sorted(set(",".join(agents["lanes"].values()).split(","))), "pro
 PY
 fi
 
-# LibWit token: env wins; else lift the Bearer from a local arxiv-libwit MCP config.
+# The run-scoped lane map only restrains dispatch when the engine's overlay
+# resolver is pointed at it; MINI_ORK_AGENTS is that pointer. providers.yaml
+# already restricts the provider set, this closes the lane half.
+if [ -f "$RUN_DIR/config/agents.yaml" ]; then
+  export MINI_ORK_AGENTS="$RUN_DIR/config/agents.yaml"
+fi
+
+# LibWit token: env wins; else lift the Bearer from a local arxiv-libwit MCP
+# config. The path is machine-local by design — absent path, unreadable JSON,
+# or empty token are all a clear stop, never a silent unauthenticated run.
 if [ -z "${ARXIV_API_TOKEN:-}" ]; then
-  ARXIV_API_TOKEN="$(python3 - "${LIBWIT_MCP_JSON:-/Volumes/docker-ssd/ps/researcher/.mcp.json}" <<'PY'
+  MCP_JSON="${LIBWIT_MCP_JSON:-/Volumes/docker-ssd/ps/researcher/.mcp.json}"
+  if [ ! -f "$MCP_JSON" ]; then
+    echo "launch: ARXIV_API_TOKEN unset and no arxiv-libwit MCP config at $MCP_JSON — export ARXIV_API_TOKEN or set LIBWIT_MCP_JSON" >&2
+    exit 2
+  fi
+  ARXIV_API_TOKEN="$(python3 - "$MCP_JSON" <<'PY'
 import json, sys
-auth = json.load(open(sys.argv[1]))["mcpServers"]["arxiv-libwit"]["headers"]["Authorization"]
-print(auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else auth)
+try:
+    auth = json.load(open(sys.argv[1]))["mcpServers"]["arxiv-libwit"]["headers"]["Authorization"]
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    sys.exit(f"launch: cannot read the LibWit bearer from {sys.argv[1]}: {exc}")
+token = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else auth
+if not token.strip():
+    sys.exit("launch: the LibWit Authorization header holds no token")
+print(token.strip())
 PY
-)"
+)" || exit 2
+  [ -n "$ARXIV_API_TOKEN" ] || { echo "launch: empty ARXIV_API_TOKEN" >&2; exit 2; }
 fi
 export ARXIV_API_TOKEN
 

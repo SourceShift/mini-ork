@@ -493,6 +493,7 @@ def verify(final_path: Path, merged_path: Path, corpus_path: Path) -> None:
         "## Forecast",
         "## Human Impact",
         "## How to Prepare",
+        "## What Would Change This Forecast",
         "## Appendix A",
         "## Appendix B",
     ):

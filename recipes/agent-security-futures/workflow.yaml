@@ -284,7 +284,7 @@ nodes:
       impact_report: { required: true }
       merged_review: { required: true }
       source_corpus: { required: true }
-    outputs: [{ name: final_review, kind: markdown, path: security-technique-review.md }]
+    outputs: [{ name: final_review, kind: markdown, path: agent-security-futures.md }]
 
   - name: review_completeness
     type: verifier
@@ -362,4 +362,4 @@ edges:
   - { from: review_completeness, to: rollback, edge_type: escalates_to, condition: fail }
 
 rollback_strategy: retain_source_manifest_and_completed_shards
-source_artifact: security-technique-review.md
+source_artifact: agent-security-futures.md
