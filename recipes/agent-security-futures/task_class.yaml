@@ -1,0 +1,35 @@
+name: agent_security_futures
+version: "0.1.0"
+description: >
+  Futures research on AI agent security: collect the top 2000 2026 papers on
+  the security of and by tool-using agents, cluster their techniques into ten
+  themes, analyze each theme for maturity, trajectory and the defensive move
+  that answers it, have two independent reviewer lanes score severity, momentum,
+  evidence and readiness against a written preparedness baseline, and deliver a
+  briefing — trending now, forecast, human impact, how to prepare.
+matches:
+  keywords:
+    - agent security trends
+    - future of agent security
+    - agent security forecast
+    - agentic security research
+    - AI agent risk outlook
+    - how will agent security evolve
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 5
+  max_usd: 40
+  per_lens_usd: 1.5
+
+runtime_model:
+  min_minutes: 60
+  max_minutes: 300
