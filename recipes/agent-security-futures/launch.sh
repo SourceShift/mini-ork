@@ -38,6 +38,11 @@ allowed = {"glm", "minimax"}
 for role, value in list(agents["lanes"].items()):
     lanes = [l.strip() for l in str(value).split(",") if l.strip() in allowed]
     agents["lanes"][role] = ",".join(lanes) if lanes else "glm,minimax"
+# Without these two the lens roles both fall back to "glm,minimax", resolve to
+# one family, and the two "independent" forecast reviewers are the same model
+# twice. Pin each lens to its own family, with the other as fallback.
+agents["lanes"]["glm_lens"] = "glm,minimax"
+agents["lanes"]["minimax_lens"] = "minimax,glm"
 yaml.safe_dump(agents, open(f"{dst}/agents.yaml", "w"), sort_keys=False)
 providers = yaml.safe_load(open(f"{src}/providers.yaml"))
 table = providers.get("providers", providers)
