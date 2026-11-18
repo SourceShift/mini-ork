@@ -32,6 +32,15 @@ regexes = [
   '''^lin_api_secret[0-9]+$''',
   '''^xoxb-[0-9]{10}-[0-9]{10}-$''',
   '''^ambient-anthropic-[0-9]+$''',
+  # The security-verifier fixtures. `abcdef123456` is the `api_key:` example in
+  # `test_credential_literal_boundaries` (quoted again by the SEC-G06-T05
+  # kickoff); the other two are the scanning and masking inputs in
+  # `test_verify_secret_candidates_py.py`, quoted by the SEC-G10-T08 kickoff.
+  # Anchored on the whole value, so a real key of any other shape is reported
+  # even in those same files.
+  '''^abcdef123456$''',
+  '''^Zk4Qm9vRt2Xb7Lp0Ws3Nh6Yc8Jd1fA5gE2uT$''',
+  '''^0123456789abcdef$''',
 ]
 
 # 2. Public client-side analytics keys.

@@ -400,7 +400,12 @@ def test_real_recipes_compile_and_expose_retry_edges():
     for recipe, sources in (
         # `fallbacks` is a first-class verifier in code-fix (the AST
         # fallback guard runs beside typecheck) and revises like the rest.
-        ("code-fix", {"typecheck", "fallbacks", "test", "reviewer"}),
+        # This pin is exact on purpose, so every new verifier that gains a
+        # `retries` edge has to be added here: the set is what the compiler
+        # actually produces, and it grew to nine with the security work.
+        ("code-fix", {"typecheck", "fallbacks", "security", "hypotheses",
+                      "deception", "test", "dependencies", "security_oracle",
+                      "reviewer"}),
         ("framework-edit", {"static_check_verifier", "test_verifier",
                             "kickoff_contract_verifier", "spec_test_verifier",
                             "reviewer"}),
