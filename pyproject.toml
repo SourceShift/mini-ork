@@ -74,7 +74,7 @@ e2b = ["e2b>=2.56,<3"]
 modal = ["modal>=1.6,<2"]
 # ACP (Agent Client Protocol) stdio agent — `mini-ork acp`. Bounded to the
 # 0.12 line because the ACP wire schema shifts between minor releases.
-acp = ["agent-client-protocol>=0.12,<0.13"]
+acp = ["agent-client-protocol>=0.12,<1.1"]
 # The supported installation profile: core CLI plus the local web sidecar,
 # Crucible runtime, and GEPA optimization. Provider CLIs remain external because
 # they need user auth.
