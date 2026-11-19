@@ -253,7 +253,7 @@ def render_markdown(data: dict) -> str:
         "",
         f"- attempts: {h.get('attempts', 0)}, successes: {h.get('successes', 0)}, "
         f"cost: {h.get('cost_usd', 0.0):.4f} USD",
-        "- attempts per accepted attempt: "
+        "- attempts per success: "
         + ("— (nothing succeeded)" if aps is None else f"{aps:.2f}"),
         f"- revise: {_pct(share_cost.get('revise', 0.0))} of cost, "
         f"{_pct(share_att.get('revise', 0.0))} of attempts",

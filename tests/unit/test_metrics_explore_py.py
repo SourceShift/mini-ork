@@ -234,7 +234,7 @@ def test_render_prints_the_two_caveats(db):
     assert "caller-declared only" in text
     assert "unclassified" in text
     assert "| code-fix | revise |" in text
-    assert "attempts per accepted attempt" in text
+    assert "attempts per success" in text
 
 
 def test_metrics_dispatches_explore(db):
