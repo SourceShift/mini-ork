@@ -11,6 +11,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 
 # mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
@@ -22,6 +24,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
 from mini_ork.verify.pm import classify_suite_spawn, exec_argv, run_argv, run_logged  # noqa: E402
+from mini_ork.verify.langs import python_test_files, rust_packages  # noqa: E402
 
 
 def _root_multi_project_config() -> str:
@@ -105,14 +108,15 @@ TEST_FILES = list(dict.fromkeys(TEST_FILES))
 jest_rc = 0
 jest_tail = ""
 argv = []  # set below when there is anything to run; the no-tests path has no spawn
+ts_passed = True
 if not TEST_FILES:
     if re.search(r"\.(ts|tsx)$", TOUCHED, re.M):
         ev.write("no scoped tests found for touched TypeScript files - failing closed\n")
-        passed = False
+        ts_passed = False
         jest_rc = 1
     else:
-        ev.write("no scoped Jest tests for non-TypeScript touched files - passing with verifier/local evidence only\n")
-        passed = True
+        ev.write("no scoped Jest tests for these touched files\n")
+        ts_passed = True
         jest_rc = 0
 else:
     pkg = ""
@@ -154,7 +158,56 @@ else:
     ev.write(f"$ {shlex.join(argv)}\n")
     ev.flush()
     jest_rc, jest_tail = run_logged(argv, EVIDENCE, env=env, stream=ev)
-    passed = jest_rc == 0
+    ts_passed = jest_rc == 0
+
+# ── Rust ────────────────────────────────────────────────────────────────────
+# `cargo test -p <pkg>` is the scoped equivalent of `jest --runTestsByPath`:
+# the test targets of the crates this run touched, in one invocation. A
+# workspace member list is a property of the target repo — read from the
+# manifests the touched files sit under, never assumed.
+rust_rc = 0
+rust_tail = ""
+rust_argv = []
+rust_pkgs = []
+rust_skipped = ""
+RUST_FILES = [p for p in TOUCHED.split() if p.endswith(".rs") and os.path.exists(p)]
+if RUST_FILES:
+    rust_pkgs = rust_packages(RUST_FILES)
+    if not shutil.which("cargo"):
+        rust_skipped = "cargo is not on PATH"
+        ev.write("rust files touched but cargo is not on PATH - tier2 abstains on "
+                 "the Rust part of this change\n")
+    else:
+        rust_argv = ["cargo", "test", "--quiet"]
+        for name in rust_pkgs:
+            rust_argv += ["-p", name]
+        ev.write(f"$ {shlex.join(rust_argv)}\n")
+        ev.flush()
+        rust_rc, rust_tail = run_logged(rust_argv, EVIDENCE, stream=ev)
+
+# ── Python ──────────────────────────────────────────────────────────────────
+# A touched module runs its sibling test_<module>.py when one exists. Probing
+# pytest first keeps "the runner is not installed" an abstention instead of a
+# refutation (rc 1 from `-m pytest` also means "No module named pytest").
+python_rc = 0
+python_tail = ""
+python_argv = []
+python_tests = python_test_files(TOUCHED.split())
+python_skipped = ""
+if python_tests:
+    probe = subprocess.run([sys.executable, "-m", "pytest", "--version"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode != 0:
+        python_skipped = "pytest is not importable in this interpreter"
+        ev.write("python tests exist but pytest is not importable - tier2 "
+                 "abstains on the Python part of this change\n")
+    else:
+        python_argv = [sys.executable, "-m", "pytest", "-q", *python_tests]
+        ev.write(f"$ {shlex.join(python_argv)}\n")
+        ev.flush()
+        python_rc, python_tail = run_logged(python_argv, EVIDENCE, stream=ev)
+
+passed = ts_passed and rust_rc == 0 and python_rc == 0
 
 ev.close()
 payload = {
@@ -163,13 +216,32 @@ payload = {
     "evidence_path": EVIDENCE,
     "jest_rc": jest_rc,
     "test_files": " ".join(TEST_FILES),
+    "rust_rc": rust_rc,
+    "rust_packages": rust_pkgs,
+    "python_rc": python_rc,
+    "python_tests": python_tests,
 }
-# rc 127 / a negative rc means jest never judged the code — a missing binary or
-# a killed process, not a failing test. Declared so the engine abstains instead
-# of refuting (see mini_ork/verify/pm.py).
+if rust_skipped:
+    payload["rust_skipped"] = rust_skipped
+if python_skipped:
+    payload["python_skipped"] = python_skipped
+# rc 127 / a negative rc means the runner never judged the code — a missing
+# binary or a killed process, not a failing test. Declared so the engine abstains
+# instead of refuting (see mini_ork/verify/pm.py). A real failure in any one
+# suite outranks an abstention in another.
 if not passed:
-    _kind = classify_suite_spawn(argv, jest_rc, jest_tail)
-    if _kind:
-        payload["failure_kind"] = _kind
+    kinds = []
+    for ok, suite_argv, rc, tail in (
+        (ts_passed, argv, jest_rc, jest_tail),
+        (rust_rc == 0, rust_argv, rust_rc, rust_tail),
+        (python_rc == 0, python_argv, python_rc, python_tail),
+    ):
+        if ok:
+            continue
+        kinds.append(classify_suite_spawn(suite_argv, rc, tail) or "code")
+    if "code" in kinds:
+        payload["failure_kind"] = "code"
+    elif kinds:
+        payload["failure_kind"] = kinds[0]
 print(json.dumps(payload))
 sys.exit(0 if passed else 1)

@@ -6,10 +6,12 @@
 # semantics, evidence text, and JSON output (jq queries reimplemented with the
 # json module).
 
+import ast
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,7 @@ if _engine not in sys.path:
 from mini_ork.verify.pm import (  # noqa: E402
     classify_spawn, describe, exec_argv, project_scope_error, run_argv,
 )
+from mini_ork.verify.langs import is_python, rust_packages  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -110,6 +113,8 @@ if READY is not True or not TOUCHED_FILES:
 
 SOURCE_FILES = []
 SHELL_FILES = []
+RUST_FILES = []
+PYTHON_FILES = []
 ARTIFACT_FILES = []
 for path in TOUCHED_FILES:
     if path.startswith(".mini-ork/runs/") or "/.mini-ork/runs/" in path:
@@ -118,18 +123,27 @@ for path in TOUCHED_FILES:
         SOURCE_FILES.append(path)
     elif path.endswith(".sh"):
         SHELL_FILES.append(path)
+    elif path.endswith(".rs"):
+        RUST_FILES.append(path)
+    elif is_python(path):
+        PYTHON_FILES.append(path)
 
 # A deliverable that removes a file still lists it in touched_files, and there
 # is nothing left to typecheck or lint. ESLint 8 aborts the whole run with "No
 # files matching the pattern" (exit 2) on a path that does not exist, so a
 # removal could never pass tier1 (m3a-run-log-reader-removal, 2026-10-15).
-DELETED_FILES = [p for p in SOURCE_FILES + SHELL_FILES if not os.path.exists(p)]
+_DELETABLE = SOURCE_FILES + SHELL_FILES + RUST_FILES + PYTHON_FILES
+DELETED_FILES = [p for p in _DELETABLE if not os.path.exists(p)]
 SOURCE_FILES = [p for p in SOURCE_FILES if os.path.exists(p)]
 SHELL_FILES = [p for p in SHELL_FILES if os.path.exists(p)]
+RUST_FILES = [p for p in RUST_FILES if os.path.exists(p)]
+PYTHON_FILES = [p for p in PYTHON_FILES if os.path.exists(p)]
 
 ev.write(f"touched_files={len(TOUCHED_FILES)}\n")
 ev.write(f"source_files={len(SOURCE_FILES)}\n")
 ev.write(f"shell_files={len(SHELL_FILES)}\n")
+ev.write(f"rust_files={len(RUST_FILES)}\n")
+ev.write(f"python_files={len(PYTHON_FILES)}\n")
 ev.write(f"artifact_files={len(ARTIFACT_FILES)}\n")
 ev.write(f"deleted_files={len(DELETED_FILES)}\n")
 for path in DELETED_FILES:
@@ -246,7 +260,63 @@ if SHELL_FILES:
                           stdout=ev, stderr=subprocess.STDOUT).returncode != 0:
             shell_rc = 1
 
-passed = tsc_rc == 0 and lint_rc == 0 and shell_rc == 0
+# ── Rust ────────────────────────────────────────────────────────────────────
+# A touched .rs file belongs to the crate whose Cargo.toml is its nearest
+# ancestor; `cargo check -p <pkg>` is the Rust equivalent of `tsc --noEmit`
+# scoped to the change. Touched files no crate owns fall back to a workspace
+# check — the same "narrow to this run's surface, never a package guess" rule
+# typecheck.py established.
+rust_rc = 0
+rust_argv = []
+rust_out = ""
+rust_kind = ""
+rust_pkgs = rust_packages(RUST_FILES)
+if RUST_FILES:
+    if not shutil.which("cargo"):
+        ev.write("rust files touched but cargo is not on PATH - tier1 abstains on "
+                 "the Rust part of this change\n")
+        rust_kind = "toolchain"
+    else:
+        if rust_pkgs:
+            rust_argv = ["cargo", "check", "--quiet"]
+            for name in rust_pkgs:
+                rust_argv += ["-p", name]
+        else:
+            rust_argv = ["cargo", "check", "--quiet"]
+        ev.write(f"$ {shlex.join(rust_argv)}\n")
+        ev.flush()
+        try:
+            _rust = subprocess.run(rust_argv, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, timeout=600)
+            rust_rc = _rust.returncode
+            rust_out = _rust.stdout
+            ev.write(rust_out)
+        except subprocess.TimeoutExpired:
+            # A killed tool never judged the code — abstain, do not refute.
+            rust_rc = 124
+            rust_out = "cargo check timed out after 600s"
+            rust_kind = "toolchain"
+            ev.write(rust_out + "\n")
+        ev.flush()
+
+# ── Python ──────────────────────────────────────────────────────────────────
+# Syntax is the floor a compile gate can check without a project-wide type
+# checker: parse every touched module with the interpreter that will import it.
+# No subprocess and no __pycache__ — ast.parse reads the source and returns.
+python_rc = 0
+if PYTHON_FILES:
+    for path in PYTHON_FILES:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                ast.parse(handle.read(), filename=path)
+        except SyntaxError as exc:
+            python_rc = 1
+            ev.write(f"python syntax error in {path}: {exc}\n")
+    ev.write(f"python syntax: {len(PYTHON_FILES)} file(s) parsed, "
+             f"py_rc={python_rc}\n")
+    ev.flush()
+
+passed = tsc_rc == 0 and lint_rc == 0 and shell_rc == 0 and rust_rc == 0 and python_rc == 0
 
 # A failed run says WHY. `classify_spawn` returns "toolchain" when a tool never
 # started — the manager refused, the binary is missing — which the engine reads
@@ -260,6 +330,9 @@ envelope = {
     "tsc_rc": tsc_rc,
     "lint_rc": lint_rc,
     "shell_rc": shell_rc,
+    "rust_rc": rust_rc,
+    "python_rc": python_rc,
+    "rust_packages": rust_pkgs,
 }
 if not passed:
     # A REFUTATION outranks an abstention. `toolchain` excuses the whole
@@ -267,11 +340,21 @@ if not passed:
     # in another: `tsc` reporting a type error next to an eslint that never
     # started is still a refutation of the change.
     kinds = []
+    if rust_kind:
+        kinds.append(rust_kind)
     for argv, rc, out in ((tsc_argv, tsc_rc, tsc_out),
-                          (lint_argv, lint_rc, lint_out)):
-        if rc != 0:
-            kinds.append(classify_spawn(argv, rc, out) or "code")
+                          (lint_argv, lint_rc, lint_out),
+                          (rust_argv, rust_rc, rust_out)):
+        if rc == 0:
+            continue
+        if argv is rust_argv and rust_kind:
+            # A timeout (or a missing tool) never judged the code; the kind was
+            # decided where that happened, not from rc alone.
+            continue
+        kinds.append(classify_spawn(argv, rc, out) or "code")
     if shell_rc != 0:  # `bash -n` read the script and rejected it
+        kinds.append("code")
+    if python_rc != 0:  # ast.parse read the module and rejected it
         kinds.append("code")
     envelope["failure_kind"] = "code" if "code" in kinds else (kinds[0] if kinds else "code")
 

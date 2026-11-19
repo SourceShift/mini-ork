@@ -21,6 +21,16 @@ nodes or Daytona / E2B / Modal sandboxes. The verification stack is on by defaul
 
 ### Added
 
+- **Rust and Python coverage in the recursive-validate-impl tiers**: tier1 runs
+  `cargo check -p <crate>` for the crates a touched `.rs` file belongs to and
+  `ast.parse` for touched Python modules; tier2 runs `cargo test -p <crate>`
+  and sibling pytest files; tier3 runs Rust `tests/*` property suites
+  (`cargo test --test <target>`). Scope comes from
+  `mini_ork.verify.langs` (nearest `Cargo.toml`, sibling `test_<module>.py`).
+  Previously all three tiers passed vacuously on non-TypeScript repos — the
+  evidence said "no TypeScript/JavaScript source files" while the tier-4 panel
+  carried the entire gate. A missing `cargo`/`pytest` is reported as an
+  abstention, never as a refutation.
 - **Test-gaming scan**: `mini_ork.verify.gaming_scan` flags production code a change adds that
   probes the test harness (`PYTEST_CURRENT_TEST`, pytest imports, MonkeyPatch, frame walks, writes
   into another module's attributes). It runs by default as framework-edit static-check's

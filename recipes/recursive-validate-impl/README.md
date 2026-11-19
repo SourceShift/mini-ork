@@ -11,7 +11,21 @@ The recipe uses a five-tier quality stack inspired by the canonical recursive
 verification design: compile/typecheck, scoped unit tests, property or mutation
 checks when available, a heterogeneous tier-4 panel, and final DoD probe review.
 Cheap deterministic checks run first; the LLM panel only runs after lower tiers
-are green. The reflector and replanner convert failures into the next plan
+are green.
+
+### Languages each tier actually checks
+
+| Tier | TypeScript/JS | Rust | Python | Shell |
+|---|---|---|---|---|
+| tier1 | `type-check:touched` / `tsc`, eslint | `cargo check -p <crate>` for the touched crates | `ast.parse` of each touched module | `bash -n` |
+| tier2 | jest/vitest on scoped test files | `cargo test -p <crate>` for the touched crates | sibling `test_<module>.py` via pytest | — |
+| tier3 | stryker (when configured) | `cargo test --test <target>` for `tests/*` property suites | — | — |
+
+Scope comes from the touched files: a `.rs` file belongs to the nearest
+ancestor `Cargo.toml`, a Python module to its sibling `test_<module>.py`
+(`mini_ork.verify.langs`). A tier with no applicable check records that fact in
+its evidence and JSON payload; it does not silently claim a pass. A missing
+toolchain (`cargo`, `pytest`) is an abstention, not a refutation. The reflector and replanner convert failures into the next plan
 mutation, while `divergence_kill` prevents repeating the same failed iteration.
 
 Tier 4 is quality-aware, not just completion-aware. Each panel lens reruns DoD

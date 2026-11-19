@@ -9,6 +9,7 @@
 import json
 import os
 import shlex
+import shutil
 import sys
 
 # mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
@@ -20,6 +21,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
 from mini_ork.verify.pm import classify_suite_spawn, exec_argv, run_logged  # noqa: E402
+from mini_ork.verify.langs import rust_property_targets  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -78,6 +80,37 @@ if os.path.isfile("node_modules/.bin/fast-check") or '"fast-check"' in pkg:
 else:
     checks_skipped.append("property: no fast-check")
 
+# ── Rust property targets ──────────────────────────────────────────────────
+# A Rust property suite is an integration test under `<crate>/tests/` named like
+# one or using `proptest!`/`quickcheck!`. `cargo test --test <stem>` runs
+# exactly that target in the crates this run touched — the Rust analogue of the
+# TS property run above, and the first time tier3 has anything to execute on a
+# repo without node.
+rust_property_argv = []
+rust_property_tail = ""
+rust_targets = rust_property_targets(
+    [p for p in TOUCHED.split() if p.endswith(".rs")]
+) if TOUCHED.strip() else []
+if rust_targets:
+    if not shutil.which("cargo"):
+        checks_skipped.append("property: Rust property target present but cargo is not on PATH")
+        ev.write("rust property target found but cargo is not on PATH - skipping\n")
+        ev.flush()
+    else:
+        for package, target in rust_targets:
+            argv = ["cargo", "test", "--quiet", "-p", package, "--test", target]
+            ev.write(f"$ {shlex.join(argv)}\n")
+            ev.flush()
+            rc, tail = run_logged(argv, EVIDENCE, stream=ev)
+            checks_ran.append(f"property:{package}:{target}")
+            rust_property_argv, rust_property_tail = argv, tail
+            property_rc = rc
+            if rc != 0:
+                passed = False
+                break
+elif TOUCHED.strip():
+    checks_skipped.append("property: no Rust property target in the touched crates")
+
 if os.path.isfile("stryker.conf.json") or os.path.isfile("stryker.conf.js"):
     ev.write("running mutation tests; this may take 5-30 min\n")
     mutation_argv = exec_argv(".", "stryker", "run")
@@ -103,11 +136,19 @@ payload = {
     "checks_skipped": checks_skipped,
     "vacuous": not checks_ran,
 }
-# Stryker not installed (rc 127) or killed before it scored anything is not a
-# verdict on the code — abstain rather than refute (mini_ork/verify/pm.py).
-if not passed and mutation_rc is not None:
-    _kind = classify_suite_spawn(mutation_argv, mutation_rc, mutation_tail)
-    if _kind:
-        payload["failure_kind"] = _kind
+# Stryker (or cargo) not installed (rc 127) or killed before it scored anything
+# is not a verdict on the code — abstain rather than refute
+# (mini_ork/verify/pm.py). A real failure in either check outranks an abstention.
+if not passed:
+    kinds = []
+    for check_argv, rc, tail in ((mutation_argv, mutation_rc, mutation_tail),
+                                 (rust_property_argv, property_rc, rust_property_tail)):
+        if rc is None or rc == 0:
+            continue
+        kinds.append(classify_suite_spawn(check_argv, rc, tail) or "code")
+    if "code" in kinds:
+        payload["failure_kind"] = "code"
+    elif kinds:
+        payload["failure_kind"] = kinds[0]
 print(json.dumps(payload))
 sys.exit(0)
