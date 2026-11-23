@@ -37,9 +37,10 @@ the framework ships the loop, the primitives, and the interfaces.
 
 Two properties of this picture surprise people:
 
-- **UNVERIFIED is not the same branch as REFUTED.** A refutation goes back to the
-  implementer; an abstention withholds the publish and leaves the edit in place.
-  Nothing rolls back. That asymmetry is deliberate (§4.2).
+- **UNVERIFIED is not the same branch as REFUTED.** A refutation fails the run
+  and the rollback discards the edit, sending it back to the implementer; an
+  abstention withholds the publish and leaves the edit in place. Only the refute
+  branch rolls back. That asymmetry is deliberate (§4.2).
 - **The reflection and learning stages do not gate publication.** They run after
   the verdict is written. A run that publishes is never blocked by its own
   post-mortem.
@@ -151,9 +152,10 @@ Three rules make the difference concrete:
    because its homework is not an input.
 2. **Each required level maps to specific evidence**, and a level that no
    instrument covered is `n/a`, not "failed" (§4.3).
-3. **One policy decides**: any required level REFUTED → `refute` (back to the
-   implementer); otherwise any required level not PROVEN → `abstain` (withhold,
-   leave the tree); otherwise → `publish`.
+3. **One policy decides**: any required level REFUTED → `refute` (fail the run,
+   roll the edit back, return it to the implementer); otherwise any required
+   level not PROVEN → `abstain` (withhold, leave the tree); otherwise →
+   `publish`.
 
 That is the entire mechanism. The rest of this section is why each rule exists
 and what can go wrong with it.
@@ -162,8 +164,9 @@ and what can go wrong with it.
 
 Three runs from one experiment (`.mini-ork/runs/` on a working install) make the
 above concrete. All three used `task_class=code_fix`, so the required levels are
-`applies, executes, target, preserve` (never `contract` — that instrument does
-not exist for this class, so it is `n/a` and skipped).
+`applies, executes, target, preserve`. `contract` is not required for this class
+(only `verified_artifact` requires it), so with no behavioral verifier in these
+recipes it reports `n/a` and is skipped — never counted as a failure.
 
 **1. The normal case — everything PROVEN, publish.**
 
@@ -204,9 +207,10 @@ $ jq -c '{levels, applies: .levels_reasons.applies, levels_decision}' .mini-ork/
 ```
 
 A plausible-sounding completion that edited no file is REFUTED before any test
-runs, and `refute` sends it back rather than publishing a no-op. The other four
-levels are UNVERIFIED because there was nothing to run them against — they are
-not counted as failures against the implementer.
+runs, and `refute` fails the run and rolls the empty edit back rather than
+publishing a no-op. The other three levels are UNVERIFIED because there was
+nothing to run them against — they are not counted as failures against the
+implementer — and `contract` is `n/a` because no behavioral verifier ran.
 
 **3. The case a test runner cannot express — tests green, run abstains.**
 
@@ -240,8 +244,10 @@ flowchart TD
 ```
 
 Reproduce any of this on a local install: `jq -c '{levels,levels_reasons,levels_decision}'
-.mini-ork/runs/<run>/verdict.json`. The same block is what the publisher reads —
-there is no second opinion downstream.
+.mini-ork/runs/<run>/verdict.json`. The publisher does not read this JSON — it
+recomputes the same vector from the same files when its own gate runs, so the
+two can only agree, and a withheld publish is that gate refusing rather than a
+reviewer overriding it.
 
 ### 4.1 One bit cannot say "I don't know"
 
@@ -277,10 +283,11 @@ A verifier emits a JSON envelope. The executor classifies that envelope:
 | `status: skipped` | not an abstention — the verifier had no subject; its `pass` bit is the answer |
 | no `pass` field, or no JSON | the exit code stands, unchanged |
 
-The envelope decides, never the rc. Every shipped abstainer happens to exit 0
-today — `emit_unverified` in `recipes/code-fix/verifiers/test.py` says so in its
-contract, as do `fallback_guard` and `typecheck` — and the rule exists so that
-nobody has to rely on that. The behavioural engine deliberately exits non-zero
+The envelope decides, never the rc. Every shipped abstainer happens to arrive at
+the executor with exit 0 today — `emit_unverified` in
+`recipes/code-fix/verifiers/test.py` says so in its contract, as do
+`fallback_guard` and `typecheck` — and the rule exists so that nobody has to
+rely on that. The behavioural engine deliberately exits non-zero
 on UNVERIFIED, and only a wrapper keeps that from turning into a failed node —
 read the rc instead of the envelope and the same abstention becomes a code
 failure the moment the wrapper is bypassed.
@@ -322,9 +329,11 @@ only place that declaration lives:
 | `framework_edit` | `executes` |
 | `verified_artifact` | `contract` |
 
-`publish_decision(vector, required=…)` then does one thing: if any required
-level is not PROVEN, it withholds. That is the whole policy, and it is why
-"abstain" costs a publish instead of a rollback.
+`publish_decision(vector, required=…)` returns one of three answers: `refute`
+(any required level REFUTED), `abstain` (any required level neither PROVEN nor
+`n/a`), or `publish`. The publisher maps `refute` to a failed run whose rollback
+discards the edit, and `abstain` to a withheld publish that keeps it — exit 0,
+so no rollback fires. That mapping is the whole policy.
 
 The `n/a` value exists so that "this recipe never had that instrument" is not
 mistaken for "the instrument failed to prove". Conflating them withholds every
@@ -340,8 +349,8 @@ ask "is the code correct?", they ask **"was the check capable of failing?"**.
 |---|---|---|
 | Suite adequacy | can the suite kill its own mutants? `killed/(killed+survived)`; INADEQUATE downgrades a green to UNVERIFIED | every code-fix run |
 | Probe validity | was this probe already green on the untouched base? did it cover one criterion, not several? | pre-publish gate (`MO_PROBE_VALIDITY`, default off) |
-| Gate hackability | can a registered gate be passed by inputs carrying no evidence? five hollow inputs + a mandatory control | promotion, `mini-ork gate-fuzz` |
-| Verifier mutation | does a verifier's verdict move when its own input is mutated six ways? | certificate scoring |
+| Gate hackability | can a registered gate be passed by inputs carrying no evidence? five hollow inputs + a mandatory control | promotion gate reads it; records only from a manual `mini-ork gate-fuzz --hackability` |
+| Verifier mutation | does a verifier's verdict move when its own input is mutated six ways? | verify catalog reads it; records only from a manual `mini-ork instruments verifier-mutation --card` |
 | Oracle integrity | does the judge reject injected defects and accept known-good controls? | promotion gate (producer) |
 | Judge validity | does a reviewer lane's approval history agree with execution evidence? | promotion, shadow by default |
 | Reward↔evidence pairing | does a run's reward agree with its verifier results? | GRPO writeback |
@@ -365,17 +374,29 @@ Three things about this table that are easy to miss:
 Newcomers assume everything in `mini_ork/verify/` is on the critical path. Most
 of it is not, and the difference is tracked deliberately.
 
-- **Enforced on every code-fix run**: suite adequacy and the level vector.
-- **Enforced at promotion / `mini-ork certify`**: hackability, oracle integrity,
-  discrimination, hidden checks, the equivalence operator.
-- **Shadow (records, never blocks)**: metamorphic relations and differential in
-  code-fix (`MO_CODEFIX_CERTIFY`), judge validity, suite strengthening.
+- **Live on every code-fix run**: suite adequacy and the level vector.
+- **Live at the promotion gate**: oracle integrity (audits the judge, then
+  records and scores that record) and judge validity (in shadow, its default).
+- **`mini-ork certify` only**: metamorphic relations, differential,
+  discrimination (only when candidates are passed), hidden regenerable checks.
+- **Opt-in per recipe**: the equivalence operator and behavioral recomputation,
+  for a recipe whose contract declares them.
+- **Shadow (records, never blocks)**: relations and differential during
+  `mini-ork run code-fix` (`MO_CODEFIX_CERTIFY`); judge validity until set to
+  `1`/`enforce`.
+- **Consumer on, producer manual**: gate hackability (`mini-ork gate-fuzz
+  --hackability`) and verifier mutation (`mini-ork instruments verifier-mutation
+  --card`). Both read a record nothing writes automatically, so their "no
+  finding" means "no record", not "no problem".
 - **Off by default**: probe validity behind an A/B (`MO_PROBE_VALIDITY=1`);
   authorship separation, whose `shadow` mode records and `1` refuses the run.
 
 The canonical table lives in `verification-stack.md` under "Where each instrument
-runs today", and a test asserts the doc and the code agree. Change a default and
-that test is what tells you the doc is now lying.
+runs today". The pin test (`tests/unit/test_verification_stack_doc_py.py`)
+checks that every module and knob the doc names still exists and is read by the
+runtime — it cannot notice that a default changed under a knob that still
+exists. For that, `docs/operator/feature-flags.md` and the module are the
+source.
 
 The reason for the asymmetry is the same reason you do not add a gate that fires
 on a correct fix: a wrong veto is worse than no veto, because it teaches people
@@ -408,8 +429,8 @@ The order that keeps the stack honest:
 Work outward from the verdict, and stop at the first thing that explains it.
 
 ```bash
-mini-ork why <run_id>            # the verdict and its reasons
-cat <run_dir>/verdict.json       # which levels, which reasons
+mini-ork why <run_id> <node>     # which lane served the node, and why
+cat <run_dir>/verdict.json       # the verdict: which levels, which reasons
 jq . <run_dir>/verifier_test.json   # the envelope behind `executes`/`target`
 ls <run_dir>/evidence/           # the logs the envelope summarises
 sqlite3 "$MINI_ORK_DB" \
@@ -432,15 +453,17 @@ is unavailable rather than printing zeros when the migration has not run.
 
 ## 6. The learning loop, briefly
 
-After the verdict, three channels write back: rubric scores, textual gradients,
-and patterns. None of it is allowed to be the reason a run published —
+Signals are recorded as the run goes (a PRM score per node, prompt win rates at
+reflect). Two end-of-run writers then fold them into the next run: **GRPO
+advantages** (a lane's z-score against its task-class peers) and **conductor
+outcomes** (did the chosen topology pay off). Those two are gated by
+`MO_LEARNING_WRITEBACK` (default `1`; `0` skips them for a run whose lessons you
+do not want folded in).
+
+None of it is allowed to be the reason a run published —
 `reward_evidence_pairing` drops a positive reward that execution contradicts,
 because a reward that disagrees with the evidence is the most expensive thing to
-learn from.
-
-Writeback happens at end of run, gated by `MO_LEARNING_WRITEBACK` (default
-`1`; `0` disables it for a run whose lessons you do not want folded into the
-next one). The full lifecycle is
+learn from. The full lifecycle is
 [LEARNING-LOOP-LIFECYCLE.md](LEARNING-LOOP-LIFECYCLE.md).
 
 ---
