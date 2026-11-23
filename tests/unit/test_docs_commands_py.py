@@ -30,6 +30,7 @@ from mini_ork.cli.main import SUBCOMMAND_REGISTRY  # noqa: E402
 CLI_PAGES = (
     REPO / "docs" / "README.md",
     REPO / "docs" / "EXTENSION.md",
+    REPO / "docs" / "INTERNALS.md",
     REPO / "docs" / "UI.md",
     REPO / "docs" / "LEARNING-LOOP-LIFECYCLE.md",
 )

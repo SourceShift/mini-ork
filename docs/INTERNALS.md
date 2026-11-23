@@ -166,11 +166,13 @@ A verifier emits a JSON envelope. The executor classifies that envelope:
 | `status: skipped` | not an abstention — the verifier had no subject; its `pass` bit is the answer |
 | no `pass` field, or no JSON | the exit code stands, unchanged |
 
-The envelope decides, never the rc. Both shipped abstainers happen to exit 0
-today, and the rule exists so that nobody has to rely on that. The behavioural
-engine deliberately exits non-zero on UNVERIFIED, and only a wrapper keeps that
-from turning into a failed node — read the rc instead of the envelope and the
-same abstention becomes a code failure the moment the wrapper is bypassed.
+The envelope decides, never the rc. Every shipped abstainer happens to exit 0
+today — `emit_unverified` in `recipes/code-fix/verifiers/test.py` says so in its
+contract, as do `fallback_guard` and `typecheck` — and the rule exists so that
+nobody has to rely on that. The behavioural engine deliberately exits non-zero
+on UNVERIFIED, and only a wrapper keeps that from turning into a failed node —
+read the rc instead of the envelope and the same abstention becomes a code
+failure the moment the wrapper is bypassed.
 
 There is also an operational form of abstention worth knowing: a verifier that
 shells out to `pnpm`, `psql`, `stryker`, `playwright` or `pytest` must report a
@@ -233,7 +235,7 @@ ask "is the code correct?", they ask **"was the check capable of failing?"**.
 | Judge validity | does a reviewer lane's approval history agree with execution evidence? | promotion, shadow by default |
 | Reward↔evidence pairing | does a run's reward agree with its verifier results? | GRPO writeback |
 | Metamorphic relations / differential | does a patched behaviour hold under relations, and differ from base only where intended? | `mini-ork certify`; shadow in code-fix |
-| Authorship separation | is the probe author a different model family from the implementer? | shadow, default off |
+| Authorship separation | is the probe author a different model family from the implementer? | off by default; `shadow` records, `1` refuses |
 
 Three things about this table that are easy to miss:
 
@@ -256,9 +258,9 @@ of it is not, and the difference is tracked deliberately.
 - **Enforced at promotion / `mini-ork certify`**: hackability, oracle integrity,
   discrimination, hidden checks, the equivalence operator.
 - **Shadow (records, never blocks)**: metamorphic relations and differential in
-  code-fix (`MO_CODEFIX_CERTIFY`), judge validity, suite strengthening,
-  authorship separation.
-- **Off by default behind an A/B**: probe validity (`MO_PROBE_VALIDITY=1`).
+  code-fix (`MO_CODEFIX_CERTIFY`), judge validity, suite strengthening.
+- **Off by default**: probe validity behind an A/B (`MO_PROBE_VALIDITY=1`);
+  authorship separation, whose `shadow` mode records and `1` refuses the run.
 
 The canonical table lives in `verification-stack.md` under "Where each instrument
 runs today", and a test asserts the doc and the code agree. Change a default and
@@ -325,8 +327,9 @@ and patterns. None of it is allowed to be the reason a run published —
 because a reward that disagrees with the evidence is the most expensive thing to
 learn from.
 
-Deferred learning exists for long runs: dispatch with `MO_POST_RUN_LEARNING=0`
-and run `mini-ork settle <run_id>` afterwards. The full lifecycle is
+Writeback happens at end of run, gated by `MO_LEARNING_WRITEBACK` (default
+`1`; `0` disables it for a run whose lessons you do not want folded into the
+next one). The full lifecycle is
 [LEARNING-LOOP-LIFECYCLE.md](LEARNING-LOOP-LIFECYCLE.md).
 
 ---
