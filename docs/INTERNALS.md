@@ -164,9 +164,10 @@ and what can go wrong with it.
 
 Three runs from one experiment (`.mini-ork/runs/` on a working install) make the
 above concrete. All three used `task_class=code_fix`, so the required levels are
-`applies, executes, target, preserve`. `contract` is not required for this class
-(only `verified_artifact` requires it), so with no behavioral verifier in these
-recipes it reports `n/a` and is skipped — never counted as a failure.
+`applies, executes, target, preserve`. `contract` is only *required* for
+`verified_artifact`; carried by a behavioral verifier it can still be PROVEN or
+REFUTED for any class. None of these three runs had one, so it reports `n/a` and
+is skipped — never counted as a failure.
 
 **1. The normal case — everything PROVEN, publish.**
 
@@ -385,9 +386,10 @@ of it is not, and the difference is tracked deliberately.
 - **Opt-in per recipe**: the equivalence operator and behavioral recomputation,
   for a recipe whose contract declares them.
 - **Consumer on, producer manual**: gate hackability (`mini-ork gate-fuzz
-  --hackability`) and verifier mutation (`mini-ork instruments verifier-mutation
-  --card`). Both read a record nothing writes automatically, so their "no
-  finding" means "no record", not "no problem".
+  --hackability --gate <id>`) and verifier mutation (`mini-ork instruments
+  verifier-mutation --observable <observable.json> [--card <card.json>]`). Both
+  read a record nothing writes automatically, so their "no finding" means "no
+  record", not "no problem".
 - **Off by default**: probe validity behind an A/B (`MO_PROBE_VALIDITY=1`);
   authorship separation, whose `shadow` mode records and `1` refuses the run.
 
@@ -424,18 +426,21 @@ The order that keeps the stack honest:
 
 ### 4.7 The verifier inventory: what ships and how one works
 
-**How many.** 174 runnable verifier scripts across 56 recipes, under
-`recipes/*/verifiers/`, counted from the repo root (snapshot 2026-11; recount
-with the command below). Those 174 sit inside 290 files in `verifiers/` dirs:
-the rest are `_`-prefixed shared helpers imported by scripts (`_stage.py`,
-`_lib.py`, `_common.py`) and test files. On the framework side, separately: 28
-modules in `mini_ork/verify/`, 18 in `mini_ork/certify/`, plus the gates under
-`mini_ork/gates/`.
+**How many.** 165 runnable verifier scripts across 54 recipes on a clean
+checkout of `main` (snapshot 2026-11). They are 180 tracked scripts under
+`recipes/*/verifiers/` minus 15 `_`-prefixed shared helpers (`_stage.py`,
+`_lib.py`, `_common.py`) and their tests; one more tracked file in those
+directories is not a script at all (an `.observable.yaml`), which is how 181
+tracked files add up. Count with `git ls-files`, not `find`: a working checkout
+that carries untracked recipes or `__pycache__` reports more, and the number you
+want is what a clone gets. On the framework side, separately: 27 modules in
+`mini_ork/verify/` (`__init__.py` aside), 18 in `mini_ork/certify/`, plus the
+gates under `mini_ork/gates/`.
 
 ```bash
-# runnable verifier scripts, excluding helpers and tests (→ 174)
-find recipes -path '*/verifiers/*' -type f \( -name '*.py' -o -name '*.sh' \) \
-  ! -name '_*' ! -path '*/tests/*' | wc -l
+# runnable verifier scripts, excluding helpers and tests (→ 165)
+git ls-files 'recipes/*/verifiers/*' | grep -E '\.(py|sh)$' \
+  | grep -v '/_' | grep -v '/tests/' | wc -l
 ls recipes/code-fix/verifiers/                    # the nine that gate a fix
 ```
 
@@ -453,10 +458,13 @@ ls recipes/code-fix/verifiers/                    # the nine that gate a fix
    tree: `MINI_ORK_TOUCHED_FILES` when a caller set it, else
    `mini_ork.verify.touched_files` / the run's dirty set against its base ref.
    A pre-existing problem elsewhere is not this patch's failure.
-3. **Runs, then emits one JSON envelope on stdout**: `pass`, and optionally
-   `status` (`unverified`, `abstain`, `skipped`, `vacuous`), `failure_kind`
-   (`toolchain`), `evidence_path`, `error_summary`. It writes the log the
-   envelope points at.
+3. **Runs, then emits one JSON envelope on stdout**: a boolean `pass`, and
+   optionally `verdict` (`pass`/`fail`/`abstain`/`vacuous`), `status`
+   (`unverified` when it never judged the code, `vacuous` when it had nothing to
+   check), `failure_kind` (`toolchain`), `evidence_path`, `error_summary`. It
+   writes the log the envelope points at. The executor keys its abstention on
+   `status: unverified|abstain` and `failure_kind`, never on the exit code
+   (§4.2).
 4. **Exit code is secondary**: 0 for pass *or* abstain, 1 only for a
    refutation (§4.2).
 5. **The result is stored as `verifier_<stem>.json`** in the run dir. Guards
@@ -467,8 +475,8 @@ ls recipes/code-fix/verifiers/                    # the nine that gate a fix
    `pass: null` as *unmeasured*, out of both counts, so it cannot lift the
    verdict.
 6. **The level vector and the publisher's abstain gate read those files**
-   (§4.3, §4.2). They are also what `mini-ork why` and the IDE surface point
-   at.
+   (§4.3, §4.2), and the IDE surface links them from the node. `mini-ork why
+   <run> <node>` is a different question — lane provenance, not the verdict.
 
 **The nine code-fix verifiers**, and what each actually establishes:
 
@@ -489,8 +497,8 @@ technique-review recipes (`rsi-*`, `security-technique-review`, …) run a
 shard → collect → pack → assemble pipeline whose scripts *produce artifacts*,
 with a final `verify.py` checking completeness; panel recipes ship a
 `panel-completeness` check; domain recipes carry one small fixed set — a
-completeness check plus a schema check for `chapter-review`, a single
-`link-verifier.py` for `docs`. Same envelope contract, different job:
+completeness check plus a schema check for `chapter-review`, `grep-assert.py`
+and `link-verifier.py` for `docs`. Same envelope contract, different job:
 producing evidence versus grading it.
 
 **Two rules worth carrying away.** First, a verifier's mandate is the change
@@ -535,7 +543,9 @@ advantages** (a lane's z-score against its task-class peers) and **conductor
 outcomes** (did the chosen topology pay off). Those two are gated by
 `MO_LEARNING_WRITEBACK` (default `1`; `0` skips those two writers for a run
 whose routing evidence you do not want folded in — the per-node PRM scores and
-prompt win rates are recorded either way).
+prompt win rates are recorded either way). A third, separate writer,
+`lane_router.recompute_advantages`, has its own switch,
+`MO_LANE_ROUTER` (default `1`), so turning writeback off does not stop it.
 
 None of it is allowed to be the reason a run published —
 `reward_evidence_pairing` drops a positive reward that execution contradicts,
