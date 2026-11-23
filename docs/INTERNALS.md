@@ -132,6 +132,117 @@ check `schema_migrations` before reading the code.
 
 ## 4. Verification, which is the part that matters
 
+### What "verification" means here
+
+**Verification is the step that turns an executed change into one of three
+claims you are allowed to make about it — it holds, it does not hold, or nobody
+established that it holds — from evidence the change did not produce for itself.**
+
+It is not the tests. A test suite answers *"does the code pass?"* Verification
+asks *"what did we measure, with which instrument, and does that measurement
+prove this particular claim?"* Tests are one evidence source among several.
+
+Three rules make the difference concrete:
+
+1. **The evidence is produced by named, deterministic files** —
+   `implementer-summary.json`, `verifier_test.json`, `verifier_behavioral.json`,
+   `verifier_<stem>.json`. A reviewer's prose opinion, a panel vote, or a rubric
+   score never feeds the decision. A model cannot grade its own homework here
+   because its homework is not an input.
+2. **Each required level maps to specific evidence**, and a level that no
+   instrument covered is `n/a`, not "failed" (§4.3).
+3. **One policy decides**: any required level REFUTED → `refute` (back to the
+   implementer); otherwise any required level not PROVEN → `abstain` (withhold,
+   leave the tree); otherwise → `publish`.
+
+That is the entire mechanism. The rest of this section is why each rule exists
+and what can go wrong with it.
+
+### A real run, traced end to end
+
+Three runs from one experiment (`.mini-ork/runs/` on a working install) make the
+above concrete. All three used `task_class=code_fix`, so the required levels are
+`applies, executes, target, preserve` (never `contract` — that instrument does
+not exist for this class, so it is `n/a` and skipped).
+
+**1. The normal case — everything PROVEN, publish.**
+
+```
+$ cat .mini-ork/runs/vt6-strong-20261005212743/verifier_test.json | jq -c .
+{"verifier":"test","pass":true,"post_rc":0,
+ "error_summary":"post-patch suite green; replay: tests exercise the change; suite adequacy ADEQUATE (score 1.000)",
+ "replay":{"base_failed":["tests/test_calc.py::test_add"],
+           "overlap":["tests/test_calc.py::test_add"]},
+ "suite_adequacy":{"verdict":"ADEQUATE","score":1.0,"killed":12,"survived":0}}
+```
+
+```
+$ jq -c '{levels, levels_decision}' .mini-ork/runs/vt6-strong-20261005212743/verdict.json
+{"levels":{"applies":"PROVEN","executes":"PROVEN","target":"PROVEN",
+           "preserve":"PROVEN","contract":"n/a"},
+ "levels_decision":"publish"}
+```
+
+Read it as four separate questions, each answered by its own line:
+`applies` — `implementer-summary.json: implemented, files_changed=2`;
+`executes` — `verifier_test.json: post_rc=0`;
+`target` — `verifier_test.json: pass with replay overlap` (a test that failed on
+the base and passes now is the shape of "the thing asked for actually works");
+`preserve` — `verifier_test.json: post_rc=0` on the whole suite.
+
+**2. The lie catcher — the implementer did nothing.**
+
+```
+$ cat .mini-ork/runs/vt6-leak-k1-20261005215711/implementer-summary.json | jq -c '{status, files_changed}'
+{"status":"no_changes","files_changed":[]}
+
+$ jq -c '{levels, applies: .levels_reasons.applies, levels_decision}' .mini-ork/runs/vt6-leak-k1-20261005215711/verdict.json
+{"levels":{"applies":"REFUTED","executes":"UNVERIFIED","target":"UNVERIFIED",
+           "preserve":"UNVERIFIED","contract":"n/a"},
+ "applies":"implementer-summary.json: no_changes",
+ "levels_decision":"refute"}
+```
+
+A plausible-sounding completion that edited no file is REFUTED before any test
+runs, and `refute` sends it back rather than publishing a no-op. The other four
+levels are UNVERIFIED because there was nothing to run them against — they are
+not counted as failures against the implementer.
+
+**3. The case a test runner cannot express — tests green, run abstains.**
+
+```
+$ jq -c '{pass, post_rc, suite_adequacy}' .mini-ork/runs/vt6-weak-20261005212743/verifier_test.json
+{"pass":false,"post_rc":0,
+ "suite_adequacy":{"verdict":"INADEQUATE","score":0.167,"killed":2,"survived":10}}
+
+$ jq -c '{levels, levels_decision}' .mini-ork/runs/vt6-weak-20261005212743/verdict.json
+{"levels":{"applies":"PROVEN","executes":"PROVEN","target":"UNVERIFIED",
+           "preserve":"UNVERIFIED","contract":"n/a"},
+ "levels_decision":"abstain"}
+```
+
+The suite passed (`post_rc: 0`) and the run still refused to publish, because
+the suite killed only 2 of 12 injected mutants: a green suite that cannot fail
+is not evidence that the change is correct. This is the whole thesis in one
+line — *green is a measurement, not a verdict* — and it is why suite adequacy
+runs on every code-fix publish (§4.4).
+
+```mermaid
+flowchart TD
+  S[implementer-summary.json] --> A{applies}
+  T[verifier_test.json] --> E{executes}
+  T --> G{target}
+  T --> P{preserve}
+  A & E & G & P --> D{publish_decision}
+  D -->|"any required REFUTED"| R[refute<br/>back to implementer]
+  D -->|"not PROVEN, none REFUTED"| W[abstain<br/>withhold, keep tree]
+  D -->|"all PROVEN or n/a"| PUB[publish]
+```
+
+Reproduce any of this on a local install: `jq -c '{levels,levels_reasons,levels_decision}'
+.mini-ork/runs/<run>/verdict.json`. The same block is what the publisher reads —
+there is no second opinion downstream.
+
 ### 4.1 One bit cannot say "I don't know"
 
 A boolean verdict forces every non-pass into the failure branch, so a missing
