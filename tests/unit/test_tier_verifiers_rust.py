@@ -216,3 +216,44 @@ def test_tier3_a_failing_rust_property_run_fails_the_node(tmp_path):
     assert payload["vacuous"] is False
     assert payload["property_rc"] == 1
     assert payload.get("failure_kind") == "code"
+
+
+def _python_repo(tmp_path: Path, *, failing: bool = False) -> Path:
+    """A touched module with a sibling tests/ suite, mirroring sdks/python."""
+    pkg = tmp_path / "sdks" / "py" / "pkg"
+    (pkg / "tests").mkdir(parents=True)
+    (pkg / "mod.py").write_text("def one():\n    return 1\n", encoding="utf-8")
+    body = "def test_one():\n    assert {} == {}\n".format(
+        "2" if failing else "1", 1)
+    (pkg / "tests" / "test_mod.py").write_text(body, encoding="utf-8")
+    return pkg
+
+
+def test_tier3_runs_the_python_suite_and_is_not_vacuous(tmp_path):
+    pkg = _python_repo(tmp_path)
+    touched = str(pkg.relative_to(tmp_path) / "mod.py")
+    run_dir = _fixture(tmp_path, [touched])
+
+    result = _run(TIER3, tmp_path, run_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["pass"] is True
+    assert payload["vacuous"] is False
+    assert payload["checks_ran"] == ["python:pytest:sdks/py/pkg/tests"]
+    assert payload["property_rc"] == 0
+
+
+def test_tier3_a_failing_python_suite_fails_the_node(tmp_path):
+    pkg = _python_repo(tmp_path, failing=True)
+    touched = str(pkg.relative_to(tmp_path) / "mod.py")
+    run_dir = _fixture(tmp_path, [touched])
+
+    result = _run(TIER3, tmp_path, run_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["pass"] is False
+    assert payload["vacuous"] is False
+    assert payload["property_rc"] != 0
+    assert payload.get("failure_kind") == "code"

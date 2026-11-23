@@ -6,6 +6,7 @@
 # semantics, evidence text, and JSON output (jq queries reimplemented with the
 # json module).
 
+import importlib.util
 import json
 import os
 import shlex
@@ -111,6 +112,48 @@ if rust_targets:
 elif TOUCHED.strip():
     checks_skipped.append("property: no Rust property target in the touched crates")
 
+# ── Python behaviour targets ───────────────────────────────────────────────
+# On a repo with neither node nor cargo, tier3 had nothing it could execute and
+# every Python deliverable produced a vacuous artifact the tier-4 panel rightly
+# refused. Run the touched code's own pytest suite instead: it is the strongest
+# machine check available in that language, it includes hypothesis property
+# tests when the repo has them, and it makes `checks_ran` non-empty.
+python_property_argv = []
+python_property_tail = ""
+py_touched = [p for p in TOUCHED.split() if p.endswith(".py")]
+if py_touched and not checks_ran and not rust_targets:
+    candidate_roots = []
+    for path in py_touched:
+        directory = os.path.dirname(os.path.abspath(path))
+        while directory not in ("", os.path.dirname(directory)):
+            tests_dir = os.path.join(directory, "tests")
+            if os.path.isdir(tests_dir) and any(
+                name.startswith("test") and name.endswith(".py")
+                for name in os.listdir(tests_dir)
+            ):
+                candidate_roots.append(os.path.relpath(tests_dir))
+                break
+            directory = os.path.dirname(directory)
+    if not candidate_roots:
+        checks_skipped.append("property: no pytest suite found above the touched Python files")
+        ev.write("touched Python files have no enclosing tests/ suite - skipping\n")
+        ev.flush()
+    elif importlib.util.find_spec("pytest") is None:
+        checks_skipped.append("property: pytest is not importable by the run's interpreter")
+    else:
+        # One suite per distinct root; sorted for determinism.
+        for root in sorted(set(candidate_roots)):
+            argv = [sys.executable, "-m", "pytest", root, "-q", "-p", "no:cacheprovider"]
+            ev.write(f"$ {shlex.join(argv)}\n")
+            ev.flush()
+            rc, tail = run_logged(argv, EVIDENCE, stream=ev)
+            checks_ran.append(f"python:pytest:{root}")
+            python_property_argv, python_property_tail = argv, tail
+            property_rc = rc
+            if rc != 0:
+                passed = False
+                break
+
 if os.path.isfile("stryker.conf.json") or os.path.isfile("stryker.conf.js"):
     ev.write("running mutation tests; this may take 5-30 min\n")
     mutation_argv = exec_argv(".", "stryker", "run")
@@ -142,7 +185,8 @@ payload = {
 if not passed:
     kinds = []
     for check_argv, rc, tail in ((mutation_argv, mutation_rc, mutation_tail),
-                                 (rust_property_argv, property_rc, rust_property_tail)):
+                                 (rust_property_argv, property_rc, rust_property_tail),
+                                 (python_property_argv, property_rc, python_property_tail)):
         if rc is None or rc == 0:
             continue
         kinds.append(classify_suite_spawn(check_argv, rc, tail) or "code")
