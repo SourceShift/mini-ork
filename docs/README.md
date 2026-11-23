@@ -20,6 +20,10 @@ previous one.
   and no secret ever typed into the conversation.
 - **[Architecture](architecture/)** — the system's shape, with the verification
   stack and the artifact-graph contracts.
+- **[Internals](INTERNALS.md)** — the newcomer's map: where the code lives, what
+  a run leaves behind, and the verification layer end to end (three-valued
+  verdicts, the abstention contract, the level vector, which instruments grade
+  the apparatus, and what is enforced versus shadow).
 - **[UI and API](UI.md)** — the IDE, the JSON API, and the attention taxonomy
   behind every "needs you".
 - **[Python SDK](PYTHON-SDK.md)** — embedding the primitives, or driving

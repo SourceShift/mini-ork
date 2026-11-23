@@ -7,6 +7,7 @@ This file is the canonical context map. Detail lives in `docs/`; procedural know
 
 ## Map
 
+- **[Internals](docs/INTERNALS.md)** — newcomer's map of the codebase; the verification layer (three-valued verdicts, abstention envelope, level vector, apparatus-grading instruments) explained end to end
 - **[docs/architecture](docs/architecture)** — system design and component diagrams
 - **[Artifact graph contracts](docs/architecture/artifact-graph.md)** — declared ports, run-local manifests, transforms, and visibility limits
 - **[Cloud sandbox providers](docs/architecture/cloud-sandbox-providers.md)** — node providers (static VMs, Daytona, …) behind one node-agent protocol; `--placement remote --env <profile>`
