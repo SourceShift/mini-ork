@@ -25,6 +25,7 @@ synthesis documents.
 | --- | --- |
 | `citation-verification-2026-06-01.md` | Citation verification and citation-hygiene notes. |
 | `synthesis-latest.md` | Latest research synthesis snapshot. |
+| `2026-11-23-agent-friendly-codebase-practices.md` | Literature review of 26 papers on what makes a repository workable for coding agents; complements `repo-practices-latest.md`, which is the internal synthesis. |
 
 ## Contribution Rules
 
