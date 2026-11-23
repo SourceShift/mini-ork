@@ -428,8 +428,8 @@ The order that keeps the stack honest:
 
 **How many.** 165 runnable verifier scripts across 54 recipes on a clean
 checkout of `main` (snapshot 2026-11). They are 180 tracked scripts under
-`recipes/*/verifiers/` minus 15 `_`-prefixed shared helpers (`_stage.py`,
-`_lib.py`, `_common.py`) and their tests; one more tracked file in those
+`recipes/*/verifiers/` minus 14 `_`-prefixed shared helpers (`_stage.py`,
+`_lib.py`, `_common.py`, …) and one test file; one more tracked file in those
 directories is not a script at all (an `.observable.yaml`), which is how 181
 tracked files add up. Count with `git ls-files`, not `find`: a working checkout
 that carries untracked recipes or `__pycache__` reports more, and the number you
@@ -459,12 +459,14 @@ ls recipes/code-fix/verifiers/                    # the nine that gate a fix
    `mini_ork.verify.touched_files` / the run's dirty set against its base ref.
    A pre-existing problem elsewhere is not this patch's failure.
 3. **Runs, then emits one JSON envelope on stdout**: a boolean `pass`, and
-   optionally `verdict` (`pass`/`fail`/`abstain`/`vacuous`), `status`
-   (`unverified` when it never judged the code, `vacuous` when it had nothing to
-   check), `failure_kind` (`toolchain`), `evidence_path`, `error_summary`. It
-   writes the log the envelope points at. The executor keys its abstention on
-   `status: unverified|abstain` and `failure_kind`, never on the exit code
-   (§4.2).
+   optionally `verdict` (`pass`/`fail`/`abstain`/`vacuous`) and/or `status`.
+   Recipes use `status` two ways: as the verdict itself (`pass`, `fail`,
+   `skipped`, `error` — `docs` does this) or for the abstain contract
+   (`unverified`; `vacuous` when it had nothing to check). Plus `failure_kind`
+   (`toolchain`), `evidence_path`, `error_summary`. It writes the log the
+   envelope points at. The executor's abstention keys on
+   `status: unverified|abstain` and `failure_kind`, never on the exit code;
+   `status: skipped` is deliberately not an abstention (§4.2).
 4. **Exit code is secondary**: 0 for pass *or* abstain, 1 only for a
    refutation (§4.2).
 5. **The result is stored as `verifier_<stem>.json`** in the run dir. Guards
@@ -543,9 +545,11 @@ advantages** (a lane's z-score against its task-class peers) and **conductor
 outcomes** (did the chosen topology pay off). Those two are gated by
 `MO_LEARNING_WRITEBACK` (default `1`; `0` skips those two writers for a run
 whose routing evidence you do not want folded in — the per-node PRM scores and
-prompt win rates are recorded either way). A third, separate writer,
-`lane_router.recompute_advantages`, has its own switch,
-`MO_LANE_ROUTER` (default `1`), so turning writeback off does not stop it.
+prompt win rates are recorded either way). Three more writers in the same
+end-of-run block have their own switches, not this one: artifact rewards
+(`MO_ARTIFACT_REWARD`), run-reward grading (`MO_GRADE_RUN_REWARD`), and
+`lane_router.recompute_advantages` (`MO_LANE_ROUTER`) — all default `1`, so
+turning writeback off does not stop them.
 
 None of it is allowed to be the reason a run published —
 `reward_evidence_pairing` drops a positive reward that execution contradicts,
