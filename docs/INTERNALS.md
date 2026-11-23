@@ -422,6 +422,72 @@ The order that keeps the stack honest:
 6. Write the test that proves abstention is not a pass. That test is the
    feature; the happy path is the easy half.
 
+### 4.7 The verifier inventory: what ships and how one works
+
+**How many.** 174 runnable verifier scripts across 56 recipes, under
+`recipes/*/verifiers/` (snapshot 2026-11; recount with the command below).
+Those 174 sit inside 290 files in `verifiers/` dirs: the rest are `_`-prefixed
+shared helpers imported by scripts (`_stage.py`, `_lib.py`, `_common.py`) and
+test files. On the framework side, separately: 28 modules in
+`mini_ork/verify/`, 18 in `mini_ork/certify/`, plus the gates under
+`mini_ork/gates/`.
+
+```bash
+# runnable verifier scripts, excluding helpers and tests
+find recipes -path '*/verifiers/*' -type f \( -name '*.py' -o -name '*.sh' \) \
+  ! -name '_*' ! -path '*/tests/*' | wc -l        # 174
+ls recipes/code-fix/verifiers/                    # the nine that gate a fix
+```
+
+**How one works**, end to end — the contract every verifier obeys:
+
+1. **Declared in the recipe's `workflow.yaml`** as a node with
+   `type: verifier` and `verifier_ref: verifiers/<name>.py`. No prompt, no
+   lane: it is a process, not a model call.
+2. **Invoked with the run's context**: `MINI_ORK_RUN_DIR`, `MO_TARGET_CWD`, and
+   `MINI_ORK_TOUCHED_FILES` (else the run's dirty set since its base ref).
+   That last one defines its **scope: the run's own change surface**, not the
+   tree — a pre-existing problem elsewhere is not this patch's failure.
+3. **Runs, then emits one JSON envelope on stdout**: `pass`, and optionally
+   `status` (`unverified` / `abstain` / `skipped` / `vacuous`),
+   `failure_kind` (`toolchain`), `evidence_path`, `error_summary`. It writes
+   the log the envelope points at.
+4. **Exit code is secondary**: 0 for pass *or* abstain, 1 only for a
+   refutation (§4.2).
+5. **The executor stores the envelope** as `verifier_<stem>.json` in the run
+   dir. Two guards fire here: exit 0 with a **zero-byte evidence file is a
+   fail**, not a pass ("vacuous pass suppressed"); and explicit
+   `verdict: vacuous` / `pass: null` is recorded as *unmeasured*, kept out of
+   both counts so it cannot lift the verdict.
+6. **The level vector reads those files** (§4.3). Nothing else does.
+
+**The nine code-fix verifiers**, and what each actually establishes:
+
+| Verifier | What it proves | Abstains when |
+|---|---|---|
+| `test.py` | baseline-relative: the patch does not make the suite worse, a test failed on base and passes now, and the suite can kill mutants | no suite, no interpreter, pre-patch base unavailable |
+| `typecheck.py` | the project's type-checker passes over the touched files | no checker installed |
+| `fallback_guard.py` | no `except: pass` / `return None` on error was added in touched files (AST walk, cheap) | touched set unresolvable |
+| `dep_guard.py` | each *added* import/requirement resolves in the vendored allowlist, has an exact `==` pin, and is not URL/VCS | no allowlist snapshot |
+| `security.py` | no committed credentials or dangerous-API additions on the change surface | scanner off/unavailable (`MO_SECURITY_SCANNER=off` abstains, never passes) |
+| `security_oracle.py` | an independent exploit test fails on base, passes on head, while the functional command stays green on both | no exploit test supplied (vacuous) |
+| `hypothesis.py` | a dangerous-API pattern is a *hypothesis*; it reports a finding only when an executed probe confirms it | no probes produced (vacuous) |
+| `deception.py` | classifies the repair base-vs-head: `introduction`, `omission`, `inadequacy`, or `clean` | no named target → `unmeasured` |
+| `metamorphic.py` | task-supplied relations hold; a relation fails only with a real counterexample | no spec / relation cannot execute |
+
+**The other families** are shaped differently and mostly not graders: the
+technique-review recipes (`rsi-*`, `security-technique-review`, …) run a
+shard → collect → pack → assemble pipeline whose scripts *produce artifacts*,
+with a final `verify.py` checking completeness; panel recipes ship one
+`panel-completeness` check; domain recipes carry a single check
+(`schema.py`, `link-verifier.py`, `audit_coverage.py`). Same envelope contract,
+different job: producing evidence versus grading it.
+
+**Two rules worth carrying away.** First, a verifier's mandate is the change
+surface: the tree-wide sweeps (`mini-ork fallbacks --all`) are ratchets you run
+on purpose, not gates. Second, "vacuous" is a first-class outcome — a verifier
+with nothing to check says so, and that is never a pass.
+
 ---
 
 ## 5. When a run says no: reading the evidence
