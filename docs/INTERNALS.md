@@ -349,8 +349,8 @@ ask "is the code correct?", they ask **"was the check capable of failing?"**.
 |---|---|---|
 | Suite adequacy | can the suite kill its own mutants? `killed/(killed+survived)`; INADEQUATE downgrades a green to UNVERIFIED | every code-fix run |
 | Probe validity | was this probe already green on the untouched base? did it cover one criterion, not several? | pre-publish gate (`MO_PROBE_VALIDITY`, default off) |
-| Gate hackability | can a registered gate be passed by inputs carrying no evidence? five hollow inputs + a mandatory control | promotion gate reads it; records only from a manual `mini-ork gate-fuzz --hackability` |
-| Verifier mutation | does a verifier's verdict move when its own input is mutated six ways? | verify catalog reads it; records only from a manual `mini-ork instruments verifier-mutation --card` |
+| Gate hackability | can a registered gate be passed by inputs carrying no evidence? five hollow inputs + a mandatory control | promotion gate reads it; records only from a manual `mini-ork gate-fuzz --hackability --gate <id>` |
+| Verifier mutation | does a verifier's verdict move when its own input is mutated six ways? | verify catalog reads it; records only from a manual `mini-ork instruments verifier-mutation --observable <observable.json> [--card <card.json>]` |
 | Oracle integrity | does the judge reject injected defects and accept known-good controls? | promotion gate (producer) |
 | Judge validity | does a reviewer lane's approval history agree with execution evidence? | promotion, shadow by default |
 | Reward↔evidence pairing | does a run's reward agree with its verifier results? | GRPO writeback |
@@ -377,13 +377,13 @@ of it is not, and the difference is tracked deliberately.
 - **Live on every code-fix run**: suite adequacy and the level vector.
 - **Live at the promotion gate**: oracle integrity (audits the judge, then
   records and scores that record) and judge validity (in shadow, its default).
-- **`mini-ork certify` only**: metamorphic relations, differential,
-  discrimination (only when candidates are passed), hidden regenerable checks.
+- **`mini-ork certify` only**: discrimination (only when candidates are passed)
+  and hidden regenerable checks.
+- **On inside `mini-ork certify`, shadow during `mini-ork run code-fix`**:
+  metamorphic relations and differential (`MO_CODEFIX_CERTIFY`). Judge validity
+  is shadow at the promotion gate until set to `1`/`enforce`.
 - **Opt-in per recipe**: the equivalence operator and behavioral recomputation,
   for a recipe whose contract declares them.
-- **Shadow (records, never blocks)**: relations and differential during
-  `mini-ork run code-fix` (`MO_CODEFIX_CERTIFY`); judge validity until set to
-  `1`/`enforce`.
 - **Consumer on, producer manual**: gate hackability (`mini-ork gate-fuzz
   --hackability`) and verifier mutation (`mini-ork instruments verifier-mutation
   --card`). Both read a record nothing writes automatically, so their "no
@@ -425,41 +425,50 @@ The order that keeps the stack honest:
 ### 4.7 The verifier inventory: what ships and how one works
 
 **How many.** 174 runnable verifier scripts across 56 recipes, under
-`recipes/*/verifiers/` (snapshot 2026-11; recount with the command below).
-Those 174 sit inside 290 files in `verifiers/` dirs: the rest are `_`-prefixed
-shared helpers imported by scripts (`_stage.py`, `_lib.py`, `_common.py`) and
-test files. On the framework side, separately: 28 modules in
-`mini_ork/verify/`, 18 in `mini_ork/certify/`, plus the gates under
+`recipes/*/verifiers/`, counted from the repo root (snapshot 2026-11; recount
+with the command below). Those 174 sit inside 290 files in `verifiers/` dirs:
+the rest are `_`-prefixed shared helpers imported by scripts (`_stage.py`,
+`_lib.py`, `_common.py`) and test files. On the framework side, separately: 28
+modules in `mini_ork/verify/`, 18 in `mini_ork/certify/`, plus the gates under
 `mini_ork/gates/`.
 
 ```bash
-# runnable verifier scripts, excluding helpers and tests
+# runnable verifier scripts, excluding helpers and tests (→ 174)
 find recipes -path '*/verifiers/*' -type f \( -name '*.py' -o -name '*.sh' \) \
-  ! -name '_*' ! -path '*/tests/*' | wc -l        # 174
+  ! -name '_*' ! -path '*/tests/*' | wc -l
 ls recipes/code-fix/verifiers/                    # the nine that gate a fix
 ```
 
 **How one works**, end to end — the contract every verifier obeys:
 
-1. **Declared in the recipe's `workflow.yaml`** as a node with
-   `type: verifier` and `verifier_ref: verifiers/<name>.py`. No prompt, no
-   lane: it is a process, not a model call.
-2. **Invoked with the run's context**: `MINI_ORK_RUN_DIR`, `MO_TARGET_CWD`, and
-   `MINI_ORK_TOUCHED_FILES` (else the run's dirty set since its base ref).
-   That last one defines its **scope: the run's own change surface**, not the
-   tree — a pre-existing problem elsewhere is not this patch's failure.
+1. **Declared in the recipe**, either as a `workflow.yaml` node with
+   `type: verifier` + `verifier_ref: verifiers/<name>.py`, or in
+   `artifact_contract.yaml`'s `success_verifiers` (code-fix's
+   `metamorphic.py` lives there, not as a node). No prompt, no lane: it is a
+   process, not a model call.
+2. **Invoked with `cwd` = the target worktree**, and env `MINI_ORK_RUN_DIR`,
+   `MINI_ORK_PLAN_PATH`, `ARTIFACT_PATH`, and the engine's `PYTHONPATH` put
+   first (so a verifier imports the code that dispatched it, not a stale
+   checkout). It resolves its own **scope — the run's change surface**, not the
+   tree: `MINI_ORK_TOUCHED_FILES` when a caller set it, else
+   `mini_ork.verify.touched_files` / the run's dirty set against its base ref.
+   A pre-existing problem elsewhere is not this patch's failure.
 3. **Runs, then emits one JSON envelope on stdout**: `pass`, and optionally
-   `status` (`unverified` / `abstain` / `skipped` / `vacuous`),
-   `failure_kind` (`toolchain`), `evidence_path`, `error_summary`. It writes
-   the log the envelope points at.
+   `status` (`unverified`, `abstain`, `skipped`, `vacuous`), `failure_kind`
+   (`toolchain`), `evidence_path`, `error_summary`. It writes the log the
+   envelope points at.
 4. **Exit code is secondary**: 0 for pass *or* abstain, 1 only for a
    refutation (§4.2).
-5. **The executor stores the envelope** as `verifier_<stem>.json` in the run
-   dir. Two guards fire here: exit 0 with a **zero-byte evidence file is a
-   fail**, not a pass ("vacuous pass suppressed"); and explicit
-   `verdict: vacuous` / `pass: null` is recorded as *unmeasured*, kept out of
-   both counts so it cannot lift the verdict.
-6. **The level vector reads those files** (§4.3). Nothing else does.
+5. **The result is stored as `verifier_<stem>.json`** in the run dir. Guards
+   sit at three different points, and it matters which: the node path marks a
+   command it judged a no-op `status: vacuous`; the `mini-ork verify`
+   dispatcher (the artifact path) additionally suppresses a **zero-byte
+   evidence file with exit 0** as a fail, and records an explicit
+   `pass: null` as *unmeasured*, out of both counts, so it cannot lift the
+   verdict.
+6. **The level vector and the publisher's abstain gate read those files**
+   (§4.3, §4.2). They are also what `mini-ork why` and the IDE surface point
+   at.
 
 **The nine code-fix verifiers**, and what each actually establishes:
 
@@ -478,10 +487,11 @@ ls recipes/code-fix/verifiers/                    # the nine that gate a fix
 **The other families** are shaped differently and mostly not graders: the
 technique-review recipes (`rsi-*`, `security-technique-review`, …) run a
 shard → collect → pack → assemble pipeline whose scripts *produce artifacts*,
-with a final `verify.py` checking completeness; panel recipes ship one
-`panel-completeness` check; domain recipes carry a single check
-(`schema.py`, `link-verifier.py`, `audit_coverage.py`). Same envelope contract,
-different job: producing evidence versus grading it.
+with a final `verify.py` checking completeness; panel recipes ship a
+`panel-completeness` check; domain recipes carry one small fixed set — a
+completeness check plus a schema check for `chapter-review`, a single
+`link-verifier.py` for `docs`. Same envelope contract, different job:
+producing evidence versus grading it.
 
 **Two rules worth carrying away.** First, a verifier's mandate is the change
 surface: the tree-wide sweeps (`mini-ork fallbacks --all`) are ratchets you run
@@ -523,8 +533,9 @@ Signals are recorded as the run goes (a PRM score per node, prompt win rates at
 reflect). Two end-of-run writers then fold them into the next run: **GRPO
 advantages** (a lane's z-score against its task-class peers) and **conductor
 outcomes** (did the chosen topology pay off). Those two are gated by
-`MO_LEARNING_WRITEBACK` (default `1`; `0` skips them for a run whose lessons you
-do not want folded in).
+`MO_LEARNING_WRITEBACK` (default `1`; `0` skips those two writers for a run
+whose routing evidence you do not want folded in — the per-node PRM scores and
+prompt win rates are recorded either way).
 
 None of it is allowed to be the reason a run published —
 `reward_evidence_pairing` drops a positive reward that execution contradicts,
