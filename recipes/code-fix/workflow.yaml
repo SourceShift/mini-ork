@@ -136,6 +136,16 @@ nodes:
     prompt_ref: null
     dispatch_mode: serial
 
+  # Outbound contribution (inert until MO_CONTRIBUTE_SLUG is set). Runs after
+  # the publisher because that is what commits the patch: pushing earlier would
+  # push a branch without the change. Refuses a MO_SECURITY_FIX run outright —
+  # a security patch must go to the private channel in SECURITY.md — and skips
+  # without failing when the publisher withheld the run.
+  - name: contributor
+    type: contributor
+    prompt_ref: null
+    dispatch_mode: serial
+
   - name: rollback
     type: rollback
     prompt_ref: null
@@ -151,6 +161,7 @@ edges:
   - { from: test,        to: reviewer,    edge_type: depends_on    }
   - { from: reviewer,    to: eval,        edge_type: depends_on    }
   - { from: eval,        to: publisher,   edge_type: depends_on    }
+  - { from: publisher,   to: contributor, edge_type: depends_on    }
   - { from: typecheck,   to: rollback,    edge_type: escalates_to  }
   - { from: fallbacks,   to: rollback,    edge_type: escalates_to  }
   - { from: test,        to: rollback,    edge_type: escalates_to  }

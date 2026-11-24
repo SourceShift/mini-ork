@@ -114,6 +114,47 @@ this recipe will run end-to-end via mini-ork itself.
 | Synthesis depth | `prompts/synthesis.md` | Customize the cross-lens ranking matrix |
 | Output target | `verifiers/audit-published.sh` | Publish to docs/, GitHub Issues, Slack, etc. |
 
+## Closing the loop: a finding is not a contribution
+
+An audit ends with findings, and a finding on a tracker is the most attractive
+work on it: on 2026-11-24 a confirmed p3 was reproduced and merged by an
+outside contributor within three hours of being filed. Filing without patching
+hands the commit away. The published findings therefore feed a `code-fix` run,
+which now ends in a PR by itself.
+
+Per finding, write a kickoff that names the issue, the fix shape, and numbered
+Done-When criteria, then run the fix recipe with the outbound contribution
+switched on:
+
+```bash
+MINI_ORK_TARGET_CWD=/path/to/clone \
+MO_CONTRIBUTE_SLUG=owner/repo \
+MO_CONTRIBUTE_TITLE="fix(scope): one line, conventional commit style" \
+MO_CONTRIBUTE_BASE=main \
+MO_CONTRIBUTE_REMOTE=fork \
+MO_CONTRIBUTE_HEAD_OWNER=<your-github-handle> \
+MO_CONTRIBUTE_BRANCH=fix/<slug> \
+MO_CONTRIBUTE_ISSUE=<number> \
+  mini-ork run code-fix ./finding-03-pr-body-input.md
+```
+
+The `contributor` node runs after the publisher, because publishing is what
+commits the patch. It pushes the branch and opens the PR through
+`mini_ork.cli.contribute` (`gh auth login` for the simple tier, `GH_TOKEN` for
+the secure one; both fail closed). It writes what it did to
+`<run>/contribution.json`, and — unless `MO_CONTRIBUTE_STRICT=1` — a failed
+push or PR records the failure without failing the run, so a network error
+cannot trigger a rollback of an already-published patch.
+
+Two guards the loop depends on:
+
+- **The body.** Write `<run>/pr-body.md` (or set `MO_CONTRIBUTE_BODY_FILE`).
+  Without it the PR body degrades to `Fixes #N` plus one line, which reads as
+  machine output to every maintainer who sees it.
+- **Security findings never take this path.** A run marked `MO_SECURITY_FIX`
+  is refused outright by the contributor: the finding goes to the channel named
+  in the target's `SECURITY.md`, and a public PR discloses it.
+
 ## See also
 
 - `docs/SCALABILITY-AUDIT.md` — example output produced by this recipe

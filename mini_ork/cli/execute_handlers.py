@@ -3027,6 +3027,18 @@ def _handle_publisher(ctx: NodeDispatch):
     return rc, finish_reason
 
 
+def _handle_contributor(ctx: NodeDispatch):
+    """Open the outbound PR for a published patch — see mini_ork.cli.contributor."""
+    # Same reasoning as the publisher's marker: the pending record must be
+    # durable before the irreversible effect (push + PR create), or a crash
+    # leaves a landed PR the resume path cannot see and will duplicate.
+    from mini_ork.stores import checkpoints as _mc  # noqa: PLC0415
+    if _mc.mark_effect_pending(ctx.run_dir_eff, ctx.node_id, "contribute") != 0:
+        return 1, "effect_marker_failed"
+    from mini_ork.cli.contributor import contributor_node  # noqa: PLC0415
+    return contributor_node(ctx.root, ctx.run_dir_eff, ctx.db, ctx.run_id)
+
+
 def _rollback_strategy(workflow_path: str) -> str:
     """The workflow's declared compensation strategy (``rollback_strategy:``
     in workflow.yaml). Empty when undeclared/unreadable — the handler then
@@ -4272,6 +4284,7 @@ NODE_HANDLER_REGISTRY: dict[str, Callable[[NodeDispatch], tuple[int, str]]] = {
     "verifier": _handle_verifier,
     "eval": _handle_eval,
     "publisher": _handle_publisher,
+    "contributor": _handle_contributor,
     "rollback": _handle_rollback,
     "subgraph": _handle_subgraph,
 }
