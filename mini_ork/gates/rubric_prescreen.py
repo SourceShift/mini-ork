@@ -722,17 +722,27 @@ def mo_rubric_run_score(
     import contextlib
     import io as _io
     from mini_ork.dispatch import llm_dispatch as native_dispatch
+    # MO_RUBRIC_LANE is the documented operator lever for this score, but the
+    # lane argument was dropped when the dispatch moved in-process: with only
+    # --node-type, ``llm_dispatch`` falls through to
+    # ``resolve_lane_model("rubric")`` -> ``lanes.rubric`` in agents.yaml, so
+    # exporting MO_RUBRIC_LANE changed nothing while a dead ``lanes.rubric``
+    # (e.g. a provider whose plan quota expired) opened the lane fuse on every
+    # score. Forward it as ``--model`` — the same override ``--model`` means on
+    # the CLI — and only when set, so an unconfigured run keeps resolving
+    # ``lanes.rubric`` exactly as before.
+    rubric_lane = (os.environ.get("MO_RUBRIC_LANE") or "").strip()
+    argv = [
+        "--task-class", task_class,
+        "--node-type", "rubric",
+        "--prompt-text", prompt_text,
+    ]
+    if rubric_lane:
+        argv += ["--model", rubric_lane]
     stdout_buf = _io.StringIO()
     try:
         with contextlib.redirect_stdout(stdout_buf):
-            rc = native_dispatch.llm_dispatch(
-                [
-                    "--task-class", task_class,
-                    "--node-type", "rubric",
-                    "--prompt-text", prompt_text,
-                ],
-                root=mini_ork_root,
-            )
+            rc = native_dispatch.llm_dispatch(argv, root=mini_ork_root)
         raw = stdout_buf.getvalue()
     except Exception as exc:  # noqa: BLE001 — advisory-only, never raise
         rc = 1

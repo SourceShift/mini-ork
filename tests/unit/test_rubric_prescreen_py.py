@@ -464,6 +464,56 @@ def test_run_score_preserves_agent_panel_verdict(tmp_path, monkeypatch):
     assert merged["prescreen"]["pass"] is True                # namespaced, refreshable
 
 
+def test_run_score_forwards_mo_rubric_lane_as_model(tmp_path, monkeypatch):
+    """MO_RUBRIC_LANE must reach the dispatch, not just the epic-shaped path.
+
+    The run-shaped score dispatches with ``--node-type rubric`` and no lane, so
+    ``llm_dispatch`` resolved ``lanes.rubric`` from agents.yaml and the operator
+    lever was inert (a dead ``lanes.rubric`` opened the lane fuse on every score).
+    """
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("# Kickoff\nbody\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    seen = {}
+
+    def fake(argv, *, root):
+        seen["argv"] = list(argv)
+        print(json.dumps({"pass": True, "score": 6, "items": []}))
+        return 0
+
+    monkeypatch.setenv("MO_RUBRIC_LANE", "deepseek")
+    monkeypatch.setattr("mini_ork.dispatch.llm_dispatch.llm_dispatch", fake)
+    rp.mo_rubric_run_score(
+        kickoff_path=str(kickoff), run_dir=str(run_dir),
+        task_class="generic",
+        mini_ork_root=str(REPO), mini_ork_home=str(tmp_path))
+    argv = seen["argv"]
+    assert argv[argv.index("--model") + 1] == "deepseek"
+
+
+def test_run_score_without_mo_rubric_lane_leaves_model_unset(tmp_path, monkeypatch):
+    """Unset lever → no --model, so lanes.rubric still decides (old behaviour)."""
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("# Kickoff\nbody\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    seen = {}
+
+    def fake(argv, *, root):
+        seen["argv"] = list(argv)
+        print(json.dumps({"pass": True, "score": 6, "items": []}))
+        return 0
+
+    monkeypatch.delenv("MO_RUBRIC_LANE", raising=False)
+    monkeypatch.setattr("mini_ork.dispatch.llm_dispatch.llm_dispatch", fake)
+    rp.mo_rubric_run_score(
+        kickoff_path=str(kickoff), run_dir=str(run_dir),
+        task_class="generic",
+        mini_ork_root=str(REPO), mini_ork_home=str(tmp_path))
+    assert "--model" not in seen["argv"]
+
+
 def test_run_score_fresh_dir_keeps_prescreen_shape(tmp_path, monkeypatch):
     kickoff = tmp_path / "kickoff.md"
     kickoff.write_text("# Kickoff\nbody\n")
