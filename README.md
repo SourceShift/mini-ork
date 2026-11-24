@@ -279,6 +279,12 @@ Your source checkouts and git history are never touched.
 | [docs/RESULTS.md](docs/RESULTS.md) | Methods and sample sizes behind the numbers |
 | [ROADMAP.md](ROADMAP.md) | Where the project is going |
 
+## Podcast
+
+[Verifying AI-generated code: beyond plausibility](https://storage.googleapis.com/libwit-static-asset/podcasts/verifying-ai-generated-code-beyond-plausibility.m4a)
+(45 min, 32 MB, m4a) — on why a patch that looks right is not evidence, and what a
+gate has to prove instead.
+
 > [!WARNING]
 > mini-ork contains an apply loop that can rewrite its own prompts and workflows and
 > promote the change without human review. It is **off by default** (both
