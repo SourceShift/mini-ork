@@ -404,3 +404,31 @@ def test_shadow_never_turns_on_sdd_aliasing(tmp_path, monkeypatch) -> None:
         {**probe, "gate_id": "G1", "acceptance_ref": "AC1"}, {**probe, "gate_id": "G2", "acceptance_ref": "AC2"}]}))
     out, _rows = tv.check_spec(tmp_path, card, timeout=10, env=None)
     assert not any(v.startswith("aliased_probe") for v in out)
+
+
+# ── dod_probes: a child run's only declaration of its probe ─────────────────
+
+def test_load_probes_reads_dod_probes_and_uses_exit_zero_as_the_matcher() -> None:
+    """A child plan declares {id, command, expected}; expected is narration."""
+    plan = {"dod_probes": [{"id": "P1", "command": "pytest -q tests/unit/x.py",
+                            "expected": "exits 0 and prints 'AC3 pass' — the matrix cases pass"}]}
+    acceptance, probes = pv.load_probes("", plan)
+    assert acceptance == [] and len(probes) == 1
+    assert probes[0]["gate_id"] == "P1" and probes[0]["expect"] == "exit 0"
+    assert probes[0]["probe"] == "pytest -q tests/unit/x.py"
+
+
+def test_load_probes_does_not_read_one_probe_twice_when_both_shapes_agree() -> None:
+    body = "pytest -q tests/unit/x.py"
+    plan = {"verifier_contract": {"checks": [{"id": "c1", "acceptance_ref": "AC1", "command": body}]},
+            "dod_probes": [{"id": "P1", "command": "pytest  -q  tests/unit/x.py"}]}
+    _acceptance, probes = pv.load_probes("", plan)
+    assert len(probes) == 1 and probes[0]["gate_id"] == "c1"
+
+
+def test_load_probes_skips_a_dod_probe_with_no_command() -> None:
+    plan = {"dod_probes": [{"id": "P1", "expected": "runs"}, {"id": "P2", "command": "true"}]}
+    _acceptance, probes = pv.load_probes("", plan)
+    # the commandless entry contributes nothing; the vacuous one is still seen
+    assert [p["gate_id"] for p in probes] == ["P2"]
+    assert pv.is_vacuous_probe(probes[0]["probe"])

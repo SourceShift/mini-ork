@@ -409,8 +409,22 @@ def load_probes(run_dir: str, plan: dict) -> tuple[list[str], list[dict]]:
 
     Sources: plan ``verifier_contract.checks`` entries that name an
     acceptance criterion (``acceptance_ref`` / ``acceptance_refs``) and carry
-    a ``command``; SDD gate files ``<run_dir>/gates/*.json``. Checks with no
-    acceptance mapping are not probes of a criterion and are not judged here.
+    a ``command``; plan ``dod_probes`` entries carrying a ``command``; SDD gate
+    files ``<run_dir>/gates/*.json``.
+
+    ``dod_probes`` is the shape a recursive-validate-impl CHILD writes
+    (``{id, command, expected}``, usually with no criterion mapping). Without
+    it every child reported ``probes: 0, ok: true`` — which reads as "nothing
+    wrong" when it means "nothing examined", and a probe that a sibling lane
+    had already made green published unremarked.
+
+    ``dod_probes[*].expected`` is narration ("exits 0 and prints 'AC3 pass' —
+    …"), not a matcher, so its pass condition is ``exit 0``; using prose as the
+    expect regex would grade every base run as FAILED and hide the vacuity the
+    base-run rule exists to catch.
+
+    Checks with no acceptance mapping are not judged for coverage, but they are
+    still judged for static vacuity and for passing on the base tree.
     """
     acceptance: list[str] = []
     for key in ("acceptance",):
@@ -424,6 +438,23 @@ def load_probes(run_dir: str, plan: dict) -> tuple[list[str], list[dict]]:
                            "acceptance_refs": check.get("acceptance_refs"), "probe": check["command"],
                            "expect": check.get("expect") or "exit 0", "tags": check.get("tags") or [],
                            "kind": "cmd"})
+    # A child run declares its probe here and nowhere else. Dedupe on the
+    # normalized body so a plan that carries both shapes is not read as an
+    # alias of itself.
+    for probe in (plan.get("dod_probes") or []):
+        if not isinstance(probe, dict):
+            continue
+        command = probe.get("command") or probe.get("probe")
+        if not command:
+            continue
+        body = _norm(command)
+        if any(_norm(p.get("probe")) == body for p in probes):
+            continue
+        probes.append({"gate_id": probe.get("id") or probe.get("gate_id"),
+                       "acceptance_ref": probe.get("acceptance_ref"),
+                       "acceptance_refs": probe.get("acceptance_refs"),
+                       "probe": command, "expect": "exit 0",
+                       "tags": probe.get("tags") or [], "kind": "cmd"})
     gates_dir = Path(run_dir) / "gates"
     if gates_dir.is_dir():
         for gf in sorted(gates_dir.glob("*.json")):
