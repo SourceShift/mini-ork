@@ -102,6 +102,68 @@ def test_shape_check_kill_switch_still_wins_over_a_declared_artifact(monkeypatch
     assert L._shape_predicate_for("planner") is None
 
 
+# ── the gate's subject must be the NODE, not its LANE ──
+#
+# `execute._default_llm_dispatch` passes the node's lane in ``--node-type``
+# when no chain is pinned, so a file-delivering `researcher` on
+# ``model_lane: planner`` arrives as "planner" and inherits the planner's
+# reply-must-be-JSON gate. run-podcast-be1: one contract_compiler node, 68
+# min, $17.58, every lane rejected on looks_like_json while the schema-valid
+# card sat on disk.
+
+def test_lane_name_is_not_the_node_type_so_the_reply_gate_stands_down(monkeypatch):
+    monkeypatch.delenv("MO_PLAN_ARTIFACT", raising=False)
+    monkeypatch.setenv("MO_NODE_TYPE", "researcher")
+    assert L._shape_predicate_for("planner") is None
+    # Suppression only: the real node type is never consulted to ADD a gate.
+    assert L._shape_predicate_for("deepseek") is None
+
+
+def test_matching_node_type_keeps_the_reply_gate(monkeypatch):
+    monkeypatch.delenv("MO_PLAN_ARTIFACT", raising=False)
+    monkeypatch.setenv("MO_NODE_TYPE", "planner")
+    assert L._shape_predicate_for("planner") is L._NODE_SHAPE_PREDICATES["planner"]
+
+
+def test_real_planner_still_gates_its_declared_artifact(monkeypatch, tmp_path):
+    artifact = tmp_path / "plan.json"
+    artifact.write_text('{"epics": []}')
+    monkeypatch.setenv("MO_NODE_TYPE", "planner")
+    monkeypatch.setenv("MO_PLAN_ARTIFACT", str(artifact))
+    assert L._shape_predicate_for("planner")(object()) is True
+
+
+def test_prose_reply_on_a_planner_lane_is_dispatched_once(monkeypatch, tmp_path):
+    # The incident, end to end: the lane did its job with a tool and answered
+    # with a summary line. One run, no shape-reject, no retries.
+    monkeypatch.setattr(L, "cost_circuit_open", lambda *a, **k: False)
+    monkeypatch.setattr(L, "write_llm_calls_row", lambda *a, **k: None)
+    monkeypatch.setattr(L, "backoff_seconds", lambda n: 0)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("MO_DISPATCH_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("MO_NODE_TYPE", "researcher")
+    for key in ("MO_SHAPE_CHECK", "MO_PLAN_ARTIFACT", "MO_DISPATCH_CHAIN"):
+        monkeypatch.delenv(key, raising=False)
+    calls = []
+
+    # Declaring BOTH seams is what lets this fake see them: ``on_attempt``
+    # gates the whole kwargs block, ``accept`` is the predicate itself. Without
+    # them the fake is never handed a predicate and the test is vacuous.
+    def lane_writes_the_card(model, prompt, out_file, timeout_s, max_turns,
+                             accept=None, on_attempt=None):
+        calls.append((model, accept))
+        Path(out_file).write_text("Wrote the spec card to spec-cards/s.json.\n")
+        return 0
+
+    out = str(tmp_path / "out.txt")
+    rc = L.llm_dispatch(["--node-type", "planner", "--model", "planner",
+                         "--prompt-text", "x", "--out", out],
+                        dispatch_fn=lane_writes_the_card)
+    assert rc == 0
+    assert calls == [("planner", None)]
+
+
 # ── dispatch_with_fallback + accept predicate ──
 
 def test_wrong_shape_first_lane_falls_back_to_good_shape(monkeypatch):

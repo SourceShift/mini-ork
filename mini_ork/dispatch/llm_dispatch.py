@@ -925,6 +925,23 @@ def _plan_artifact_predicate(path: str) -> Callable[[object], bool]:
 def _shape_predicate_for(node_type: str) -> Callable[[object], bool] | None:
     if os.environ.get("MO_SHAPE_CHECK", "1") == "0":
         return None
+    # ``--node-type`` is not always a node type. When no dispatch chain is
+    # pinned, ``execute._default_llm_dispatch`` passes the node's LANE as both
+    # ``--model`` and ``--node-type``, so a ``researcher`` node carrying
+    # ``model_lane: planner`` arrives here as "planner" and inherits a
+    # reply-must-be-JSON gate on a node whose deliverable is a run-dir FILE.
+    # Measured: run-podcast-be1 spent 68 min / $17.58 on one
+    # ``contract_compiler`` node — every lane in the fallback chain rejected on
+    # ``looks_like_json`` (the lane answered with a summary line) while the
+    # schema-valid card sat on disk the whole time.
+    #
+    # ``MO_NODE_TYPE`` carries the node's real workflow type once the executor
+    # published it. A mismatch means this gate chose its subject from a lane
+    # name, so it must stand down rather than fail a node for a contract that
+    # node never had. Suppression only: this can never add a gate.
+    real_node_type = os.environ.get("MO_NODE_TYPE", "").strip()
+    if real_node_type and real_node_type != node_type:
+        return None
     predicate = _NODE_SHAPE_PREDICATES.get(node_type)
     if predicate is None:
         return None

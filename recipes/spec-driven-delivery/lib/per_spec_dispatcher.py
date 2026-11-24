@@ -778,6 +778,25 @@ def _launch_child(
     env["MINI_ORK_PARENT_RUN_ID"] = parent_run_id
     env.pop("MINI_ORK_RUN_DIR", None)
     env.pop("MINI_ORK_PLAN_PATH", None)
+    # Recovery mode must not reach a fan-out child. ``recover`` exports
+    # MINI_ORK_RECOVERY_FROM + MINI_ORK_RECOVERY_CLOSURE and the native
+    # executor reads them as "this run is a partial closure of a parent DAG",
+    # so a child spawned from a recovering parent collapsed to a 1-of-15 node
+    # closure and skipped every upstream producer. Observed on
+    # run-podcast-be1: ``recovery: from_node=ratification_check closure=1/15
+    # nodes``, then tier1-compile-typecheck failed with "no implementer
+    # artifact ready_for_tier1=true" and publisher BLOCKed on a missing panel
+    # verdict — inside children that were supposed to run the whole DAG. A
+    # child is a fresh run; only the parent may be a recovery.
+    for _recovery_key in (
+        "MINI_ORK_RECOVERY_FROM",
+        "MINI_ORK_RECOVERY_CLOSURE",
+        "MINI_ORK_RECOVERY_RUN_ID",
+        "MINI_ORK_RECOVERY_SKU",
+        "MINI_ORK_RECOVERY_STRATEGY",
+        "MINI_ORK_RECOVERY_REQUEST",
+    ):
+        env.pop(_recovery_key, None)
 
     record = _record_for(
         spec_id,

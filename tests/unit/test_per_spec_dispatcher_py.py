@@ -517,3 +517,63 @@ def test_a_repair_that_outlives_the_wait_is_recorded_failed(tmp_path, monkeypatc
 
     assert out["status"] == psd.STATUS_FAILED
     assert "still running after 0s" in log_path.read_text(encoding="utf-8")
+
+
+# ── a fan-out child is a FRESH run, never a recovery ──────────────────────
+#
+# run-podcast-be1: `recover --from-node ratification_check` exported
+# MINI_ORK_RECOVERY_FROM + MINI_ORK_RECOVERY_CLOSURE, `_launch_child` copied
+# os.environ into each child, and every child collapsed to a 1-of-15 node
+# closure ("recovery: from_node=ratification_check closure=1/15 nodes") — so
+# tier1 had no implementer artifact and publisher had no panel verdict, in
+# children that were supposed to run the whole DAG.
+
+
+RECOVERY_DUMPER = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    # Stub child: write the recovery vars it actually INHERITED to a file.
+    env | grep '^MINI_ORK_RECOVERY_' | sort > "${MO_RECOVERY_DUMP:?}"
+    exit 0
+    """
+)
+
+
+def test_child_does_not_inherit_recovery_scope(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    home = tmp_path / "home"
+    (home / "runs").mkdir(parents=True)
+    root = tmp_path / "root"
+    (root / "bin").mkdir(parents=True)
+    child = root / "bin" / "mini-ork"
+    child.write_text(RECOVERY_DUMPER, encoding="utf-8")
+    child.chmod(child.stat().st_mode | stat.S_IEXEC)
+
+    dump = tmp_path / "recovery-env.txt"
+    monkeypatch.setenv("MO_RECOVERY_DUMP", str(dump))
+    # The parent is a recovery; its children must not be.
+    for key, value in {
+        "MINI_ORK_RECOVERY_FROM": "ratification_check",
+        "MINI_ORK_RECOVERY_CLOSURE": "ratification_check",
+        "MINI_ORK_RECOVERY_RUN_ID": "run-parent",
+        "MINI_ORK_RECOVERY_SKU": "sdd",
+        "MINI_ORK_RECOVERY_STRATEGY": "resume",
+        "MINI_ORK_RECOVERY_REQUEST": "req-1",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    deliverable = _deliverable("D0")
+    card = _card("spec-a", [deliverable], tmp_path)
+
+    _record, proc, log, _path = psd._launch_child(
+        "spec-a", "D0", deliverable, card, _gates_doc(), run_dir, root, home,
+        "run-parent", [],
+    )
+    assert proc is not None
+    assert proc.wait(timeout=30) == 0
+    log.close()
+
+    assert dump.read_text(encoding="utf-8") == "", (
+        "a fan-out child inherited the parent's recovery closure, which "
+        "collapses it to a partial DAG")
