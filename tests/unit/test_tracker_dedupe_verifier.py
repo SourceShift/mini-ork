@@ -155,6 +155,10 @@ def test_removes_finding_whose_primary_symbol_is_in_a_tracker_title(tmp_path):
     restored = (run_dir / "already-reported.md").read_text(encoding="utf-8")
     assert "#3453" in restored
     assert "resolveScriptSource turns https into file URLs" in restored
+    # The synthesis keeps only a one-line pointer, so if the comment's promise
+    # ("nothing is deleted") is to hold, the block's own text must be here.
+    assert "pathToFileURL" in restored
+    assert "Root cause: the `http:` case is never constructed." in restored
 
 
 def test_keeps_findings_when_only_a_secondary_term_matches(tmp_path):
@@ -385,10 +389,28 @@ def test_a_generic_capitalised_word_is_not_a_symbol(tmp_path):
     assert (run_dir / "synthesis.md").read_text(encoding="utf-8") == synth
 
 
+def test_a_bare_filename_is_not_a_symbol(tmp_path):
+    # `lib.rs` is in half the issue titles of a Rust repo. Treating it as the
+    # finding's subject lets an unrelated thread delete a real finding.
+    synth = (
+        "# Bug audit (synthesis)\n\n## P1 — Bugs\n"
+        "- [BUG-001] `lib.rs` re-parses every event before writing it\n"
+        "  - File: `acoustic/python-oss/src/lib.rs:409`\n"
+    )
+    titles = {"lib.rs": [(500, "lib.rs: rotation deletes spool files early", "open")]}
+    payload, run_dir = _run(tmp_path, synth=synth, titles=titles)
+
+    assert payload["skipped"] == []
+    assert payload["possible"] == []
+    assert "lib.rs" not in _gh_calls(tmp_path)
+    assert (run_dir / "synthesis.md").read_text(encoding="utf-8") == synth
+
+
 def test_each_finding_gets_its_own_term_budget(tmp_path):
     # One global cap made coverage a function of position: with 35 findings and
     # a 40-term ceiling, the last three were never searched. Every finding must
-    # get its own budget instead.
+    # get its own budget instead, and the truncation must be visible in the
+    # verdict rather than only in the log.
     bases = [
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
         "hotel", "india", "juliet", "kilo", "lima", "mike", "november",
@@ -400,9 +422,11 @@ def test_each_finding_gets_its_own_term_budget(tmp_path):
         words = " ".join(f"`{base}{suffix}`" for suffix in suffixes)
         lines.append(f"- [BUG-{index:03d}] {words} mangled")
         lines.append("  - File: `src/thing.py:1`")
+        # A fifth term (weak, from the body) is always past the budget.
+        lines.append(f"  - Symptom: `{base}EchoToken` is lost.")
     synth = "\n".join(lines) + "\n"
 
-    payload, _ = _run(tmp_path, synth=synth, titles={})
+    payload, run_dir = _run(tmp_path, synth=synth, titles={})
 
     calls = set(_gh_calls(tmp_path))
     for base in bases:
@@ -410,3 +434,6 @@ def test_each_finding_gets_its_own_term_budget(tmp_path):
             f"{base}'s terms were never searched — the budget is global again"
         )
     assert payload["searched_terms"] >= len(bases) * 4
+    assert sorted(payload["truncated"]) == [f"BUG-{i:03d}" for i in range(1, 17)]
+    restored = (run_dir / "already-reported.md").read_text(encoding="utf-8")
+    assert "ran out of budget" in restored

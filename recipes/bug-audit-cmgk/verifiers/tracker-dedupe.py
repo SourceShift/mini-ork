@@ -38,8 +38,8 @@ Inputs (env):
 Output (stdout): one JSON object
   {"verifier": "tracker-dedupe", "pass": bool, "status": "checked"|"partial"
    |"skipped"|"abstained", "skipped": [...], "possible": [...],
-   "searched_terms": N, "failed_queries": N, "evidence_path": "...",
-   "reason": "..."}
+   "searched_terms": N, "failed_queries": N, "truncated": [...],
+   "evidence_path": "...", "reason": "..."}
 
 `status` is never silently "checked" when nothing could be queried: an absent
 `gh`, an unauthenticated `gh`, a repository the token cannot see, or a
@@ -58,7 +58,9 @@ Term budget. Each finding gets its own budget (`PER_FINDING_TERMS`), so a long
 list cannot starve its tail: a global cap made coverage a function of the
 finding's position in the document, and finding 33 onward went unsearched.
 Terms already queried for an earlier finding are re-used from the cache and
-cost nothing.
+cost nothing. A finding whose terms ran out before all of them were searched is
+listed in `truncated` and in the run's report, so a partial check is visible in
+the verdict instead of only in the log.
 
 Exit code: always 0 (caller reads `.pass`). `pass` is false only when the
 repository *was* searched, duplicates were found, and the rewrite could not be
@@ -97,6 +99,14 @@ TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 # named the subject is what lets a generic word delete a real finding.
 LOWER_HUMP = re.compile(r"^[a-z]+(?:[A-Z][a-z0-9]*)+$")
 UPPER_HUMP = re.compile(r"^[A-Z][A-Za-z0-9]*(?:[A-Z][a-z0-9]+)+$")
+# A bare filename is not an identifier. `lib.rs` appears in half the titles of a
+# Rust repository; matching one on that and deleting a finding is the same
+# defect as matching a generic noun.
+FILE_NAME = re.compile(
+    r"^[A-Za-z0-9_.-]+\.(?:rs|py|pyi|ts|tsx|js|jsx|mjs|cjs|go|java|kt|rb|c|h|cc|"
+    r"cpp|hpp|toml|yaml|yml|json|md|cfg|ini|sh|txt|lock)$",
+    re.IGNORECASE,
+)
 
 # Per finding, not per run: a global cap made the tail of a long synthesis go
 # unsearched (35 findings, 40 terms, findings 33-35 skipped). Terms already in
@@ -198,6 +208,8 @@ def _distinctive(token):
     """
     if len(token) < 6 or not TOKEN.match(token):
         return False
+    if FILE_NAME.match(token):
+        return False
     if "_" in token or "." in token:
         return True
     return bool(LOWER_HUMP.match(token) or UPPER_HUMP.match(token))
@@ -245,7 +257,10 @@ def _finding_terms(block):
                 weak.append(token)
     for anchor in PATH_ANCHOR.findall(body):
         base = re.split(r"[\\/]", anchor)[-1]
-        if len(base) >= 6 and base not in strong and base not in weak:
+        # A basename shared by every finding in a file (`lib.rs`, `index.ts`)
+        # only produces a "possible" line that names nothing.
+        if len(base) >= 6 and not FILE_NAME.match(base) \
+                and base not in strong and base not in weak:
             weak.append(base)
     return strong[:4], weak[:6]
 
@@ -423,6 +438,7 @@ def main():
     terms_searched = set()
     skip = []
     possible = []
+    truncated = []
     for block in findings:
         bug_id = _bug_id(block)
         if not bug_id:
@@ -446,10 +462,12 @@ def main():
                     _say(lines, f"{bug_id}: per-finding budget "
                                 f"({PER_FINDING_TERMS} terms) reached; "
                                 "remaining terms unsearched")
+                    truncated.append(bug_id)
                     break
                 if len(terms_searched) >= MAX_TOTAL_TERMS:
                     _say(lines, f"{bug_id}: global budget ({MAX_TOTAL_TERMS} "
                                 "terms) reached; remaining terms unsearched")
+                    truncated.append(bug_id)
                     break
                 terms_searched.add(term)
                 fresh += 1
@@ -482,11 +500,11 @@ def main():
         identified_by.sort(key=_rank)
         if identified_by:
             skip.append({"bug": bug_id, "primary": identified_by[0]["term"],
-                         "matches": identified_by})
+                         "matches": identified_by, "block": list(block)})
         elif candidates:
             possible.append({"bug": bug_id,
                              "primary": strong[0] if strong else candidates[0]["term"],
-                             "matches": candidates[:3]})
+                             "matches": candidates[:3], "block": list(block)})
 
     failed = len(stats["failures"])
     if failed and failed >= stats["queries"]:
@@ -504,7 +522,7 @@ def main():
         _say(lines, f"{failed}/{stats['queries']} tracker queries failed "
                     f"-> status {status}")
 
-    if skip or possible or failed:
+    if skip or possible or failed or truncated:
         report = ["# Already reported — skipped by tracker-dedupe", ""]
         report.append(
             f"Target: `{slug}`  ·  searched {len(terms_searched)} term(s)"
@@ -526,6 +544,13 @@ def main():
                 extra = len(entry["matches"]) - 5
                 if extra > 0:
                     report.append(f"  - …and {extra} more in the same search")
+                # The synthesis now holds only a one-line pointer, so the
+                # finding's own text has to live here or it is gone for good.
+                report.append("  - Original finding:")
+                report.append("")
+                report.append("    ```")
+                report.extend(f"    {line}" for line in entry["block"])
+                report.append("    ```")
             report.append("")
         if possible:
             report.append("## Possible (weaker overlap — left in the synthesis)")
@@ -538,6 +563,12 @@ def main():
                         f"  - {match['kind']} #{match['number']} "
                         f"({state}) {match['title']} — {match['url']}"
                     )
+            report.append("")
+        if truncated:
+            report.append("## Findings whose terms ran out of budget (coverage gap)")
+            report.append("")
+            for bug_id in truncated:
+                report.append(f"- `{bug_id}`: later terms were not searched")
             report.append("")
         if stats["failures"]:
             report.append("## Tracker queries that failed (coverage gap)")
@@ -579,6 +610,7 @@ def main():
                 "skipped": skip, "possible": possible,
                 "searched_terms": len(terms_searched),
                 "failed_queries": failed,
+                "truncated": truncated,
                 "evidence_path": LOG,
                 "reason": f"duplicates found but synthesis rewrite failed: {exc}",
             }))
@@ -591,9 +623,10 @@ def main():
         "skipped": skip, "possible": possible,
         "searched_terms": len(terms_searched),
         "failed_queries": failed,
+        "truncated": truncated,
         "evidence_path": LOG,
         "reason": reason,
-        "already_reported_path": SKIPPED_MD if (skip or possible or failed) else "",
+        "already_reported_path": SKIPPED_MD if (skip or possible or failed or truncated) else "",
     }))
     return 0
 
