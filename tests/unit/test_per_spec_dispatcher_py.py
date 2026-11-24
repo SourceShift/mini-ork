@@ -578,3 +578,123 @@ def test_child_does_not_inherit_recovery_scope(tmp_path, monkeypatch):
     assert dump.read_text(encoding="utf-8") == "", (
         "a fan-out child inherited the parent's recovery closure, which "
         "collapses it to a partial DAG")
+
+
+# ── a child that recovered after its process exited ───────────────────────
+#
+# `execute` writes a run-level verdict.json with `verdict: "fail"` whenever
+# any node failed, and never rewrites it once a panel verdict exists. A child
+# that fails tier4, exits 1, and is then recovered has BOTH files: bookkeeping
+# that predates the recovery, and the panel gate that approved it. The record
+# was frozen at exit, so the stale one won — measured on
+# run-podcast-be2-1795523630, whose `migration` deliverable published $12.06
+# and was still recorded `failed`, blocking the 6 deliverables behind it.
+
+
+def _bookkeeping_fail_panel_approve(child_dir: Path) -> None:
+    child_dir.mkdir(parents=True, exist_ok=True)
+    (child_dir / "verdict.json").write_text(
+        json.dumps({"verdict": "fail", "failed_nodes": 6, "dispatched": 15,
+                    "source": "execute@run-level"}), encoding="utf-8")
+    (child_dir / "panel-verdict.json").write_text(
+        json.dumps({"verdict": "APPROVE"}), encoding="utf-8")
+
+
+def test_settle_records_flips_a_child_the_panel_approved_after_exit(tmp_path):
+    child_dir = tmp_path / "home" / "runs" / "parent--S1--D1"
+    _bookkeeping_fail_panel_approve(child_dir)
+    record = psd._record_for("S1", "D1", child_kickoff=None, status=psd.STATUS_FAILED,
+                             child_run_id="parent--S1--D1", child_run_dir=str(child_dir))
+    record["error"] = "child exited 1; pass=False"
+    records = {("S1", "D1"): record}
+
+    flipped = psd._settle_records(records)
+
+    assert flipped == [("S1", "D1", "failed")]
+    assert record["status"] == psd.STATUS_DELIVERED
+    assert record["settled_from"] == "failed"
+    assert "error" not in record
+    assert record["verdict_path"].endswith("panel-verdict.json")
+
+
+def test_settle_records_leaves_a_child_that_never_recovered_failed(tmp_path):
+    """Bookkeeping-only evidence must not promote a genuinely failed child."""
+    child_dir = tmp_path / "home" / "runs" / "parent--S1--D1"
+    child_dir.mkdir(parents=True)
+    (child_dir / "verdict.json").write_text(
+        json.dumps({"verdict": "fail", "failed_nodes": 6,
+                    "source": "execute@run-level"}), encoding="utf-8")
+    record = psd._record_for("S1", "D1", child_kickoff=None, status=psd.STATUS_FAILED,
+                             child_run_id="parent--S1--D1", child_run_dir=str(child_dir))
+    records = {("S1", "D1"): record}
+
+    assert psd._settle_records(records) == []
+    assert record["status"] == psd.STATUS_FAILED
+
+
+def test_settle_records_ignores_a_delivered_record_and_a_missing_dir(tmp_path):
+    ok = psd._record_for("S1", "D0", child_kickoff=None, status=psd.STATUS_DELIVERED,
+                         child_run_dir=str(tmp_path))
+    gone = psd._record_for("S1", "D1", child_kickoff=None, status=psd.STATUS_FAILED,
+                           child_run_dir=str(tmp_path / "nope"))
+    records = {("S1", "D0"): ok, ("S1", "D1"): gone}
+
+    assert psd._settle_records(records) == []
+    assert gone["status"] == psd.STATUS_FAILED
+
+
+def test_collect_child_cites_the_panel_artifact_it_was_graded_by(tmp_path):
+    """The record names the deciding artifact, not `verdict.json` by habit.
+
+    The aggregator recomputes from this path. Citing the executor's bookkeeping
+    made an independent check agree with a stale outcome.
+    """
+    child_dir, _record, proc = _failed_child(tmp_path, repair_state=None)
+    (child_dir / "verdict.json").write_text(
+        json.dumps({"verdict": "fail", "source": "execute@run-level"}), encoding="utf-8")
+    (child_dir / "panel-verdict.json").write_text(
+        json.dumps({"verdict": "APPROVE"}), encoding="utf-8")
+    record = psd._record_for("S1", "D1", child_kickoff=None, status=psd.STATUS_PENDING,
+                             child_run_id="parent--S1--D1", child_run_dir=str(child_dir))
+    log_path = tmp_path / "collect.log"
+    log_path.write_text("child_run_id=parent--S1--D1\n", encoding="utf-8")
+
+    psd._collect_child(record, proc, None, log_path, tmp_path / "home")
+
+    assert record["verdict_path"].endswith("panel-verdict.json")
+
+
+def test_dispatch_settles_a_child_that_approved_after_a_nonzero_exit(tmp_path, monkeypatch):
+    """End to end: one settled record must lower the run's exit code.
+
+    Latching the exit code while the record was still failed fails the node
+    over a deliverable the same run now records as delivered — the same block
+    one level up.
+    """
+    run_dir = _build_run_dir(tmp_path)
+    env = _dispatch_env(run_dir, tmp_path)
+    # The stub child exits 0 and writes only a pass verdict; re-point every
+    # child at a wrapper that reproduces the production artifact pair instead.
+    wrapper = tmp_path / "bookkeeping-child"
+    stub = env["MINI_ORK_PER_SPEC_MINI_ORK_BIN"]
+    wrapper.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        "{stub}" "$@"
+        rc=$?
+        run_dir="${{MINI_ORK_HOME}}/runs/${{MINI_ORK_RUN_ID}}"
+        printf '{{"verdict":"fail","failed_nodes":6,"dispatched":15,\
+"source":"execute@run-level"}}\\n' > "$run_dir/verdict.json"
+        printf '{{"verdict":"APPROVE"}}\\n' > "$run_dir/panel-verdict.json"
+        echo "child_run_id=${{MINI_ORK_RUN_ID}}"
+        echo "child_run_dir=$run_dir"
+        exit 1
+        """), encoding="utf-8")
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+    env["MINI_ORK_PER_SPEC_MINI_ORK_BIN"] = str(wrapper)
+
+    assert _run_dispatch(monkeypatch, env) == 0, (
+        "records that all settle to delivered must not fail the node")
+
+    for record in _records(run_dir).values():
+        assert record["status"] == "delivered"
+        assert record["verdict_path"].endswith("panel-verdict.json")

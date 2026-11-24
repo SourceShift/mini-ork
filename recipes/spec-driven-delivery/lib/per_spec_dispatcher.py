@@ -868,7 +868,14 @@ def _collect_child(
         record["error"] = f"missing child verdict (rc={proc.returncode})"
         return record
 
-    verdict_path = Path(record["child_run_dir"]) / "verdict.json"
+    # Name the artifact that actually decided the status. `_read_child_verdict`
+    # prefers a real panel gate over the executor's own `verdict.json`
+    # bookkeeping, so rehardcoding `verdict.json` here made the record cite a
+    # file that agrees with nothing: `execute` writes it at the end of a pass
+    # with `verdict: "fail"` when any node failed, and never rewrites it once a
+    # panel verdict exists, so a recovered child stayed cited as failed.
+    deciding = _str(verdict.get("_source_path"))
+    verdict_path = Path(deciding) if deciding else Path(record["child_run_dir"]) / "verdict.json"
     if not verdict_path.is_file():
         alt = Path(record["child_run_dir"]) / "panel-verdict.json"
         verdict_path = alt if alt.is_file() else verdict_path
@@ -886,6 +893,61 @@ def _collect_child(
                 record["repaired"] = True
                 record.pop("error", None)
     return record
+
+
+def _settle_one(record: dict[str, Any]) -> str | None:
+    """Flip one non-delivered record to delivered if its child now approves.
+
+    ``_collect_child`` grades a child once, at process exit, and the record is
+    frozen from then on. A child that fails its tier-4 panel, exits non-zero,
+    and is then recovered — ``mini-ork recover`` re-runs the panel and the
+    publisher writes APPROVE — stays ``failed`` in this run's record forever,
+    even though the gate it was graded by now approves. That stale record
+    fails ``per_spec_dispatcher`` and, because the DAG blocks on it,
+    dispatches nothing behind it (measured on run-podcast-be2-1795523630:
+    4 of 10 deliverables published, the other 6 never launched).
+
+    ``_read_child_verdict`` prefers a real panel gate over the executor's
+    ``verdict.json`` bookkeeping, so one re-read settles it. No LLM call, no
+    re-dispatch.
+
+    Returns the previous status when the record flipped, else ``None``.
+    """
+    if record.get("status") == STATUS_DELIVERED:
+        return None
+    child_dir_raw = _str(record.get("child_run_dir"))
+    if not child_dir_raw:
+        return None
+    child_dir = Path(child_dir_raw)
+    if not child_dir.is_dir():
+        return None
+    verdict = _read_child_verdict(child_dir)
+    if verdict is None or verdict.get("pass") is not True:
+        return None
+    previous = _str(record.get("status"))
+    record["status"] = STATUS_DELIVERED
+    record.pop("error", None)
+    record["settled_from"] = previous
+    record["commit"] = _child_commit(verdict, child_dir)
+    deciding = _str(verdict.get("_source_path"))
+    if deciding:
+        record["verdict_path"] = deciding
+    return previous
+
+
+def _settle_records(
+    records: dict[tuple[str, str], dict[str, Any]],
+) -> list[tuple[str, str, str]]:
+    """Settle every recorded child before the results file is written.
+
+    Returns ``(spec_id, deliverable_id, previous_status)`` per flipped record.
+    """
+    flipped: list[tuple[str, str, str]] = []
+    for (spec_id, deliverable_id), record in records.items():
+        previous = _settle_one(record)
+        if previous is not None:
+            flipped.append((spec_id, deliverable_id, previous))
+    return flipped
 
 
 def _reuse_delivered_child(
@@ -956,7 +1018,15 @@ def _prepare(
 
     dep_pairs = _effective_deps(spec_id, deliverable, cards, spec_dep_specs)
     for dep_spec, dep_did in dep_pairs:
-        dep_status = records.get((dep_spec, dep_did), {}).get("status")
+        dep_record = records.get((dep_spec, dep_did), {})
+        # A dependency whose child failed and was then recovered reads
+        # `failed` here — the record was graded at that child's exit. Settle
+        # it before reading the status, or the recovery is invisible and
+        # every dependent is marked pending behind a deliverable that shipped.
+        if dep_record and _settle_one(dep_record) is not None:
+            print(f"per_spec_dispatcher: dependency {dep_spec}/{dep_did} settled to "
+                  "delivered — its child recovered after exit", file=sys.stderr)
+        dep_status = dep_record.get("status")
         if dep_status not in _DELIVERED_SET:
             record = _record_for(
                 spec_id, deliverable_id,
@@ -1175,6 +1245,16 @@ def dispatch() -> int:
                 exit_code = 1
                 if fail_fast:
                     break
+
+    for spec_id, deliverable_id, previous in _settle_records(records):
+        print(f"per_spec_dispatcher: {spec_id}/{deliverable_id} settled to delivered "
+              f"(was {previous}) — the child recovered after exit", file=sys.stderr)
+    # The exit code was latched while those records were still failed. Settle
+    # it, or the node fails the run over a deliverable it now records as
+    # delivered — the same block, one level up. Only ever lowers 1 → 0: a
+    # record that is still failed/pending/blocked keeps the failure.
+    if records and all(r.get("status") == STATUS_DELIVERED for r in records.values()):
+        exit_code = 0
 
     deliverables_list = [records[key] for key in records]
     output = {

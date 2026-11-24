@@ -133,6 +133,22 @@ def check_child(rec: dict) -> tuple[str, str, str | None]:
     if not verdict_file.is_file() or verdict_file.stat().st_size == 0:
         return "pending", "child verdict artifact missing or empty", None
     status, reason, verdict = parse_verdict(verdict_file)
+    # An executor roll-up is NOT a verdict about this deliverable: `execute`
+    # writes `{"verdict": "fail", "source": "execute@run-level"}` whenever any
+    # node of the child failed, and never rewrites it once a panel verdict
+    # exists. Citing it to a child that failed tier4, exited, and was then
+    # recovered reproduces the stale failure instead of checking it. A real
+    # panel gate beside it is the verdict; grade that.
+    rollup = isinstance(verdict, dict) and _str(verdict.get("source")) == "execute@run-level"
+    if status == "pending" or rollup:
+        panel = Path(child) / "panel-verdict.json"
+        if panel.is_file() and panel.resolve() != verdict_file.resolve():
+            p_status, p_reason, p_verdict = parse_verdict(panel)
+            if p_status != "pending":
+                why = ("executor roll-up is not a deliverable verdict" if rollup
+                       else "cited artifact decides nothing")
+                return p_status, f"{p_reason} (panel artifact; {why})", \
+                    _commit(p_verdict, Path(child))
     return status, reason, _commit(verdict, Path(child))
 
 
