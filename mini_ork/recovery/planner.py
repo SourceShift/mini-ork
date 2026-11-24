@@ -1348,7 +1348,16 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             sys.stderr.write(f"detail:  {nc['detail']}\n")
         sys.stderr.write("Pass --force to override.\n")
         return 1
-    if (not is_parked) and hint is not None and hint.get("needs_change") and not ack_change and not status_only:
+    # ``--force`` is the blanket override the gate above advertises ("Pass
+    # --force to override"), and ``mini_ork.cli.board_cmd`` already reads it
+    # that way (``not ack_change and not force``). Requiring a SECOND flag here
+    # made the two refusals a dead end: an operator who took the advice and
+    # passed ``--force`` was refused again, told to pass ``--ack-change``, and
+    # a run that passed only ``--ack-change`` was refused by the gate above.
+    # Measured 2026-11-24 on run-podcast-be2-1795523630 — both single-flag
+    # invocations exited 1 without dispatching.
+    if ((not is_parked) and hint is not None and hint.get("needs_change")
+            and not (ack_change or force) and not status_only):
         nc = hint["needs_change"]
         # A ``kind == 'lane'`` needs_change is satisfied by the operator's
         # ``--lane <alias>=<lane>`` flag — the flag IS the change (kickoff

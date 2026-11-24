@@ -557,6 +557,59 @@ def test_hint_needs_change_refuses_unless_ack_change(
     assert "--ack-change" in out_err.err
 
 
+def test_force_alone_clears_the_needs_change_gate(tmp_path, monkeypatch, capsys):
+    """``--force`` is the blanket override the first gate advertises.
+
+    Measured 2026-11-24: the retry hint carried ``retryable: false`` AND
+    ``needs_change``. ``--force`` cleared the first gate, then this one refused
+    and told the operator to pass ``--ack-change``; ``--ack-change`` alone was
+    refused by the first gate. Following either instruction was a dead end.
+    """
+    db, run_dir, recipe, _ = _setup_db(tmp_path)
+    _set_run_dir(monkeypatch, run_dir)
+    run_id = "run-hint-force-ack-1"
+    Path(run_dir, "retry-hint.json").write_text(json.dumps({
+        "retryable": True, "strategy": "resume", "from_node": None,
+        "needs_change": {"kind": "config_drift", "summary": "fix CONFIG",
+                          "detail": "edit mini_ork/config.py"},
+        "command": "mini-ork recover run-hint-force-ack-1 --force",
+    }))
+
+    wf = tmp_path / "wf.yaml"
+    _hint_workflow(wf)
+    monkeypatch.setenv("MINI_ORK_RECIPE", recipe)
+
+    rp.main([run_id, "--strategy", "resume", "--workflow", str(wf), "--db", db,
+             "--force"])
+    err = capsys.readouterr().err
+    assert "Needs a change before retrying" not in err, err
+
+
+def test_force_clears_both_refusals_when_retryable_is_false(
+    tmp_path, monkeypatch, capsys
+):
+    """The shape that stranded the podcast run: both refusals, one flag."""
+    db, run_dir, recipe, _ = _setup_db(tmp_path)
+    _set_run_dir(monkeypatch, run_dir)
+    run_id = "run-hint-force-both-1"
+    Path(run_dir, "retry-hint.json").write_text(json.dumps({
+        "retryable": False, "strategy": "none", "from_node": None,
+        "needs_change": {"kind": "unknown", "summary": "the cause was not classified",
+                          "detail": "Failed at ?"},
+        "command": "mini-ork recover run-hint-force-both-1 --force",
+    }))
+
+    wf = tmp_path / "wf.yaml"
+    _hint_workflow(wf)
+    monkeypatch.setenv("MINI_ORK_RECIPE", recipe)
+
+    rp.main([run_id, "--strategy", "resume", "--workflow", str(wf), "--db", db,
+             "--force"])
+    err = capsys.readouterr().err
+    assert "retry-hint refuses this run" not in err, err
+    assert "Needs a change before retrying" not in err, err
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. plan_restore dry-run
 # ─────────────────────────────────────────────────────────────────────────────
