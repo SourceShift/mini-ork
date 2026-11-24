@@ -68,6 +68,10 @@ def _plan_gate(monkeypatch, tmp_path, text):
     """The planner gate as ``_shape_predicate_for`` builds it for a plan file."""
     artifact = tmp_path / "epic-runner-plan.json"
     monkeypatch.setenv("MO_PLAN_ARTIFACT", str(artifact))
+    # A real planner node publishes MO_NODE_TYPE; a developer running pytest
+    # inside a mini-ork lane may have it in the ambient env. Pin it so these
+    # assertions describe the gate and not the caller's shell.
+    monkeypatch.delenv("MO_NODE_TYPE", raising=False)
     if text is not None:
         artifact.write_text(text)
     return L._shape_predicate_for("planner")
@@ -92,6 +96,7 @@ def test_declared_plan_artifact_still_rejects_a_missing_or_non_json_file(
 
 def test_no_declared_artifact_keeps_the_reply_gate_and_prose_nodes_ungated(monkeypatch):
     monkeypatch.delenv("MO_PLAN_ARTIFACT", raising=False)
+    monkeypatch.delenv("MO_NODE_TYPE", raising=False)
     assert L._shape_predicate_for("planner") is L._NODE_SHAPE_PREDICATES["planner"]
     assert L._shape_predicate_for("reviewer") is None
 
@@ -99,6 +104,7 @@ def test_no_declared_artifact_keeps_the_reply_gate_and_prose_nodes_ungated(monke
 def test_shape_check_kill_switch_still_wins_over_a_declared_artifact(monkeypatch, tmp_path):
     monkeypatch.setenv("MO_PLAN_ARTIFACT", str(tmp_path / "plan.json"))
     monkeypatch.setenv("MO_SHAPE_CHECK", "0")
+    monkeypatch.delenv("MO_NODE_TYPE", raising=False)
     assert L._shape_predicate_for("planner") is None
 
 

@@ -171,8 +171,15 @@ def node_env_overrides(
         overrides[ENV_TARGET_CWD] = target_cwd
     # The node's workflow type: picks the type-aware default tool grant for
     # nodes without a `tools:` block, and the MO_PLACEMENT_LOCAL_ROLES opt-out.
-    if node_type is not None:
-        overrides["MO_NODE_TYPE"] = node_type
+    # Published unconditionally, because ``None`` means REMOVE for
+    # ``apply_env_overrides``: the executor's ``os.environ`` writes are never
+    # restored (``publish_env`` docstring), so a conditional publish would let
+    # the previous node's type answer for this one. Two readers make that
+    # dangerous — the type-aware tool grant above, and
+    # ``llm_dispatch._shape_predicate_for``, which stands a reply-shape gate
+    # down on a mismatch with its ``--node-type`` argument. An absent value is
+    # the honest answer for a node that declared no type.
+    overrides["MO_NODE_TYPE"] = node_type
     # remote-nodes-10: the identity a remote proc is deduplicated by, so a
     # recovery re-dispatch of the same attempt re-attaches instead of re-running.
     if attempt is not None:

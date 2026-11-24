@@ -788,15 +788,23 @@ def _launch_child(
     # artifact ready_for_tier1=true" and publisher BLOCKed on a missing panel
     # verdict — inside children that were supposed to run the whole DAG. A
     # child is a fresh run; only the parent may be a recovery.
+    #
+    # The list mirrors ``mini_ork.cli.main._INHERITED_RECOVERY_SCOPE_VARS``
+    # (the same scrub a top-level ``run`` performs). Keep the two in step: a
+    # var added there and missed here leaks again, and the reader that matters
+    # most is ``execute``'s ``MINI_ORK_RECOVERY_ACTIVE`` — a child that still
+    # believes recovery is active is not a fresh run by its own reading.
     for _recovery_key in (
         "MINI_ORK_RECOVERY_FROM",
         "MINI_ORK_RECOVERY_CLOSURE",
         "MINI_ORK_RECOVERY_RUN_ID",
         "MINI_ORK_RECOVERY_SKU",
         "MINI_ORK_RECOVERY_STRATEGY",
+        "MINI_ORK_RECOVERY_ACTIVE",
         "MINI_ORK_RECOVERY_REQUEST",
     ):
         env.pop(_recovery_key, None)
+
 
     record = _record_for(
         spec_id,

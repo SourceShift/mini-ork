@@ -559,6 +559,7 @@ def test_child_does_not_inherit_recovery_scope(tmp_path, monkeypatch):
         "MINI_ORK_RECOVERY_RUN_ID": "run-parent",
         "MINI_ORK_RECOVERY_SKU": "sdd",
         "MINI_ORK_RECOVERY_STRATEGY": "resume",
+        "MINI_ORK_RECOVERY_ACTIVE": "1",
         "MINI_ORK_RECOVERY_REQUEST": "req-1",
     }.items():
         monkeypatch.setenv(key, value)

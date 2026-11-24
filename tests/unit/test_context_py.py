@@ -77,6 +77,18 @@ def test_node_env_overrides_target_cwd_opt_in():
     assert ov["MO_TARGET_CWD"] == "/t"
 
 
+def test_node_env_overrides_clears_a_previous_node_type():
+    # ``MO_NODE_TYPE`` is not restored between nodes (publish_env writes
+    # os.environ and never puts it back), so a node that declares no type must
+    # REMOVE the previous node's, not inherit it. Two readers depend on the
+    # value being this node's: the type-aware tool grant, and
+    # llm_dispatch._shape_predicate_for, which stands a reply-shape gate down
+    # on a mismatch with its --node-type argument.
+    assert node_env_overrides(node_id="n", run_dir="/rd")["MO_NODE_TYPE"] is None
+    assert node_env_overrides(
+        node_id="n", run_dir="/rd", node_type="researcher")["MO_NODE_TYPE"] == "researcher"
+
+
 def test_apply_env_overrides_set_and_pop():
     env = {"A": "1", "B": "2"}
     apply_env_overrides({"A": "9", "B": None, "C": "3"}, env=env)
