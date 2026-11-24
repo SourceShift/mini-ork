@@ -560,14 +560,18 @@ def _decide(db_path: str, run_dir: str, node_id: str, node_type: str,
 
 # ── vocabulary ─────────────────────────────────────────────────────────────
 
-def test_irreversible_node_types_is_publisher_only():
+def test_irreversible_node_types_pin_the_outbound_effects():
+    # Both types touch the outside world: publisher commits and delivers,
+    # contributor pushes a branch and opens a PR. Resume must RECONCILE them,
+    # never rerun — a rerun duplicates the effect (a second PR).
     assert isinstance(mc.IRREVERSIBLE_NODE_TYPES, frozenset)
-    assert mc.IRREVERSIBLE_NODE_TYPES == frozenset({"publisher"})
+    assert mc.IRREVERSIBLE_NODE_TYPES == frozenset({"publisher", "contributor"})
     assert "rollback" not in mc.IRREVERSIBLE_NODE_TYPES
 
 
 @pytest.mark.parametrize("node_type,expected", [
     ("publisher", "irreversible"),
+    ("contributor", "irreversible"),
     ("rollback", "reversible"),
     ("implementer", "reversible"),
     ("", "reversible"),

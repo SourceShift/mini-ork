@@ -918,11 +918,12 @@ def _node_reusable_from_checkpoint(
 # none — it is an effect record written before the effect and closed at node
 # end.
 
-#: The node types that can change state outside the run directory. Verified
-#: against the recipe corpus: recipes declare ``type: publisher`` and nothing
-#: else in this class. ``rollback`` is deliberately absent — it reverts an
-#: effect rather than producing one, and it writes no effect record yet.
-IRREVERSIBLE_NODE_TYPES = frozenset({"publisher"})
+#: The node types that can change state outside the run directory. ``publisher``
+#: commits and delivers; ``contributor`` pushes a branch and opens a pull
+#: request, which no local revert can take back. ``rollback`` is deliberately
+#: absent — it reverts an effect rather than producing one, and it writes no
+#: effect record yet.
+IRREVERSIBLE_NODE_TYPES = frozenset({"publisher", "contributor"})
 
 #: The per-node effect record lives beside the run's artifacts, not in
 #: SQLite: a sidecar is the smallest persistence that survives the crash the
