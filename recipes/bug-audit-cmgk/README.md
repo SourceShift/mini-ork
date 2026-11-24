@@ -37,6 +37,28 @@ audit on**, the recipe:
 - (Optional) `docs/refactor/<slug>-AUDIT.md` published by the
   publisher node
 
+## Tracker de-duplication (before publishing)
+
+A lens panel reads code, and code cannot tell it that the repo already has an
+issue for this defect — or that a maintainer already declined the change in a
+closed thread. The `tracker_dedupe` node runs after synthesis and before the
+completeness verifier: it searches the target repo's issues and PRs (open and
+closed) for each finding's primary symbol, and when a tracker **title** matches
+that symbol it moves the finding out of `synthesis.md` into
+`already-reported.md` (restored verbatim, with the issue/PR links). A weaker
+overlap is listed as "possible" and left in the report — dropping a real
+finding costs more than shipping one duplicate.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `MO_AUDIT_TARGET_REPO` | git `origin` of the cwd | `owner/name` the de-dupe searches |
+| `MO_AUDIT_DEDUPE_OFF` | unset | `1` skips the check (`status: "skipped"`) |
+
+The node abstains — `pass: true`, `status: "abstained"`, with a reason — when
+`gh` is missing or the repo cannot be resolved; it never reports a check it did
+not run. `pass: false` (and therefore a publisher refusal, since the envelope
+is gating) means duplicates **were** found and the rewrite could not be written.
+
 ## When to use
 
 - Before a major release — audit your own framework for what to fix in v0.x+1

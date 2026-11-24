@@ -18,6 +18,14 @@ nodes:
   - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel }
   - { name: minimax_lens,      type: researcher,  model_lane: minimax_lens,    prompt_ref: prompts/lens-minimax.md,   dispatch_mode: parallel }
   - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial }
+  # The lens panel reads code and cannot see the target's issue tracker, so a
+  # finding the repo already reported (or already declined, with the reason
+  # living only in a closed issue) survives synthesis at full consensus. This
+  # node checks the synthesis against the tracker and moves such a finding to
+  # <run>/already-reported.md before the publisher emits it. Placement is
+  # deliberate: after synthesis, before the completeness verifier, so the
+  # published artifact — not the lens reports — is what gets de-duplicated.
+  - { name: tracker_dedupe,  type: verifier, verifier_ref: verifiers/tracker-dedupe.py, dispatch_mode: serial }
   - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.py, dispatch_mode: serial }
   - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial }
   - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
@@ -31,9 +39,11 @@ edges:
   - { from: kimi_lens,  to: synthesizer, edge_type: depends_on }
   - { from: codex_lens, to: synthesizer, edge_type: depends_on }
   - { from: minimax_lens,  to: synthesizer, edge_type: depends_on }
-  - { from: synthesizer, to: lens_completeness, edge_type: depends_on }
+  - { from: synthesizer, to: tracker_dedupe, edge_type: depends_on }
+  - { from: tracker_dedupe, to: lens_completeness, edge_type: depends_on }
   - { from: lens_completeness, to: publisher, edge_type: depends_on }
   - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: tracker_dedupe, to: rollback, edge_type: escalates_to }
   - { from: lens_completeness, to: rollback, edge_type: escalates_to }
 
 rollback_strategy: keep_lens_reports_discard_synthesis

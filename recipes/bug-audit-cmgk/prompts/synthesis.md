@@ -21,6 +21,14 @@ at `${MINI_ORK_RUN_DIR}/synthesis.md`.
 6. **Report-only contract** — synthesis is a BUG LIST, NOT a patch
    plan. Each entry's "fix shape" is at most ONE-LINE pointing at
    where a fix would land. No diffs, no PRs.
+7. **Honour the tracker check** — if `${MINI_ORK_RUN_DIR}/already-reported.md`
+   exists, it lists findings a later step matched against the target's
+   issue/PR tracker. Do NOT re-add a finding listed there, and do not
+   argue it back in because the lenses agreed: a tracker entry means the
+   repo already knows, or already declined with a reason the lens could
+   not see. Keep the one-line `[BUG-NNN]` placeholder where the block was,
+   so the counts in `## Summary` stay readable. On a retry, preserve the
+   existing `[ALREADY-REPORTED: #N]` annotations verbatim.
 
 ## Output shape
 
