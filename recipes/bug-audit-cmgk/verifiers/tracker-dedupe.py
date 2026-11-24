@@ -36,14 +36,29 @@ Inputs (env):
   MO_AUDIT_DEDUPE_OFF=1     skip the whole check (still writes the log)
 
 Output (stdout): one JSON object
-  {"verifier": "tracker-dedupe", "pass": bool, "status": "checked"|"skipped"
-   |"abstained", "skipped": [...], "possible": [...], "searched_terms": N,
-   "evidence_path": "...", "reason": "..."}
+  {"verifier": "tracker-dedupe", "pass": bool, "status": "checked"|"partial"
+   |"skipped"|"abstained", "skipped": [...], "possible": [...],
+   "searched_terms": N, "failed_queries": N, "evidence_path": "...",
+   "reason": "..."}
 
 `status` is never silently "checked" when nothing could be queried: an absent
-`gh`, an unauthenticated `gh`, or an unknown repository all report `abstained`
-with a reason, and that reason is also written into the synthesis header so the
-published document cannot claim a duplicate check it did not get.
+`gh`, an unauthenticated `gh`, a repository the token cannot see, or a
+per-query failure all land in `abstained` (nothing answered) or `partial`
+(some queries answered, some did not) with the failing queries named in
+`reason` and in the run's already-reported.md. A tracker query that errors
+returns no hits, which is indistinguishable from "no duplicates" — so the two
+are counted separately and the count is published. The check never claims more
+coverage than it got.
+
+Stdout carries exactly one JSON object and nothing else: the runner tees this
+process's stderr into the evidence capture, so a diagnostic printed there makes
+`verifier_tracker-dedupe.json` unparsable. Diagnostics go to the LOG file.
+
+Term budget. Each finding gets its own budget (`PER_FINDING_TERMS`), so a long
+list cannot starve its tail: a global cap made coverage a function of the
+finding's position in the document, and finding 33 onward went unsearched.
+Terms already queried for an earlier finding are re-used from the cache and
+cost nothing.
 
 Exit code: always 0 (caller reads `.pass`). `pass` is false only when the
 repository *was* searched, duplicates were found, and the rewrite could not be
@@ -55,7 +70,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 
 RUN_DIR = os.environ.get("MINI_ORK_RUN_DIR", "")
 
@@ -75,11 +89,21 @@ BUG_LINE = re.compile(r"^- \[(BUG-[0-9A-Za-z]+)\]\s*(.*)$")
 TICKETED = re.compile(r"\[ALREADY-REPORTED:\s*#(\d+)\]")
 PATH_ANCHOR = re.compile(r"`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+):\d+`")
 BACKTICK = re.compile(r"`([^`\n]+)`")
-IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{4,}$")
 TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
-CAMEL = re.compile(r"^[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*$")
+# A CamelCase identifier only reads as a *symbol* when it is made of at least
+# two word segments. `sourcePath`, `OpenOptions`, `MCPClient`, `toJSON` are
+# symbols; `Response`, `Session`, `Python` are ordinary capitalised English and
+# appear in half the tracker titles on GitHub. Searching the latter as if they
+# named the subject is what lets a generic word delete a real finding.
+LOWER_HUMP = re.compile(r"^[a-z]+(?:[A-Z][a-z0-9]*)+$")
+UPPER_HUMP = re.compile(r"^[A-Z][A-Za-z0-9]*(?:[A-Z][a-z0-9]+)+$")
 
-MAX_TERMS = 40
+# Per finding, not per run: a global cap made the tail of a long synthesis go
+# unsearched (35 findings, 40 terms, findings 33-35 skipped). Terms already in
+# the cache are free, so this bounds only *new* tracker queries.
+PER_FINDING_TERMS = 4
+# Safety valve for a pathological document; hitting it is logged, never silent.
+MAX_TOTAL_TERMS = 200
 GH_TIMEOUT = 60
 
 
@@ -91,8 +115,11 @@ def _log_write(lines):
 
 
 def _say(lines, message):
+    # The LOG file is the evidence artifact; stderr is NOT. The runner tees
+    # stderr into the capture that must contain exactly one JSON object, so a
+    # line printed here makes verifier_tracker-dedupe.json unparsable and the
+    # whole run records `contract: UNVERIFIED` despite passing.
     lines.append(message)
-    print(f"[tracker-dedupe] {message}", file=sys.stderr)
 
 
 def _git_origin_slug(repo_dir):
@@ -165,13 +192,15 @@ def _distinctive(token):
     """True for a token that reads as a code symbol, not prose.
 
     `sourcePath`, `evaluate_script`, `McpContext.loadResource` are symbols;
-    `response`, `body`, `capped` are words that every tracker is full of.
+    `response`, `body`, `capped`, `Response`, `Session` are words that every
+    tracker is full of. A single capital letter inside a word is not enough
+    evidence of code — the shape has to be at least two word segments.
     """
     if len(token) < 6 or not TOKEN.match(token):
         return False
     if "_" in token or "." in token:
         return True
-    return any(ch.isupper() for ch in token[1:])
+    return bool(LOWER_HUMP.match(token) or UPPER_HUMP.match(token))
 
 
 def _finding_terms(block):
@@ -191,7 +220,11 @@ def _finding_terms(block):
     strong = []
     for code in BACKTICK.findall(title):
         token = code.strip()
-        if len(token) >= 6 and TOKEN.match(token) and token not in strong:
+        # Backticks are the synthesis author's claim that this is code, but the
+        # author is a model: `\`Response\`` in a title is as likely as
+        # `\`sourcePath\``. Require the same symbol shape either way, so one
+        # generic word cannot delete a genuine finding.
+        if _distinctive(token) and token not in strong:
             strong.append(token)
     for word in re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", title):
         if _distinctive(word) and word not in strong:
@@ -205,7 +238,9 @@ def _finding_terms(block):
             continue
         if " " in token or "/" in token or "\\" in token:
             continue
-        if CAMEL.match(token) or (IDENT.match(token) and len(token) >= 6):
+        # Same shape rule as the title: a plain capitalised or lowercase word
+        # is prose, and searching it only produces a misleading "possible".
+        if _distinctive(token):
             if token not in strong and token not in weak:
                 weak.append(token)
     for anchor in PATH_ANCHOR.findall(body):
@@ -231,15 +266,20 @@ def _gh(argv):
         return None, f"unparseable gh output: {exc}"
 
 
-def _search(slug, term, kind, cache, lines):
+def _search(slug, term, kind, cache, lines, stats):
     key = (kind, term.lower())
     if key in cache:
         return cache[key]
     argv = [kind, "list", "--repo", slug, "--state", "all",
             "--search", term, "--limit", "20",
             "--json", "number,title,state,url"]
+    stats["queries"] += 1
     payload, error = _gh(argv)
     if payload is None:
+        # A failed query returns no hits, which is the same value as "this repo
+        # has nothing on that term". Count it so the verdict can say the check
+        # was incomplete instead of reporting the outage as clean coverage.
+        stats["failures"].append(f"{kind} {term!r}: {error}")
         _say(lines, f"gh {kind} list failed for {term!r}: {error}")
         cache[key] = []
         return []
@@ -379,6 +419,7 @@ def main():
         return 0
 
     cache = {}
+    stats = {"queries": 0, "failures": []}
     terms_searched = set()
     skip = []
     possible = []
@@ -395,13 +436,25 @@ def main():
             continue
         candidates = []
         seen = set()
+        fresh = 0
         for term in strong + weak:
-            if len(terms_searched) >= MAX_TERMS:
-                _say(lines, f"{bug_id}: term budget exhausted, remaining terms unsearched")
-                break
-            terms_searched.add(term)
+            # Terms another finding already searched come from the cache and are
+            # free, so they never count against this finding's budget — only a
+            # new tracker query does.
+            if term not in terms_searched:
+                if fresh >= PER_FINDING_TERMS:
+                    _say(lines, f"{bug_id}: per-finding budget "
+                                f"({PER_FINDING_TERMS} terms) reached; "
+                                "remaining terms unsearched")
+                    break
+                if len(terms_searched) >= MAX_TOTAL_TERMS:
+                    _say(lines, f"{bug_id}: global budget ({MAX_TOTAL_TERMS} "
+                                "terms) reached; remaining terms unsearched")
+                    break
+                terms_searched.add(term)
+                fresh += 1
             for kind in ("issue", "pr"):
-                hits = _search(slug, term, kind, cache, lines)
+                hits = _search(slug, term, kind, cache, lines, stats)
                 for match in _match(hits, term):
                     key = (kind, match["number"])
                     if key in seen:
@@ -435,9 +488,29 @@ def main():
                              "primary": strong[0] if strong else candidates[0]["term"],
                              "matches": candidates[:3]})
 
-    if skip or possible:
+    failed = len(stats["failures"])
+    if failed and failed >= stats["queries"]:
+        status = "abstained"
+        reason = (f"all {failed} tracker queries failed; the duplicate check "
+                  "did not run")
+    elif failed:
+        status = "partial"
+        reason = (f"{failed} of {stats['queries']} tracker queries failed; "
+                  "coverage is incomplete")
+    else:
+        status = "checked"
+        reason = ""
+    if failed:
+        _say(lines, f"{failed}/{stats['queries']} tracker queries failed "
+                    f"-> status {status}")
+
+    if skip or possible or failed:
         report = ["# Already reported — skipped by tracker-dedupe", ""]
-        report.append(f"Target: `{slug}`  ·  searched {len(terms_searched)} term(s)")
+        report.append(
+            f"Target: `{slug}`  ·  searched {len(terms_searched)} term(s)"
+            + (f"  ·  {failed} quer{'y' if failed == 1 else 'ies'} failed"
+               if failed else "")
+        )
         report.append("")
         if skip:
             report.append("## Skipped (tracker title matched a symbol from the finding's title)")
@@ -466,6 +539,15 @@ def main():
                         f"({state}) {match['title']} — {match['url']}"
                     )
             report.append("")
+        if stats["failures"]:
+            report.append("## Tracker queries that failed (coverage gap)")
+            report.append("")
+            for failure in stats["failures"][:20]:
+                report.append(f"- {failure}")
+            extra = len(stats["failures"]) - 20
+            if extra > 0:
+                report.append(f"- …and {extra} more")
+            report.append("")
         with open(SKIPPED_MD, "w", encoding="utf-8") as handle:
             handle.write("\n".join(report))
 
@@ -493,9 +575,10 @@ def main():
             lines.append(f"rewrite failed: {exc}")
             _log_write(lines)
             print(json.dumps({
-                "verifier": "tracker-dedupe", "pass": False, "status": "checked",
+                "verifier": "tracker-dedupe", "pass": False, "status": status,
                 "skipped": skip, "possible": possible,
                 "searched_terms": len(terms_searched),
+                "failed_queries": failed,
                 "evidence_path": LOG,
                 "reason": f"duplicates found but synthesis rewrite failed: {exc}",
             }))
@@ -504,11 +587,13 @@ def main():
 
     _log_write(lines)
     print(json.dumps({
-        "verifier": "tracker-dedupe", "pass": True, "status": "checked",
+        "verifier": "tracker-dedupe", "pass": True, "status": status,
         "skipped": skip, "possible": possible,
         "searched_terms": len(terms_searched),
+        "failed_queries": failed,
         "evidence_path": LOG,
-        "already_reported_path": SKIPPED_MD if (skip or possible) else "",
+        "reason": reason,
+        "already_reported_path": SKIPPED_MD if (skip or possible or failed) else "",
     }))
     return 0
 

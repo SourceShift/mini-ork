@@ -10,10 +10,17 @@ These tests pin the three properties that keep that from recurring:
     published synthesis and restored verbatim in `already-reported.md`;
   * a weaker overlap (secondary term only) is reported but NOT removed —
     precision over recall, because dropping a real finding costs more;
-  * an unavailable tracker (no `gh`) is reported as `abstained`, never as a
-    silent pass that the published document could claim as a clean check.
+  * an unavailable tracker (no `gh`, or every query failing) is reported as
+    `abstained`, a partly-answered one as `partial` — never as a silent
+    `checked` that the published document could claim was clean;
+  * a generic capitalised word (`Response`, `Session`) is not treated as a
+    code symbol, so it cannot delete a finding;
+  * every finding gets its own term budget, so a long synthesis cannot starve
+    its tail the way one global cap did (35 findings, 40 terms, 33-35 skipped);
 
-`gh` is faked on PATH; nothing here touches the network.
+`gh` is faked on PATH; nothing here touches the network. The verifier's stderr
+must stay empty — the runner tees it into the evidence capture, and a stray
+line there makes `verifier_tracker-dedupe.json` unparsable.
 """
 
 import json
@@ -28,11 +35,16 @@ SCRIPT = REPO / "recipes/bug-audit-cmgk/verifiers/tracker-dedupe.py"
 
 FAKE_GH = '''\
 #!{python}
-import json, sys
+import json, os, sys
 
 argv = sys.argv[1:]
 kind = argv[0]
 term = argv[argv.index("--search") + 1]
+with open({log!r}, "a", encoding="utf-8") as handle:
+    handle.write(term + "\\n")
+if os.environ.get("FAKE_GH_FAIL_ALL") == "1" or term in {failing!r}:
+    sys.stderr.write("gh: simulated failure\\n")
+    raise SystemExit(1)
 TITLES = {titles}
 emit = []
 for number, title, state in TITLES.get(term, []):
@@ -43,10 +55,13 @@ print(json.dumps(emit))
 '''
 
 
-def _fake_gh(bin_dir, titles):
+def _fake_gh(bin_dir, titles, failing=()):
     path = bin_dir / "gh"
     path.write_text(
-        FAKE_GH.format(python=sys.executable, titles=repr(titles)),
+        FAKE_GH.format(
+            python=sys.executable, titles=repr(titles),
+            failing=tuple(failing), log=str(bin_dir / "gh-calls.log"),
+        ),
         encoding="utf-8",
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -80,7 +95,8 @@ SYNTH = """\
 """
 
 
-def _run(tmp_path, synth=SYNTH, titles=None, path_extra=None, env_extra=None):
+def _run(tmp_path, synth=SYNTH, titles=None, path_extra=None, env_extra=None,
+         failing=()):
     run_dir = tmp_path / "run"
     run_dir.mkdir(exist_ok=True)
     target = run_dir / "synthesis.md"
@@ -89,7 +105,7 @@ def _run(tmp_path, synth=SYNTH, titles=None, path_extra=None, env_extra=None):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     if titles is not None:
-        _fake_gh(bin_dir, titles)
+        _fake_gh(bin_dir, titles, failing=failing)
     env = {
         **os.environ,
         "MINI_ORK_RUN_DIR": str(run_dir),
@@ -103,8 +119,18 @@ def _run(tmp_path, synth=SYNTH, titles=None, path_extra=None, env_extra=None):
         env=env, cwd=str(tmp_path),
     )
     assert proc.returncode == 0, proc.stderr
+    # The runner tees stderr into the evidence capture, which must hold exactly
+    # one JSON object. Any diagnostic the verifier prints there makes
+    # verifier_tracker-dedupe.json unparsable and the run records
+    # `contract: UNVERIFIED` even when the verdict is pass.
+    assert proc.stderr == "", proc.stderr
     payload = json.loads(proc.stdout)
     return payload, run_dir
+
+
+def _gh_calls(tmp_path):
+    log = tmp_path / "bin" / "gh-calls.log"
+    return log.read_text(encoding="utf-8").split("\n") if log.exists() else []
 
 
 def test_removes_finding_whose_primary_symbol_is_in_a_tracker_title(tmp_path):
@@ -306,3 +332,81 @@ def test_second_pass_leaves_its_own_breadcrumb_alone(tmp_path):
     assert second["status"] == "checked"
     assert second["skipped"] == []
     assert (run_dir / "synthesis.md").read_text(encoding="utf-8") == after_first
+
+
+def test_every_query_failing_abstains_instead_of_reporting_a_clean_check(tmp_path):
+    # A failed `gh` call returns no hits, which is the same value as "this repo
+    # has nothing on that term". Reporting `checked` there is a lie the
+    # published document would repeat.
+    payload, run_dir = _run(
+        tmp_path, titles={}, env_extra={"FAKE_GH_FAIL_ALL": "1"},
+    )
+
+    assert payload["pass"] is True
+    assert payload["status"] == "abstained"
+    assert payload["failed_queries"] > 0
+    assert "failed" in payload["reason"]
+    assert (run_dir / "synthesis.md").read_text(encoding="utf-8") == SYNTH
+    restored = (run_dir / "already-reported.md").read_text(encoding="utf-8")
+    assert "coverage gap" in restored
+    assert "simulated failure" in restored
+
+
+def test_partial_tracker_failure_reports_partial_coverage(tmp_path):
+    payload, run_dir = _run(
+        tmp_path, titles={}, failing=("loadResource",),
+    )
+
+    assert payload["pass"] is True
+    assert payload["status"] == "partial"
+    assert payload["failed_queries"] == 2  # one failing term, two queries (issue+pr)
+    assert "incomplete" in payload["reason"]
+    restored = (run_dir / "already-reported.md").read_text(encoding="utf-8")
+    assert "loadResource" in restored
+
+
+def test_a_generic_capitalised_word_is_not_a_symbol(tmp_path):
+    # `Response` is capitalised, so a shape-agnostic "has an uppercase letter"
+    # rule treats it as code. A tracker title that says the word then matches,
+    # and a real finding is deleted by a generic noun.
+    synth = (
+        "# Bug audit (synthesis)\n\n## P1 — Bugs\n"
+        "- [BUG-001] `Response` buffers the whole body\n"
+        "  - File: `src/tools/network.ts:88`\n"
+        "  - Symptom: `Response` is read without a cap.\n"
+    )
+    titles = {"Response": [(1, "Response buffers too much", "open")]}
+    payload, run_dir = _run(tmp_path, synth=synth, titles=titles)
+
+    assert payload["status"] == "checked"
+    assert payload["skipped"] == []
+    assert payload["possible"] == []
+    assert "Response" not in _gh_calls(tmp_path)
+    assert (run_dir / "synthesis.md").read_text(encoding="utf-8") == synth
+
+
+def test_each_finding_gets_its_own_term_budget(tmp_path):
+    # One global cap made coverage a function of position: with 35 findings and
+    # a 40-term ceiling, the last three were never searched. Every finding must
+    # get its own budget instead.
+    bases = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+        "hotel", "india", "juliet", "kilo", "lima", "mike", "november",
+        "oscar", "papa",
+    ]
+    suffixes = ["Alpha", "Bravo", "Charlie", "Delta"]
+    lines = ["# Bug audit (synthesis)", "", "## P1 — Bugs"]
+    for index, base in enumerate(bases, 1):
+        words = " ".join(f"`{base}{suffix}`" for suffix in suffixes)
+        lines.append(f"- [BUG-{index:03d}] {words} mangled")
+        lines.append("  - File: `src/thing.py:1`")
+    synth = "\n".join(lines) + "\n"
+
+    payload, _ = _run(tmp_path, synth=synth, titles={})
+
+    calls = set(_gh_calls(tmp_path))
+    for base in bases:
+        assert f"{base}Alpha" in calls, (
+            f"{base}'s terms were never searched — the budget is global again"
+        )
+    assert payload["searched_terms"] >= len(bases) * 4
