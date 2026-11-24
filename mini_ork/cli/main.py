@@ -61,6 +61,12 @@ _NATIVE_SUBS = {
     # Added here for the same reason as `fallbacks` — `_NATIVE_MODULE_SUBS` is
     # pinned as a mirror of the retired runtime-select.sh mapping.
     "recipes",
+    # Outbound contribution: pushes a branch to a fork and hands the body to
+    # `gh` as a file, so a long markdown body never travels through a shell
+    # string and the base/remote/head triple is decided in one place. Added
+    # here for the same reason as `fallbacks` — `_NATIVE_MODULE_SUBS` is
+    # pinned as a mirror of the retired runtime-select.sh mapping.
+    "contribute",
 }
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this
