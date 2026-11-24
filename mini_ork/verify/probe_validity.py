@@ -419,12 +419,15 @@ def load_probes(run_dir: str, plan: dict) -> tuple[list[str], list[dict]]:
     had already made green published unremarked.
 
     ``dod_probes[*].expected`` is narration ("exits 0 and prints 'AC3 pass' —
-    …"), not a matcher, so its pass condition is ``exit 0``; using prose as the
+    …"), not a matcher, so a dod probe's pass condition is ``exit 0`` unless it
+    carries an explicit ``expect`` of its own. Using the narrated prose as the
     expect regex would grade every base run as FAILED and hide the vacuity the
     base-run rule exists to catch.
 
-    Checks with no acceptance mapping are not judged for coverage, but they are
-    still judged for static vacuity and for passing on the base tree.
+    A ``verifier_contract`` check with no acceptance mapping is excluded
+    entirely (it is not a probe of a criterion). A ``dod_probes`` entry is
+    included whether or not it names a criterion — coverage needs a mapping,
+    but static vacuity and the base-tree rule do not.
     """
     acceptance: list[str] = []
     for key in ("acceptance",):
@@ -453,7 +456,9 @@ def load_probes(run_dir: str, plan: dict) -> tuple[list[str], list[dict]]:
         probes.append({"gate_id": probe.get("id") or probe.get("gate_id"),
                        "acceptance_ref": probe.get("acceptance_ref"),
                        "acceptance_refs": probe.get("acceptance_refs"),
-                       "probe": command, "expect": "exit 0",
+                       "probe": command,
+                       # an explicit matcher wins; `expected` is narration
+                       "expect": probe.get("expect") or "exit 0",
                        "tags": probe.get("tags") or [], "kind": "cmd"})
     gates_dir = Path(run_dir) / "gates"
     if gates_dir.is_dir():

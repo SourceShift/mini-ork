@@ -432,3 +432,12 @@ def test_load_probes_skips_a_dod_probe_with_no_command() -> None:
     # the commandless entry contributes nothing; the vacuous one is still seen
     assert [p["gate_id"] for p in probes] == ["P2"]
     assert pv.is_vacuous_probe(probes[0]["probe"])
+
+
+def test_dod_probe_honours_an_explicit_matcher_over_narrated_expected() -> None:
+    plan = {"dod_probes": [
+        {"id": "P1", "command": "echo 'AC3 pass'", "expect": "AC3 pass"},
+        {"id": "P2", "command": "echo 'AC4 pass'", "expected": "exits 0 and prints 'AC4 pass'"},
+    ]}
+    _acceptance, probes = pv.load_probes("", plan)
+    assert [p["expect"] for p in probes] == ["AC3 pass", "exit 0"]
