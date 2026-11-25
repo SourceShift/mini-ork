@@ -67,6 +67,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 import uuid
@@ -635,18 +636,59 @@ def control(db_path: str, *, n: Optional[int] = None) -> dict:
 # ── consumer ─────────────────────────────────────────────────────────────────
 
 
+_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+
+
+def _produce_enabled() -> bool:
+    """On-demand measurement is on unless ``MO_GATE_HACKABILITY_PRODUCE`` says otherwise."""
+    return os.environ.get("MO_GATE_HACKABILITY_PRODUCE", "1").strip().lower() not in _OFF_VALUES
+
+
+def _measure_now(db_path: str, gate: dict) -> Optional[dict]:
+    """Audit ``gate`` with the deterministic operators only, persist, return.
+
+    The LLM proposer is skipped (``proposer=None``), so this is hermetic: five
+    known-bad documents against the real evaluator in a scratch DB, no model, no
+    network. It is the same shape ⑦ took when its promotion gate stopped
+    reporting ``unmeasured`` for a record nothing wrote — the consumer measures
+    the instrument itself, and the CLI stays the out-of-band producer that can
+    spend a proposer budget.
+
+    A gate that cannot be audited (an evaluator that raises outside the trial
+    harness, an unwritable records dir) is reported and left unmeasured; the
+    promotion decision is unchanged.
+    """
+    try:
+        record = audit_gate(db_path, gate["gate_id"], proposer=None)
+    except Exception as exc:  # noqa: BLE001 — a producer must not break a promote
+        print(f"hackability: could not audit {gate['gate_id']}: {exc}",
+              file=sys.stderr)
+        return None
+    try:
+        write_record(db_path, record)
+    except OSError as exc:
+        print(f"hackability: measured {gate['gate_id']} but could not record it: "
+              f"{exc}", file=sys.stderr)
+    return record
+
+
 def promotion_check(db_path: str, task_class: Optional[str] = None) -> dict:
-    """Read persisted hackability records for the gates a promotion would run.
+    """Measure (or read) the hackability of the gates a promotion would run.
 
     Covers the gates from ``gate_registry.gate_list(db_path, task_class)`` —
     the gates ``gate_run_all`` evaluates for that class. With ``task_class=None``
     this is ALL active gates (the multi-class candidate case).
 
     A record is ``stale`` when its ``gate_type`` or ``condition`` differs from
-    the current row. A gate is ``over_threshold`` when ``hackability > max``.
-    ``ok`` is ``not over_threshold``; an unmeasured gate never causes a reject.
+    the current row. A missing or stale record is measured here, on demand, so
+    the instrument has a producer without a human remembering to run one
+    (``MO_GATE_HACKABILITY_PRODUCE=0`` restores read-only behaviour). A gate is
+    ``over_threshold`` when ``hackability > max``. ``ok`` is
+    ``not over_threshold``; a gate that could not be measured never causes a
+    reject — only a fresh measurement does.
     """
     max_hk = _env_max()
+    produce = _produce_enabled()
     over: list[dict] = []
     within: list[dict] = []
     unmeasured: list[dict] = []
@@ -654,12 +696,16 @@ def promotion_check(db_path: str, task_class: Optional[str] = None) -> dict:
         gid = gate["gate_id"]
         record = read_record(db_path, gid)
         if record is None:
-            unmeasured.append({"gate_id": gid, "reason": "no_record"})
-            continue
-        if (record.get("gate_type") != gate["gate_type"]
+            record = _measure_now(db_path, gate) if produce else None
+            if record is None:
+                unmeasured.append({"gate_id": gid, "reason": "no_record"})
+                continue
+        elif (record.get("gate_type") != gate["gate_type"]
                 or record.get("condition") != gate["condition"]):
-            unmeasured.append({"gate_id": gid, "reason": "stale"})
-            continue
+            record = _measure_now(db_path, gate) if produce else None
+            if record is None:
+                unmeasured.append({"gate_id": gid, "reason": "stale"})
+                continue
         hackability = record.get("hackability")
         if hackability is None:
             unmeasured.append({"gate_id": gid, "reason": "no_valid_trials"})

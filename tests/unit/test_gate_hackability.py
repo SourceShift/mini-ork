@@ -462,22 +462,40 @@ def test_below_threshold(db, capsys):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (11) never audited → no_record; audited then stale → still promoted
+# (11) never audited → measured on demand; stale → re-measured; OFF → read-only
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_unmeasured_and_stale(db, capsys):
+def test_an_unmeasured_gate_is_measured_at_promotion(db, capsys):
+    """No record is no longer the steady state: the promotion gate produces it.
+
+    Before this, every promotion on a fresh DB reported ``no_record`` for every
+    gate and the reject rule could never fire — the instrument was consumed but
+    nothing in production wrote it (the hole ⑦ had).
+    """
     gid = _register(db, "scope_gate", '["code_fix"]')
+    assert hackability.read_record(str(db), gid) is None
 
     _seed_workflow(db)
     _seed_bench_all_pass(db, "cand-never")
     pobj = promotion_gate.promotion_evaluate(str(db), "cand-never")
     assert pobj["decision"] == "promoted"
-    assert {"gate_id": gid, "reason": "no_record"} in pobj["gate_hackability"]["unmeasured"]
+    hk = pobj["gate_hackability"]
+    assert hk["unmeasured"] == []
+    assert [g["gate_id"] for g in hk["within_threshold"]] == [gid]
 
-    # Audit, then UPDATE the condition → the record is now stale.
+    record = hackability.read_record(str(db), gid)
+    assert record is not None
+    assert record["hackability"] == 0.0  # the sound scope_gate
+    assert record["proposer"] is None    # deterministic operators only
+
+
+def test_a_stale_record_is_re_measured(db, capsys):
+    gid = _register(db, "scope_gate", '["code_fix"]')
     rc = gate_fuzz.main(["--hackability", "--gate", gid, "--db", str(db), "--json"])
     assert rc == 0
+    first = hackability.read_record(str(db), gid)
+
     con = sqlite3.connect(str(db))
     try:
         con.execute(
@@ -488,10 +506,24 @@ def test_unmeasured_and_stale(db, capsys):
     finally:
         con.close()
 
+    _seed_workflow(db)
     _seed_bench_all_pass(db, "cand-stale")
     pobj2 = promotion_gate.promotion_evaluate(str(db), "cand-stale")
     assert pobj2["decision"] == "promoted"
-    assert {"gate_id": gid, "reason": "stale"} in pobj2["gate_hackability"]["unmeasured"]
+    assert pobj2["gate_hackability"]["unmeasured"] == []
+    second = hackability.read_record(str(db), gid)
+    assert second is not None
+    assert second["condition"] == '["other_class"]'
+    assert second["measured_at"] >= first["measured_at"]
+
+
+def test_production_can_be_switched_off(db, monkeypatch):
+    """Read-only behaviour for a caller that must not pay the audit inline."""
+    monkeypatch.setenv("MO_GATE_HACKABILITY_PRODUCE", "0")
+    gid = _register(db, "scope_gate", '["code_fix"]')
+    check = hackability.promotion_check(str(db), "code_fix")
+    assert check["unmeasured"] == [{"gate_id": gid, "reason": "no_record"}]
+    assert hackability.read_record(str(db), gid) is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

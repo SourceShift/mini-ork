@@ -36,7 +36,10 @@ PINNED_STATES = {
     "②": "on inside certify; shadow in code-fix",
     "③": "live",
     "④": "live",
-    "⑤": "consumer on, producer manual",
+    # 2026-11-25: the promotion gate measures a gate that has no current record
+    # (deterministic operators only), so the consumer is also a producer — the
+    # same shape ⑦ took. `MO_GATE_HACKABILITY_PRODUCE=0` restores read-only.
+    "⑤": "live (deterministic operators, on demand)",
     "⑥": "opt-in per recipe",
     # 693dc18c made promotion_check the producer it used to only consume from:
     # the hermetic audit runs inside the gate (~0.06 s, no network, no model).

@@ -169,12 +169,17 @@ flowchart TB
 ④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
 at promotion, or when a recipe opts in, or their producer is a manual command.
 
-Two instruments still have a consumer but no automatic producer. ⑤: records
-come only from a manual `mini-ork gate-fuzz --hackability`. ⑩: `mini-ork
+One instrument still has a consumer but no automatic producer. ⑩: `mini-ork
 instruments verifier-mutation --observable <observable.json> --card <card.json>`
 writes `<card>.mutation.json`, the sidecar the verify catalog reads; without
-`--card` it prints the score and writes nothing. ⑦ *was* the third: the
-promotion gate read a record nothing in production wrote, so every promotion
+`--card` it prints the score and writes nothing. ⑤ *was* the second: records
+came only from a manual `mini-ork gate-fuzz --hackability`, so every promotion
+on a fresh DB read `no_record` for every gate and the reject rule could never
+fire. The promotion gate now measures a gate with no current record itself —
+deterministic operators only, no proposer, the same shape ⑦ took — and
+`gate-fuzz --hackability` stays the out-of-band producer that can spend a
+proposer budget. ⑦ *was* the third: the promotion gate read a record nothing in
+production wrote, so every promotion
 reported `unmeasured` and the guard could never fire. The gate now runs the
 audit itself (`oracle_integrity.promotion_check`) and `mini-ork instruments
 oracle-integrity` is the out-of-band producer, not a prerequisite. ⑧ has no
@@ -191,7 +196,7 @@ both halves.
 | ② | Differential check | `mini-ork certify`; `mini-ork run code-fix` in shadow (section ⑮) | on inside certify; shadow in code-fix |
 | ③ | Suite adequacy | every code-fix run (`recipes/code-fix/verifiers/test.py`) | **live** |
 | ④ | Level vector | the publisher, for recipes that declare levels (code_fix) | **live** |
-| ⑤ | Gate hackability | read by the promotion gate; records come only from a manual `mini-ork gate-fuzz --hackability` | consumer on, producer manual |
+| ⑤ | Gate hackability | the promotion gate — it audits a gate with no current record, then scores that record | **live** (deterministic operators, on demand) |
 | ⑥ | Equivalence operator | the behavioral verifier, for recipes whose contract declares an operator | opt-in per recipe |
 | ⑦ | Oracle integrity | the promotion gate — it audits the judge, then records and scores that record | **live** (hermetic, ~0.06 s) |
 | ⑧ | Judge validity | the promotion gate | **live in shadow** (the default); `1`/`enforce` quarantines |
@@ -345,14 +350,18 @@ An optional LLM proposer adds more candidates, but a proposal counts only if it 
 check. **Hackability** is `passed_bad / valid_trials`. Crashed trials are excluded and counted.
 
 **How it decides.** The record persists at `<db dir>/gate-hackability/<gate_id>.json`. `mini-ork promote` **refuses**
-a would-be promote that rests on a gate with hackability above `MO_GATE_HACKABILITY_MAX`. Unmeasured or stale gates
-never cause a rejection. (The RSI apply loop gates through its own evaluator and is unaffected.)
+a would-be promote that rests on a gate with hackability above `MO_GATE_HACKABILITY_MAX`. A gate with no record, or
+one whose `gate_type`/`condition` no longer matches its registry row, is measured right there — the five deterministic
+operators, no proposer, hermetic (a scratch DB and isolated env per gate) — and the fresh record is what the reject
+rule reads. A gate the audit could not measure never causes a rejection. (The RSI apply loop gates through its own
+evaluator and is unaffected.)
 
 **Knobs.**
 - `MO_GATE_HACKABILITY_N` (4, range 0–16): proposer documents per gate.
 - `MO_GATE_HACKABILITY_BUDGET_USD` (0.50).
 - `MO_GATE_HACKABILITY_MAX` (0.25).
 - `MO_PROMOTION_GATE_HACKABILITY` (ON).
+- `MO_GATE_HACKABILITY_PRODUCE` (ON): measure an unmeasured/stale gate at promotion time; `0` restores read-only.
 
 Run the audit with:
 
