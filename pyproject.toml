@@ -62,7 +62,7 @@ integrations = ["cryptography>=42"]
 # without one. It is optional by design: when it is absent the PDF extractor
 # fails closed with a message naming what to install, rather than degrading to
 # a blank preview. Required deps stay PyYAML + jsonschema.
-documents = ["pymupdf>=1.24,<2"]
+documents = ["pymupdf>=1.24,<3"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
 # Daytona cloud sandboxes as remote nodes (mini_ork/remote/providers/daytona.py):
 # `provider: daytona` in an environment profile. Imported only when that
