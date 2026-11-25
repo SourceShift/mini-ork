@@ -560,15 +560,31 @@ def spec_cwd() -> str:
     """The pytest working directory: the TARGET tree, never the engine.
 
     ``python -m pytest`` inserts the working directory at ``sys.path[0]``, so
-    this is also what makes the kickoff-named modules importable."""
+    this is also what makes the kickoff-named modules importable.
+
+    Two env values need care. ``MINI_ORK_ROOT`` names the ENGINE that
+    dispatched us, not this run's target. ``MINI_ORK_TARGET_REPO`` is also the
+    engine whenever a run is launched from the checkout (``bin/mini-ork``
+    defaults it to its own cwd), and ``mini_ork.runtime.run_roots`` already
+    excludes that value for exactly this reason. So skip engine pointers and
+    fall back to the cwd the executor set: ``_run_verifier_ref`` resolves it
+    from ``roots.target``, which is the worktree under test."""
+    engine = {
+        os.path.realpath(val)
+        for key in ("MINI_ORK_ROOT", "MINI_ORK_ENGINE_ROOT")
+        if (val := os.environ.get(key))
+    }
     for key in ("MO_TARGET_CWD", "MINI_ORK_TARGET_REPO"):
         val = os.environ.get(key)
-        if val and os.path.isdir(val):
+        if val and os.path.isdir(val) and os.path.realpath(val) not in engine:
             return val
+    cwd = os.getcwd()
+    if os.path.realpath(cwd) not in engine:
+        return cwd
     root = os.environ.get("MINI_ORK_ROOT")
     if root and os.path.isdir(root):
         return root
-    return os.getcwd()
+    return cwd
 
 
 def spec_timeout() -> tuple[int | None, str]:
