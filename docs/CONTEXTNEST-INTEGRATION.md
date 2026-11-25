@@ -14,6 +14,7 @@ mini-ork reads from and writes to a local [ContextNest](https://github.com/Sourc
 | **PR-5 composed CN endpoint** | ⏸ gated on PR-3 latency measurement | — |
 | **PR-6 outcome feedback loop** (EvoMem pattern) | ⏸ planned | — |
 | **Graph projection** (`POST /api/v1/graph/upsert` written best-effort from the learning pipeline) | ✅ shipped | mini-ork #204 |
+| **Learned-memory seam** (`semantic_memory` behind a protocol; CN primary, SQLite fallback) | ✅ shipped 2026-11-25 | `docs/architecture/memory-backend.md` |
 
 Full epic spec: `docs/roadmap/epics/agent-context-pack.md` in the ContextNest repo.
 
@@ -131,6 +132,18 @@ All three steps are **off by default since 2026-10-07**: they carry other sessio
 
 When mini-ork dispatches a Claude Code subagent or sees one stop, it also POSTs to CN's existing `/api/v1/cc/hook/*` endpoints. Mini-ork subagent sessions become first-class in the substrate alongside direct Claude Code sessions — same downstream consolidation, same feature inventory.
 
+### Memory backend seam (`mini_ork/memory/backends.py`)
+
+Learned memory — semantic memory today, lessons and patterns next — goes through one protocol with two implementations, so recall, learning and self-improvement ask the same place instead of each module deciding for itself. Design of record: `docs/architecture/memory-backend.md`.
+
+| Backend | What it serves |
+|---|---|
+| `cn` | `POST /api/v1/tools/store` on write, `POST /api/v1/tools/retrieve` on recall, `POST /api/v1/agent/outcome` for wins/losses, `POST /api/v1/tools/discard` to retire |
+| `sql` | the existing `semantic_memory` / `semantic_memory_uses` tables. This is the contract the CN backend was written against, not a degraded stub |
+| `auto` (default) | CN first; SQLite whenever CN cannot serve. Writes made on the SQLite side are marked `pending_cn=1` for `mini-ork memory sync` |
+
+`mini-ork memory status` prints which store is serving and how many writes are waiting to be replayed. Every run record carries `memory_backend` and `memory_fallback_reason`, so a run that silently answered from SQLite can be found afterwards.
+
 ## Configuration
 
 | Env var | Default | Effect |
@@ -140,6 +153,7 @@ When mini-ork dispatches a Claude Code subagent or sees one stop, it also POSTs 
 | `CN_HOOK_TIMEOUT_SEC` | **3** (was 1 pre-PR-1) | Hook POST timeout (the reachability ping uses `CN_TIMEOUT_SEC` instead — PR-1 fix) |
 | `CN_PING_TTL` | `30` | Seconds to cache reachability state |
 | `MO_DISABLE_CN` | unset | `1` → every CN call short-circuits, no network |
+| `MO_MEMORY_BACKEND` | `auto` | Where learned memory lives. `auto` = CN when a call succeeds, SQLite otherwise; `cn` = strict, raises rather than inventing an empty answer; `sql` = local only |
 | `MO_PLANNER_SHARED_CONTEXT` | unset | `1` puts the ContextNest planner blocks (role pack / capsule, recent sessions) and the active-state index back into the planner prompt. Off by default since 2026-10-07 |
 | `MO_USE_ROLE_PACKS` | `1` | **PR-3.** `0` to skip role packs and use only the generic capsule-or-retrieve path (only matters with `MO_PLANNER_SHARED_CONTEXT=1`) |
 | `CN_PREFETCH_REFRESH_SEC` | `1800` | Worker prefetch refresh cadence (30 min) |
@@ -148,6 +162,7 @@ When mini-ork dispatches a Claude Code subagent or sees one stop, it also POSTs 
 
 - **CN down** — every helper returns `{}` or empty string. Planner gets no CN block; worker prefetch file is absent. Mini-ork never blocks.
 - **CN slow** — `CN_TIMEOUT_SEC` clips reads at 8s; hooks at 3s. Above threshold, treated as down. The reachability ping (`cn_available`) uses the read budget so it doesn't false-negative under load (PR-1 fix; previous version used the hook budget and flipped to "down" intermittently on populated substrates).
+- **A healthy ping is not a working call** — measured 2026-11-25: `/api/v1/tools/retrieve` took 17.5 s because it embeds the query first, against the same 8 s read budget, so a daemon that answered every ping failed every recall. `MO_MEMORY_BACKEND=auto` therefore degrades to SQLite on a failed *operation* as well as on a failed ping, and marks those writes `pending_cn`. Strict `MO_MEMORY_BACKEND=cn` raises instead: that mode exists to refuse a local answer, not to hide a slow daemon.
 - **Stale CN data** — accepted. The audit motivating this integration is the proof: fresher than no data, never canonical. Workers should still verify against live code before acting on a CN atom — same rule as for any memory source.
 - **CN under consolidation pressure** — pre-PR-2, the worker would peg CPU at >90% retrying rate-limited embedder calls. PR-2 ships exponential backoff + adaptive concurrency drop, so the worker now backs off when the embedder returns `engine_overloaded`/429/`rate_limit` and recovers when the embedder does.
 
@@ -179,7 +194,7 @@ All harnesses produce evidence files with per-assertion verdicts + captured outp
   *derived* entities (`Run`/`Trace`/`GradientTarget`/`TaskClass` and their edges) that
   mini-ork already owns in its own sqlite. It is fire-and-forget — the substrate is
   unaffected when CN is unavailable, and no projection failure can fail a learning run.
-- **No fallback to a different memory backend.** When CN is down, mini-ork's local sqlite (`task_memory`, `failure_memory`) carries the load alone.
+- **No second memory backend.** *(Superseded 2026-11-25 for learned memory: the semantic store now has a SQLite implementation of the same protocol, because most installs will never run CN. See "Memory backend seam" above. `task_memory` / `failure_memory` are unchanged and still have no CN counterpart.)*
 - **No training of a retrieve-gating model.** Threshold-based gates only; revisit if signal proves weak.
 - **No tool-call-level instrumentation.** Hook framework only — substrate ingest stays at session-transcript granularity.
 
