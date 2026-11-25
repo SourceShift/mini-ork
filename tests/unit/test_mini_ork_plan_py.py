@@ -507,6 +507,22 @@ def test_dry_run_stub_still_rejected():
     assert plan.validate_plan(json.dumps(empty)) == "placeholder_plan"
 
 
+def test_a_contract_driven_plan_without_objective_is_not_a_stub():
+    """recipes/blog-post asks for title/audience/takeaways, never objective.
+
+    The plan OMITS the key; it does not emit it empty. Presence is the line
+    that separates a contract-driven plan from the stub (see
+    test_dry_run_stub_still_rejected for the empty-key side of it)."""
+    blog = {
+        "title_working": "Why agents need verification",
+        "audience": "engineers",
+        "target_word_count": 1400,
+        "key_takeaways": ["tests green is not proof"],
+        "verifier_contract": {"checks": [{"id": "c1", "description": "cites sources"}]},
+    }
+    assert plan.validate_plan(json.dumps(blog)) == "ok"
+
+
 def test_declared_plan_name_reads_the_artifact_contract(tmp_path):
     """The contract is the only place a recipe's plan name is written down
     before the run happens (epic-runner: ``epic-runner-plan.json``)."""

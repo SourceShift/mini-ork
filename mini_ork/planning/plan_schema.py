@@ -91,9 +91,22 @@ def _contains_placeholder(v):
     if isinstance(v, dict):
         if _is_stub_string(v.get("objective")):
             return True
-        # the dry-run stub is an empty shell: no objective, nothing to do
+        # the dry-run stub is an empty shell: no objective, nothing to do.
+        # A recipe planner contract may legitimately carry NEITHER key — e.g.
+        # recipes/blog-post asks for {title_working, audience, target_word_count,
+        # key_takeaways, verifier_contract} and never objective/decomposition.
+        # Reading that as the stub hard-rejected every blog-post run with
+        # "PLAN REJECTED ... placeholder values" while the judge was looking at
+        # a complete plan.
+        #
+        # The distinction that keeps both readings honest is presence, not
+        # emptiness: a contract-driven plan OMITS the key, while the stub and a
+        # plan that produced nothing both EMIT it empty. So an explicitly empty
+        # ``objective`` is still the stub's signature even when it carries
+        # verifier checks (the dry-run placeholder does exactly that).
         if not str(v.get("objective") or "").strip() and not (v.get("decomposition") or []):
-            return True
+            if "objective" in v or not (v.get("verifier_contract") or {}).get("checks"):
+                return True
         return False
     return _is_stub_string(v)
 
