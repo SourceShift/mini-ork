@@ -54,7 +54,7 @@ PINNED_STATES = {
     # is the consumer `rank_verifiers` never had — a below-floor pass is
     # downgraded to unmeasured. `MO_VERIFIER_MUTATION_PRODUCE=0` restores
     # production to the manual command.
-    "⑩": "live (six probes per PROVEN verdict)",
+    "⑩": "live (baseline + up to six mutant probes per PROVEN verdict)",
     "⑪": "removed (669c181c)",
     "⑫": "certify only",
     "⑬": "opt-in per recipe",

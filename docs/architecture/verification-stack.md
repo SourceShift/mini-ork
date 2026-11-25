@@ -206,7 +206,7 @@ both halves.
 | ⑦ | Oracle integrity | the promotion gate — it audits the judge, then records and scores that record | **live** (hermetic, ~0.06 s) |
 | ⑧ | Judge validity | the promotion gate | **live in shadow** (the default); `1`/`enforce` quarantines |
 | ⑨ | Reward↔evidence pairing | every GRPO writeback | **live** |
-| ⑩ | Verifier mutation | the behavioral verifier measures itself on PROVEN; `mini-ork verify` downgrades a below-floor pass | **live** (six probes per PROVEN verdict) |
+| ⑩ | Verifier mutation | the behavioral verifier measures itself on PROVEN; `mini-ork verify` downgrades a below-floor pass | **live** (baseline + up to six mutant probes per PROVEN verdict) |
 | ⑪ | Conformal abstention | — | removed (669c181c) |
 | ⑫ | Discrimination evidence | `mini-ork certify`, and only when candidates are passed | certify only |
 | ⑬ | Behavioral recomputation | the behavioral verifier, declared recipes | opt-in per recipe |
@@ -491,7 +491,7 @@ Two tiers, one call site: on a laptop the audit runs inline at promotion — no 
 - **`mini-ork verify`** asks the narrower question at verification time: is *this* verifier's green evidence? A measured, below-floor score downgrades the PROVEN to unmeasured (`pass: null`), which counts as neither pass nor fail. No card, no sidecar, or a corrupt sidecar leaves the pass alone.
 - **Abstention.** An UNVERIFIED variant abstains; the gate never converts abstention into a kill.
 
-**Where the measurement comes from.** `mini_ork/verify/behavioral.py::main` calls `autoproduce` after a PROVEN verdict, so a verifier that just accepted a live observable immediately scores itself against six mutated copies of that same descriptor — `kill_score = killed / (killed + survived)`, six extra probes on the same target. A REFUTED or UNVERIFIED verdict measures nothing (there is no proven baseline to mutate against), and the measurement can never change the verdict or the exit code: a failed write is a stderr note. The card is resolved as `MO_VERIFIER_MUTATION_CARD`, else the spec's sibling (`api_contract.observable.yaml` → `api_contract.card.yaml`), else `<nearest ancestor>/verifiers/<stem>.card.yaml` — the last is how a recipe-local observable finds the catalog card at the repo root. No card, no measurement: a sidecar nothing reads is litter.
+**Where the measurement comes from.** `mini_ork/verify/behavioral.py::main` calls `autoproduce` after a PROVEN verdict, so a verifier that just accepted a live observable immediately scores itself against six mutated copies of that same descriptor — `kill_score = killed / (killed + survived)`, seven extra probes on the same target — the scoring baseline itself is a probe, then one per applicable mutation (a mutation whose field the descriptor lacks is skipped, not probed). A REFUTED or UNVERIFIED verdict measures nothing (there is no proven baseline to mutate against), and the measurement can never change the verdict or the exit code: a failed write is a stderr note. The card is resolved as `MO_VERIFIER_MUTATION_CARD`, else the spec's sibling (`api_contract.observable.yaml` → `api_contract.card.yaml`), else `<nearest ancestor>/verifiers/<stem>.card.yaml` — the last is how a recipe-local observable finds the catalog card at the repo root. No card, no measurement: a sidecar nothing reads is litter.
 
 **Knobs.**
 - `MO_VERIFIER_MUTATION` (ON): mutation-discrimination scoring, both halves — `rank_verifiers` and the `mini-ork verify` admission check.
