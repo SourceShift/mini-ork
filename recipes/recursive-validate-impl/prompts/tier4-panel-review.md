@@ -1,5 +1,10 @@
 # Tier 4 - heterogeneous panel DoD review
 
+**Rust guidelines.** This recipe grants the `rust-skills` skill; it is
+materialized at `.claude/skills/rust-skills/` for the duration of this node.
+For a Rust target, read `SKILL.md` and cite the rule ids a finding violates;
+a style opinion with no rule id is not a finding.
+
 You are one of four distinct-family lenses: GLM, Kimi, OpenAI code, or MiniMax. You
 are reviewing the implementer's diff against the kickoff's DoD probes, hard
 rules, and quality expectations. Save your output to
@@ -22,10 +27,21 @@ rules, and quality expectations. Save your output to
    evidence where applicable.
 4. Check hard-rule compliance. Grep the diff and touched files for violations,
    and list each violation under `### Violated by:`.
-5. Search arxiv-search-tool, or an equivalent arxiv search tool if arxiv-search-tool is
-   unavailable, for `"<feature topic> latest techniques 2024-2026"`.
-6. Judge compliance with modern techniques for the feature class. Explain where
-   the implementation matches current practice and where it falls behind.
+5. Literature check — **only when the deliverable introduces or changes an
+   algorithm, a model interaction, or a technique the kickoff describes as
+   research-shaped.** Then run one arxiv search (a single query, bounded to a
+   couple of minutes) for `"<feature topic> latest techniques 2024-2026"`.
+   For API, infrastructure, transport, documentation, or refactor deliveries
+   write `- not applicable` under "Modern-technique compliance" and move on.
+   A slow or unavailable search tool never blocks a verdict.
+6. When step 5 applied, judge compliance with modern techniques for that
+   feature class: where the implementation matches current practice and where
+   it falls behind. Keep it to at most five bullets.
+
+Do not run the repository's test, lint, format, build, or demo commands
+yourself. Tier evidence is authoritative; the only exception is step 2's
+missing/unparsable/contradictory evidence. A panel that re-runs the suite adds
+minutes without changing the verdict.
 7. Flag claims where confidence is below 80 percent so the panel synthesizer can
    apply a verify-when-uncertain cross-model check.
 

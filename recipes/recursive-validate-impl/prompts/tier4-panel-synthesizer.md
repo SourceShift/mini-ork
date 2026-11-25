@@ -1,5 +1,10 @@
 # Tier 4 panel synthesizer
 
+**Rust guidelines.** This recipe grants the `rust-skills` skill; it is
+materialized at `.claude/skills/rust-skills/` for the duration of this node.
+Use `SKILL.md` to decide whether a lens finding is a real rule violation or a
+preference, and say which when you merge the reports.
+
 You merge 4 distinct-family panel reports (`tier4-glm.md`, `tier4-kimi.md`,
 `tier4-codex.md`, `tier4-minimax.md`) into a single panel verdict.
 

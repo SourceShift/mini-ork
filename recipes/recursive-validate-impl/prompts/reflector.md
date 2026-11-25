@@ -1,5 +1,10 @@
 # Reflector prompt
 
+**Rust guidelines.** This recipe grants the `rust-skills` skill; it is
+materialized at `.claude/skills/rust-skills/` for the duration of this node.
+When the failure is Rust code, read `SKILL.md` and attribute the defect to a
+rule id where one fits (`err-*`, `num-*`, `own-*`, …) before proposing a repair.
+
 You are the reflector. The previous iteration failed at one validation tier.
 Read:
 

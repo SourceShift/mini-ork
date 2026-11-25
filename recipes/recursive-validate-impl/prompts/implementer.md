@@ -1,8 +1,26 @@
 # Implementer prompt
 
+**Rust guidelines.** This recipe grants the `rust-skills` skill; it is
+materialized at `.claude/skills/rust-skills/` for the duration of this node.
+When the target repository contains Rust, read `SKILL.md` before writing code
+and apply its rules (ownership, error handling, unsafe, API design, async,
+numeric safety, lints). A change that violates a rule needs an explicit reason
+in the plan output, not silence.
+
 Apply the current plan in an isolated worktree or equivalent clean tree. Keep
 the patch scoped to the kickoff, the plan, and any reflector/replanner guidance
 from the current iteration. Preserve user changes in the main checkout.
+
+**Verification budget.** Verifier tiers own the full suite after you stop, so
+spend your own time on the edit, not on re-proving the repository. Run at most
+four commands, all scoped to the crates you touched: one type check
+(`cargo check -p <crate>`), the new or changed test target
+(`cargo test -p <crate> --test <file>`), `cargo fmt --all -- --check`, and —
+only when the kickoff's DoD names it — the documented demo/parity check. Do
+not run `--workspace`, `--all-targets`, `clippy --workspace`, benchmarks, or
+repeated full builds; they duplicate tier1/tier2, dominate node wall-clock,
+and their result is the verifiers' verdict, not yours. Re-read only the files
+you are about to edit; the kickoff and plan already name them.
 
 After editing, write `${MINI_ORK_RUN_DIR}/implementer-summary.json` as strict
 JSON with a mandatory `touched_files[]` array AND a mandatory `worktree_path`.

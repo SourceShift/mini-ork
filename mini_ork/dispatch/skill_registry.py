@@ -278,6 +278,16 @@ def materialize_skills(
             else:
                 link.symlink_to(source.resolve())
                 handle.created.append(link)
+        except FileExistsError:
+            # The existence check above is a TOCTOU window: parallel nodes (the
+            # tier4 lenses) materialize the same grant at the same moment, and
+            # losing that race is not a failure — the skill is present, which is
+            # everything the node needs. Failing the node here killed a lens
+            # and, through it, the whole quorum (run-1795141239-67295).
+            handle.skipped.append(name)
+            sys.stderr.write(
+                f"[skills] {link} was materialized concurrently; reusing it\n"
+            )
         except OSError as exc:
             raise SkillRegistryError(
                 f"cannot materialize skill {name!r} into {destination} "

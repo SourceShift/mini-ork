@@ -1,5 +1,10 @@
 # Replanner prompt
 
+**Rust guidelines.** This recipe grants the `rust-skills` skill; it is
+materialized at `.claude/skills/rust-skills/` for the duration of this node.
+Read `SKILL.md` before revising a plan that touches Rust, and keep the
+revision consistent with the rules the plan already commits to.
+
 You are the replanner. Read the previous `plan.json` and
 `${MINI_ORK_RUN_DIR}/reflector.json`, then produce a new plan that applies the
 reflector's `plan_mutation`.
