@@ -163,11 +163,11 @@ The last two are the ones that keep the honest-failure property from decaying.
 
 | Stage | Change | Why this order |
 |---|---|---|
-| S1 | seam + `resolve_backend` + `semantic_memory` on CN — **done 2026-11-25** (`mini_ork/memory/backends.py`, `mini_ork/cli/memory.py`, migration 0094) | smallest store with a real read/write loop; proves the seam |
+| S1 | seam + `resolve_backend` + the CN implementation of the semantic store — **done 2026-11-25** (`mini_ork/memory/backends.py`, `mini_ork/cli/memory.py`, migration 0094). The **live assembly path still reads SQLite**: `context_assembler` ranks lessons by a measured prior that CN cannot express yet (§4.1.1), so swapping the read path is S2's job, not S1's | smallest store with a real read/write loop; proves the seam |
 | S2 | lessons + gradients | the self-improvement loop; needs CN listing (4.1.1) |
 | S3 | patterns + decision basins | depends on S2's listing |
 | S4 | namespaced tables | mechanical once `list_kind` works |
-| S5 | `mini-ork memory status` / `memory sync`, retire dead SQL-only paths | operator surface last, when there is something to operate |
+| S5 | `mini-ork memory status`, retire dead SQL-only paths | `memory sync` shipped early with S1 (thin enough to build against one store); `status` waits until there is more than one store to report on, and the deletions wait until S2–S4 have moved the reads |
 
 ## 8. Falsifiers
 
@@ -184,3 +184,36 @@ The last two are the ones that keep the honest-failure property from decaying.
 - **F4 — Replay divergence.** If `memory sync` cannot reconcile offline writes
   without duplicates or lost counters, the fallback is data-losing and must be
   replaced with a hard requirement.
+
+## 9. Known gap after S1: the seam has no production caller
+
+Measured on the S1 merge (`9fa776ee`): `backends.resolve_backend()` is called
+only by its own contract tests. `context_assembler` still calls
+`semantic.rank_with_prior`, `semantic.upsert`, `semantic.record_retrievals` and
+`semantic.lookup_key` directly, and `memory_backend_statement()` says as much in
+its docstring — S1 leaves the live read path on SQLite, so the prompt reports
+`sql` truthfully.
+
+The reason is in §4.1: `semantic_lessons_md` does not free-text search. It gates
+patterns by a measured prior (`strength_score` = observed frequency) and only
+then reorders inside that gate by SimUtil-UCB utility. CN has no
+metadata-filtered listing and no per-atom score the prior could read, so recall
+from CN today would replace a measured prior with nearest-neighbour similarity —
+a silent change to *which* lessons are eligible. That is a correctness
+regression, not a latency one, and it is why the flip is S2.
+
+Before the flip:
+
+1. `GET /api/v1/memory/list` (`kind` / `namespace` / `since` / `limit`) and a
+   readable per-atom utility (§4.1.1.1–2) on the CN side.
+2. `CnMemoryBackend.list_kind` — which today raises `NotImplementedError`
+   naming that section — becomes the gate's query.
+3. `semantic_lessons_md` takes a backend from `resolve_backend()` and stops
+   importing `semantic` for the read path; `record_retrievals` and `lookup_key`
+   go through `record_use`.
+4. A parity test running the same corpus through both backends and asserting the
+   same lesson ordering, so "recall still works" is measured rather than assumed.
+
+Until then, `MO_MEMORY_BACKEND=cn` changes the prompt line and nothing else, and
+every run record carries `memory_backend` + `memory_fallback_reason` so the
+before/after is measurable from run records alone.
