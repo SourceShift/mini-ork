@@ -24,7 +24,19 @@ as sources") · Last worked: 2026-11-25 · Remaining: —
   `path/to/file.ext:42` anchors, so a 430-line, 73-anchor survey scored
   "2 sources, need ≥5" and the run was failed on citation style, not content.
 - Fix: the file:line anchor pattern now counts. Measured on the run:
-  lens-codex 2 → 26, total 146, `pass: true`.
+  lens-codex 2 → 26 → 78, run total 198, `pass: true`.
+- Anchor forms that count (`SOURCE_PATTERN`): `path/to/file.ext:42`,
+  repo-root `setup.py:12`, and `org/repo:path/file.py:42` (the directory part
+  is optional and may contain `:`, which the first version could not match).
+  A bare filename without `:42` is a mention, not an anchor, and does not count.
+- Regression test: `tests/unit/test_research_synthesis_source_verifier_py.py`
+  (commit `1cb3fd85`), four cases — anchors count, an uncited lens fails, a
+  line number is required, the synthesis must name every lens.
+- Known limits, left on purpose (named by the pre-push review): the extension
+  allowlist is fixed and case-sensitive, so a lens citing `.dart`, `.ex` or
+  `Dockerfile:12` still scores 0 on those lines; counting is per line, so N
+  anchors in one file read as N sources. Both widen what the gate accepts and
+  do not reopen this defect; revisit if another lens fails on style.
 
 ### 2. `request_changes` + `discard_synthesis` destroys the most expensive artifact
 
