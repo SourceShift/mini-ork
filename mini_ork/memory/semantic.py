@@ -232,7 +232,8 @@ CREATE TABLE IF NOT EXISTS semantic_memory (
   wins       INTEGER NOT NULL DEFAULT 0,
   retired_at      REAL    NOT NULL DEFAULT 0,
   retire_reason   TEXT    NOT NULL DEFAULT '',
-  retire_evidence TEXT    NOT NULL DEFAULT ''
+  retire_evidence TEXT    NOT NULL DEFAULT '',
+  pending_cn      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_semantic_memory_scope
   ON semantic_memory(scope);
@@ -272,6 +273,10 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("retired_at", "REAL NOT NULL DEFAULT 0"),
         ("retire_reason", "TEXT NOT NULL DEFAULT ''"),
         ("retire_evidence", "TEXT NOT NULL DEFAULT ''"),
+        # Set when the row was written while CN was unreachable. `mini-ork
+        # memory sync` replays those rows and clears the flag only on success
+        # (docs/architecture/memory-backend.md §5).
+        ("pending_cn", "INTEGER NOT NULL DEFAULT 0"),
     ),
     "semantic_memory_uses": (
         ("lane", "TEXT NOT NULL DEFAULT ''"),
@@ -553,6 +558,7 @@ def upsert(
     key: str,
     db_path: str | os.PathLike[str] | None = None,
     embedder: Embedder | None = None,
+    pending_cn: bool = False,
 ) -> int:
     """Insert or update the memory in ``scope`` identified by ``key``.
 
@@ -567,6 +573,12 @@ def upsert(
     ``wins`` — the track record belongs to the key, not to the wording — so a
     mirror can re-sync on every read without eroding what it has learned.
     Returns the memory id.
+
+    ``pending_cn=True`` marks the row as "written while ContextNest was down"
+    (docs/architecture/memory-backend.md §5). ``mini-ork memory sync`` replays
+    those rows and clears the flag only after CN accepts the write. A re-upsert
+    with ``pending_cn=False`` never clears an existing mark — only a successful
+    replay may do that.
     """
     if not isinstance(scope, str) or not scope.strip():
         raise ValueError("scope must be a non-empty string")
@@ -589,18 +601,29 @@ def upsert(
         if row is None:
             cur = conn.execute(
                 "INSERT INTO semantic_memory"
-                "(scope, text, embedding, created_at, meta) VALUES (?, ?, ?, ?, ?)",
-                (scope, text, _pack_embedding(vec), now, meta),
+                "(scope, text, embedding, created_at, meta, pending_cn) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (scope, text, _pack_embedding(vec), now, meta,
+                 1 if pending_cn else 0),
             )
             mid = _last_id(cur)
         else:
             mid = int(row["id"])
-            # Text and embedding only — uses/wins are untouched on purpose.
-            conn.execute(
-                "UPDATE semantic_memory SET text = ?, embedding = ?, created_at = ? "
-                "WHERE id = ?",
-                (text, _pack_embedding(vec), now, mid),
-            )
+            # Text and embedding only — uses/wins are untouched on purpose. A
+            # pending mark is only added, never cleared: clearing is sync's job,
+            # and only after CN has accepted the replay.
+            if pending_cn:
+                conn.execute(
+                    "UPDATE semantic_memory SET text = ?, embedding = ?, "
+                    "created_at = ?, pending_cn = 1 WHERE id = ?",
+                    (text, _pack_embedding(vec), now, mid),
+                )
+            else:
+                conn.execute(
+                    "UPDATE semantic_memory SET text = ?, embedding = ?, created_at = ? "
+                    "WHERE id = ?",
+                    (text, _pack_embedding(vec), now, mid),
+                )
         conn.commit()
     finally:
         conn.close()
@@ -647,6 +670,104 @@ def lookup_key(
     finally:
         conn.close()
     return int(row[0]) if row else None
+
+
+# ── pending_cn replay bookkeeping (docs/architecture/memory-backend.md §5) ──
+#
+# A row written while ContextNest was unreachable carries `pending_cn = 1`.
+# `mini-ork memory sync` reads those rows, replays them to CN, and clears the
+# flag only after CN accepts the write. Nothing here talks to CN — the backend
+# and the CLI own that — so these are the SQLite half of the fallback contract.
+
+
+def maybe_add_pending_column(conn: sqlite3.Connection) -> None:
+    """Add ``pending_cn`` to an existing ``semantic_memory`` (guarded ALTER).
+
+    ``_ensure_columns`` already does this through ``_ADDED_COLUMNS``; this
+    helper exists for callers that hold their own connection and predate the
+    bootstrap. Kept tiny and idempotent.
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info('semantic_memory')")}
+    if have and "pending_cn" not in have:
+        conn.execute(
+            "ALTER TABLE semantic_memory ADD COLUMN pending_cn INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def mark_pending(memory_id: int, *, db_path: str | os.PathLike[str] | None = None) -> bool:
+    """Flag ``memory_id`` as pending a CN replay. Returns False if it is gone."""
+    db = _resolve_db_path(db_path)
+    conn = _connect(db)
+    try:
+        cur = conn.execute(
+            "UPDATE semantic_memory SET pending_cn = 1 WHERE id = ?", (int(memory_id),)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def clear_pending(memory_id: int, *, db_path: str | os.PathLike[str] | None = None) -> bool:
+    """Clear the pending flag after a verified CN write. Idempotent."""
+    db = _resolve_db_path(db_path)
+    conn = _connect(db)
+    try:
+        cur = conn.execute(
+            "UPDATE semantic_memory SET pending_cn = 0 "
+            "WHERE id = ? AND pending_cn != 0",
+            (int(memory_id),),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def pending_records(
+    *,
+    db_path: str | os.PathLike[str] | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    """Rows waiting for a CN replay, oldest first.
+
+    Shape: ``{"id", "scope", "text", "key"}``. ``key`` is recovered from the
+    row's ``meta`` JSON when it carries one (the identity ``upsert`` writes);
+    rows written by ``add()`` have no key and yield ``None``, so the replay can
+    fall back to a content hash.
+    """
+    db = _resolve_db_path(db_path)
+    conn = _connect(db)
+    try:
+        sql = (
+            "SELECT id, scope, text, meta FROM semantic_memory "
+            "WHERE pending_cn = 1 ORDER BY id"
+        )
+        params: tuple = ()
+        if limit is not None and int(limit) > 0:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    out: list[dict] = []
+    for r in rows:
+        key = None
+        raw = r["meta"]
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    key = parsed.get("key")
+            except (TypeError, ValueError):
+                key = None
+        out.append({
+            "id": int(r["id"]),
+            "scope": r["scope"],
+            "text": r["text"],
+            "key": key,
+        })
+    return out
 
 
 def _utility(uses: int, wins: int) -> float:

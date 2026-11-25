@@ -1024,6 +1024,25 @@ def _static_emergent_block(dbp: str, limit: int, *,
     return "\n".join(lines)
 
 
+def memory_backend_statement(backend: str | None = None,
+                             fallback_reason: str = "") -> str:
+    """One line naming the memory backend that served the recalled-memory section.
+
+    Design of record §5: "The prompt section that carries recalled memory states
+    it in one line, so a memory-poor run is visible rather than mistaken for a
+    memory-less problem." Derived from ``MO_MEMORY_BACKEND`` without a probe —
+    S1 leaves the live read path on SQLite, so an unset/auto selection states
+    ``sql``, the store the prompt actually read.
+    """
+    if backend is None:
+        choice = (os.environ.get("MO_MEMORY_BACKEND") or "auto").strip().lower()
+        backend = choice if choice in ("cn", "sql") else "sql"
+    line = f"Memory backend: {backend}"
+    if fallback_reason:
+        line += f" (fallback: {fallback_reason})"
+    return line + "."
+
+
 def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
                         *, lane: str = "", node_id: str = "",
                         sources: list[dict] | None = None,

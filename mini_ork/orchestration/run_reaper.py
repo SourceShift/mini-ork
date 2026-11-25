@@ -317,8 +317,35 @@ def _read_verdict(db_path: str | Path, run_id: str) -> str | None:
         con.close()
 
 
+def _record_memory_backend(run_dir: Path, memory_backend: str | None,
+                           memory_fallback_reason: str = "") -> None:
+    """Persist which memory backend served this run (design §5).
+
+    ``task_runs`` is out of scope for S1's migration (only
+    ``semantic_memory``/``semantic_memory_uses`` may move), so the backend
+    travels with the run directory rather than the SQL row. A run whose memory
+    came from CN must be distinguishable from one that silently fell back, or a
+    memory-poor run looks like a memory-less problem. Best-effort: a failed
+    write must never block the close.
+    """
+    if not memory_backend:
+        return
+    payload = {"memory_backend": memory_backend}
+    if memory_fallback_reason:
+        payload["memory_fallback_reason"] = memory_fallback_reason
+    try:
+        path = Path(run_dir) / "memory-backend.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
-                     crashed: bool, rc: int | None = None, now: int | None = None) -> str | None:
+                     crashed: bool, rc: int | None = None, now: int | None = None,
+                     memory_backend: str | None = None,
+                     memory_fallback_reason: str = "") -> str | None:
     """Lifecycle teardown: a run that exits non-terminal gets a terminal status.
 
     Passed (``rc == 0``, no exception, ``verdict.json`` pass) → ``published``
@@ -344,6 +371,8 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
         return None
     if _has_unanswered_ask(run_dir):
         return None
+    # §5: record the backend that served memory before the row goes terminal.
+    _record_memory_backend(run_dir, memory_backend, memory_fallback_reason)
     now = int(time.time()) if now is None else now
     con = sqlite3.connect(str(db_path), timeout=15.0)
     try:

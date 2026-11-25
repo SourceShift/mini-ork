@@ -4701,7 +4701,18 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
         # first, then context v2), matching the IDE "Learning" tab contract
         # that the user's operator rules show up ahead of learned failure modes.
         sources[:0] = pref_sources + v2_sources
-    return pref_block + v2_block + block
+    rendered = pref_block + v2_block + block
+    if rendered:
+        # Design of record §5: the recalled-memory section says which backend
+        # served it, in one line, so a memory-poor run is visible. A disabled /
+        # empty block (MO_INJECT_LEARNINGS=0, non-LLM node) stays empty.
+        try:
+            from mini_ork import context_assembler as _ca
+            rendered = rendered.rstrip() + "\n" + \
+                _ca.memory_backend_statement() + "\n"
+        except Exception:  # noqa: BLE001 — never break prompt assembly  # fallback-guard: allow: a backend label must never fail an already-built prompt; a missing statement is a cosmetic omission
+            pass
+    return rendered
 
 
 def _intervention_gate_check(root, node_id, node_type, lane, node_desc):

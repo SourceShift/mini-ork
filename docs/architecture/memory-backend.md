@@ -126,6 +126,15 @@ Most users will not run ContextNest. Two consequences:
    prompt section that carries recalled memory states it in one line, so a
    memory-poor run is visible rather than mistaken for a memory-less problem.
 
+**A reachable daemon is not a working operation.** `available()` answers a
+health probe in ~1 s; a `retrieve` embeds the query first. Measured on the
+development box on 2026-11-25: `/api/v1/tools/retrieve` took **17.5 s** against
+`cn_client`'s 8 s read budget, so a daemon that probes healthy failed every
+recall. In `auto`, a failed CN *operation* therefore degrades to SQLite exactly
+as an unreachable daemon does — never raises, never returns `[]` — and logs
+which store served the answer. Strict `MO_MEMORY_BACKEND=cn` still raises: that
+mode exists to refuse a local answer, not to paper over a slow one.
+
 Writes made while CN is down are marked `pending_cn=1` in the SQLite row. When
 CN returns, `mini-ork memory sync` replays them idempotently (content-hash
 dedupe means a replay of an already-synced fact is a no-op) and clears the flag.
@@ -154,7 +163,7 @@ The last two are the ones that keep the honest-failure property from decaying.
 
 | Stage | Change | Why this order |
 |---|---|---|
-| S1 | seam + `resolve_backend` + `semantic_memory` on CN | smallest store with a real read/write loop; proves the seam |
+| S1 | seam + `resolve_backend` + `semantic_memory` on CN — **done 2026-11-25** (`mini_ork/memory/backends.py`, `mini_ork/cli/memory.py`, migration 0094) | smallest store with a real read/write loop; proves the seam |
 | S2 | lessons + gradients | the self-improvement loop; needs CN listing (4.1.1) |
 | S3 | patterns + decision basins | depends on S2's listing |
 | S4 | namespaced tables | mechanical once `list_kind` works |
@@ -165,9 +174,11 @@ The last two are the ones that keep the honest-failure property from decaying.
 - **F1 — Quality.** On the same task set, recall served by CN scores worse than
   SQLite (same lessons injected, worse outcomes). Then the substrate's ranking
   is not equivalent and `auto` must default to SQL, not CN.
-- **F2 — Latency.** Recall happens inside plan assembly; if the CN round-trip
-  pushes plan p95 past its budget, the seam needs a read-through cache before
-  the migration continues.
+- **F2 — Latency — OBSERVED 2026-11-25.** A CN `retrieve` took 17.5 s against
+  the 8 s read budget, so `auto` answered from SQLite on every call. The seam
+  did its job (no silent empty, no failed run), but S2 must not move the
+  lesson store until either the retrieve path is faster or a read-through
+  cache exists.
 - **F3 — Fallback is the norm.** If most runs fall back, the CN tier is not a
   tier; the effort belongs in SQLite and the directive is wrong for this user base.
 - **F4 — Replay divergence.** If `memory sync` cannot reconcile offline writes

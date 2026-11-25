@@ -358,6 +358,45 @@ def retrieve(query: str, limit: int = 8) -> str:
                       json.dumps({"query": query, "top_k": int(limit)}))
 
 
+def store(content: str, *, session_id: str = "",
+          importance: float | None = None,
+          metadata: dict | None = None) -> str:
+    """POST /api/v1/tools/store — write one fragment to ContextNest.
+
+    The memory backend seam's write path (``CnMemoryBackend.upsert``). CN
+    dedupes on content hash (``stable_fragment_id``), so replaying the same
+    content is a no-op. Returns the response body verbatim, or ``"{}"`` when CN
+    is disabled / unreachable — the caller raises a named error rather than
+    treating an empty body as a successful write. Reuses ``available()``; this
+    adds no second probe.
+    """
+    if _disabled() or not available():
+        return "{}"
+    body: dict = {"content": content, "metadata": metadata or {}}
+    if session_id:
+        body["session_id"] = session_id
+    if importance is not None:
+        body["importance"] = float(importance)
+    return _post_json("/api/v1/tools/store", json.dumps(body))
+
+
+def discard(atom_ids, reason: str = "") -> str:
+    """POST /api/v1/tools/discard — remove ids from the active set.
+
+    The CN half of ``MemoryBackend.retire`` (design §4.1.3). Returns the
+    response body verbatim, or ``"{}"`` when CN is disabled / unreachable.
+    """
+    if _disabled():
+        return "{}"
+    ids = [str(i) for i in (atom_ids or []) if str(i)]
+    if not ids or not available():
+        return "{}"
+    body: dict = {"atom_ids": ids}
+    if reason:
+        body["reason"] = reason
+    return _post_json("/api/v1/tools/discard", json.dumps(body))
+
+
 def persist_prefetch(block: str, label: str) -> str | None:
     """Append the injected CN block to ``$MINI_ORK_RUN_DIR/cn_prefetch/engine-<label>.md``.
 

@@ -1253,6 +1253,20 @@ def _write_execute_log(run_dir: str, out: str, err: str) -> None:
         fh.write(log)
 
 
+def _memory_backend_for_record() -> tuple[str, str]:
+    """The backend that served this run's memory (design §5): ``cn|sql`` + reason.
+
+    S1 leaves the live call sites on SQLite, so an unset/auto selection is
+    recorded as ``sql`` — that is the store the run actually read. An explicit
+    ``MO_MEMORY_BACKEND`` is honoured as declared. No probe: the run record
+    must not add a network round-trip to teardown.
+    """
+    choice = (context_env("MO_MEMORY_BACKEND", "") or "auto").strip().lower()
+    if choice in ("cn", "sql"):
+        return choice, ""
+    return "sql", ""
+
+
 def _close_run_record(sink: dict, *, crashed: bool, rc: int | None = None) -> None:
     """End the run's ``task_runs`` row, then drop its ``.pid``.
 
@@ -1269,7 +1283,12 @@ def _close_run_record(sink: dict, *, crashed: bool, rc: int | None = None) -> No
     try:
         db = resolve_db_path(context_env("MINI_ORK_DB") or None)
         if os.path.isfile(db):
-            run_reaper.close_run_record(db, sink.get("run_id") or "", Path(run_dir), crashed=crashed, rc=rc)
+            memory_backend, fallback_reason = _memory_backend_for_record()
+            run_reaper.close_run_record(
+                db, sink.get("run_id") or "", Path(run_dir), crashed=crashed, rc=rc,
+                memory_backend=memory_backend,
+                memory_fallback_reason=fallback_reason,
+            )
             # RB-39: revive the failure_memory writer. Its own try/except keeps
             # teardown fail-soft — a broken memory write must not stop the
             # close or the .pid release below.
@@ -2582,6 +2601,15 @@ def _execute_inprocess(rest, root):
     return mini_ork_execute.main(rest, root=root)
 
 
+def _memory_handler(rest, root):
+    """`memory` is in-process: `memory sync` reads/writes the same state.db the
+    caller is already in, and its exit code is the scriptable contract. It is
+    NOT added to `_NATIVE_MODULE_SUBS`, whose exact mapping is pinned by
+    tests/unit/test_native_dispatch_py.py."""
+    from mini_ork.cli import memory as memory_cmd
+    return memory_cmd.main(rest, root=root)
+
+
 # Recovery scope is an in-process hand-off (`recovery.planner._emit_recovery_env`):
 # the closure, strategy and entry node name the DAG of the run that computed
 # them. A `run` started as a child process inherits them — the spec-driven
@@ -2726,6 +2754,7 @@ def _build_default_registry() -> dict:
     registry["providers"] = _providers_handler
     registry["mcp"] = _mcp_handler
     registry["vault"] = _vault_handler
+    registry["memory"] = _memory_handler
     registry["version"] = _version_handler
     for alias in ("help", "--help", "-h"):
         registry[alias] = _help_handler
