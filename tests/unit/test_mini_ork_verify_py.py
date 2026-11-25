@@ -202,3 +202,81 @@ def test_rolled_back_artifact_is_attributed_to_rollback(tmp_path):
                     "evidence_path": str(reverted)}]
     assert "reverted by rollback" in e.getvalue()
     assert "missing or empty" not in e.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# instrument ⑩ consumer: a measured, non-discriminating verifier's pass is not
+# evidence. Unmeasured (no card, no sidecar) never blocks.
+# --------------------------------------------------------------------------- #
+
+
+def _card_dir(tmp_path):
+    d = tmp_path / "verifiers"
+    d.mkdir()
+    return d
+
+
+def _card_with_sidecar(d, stem, kill_score):
+    card = d / f"{stem}.card.yaml"
+    card.write_text("name: x\nkind: behavioral\n")
+    Path(str(card) + ".mutation.json").write_text(json.dumps({"kill_score": kill_score}))
+    return str(card)
+
+
+def test_a_verifier_with_no_card_is_left_alone(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_VERIFIER_MUTATION", raising=False)
+    assert ver._unadmitted_verifier(None, str(tmp_path), "api_contract") == ""
+    assert ver._unadmitted_verifier(str(tmp_path / "nope.py"), str(tmp_path), "api_contract") == ""
+
+
+def test_an_unmeasured_verifier_is_left_alone(tmp_path, monkeypatch):
+    """A card with no sidecar is unmeasured, and unmeasured never blocks."""
+    monkeypatch.delenv("MO_VERIFIER_MUTATION", raising=False)
+    d = _card_dir(tmp_path)
+    (d / "api_contract.card.yaml").write_text("name: x\n")
+    script = d / "api_contract.py"
+    script.write_text("")
+    assert ver._unadmitted_verifier(str(script), str(tmp_path), "api_contract") == ""
+
+
+def test_a_measured_nondiscriminating_verifier_is_not_admitted(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_VERIFIER_MUTATION", raising=False)
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_MIN", raising=False)
+    d = _card_dir(tmp_path)
+    _card_with_sidecar(d, "api_contract", 0.5)
+    script = d / "api_contract.py"
+    script.write_text("")
+    note = ver._unadmitted_verifier(str(script), str(tmp_path), "api_contract")
+    assert "mutation kill score 0.50" in note
+    assert "0.80" in note
+
+
+def test_a_discriminating_verifier_is_admitted(tmp_path, monkeypatch):
+    monkeypatch.delenv("MO_VERIFIER_MUTATION", raising=False)
+    d = _card_dir(tmp_path)
+    _card_with_sidecar(d, "api_contract", 1.0)
+    script = d / "api_contract.py"
+    script.write_text("")
+    assert ver._unadmitted_verifier(str(script), str(tmp_path), "api_contract") == ""
+
+
+def test_the_master_switch_restores_the_pass(tmp_path, monkeypatch):
+    d = _card_dir(tmp_path)
+    _card_with_sidecar(d, "api_contract", 0.5)
+    script = d / "api_contract.py"
+    script.write_text("")
+    monkeypatch.setenv("MO_VERIFIER_MUTATION", "off")
+    assert ver._unadmitted_verifier(str(script), str(tmp_path), "api_contract") == ""
+
+
+def test_a_root_verifiers_card_is_found_for_a_recipe_local_script(tmp_path, monkeypatch):
+    """The card may sit at ``<root>/verifiers`` even when the script does not."""
+    monkeypatch.delenv("MO_VERIFIER_MUTATION", raising=False)
+    root_cards = _card_dir(tmp_path)
+    _card_with_sidecar(root_cards, "api_contract", 0.2)
+    recipe = tmp_path / "recipes" / "x" / "verifiers"
+    recipe.mkdir(parents=True)
+    script = recipe / "api_contract.py"
+    script.write_text("")
+    assert "not admitted" in ver._unadmitted_verifier(
+        str(script), str(tmp_path), "api_contract")

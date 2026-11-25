@@ -78,8 +78,10 @@ feature decides and the evidence it writes.
 | `MO_JUDGE_VALIDITY_ROWS` | `200` | History rows audited per promotion check |
 | `MO_REWARD_EVIDENCE_PAIRING` | `"1"` | `1` drops positive rewards execution contradicts; `shadow` records and enqueues without dropping; `0`/`off` restores pre-pairing |
 | `MO_REWARD_DIVERGENCE_ENQUEUE_LIMIT` | `50` | Max reward-evidence divergences enqueued per writeback call |
-| `MO_VERIFIER_MUTATION` | `"1"` | Mutation-discrimination scoring of verifier cards; measured-below cards are dropped from ranking |
+| `MO_VERIFIER_MUTATION` | `"1"` | Mutation-discrimination scoring of verifier cards; `rank_verifiers` drops measured-below cards, and `mini-ork verify` records a measured-below verifier's pass as unmeasured instead of counting it |
 | `MO_VERIFIER_MUTATION_MIN` | `0.8` | Minimum kill score for a verifier card |
+| `MO_VERIFIER_MUTATION_PRODUCE` | `"1"` | A behavioral verifier that returns PROVEN measures its own discrimination before exiting (six extra probes on the same target) and writes the sidecar; `0`/`off` leaving production to `mini-ork instruments verifier-mutation` |
+| `MO_VERIFIER_MUTATION_CARD` | *(unset)* | Card to score against when it is not the observable spec's sibling (`api_contract.observable.yaml` → `api_contract.card.yaml`) |
 | `MO_ASSAY_DISCRIMINATION` | `"1"` | Candidates-discrimination term in the certify oracle |
 | `MO_DISCRIMINATION_MIN` | `1.0` | Required discrimination rate for a generated test |
 | *(removed)* `MO_CONFORMAL_ORACLE` | — | **Removed 2026-10-25 (`669c181c`)** with the split-conformal abstention gate. No verifier writes a confidence or a false-positive label, so the gate had nothing to calibrate on and this switch was never read. Re-adding a gate here requires the confidence writer first |

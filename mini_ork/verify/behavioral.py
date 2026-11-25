@@ -1350,6 +1350,53 @@ def _exit_code(status: str, abstain_exit: int) -> int:
     return abstain_exit  # UNVERIFIED
 
 
+def _produce_mutation_score(verdict: BehavioralVerdict, *, requester: Requester | None = None) -> None:
+    """Measure this verifier's discrimination now that it has proven something.
+
+    Instrument ⑩'s only producer used to be ``mini-ork instruments
+    verifier-mutation`` on a hand-supplied observable file, so a sidecar
+    existed only where someone remembered to measure. A PROVEN verdict is the
+    one moment the instrument has exactly what it needs: the descriptor that
+    just ran and a verifier that accepted it. The note goes to stderr because
+    stdout is the verdict envelope the dispatcher parses.
+
+    Never changes the exit code: an instrument that measures a passing
+    verifier must not be able to fail the run that produced the pass.
+    """
+    if verdict.status != PROVEN:
+        return
+    spec = os.environ.get("MO_OBSERVABLE_SPEC", "").strip()
+    if not spec:
+        # Built from MO_BEHAV_* there is no descriptor file to score against.
+        return
+    try:  # fallback-guard: allow: a measurement failure must never fail a green verifier
+        from mini_ork.gates import verifier_mutation
+
+        def _runner(observable: dict):
+            # Same transport as the verdict being measured: an injected
+            # requester (tests, a recording proxy) must not be swapped for a
+            # live HTTP call by the instrument.
+            return run(Observable.from_mapping(observable), requester=requester)
+
+        result = verifier_mutation.autoproduce(
+            spec,
+            card_path=os.environ.get("MO_VERIFIER_MUTATION_CARD") or None,
+            runner=_runner,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[behavioral] mutation score not produced: {type(exc).__name__}: {exc}\n"
+        )
+        return
+    if result["written"]:
+        sys.stderr.write(
+            f"[behavioral] mutation kill score {result['kill_score']:.2f} "
+            f"→ {result['written']}\n"
+        )
+    elif result["measured"]:
+        sys.stderr.write(f"[behavioral] mutation score not recorded: {result['reason']}\n")
+
+
 def main(argv: list[str] | None = None, *, requester: Requester | None = None) -> int:
     """CLI entrypoint for ``verifiers/*.py`` behavioral verifiers.
 
@@ -1376,6 +1423,7 @@ def main(argv: list[str] | None = None, *, requester: Requester | None = None) -
         return abstain_exit
 
     verdict = run(obs, requester=requester)
+    _produce_mutation_score(verdict, requester=requester)
     sys.stdout.write(verdict.to_json() + "\n")
     return _exit_code(verdict.status, abstain_exit)
 

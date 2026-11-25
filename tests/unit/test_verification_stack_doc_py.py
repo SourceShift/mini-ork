@@ -49,7 +49,12 @@ PINNED_STATES = {
     # column changes with it; enforcement is still the opt-in half.
     "⑧": "live in shadow (the default); `1`/`enforce` quarantines",
     "⑨": "live",
-    "⑩": "consumer on, producer manual",
+    # 2026-11-25: the producer is the PROVEN behavioral verdict itself (it
+    # measures its own discrimination before exiting), and `mini-ork verify`
+    # is the consumer `rank_verifiers` never had — a below-floor pass is
+    # downgraded to unmeasured. `MO_VERIFIER_MUTATION_PRODUCE=0` restores
+    # production to the manual command.
+    "⑩": "live (six probes per PROVEN verdict)",
     "⑪": "removed (669c181c)",
     "⑫": "certify only",
     "⑬": "opt-in per recipe",

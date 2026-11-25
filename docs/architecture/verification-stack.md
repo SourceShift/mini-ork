@@ -163,23 +163,28 @@ flowchart TB
   end
 ```
 
-## Where each instrument runs today (checked 2026-11-11)
+## Where each instrument runs today (checked 2026-11-25)
 
 "On by default" means on inside the path that calls the instrument. Only ③,
 ④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
 at promotion, or when a recipe opts in, or their producer is a manual command.
 
-One instrument still has a consumer but no automatic producer. ⑩: `mini-ork
-instruments verifier-mutation --observable <observable.json> --card <card.json>`
-writes `<card>.mutation.json`, the sidecar the verify catalog reads; without
-`--card` it prints the score and writes nothing. ⑤ *was* the second: records
-came only from a manual `mini-ork gate-fuzz --hackability`, so every promotion
-on a fresh DB read `no_record` for every gate and the reject rule could never
-fire. The promotion gate now measures a gate with no current record itself —
-deterministic operators only, no proposer, the same shape ⑦ took — and
-`gate-fuzz --hackability` stays the out-of-band producer that can spend a
-proposer budget. ⑦ *was* the third: the promotion gate read a record nothing in
-production wrote, so every promotion
+No instrument is left with a consumer and no producer. ⑩ *was* the last, and
+it had a second hole: its consumer (`rank_verifiers`) had no production
+caller either — only the tests — so a hand-written sidecar changed no run's
+behaviour. Both halves are now in the verifier path. A behavioral verifier
+that returns PROVEN measures its own discrimination before exiting
+(`verifier_mutation.autoproduce`), and `mini-ork verify` refuses to count that
+PROVEN as evidence when the measured kill score is below the floor, recording
+it as unmeasured. `mini-ork instruments verifier-mutation` stays the
+out-of-band producer for a descriptor no run probes. ⑤ was the one before it:
+records came only from a manual `mini-ork gate-fuzz --hackability`, so every
+promotion on a fresh DB read `no_record` for every gate and the reject rule
+could never fire. The promotion gate now measures a gate with no current
+record itself — deterministic operators only, no proposer, the same shape ⑦
+took — and `gate-fuzz --hackability` stays the out-of-band producer that can
+spend a proposer budget. ⑦ *was* the one before that: the promotion gate read
+a record nothing in production wrote, so every promotion
 reported `unmeasured` and the guard could never fire. The gate now runs the
 audit itself (`oracle_integrity.promotion_check`) and `mini-ork instruments
 oracle-integrity` is the out-of-band producer, not a prerequisite. ⑧ has no
@@ -201,7 +206,7 @@ both halves.
 | ⑦ | Oracle integrity | the promotion gate — it audits the judge, then records and scores that record | **live** (hermetic, ~0.06 s) |
 | ⑧ | Judge validity | the promotion gate | **live in shadow** (the default); `1`/`enforce` quarantines |
 | ⑨ | Reward↔evidence pairing | every GRPO writeback | **live** |
-| ⑩ | Verifier mutation | read by the verify catalog; records come only from a manual `mini-ork instruments verifier-mutation --card` | consumer on, producer manual |
+| ⑩ | Verifier mutation | the behavioral verifier measures itself on PROVEN; `mini-ork verify` downgrades a below-floor pass | **live** (six probes per PROVEN verdict) |
 | ⑪ | Conformal abstention | — | removed (669c181c) |
 | ⑫ | Discrimination evidence | `mini-ork certify`, and only when candidates are passed | certify only |
 | ⑬ | Behavioral recomputation | the behavioral verifier, declared recipes | opt-in per recipe |
@@ -483,13 +488,18 @@ Two tiers, one call site: on a laptop the audit runs inline at promotion — no 
 
 **How it decides.** The baseline must be PROVEN. `kill_score = killed / (killed + survived)`. An UNVERIFIED variant counts as abstained, never as killed.
 - **`rank_verifiers`** drops only cards measured below the threshold; unmeasured cards are retained.
+- **`mini-ork verify`** asks the narrower question at verification time: is *this* verifier's green evidence? A measured, below-floor score downgrades the PROVEN to unmeasured (`pass: null`), which counts as neither pass nor fail. No card, no sidecar, or a corrupt sidecar leaves the pass alone.
 - **Abstention.** An UNVERIFIED variant abstains; the gate never converts abstention into a kill.
 
-**Knobs.**
-- `MO_VERIFIER_MUTATION` (ON): mutation-discrimination scoring.
-- `MO_VERIFIER_MUTATION_MIN` (0.8): minimum kill score for a verifier card.
+**Where the measurement comes from.** `mini_ork/verify/behavioral.py::main` calls `autoproduce` after a PROVEN verdict, so a verifier that just accepted a live observable immediately scores itself against six mutated copies of that same descriptor — `kill_score = killed / (killed + survived)`, six extra probes on the same target. A REFUTED or UNVERIFIED verdict measures nothing (there is no proven baseline to mutate against), and the measurement can never change the verdict or the exit code: a failed write is a stderr note. The card is resolved as `MO_VERIFIER_MUTATION_CARD`, else the spec's sibling (`api_contract.observable.yaml` → `api_contract.card.yaml`), else `<nearest ancestor>/verifiers/<stem>.card.yaml` — the last is how a recipe-local observable finds the catalog card at the repo root. No card, no measurement: a sidecar nothing reads is litter.
 
-**Evidence.** Writes a `<card>.mutation.json` sidecar via `mini-ork instruments verifier-mutation --observable <observable.json> --card <card.json>` (without `--card` it prints the score and writes nothing; exit `2` means the verifier was not measured and no sidecar was written). "Not measured" includes the case where **no mutation applies at all** — a `function`-surface observable carries no `body`/`expect_status` field to corrupt, so it has no kill score; that exits `2` rather than writing a null one, because a null sidecar would replace a real earlier score and `admit(None)` is `True`. The certificate may carry `mutation_kill_score`.
+**Knobs.**
+- `MO_VERIFIER_MUTATION` (ON): mutation-discrimination scoring, both halves — `rank_verifiers` and the `mini-ork verify` admission check.
+- `MO_VERIFIER_MUTATION_MIN` (0.8): minimum kill score for a verifier card.
+- `MO_VERIFIER_MUTATION_PRODUCE` (ON): measure on a PROVEN verdict. `0`/`off`/`false`/`no` leaves production to the manual command.
+- `MO_VERIFIER_MUTATION_CARD` (unset): the card to score against when it is not the spec's sibling (`api_contract.observable.yaml` → `api_contract.card.yaml`).
+
+**Evidence.** Writes a `<card>.mutation.json` sidecar: in-run from a PROVEN behavioral verdict, or out of band via `mini-ork instruments verifier-mutation --observable <observable.json> --card <card.json>` (without `--card` it prints the score and writes nothing; exit `2` means the verifier was not measured and no sidecar was written). "Not measured" includes the case where **no mutation applies at all** — a `function`-surface observable carries no `body`/`expect_status` field to corrupt, so it has no kill score; that exits `2` rather than writing a null one, because a null sidecar would replace a real earlier score and `admit(None)` is `True`. The certificate may carry `mutation_kill_score`.
 
 ## ⑪ Conformal abstention — removed (2026-10)
 

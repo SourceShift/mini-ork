@@ -42,7 +42,7 @@ shipped **eight** more instruments, documented in sections ⑦–⑭ of
 | ⑦ | Oracle integrity audit (7 injected defects + 3 controls) | `mini_ork/gates/oracle_integrity.py` | `MO_ORACLE_INTEGRITY` (`1`) |
 | ⑧ | Judge validity vs execution evidence, per lane | `mini_ork/gates/judge_validity.py` | `MO_JUDGE_VALIDITY` (`shadow` by default; `1`/`enforce` quarantines; `0`/`off` disables), `MO_JUDGE_VALIDITY_MIN` (`0.80`, tighten-only) |
 | ⑨ | Reward↔evidence pairing (drop contradicted positive rewards) | `mini_ork/learning/reward_audit.py` + `learning/writeback.py` | `MO_REWARD_EVIDENCE_PAIRING` (`1`; `shadow`; `0`) |
-| ⑩ | Verifier mutation discrimination (6 mutations) | `mini_ork/gates/verifier_mutation.py` + `verify/catalog.py` | `MO_VERIFIER_MUTATION` (`1`), `MO_VERIFIER_MUTATION_MIN` (`0.8`) |
+| ⑩ | Verifier mutation discrimination (6 mutations) | `mini_ork/gates/verifier_mutation.py` + `verify/catalog.py`; produced by a PROVEN behavioral verdict, consumed by `mini-ork verify` | `MO_VERIFIER_MUTATION` (`1`, both halves), `MO_VERIFIER_MUTATION_MIN` (`0.8`), `MO_VERIFIER_MUTATION_PRODUCE` (`1`), `MO_VERIFIER_MUTATION_CARD` (unset) |
 | — | **Split-conformal abstention gate — REMOVED** (commit `669c181c`) | *gone*: `mini_ork/gates/conformal_gate.py` no longer exists | — |
 | ⑫ | Discrimination-anchored test evidence | `mini_ork/certify/discrimination.py` + `certify/oracle.py` | `MO_ASSAY_DISCRIMINATION` (`1`), `MO_DISCRIMINATION_MIN` (`1.0`) |
 | ⑬ | Behavioral recomputation (two independent replays) | `mini_ork/certify/recompute.py` + `verify/behavioral.py` | declared `Observable.recompute` block |

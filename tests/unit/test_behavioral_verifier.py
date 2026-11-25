@@ -7,6 +7,7 @@ the process-seam exit-code mapping. No network: the HTTP requester is injected.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -200,3 +201,87 @@ def test_main_abstain_exit_override(monkeypatch, capsys):
     rc = main()
     assert json.loads(capsys.readouterr().out)["status"] == UNVERIFIED
     assert rc == 0
+
+
+# --------------------------------------------------------------------------- #
+# instrument ⑩: a PROVEN verdict produces its mutation score
+# --------------------------------------------------------------------------- #
+
+_SPEC = {
+    "surface": "api",
+    "staging_url": "https://staging.example",
+    "target": "/health",
+    "expect_status": [200],
+    "expect_body": {"status": "ok", "region": "eu", "tags": ["a", "b"]},
+}
+
+
+def _write_spec(tmp_path, *, with_card=True):
+    import yaml
+
+    spec = tmp_path / "api_contract.observable.yaml"
+    spec.write_text(yaml.safe_dump(_SPEC), encoding="utf-8")
+    card = tmp_path / "api_contract.card.yaml"
+    if with_card:
+        card.write_text("name: api_contract\nkind: behavioral\n", encoding="utf-8")
+    return str(spec), str(card)
+
+
+def test_a_proven_verdict_measures_its_own_discrimination(tmp_path, monkeypatch, capsys):
+    spec, card = _write_spec(tmp_path)
+    monkeypatch.setenv("MO_OBSERVABLE_SPEC", spec)
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+    monkeypatch.delenv("MO_BEHAV_ABSTAIN_EXIT", raising=False)
+    reqr = FakeRequester(_ok(body={"status": "ok", "region": "eu", "tags": ["a", "b"]}))
+
+    rc = main([], requester=reqr)
+
+    assert rc == 0
+    payload = json.loads(Path(card + ".mutation.json").read_text(encoding="utf-8"))
+    assert payload["kill_score"] == 1.0
+    out, err = capsys.readouterr()
+    assert "mutation kill score 1.00" in err
+    # stdout stays the verdict envelope the dispatcher parses, on its own line
+    assert json.loads(out)["status"] == PROVEN
+
+
+def test_a_refuted_verdict_measures_nothing(tmp_path, monkeypatch):
+    spec, card = _write_spec(tmp_path)
+    monkeypatch.setenv("MO_OBSERVABLE_SPEC", spec)
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+    reqr = FakeRequester(_ok(status=500, body={"boom": True}))
+
+    assert main([], requester=reqr) != 0
+    assert not (tmp_path / "api_contract.card.yaml.mutation.json").exists()
+
+
+def test_the_measurement_cannot_change_the_verdict_or_the_exit_code(
+        tmp_path, monkeypatch, capsys):
+    """The instrument measures a green run; it must never be able to red it."""
+    from mini_ork.gates import verifier_mutation
+
+    spec, card = _write_spec(tmp_path)
+
+    def _no_space(_card, _result):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(verifier_mutation, "write_score", _no_space)
+    monkeypatch.setenv("MO_OBSERVABLE_SPEC", spec)
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+    reqr = FakeRequester(_ok(body={"status": "ok", "region": "eu", "tags": ["a", "b"]}))
+
+    assert main([], requester=reqr) == 0
+    assert not Path(card + ".mutation.json").exists()
+    out, err = capsys.readouterr()
+    assert json.loads(out)["status"] == PROVEN
+    assert "No space left on device" in err
+
+
+def test_no_card_means_no_sidecar(tmp_path, monkeypatch):
+    spec, card = _write_spec(tmp_path, with_card=False)
+    monkeypatch.setenv("MO_OBSERVABLE_SPEC", spec)
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+    reqr = FakeRequester(_ok(body={"status": "ok", "region": "eu", "tags": ["a", "b"]}))
+
+    assert main([], requester=reqr) == 0
+    assert not Path(card + ".mutation.json").exists()

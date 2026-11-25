@@ -417,6 +417,41 @@ def _declared_unmeasured(evidence) -> str:
     return ""
 
 
+def _unadmitted_verifier(script: str | None, root: str, name: str) -> str:
+    """Why a *measured* verifier's PROVEN must not count, or ``""``.
+
+    Instrument ⑩'s consumer: ``rank_verifiers`` drops a card whose sidecar kill
+    score is below the floor, but nothing in a run ever asked it. The question
+    that matters at verification time is narrower — should *this* verifier's
+    green be trusted? A verifier that accepts every mutated expectation has a
+    perfect pass record and no value, so its PROVEN is downgraded to unmeasured
+    (neither pass nor fail), exactly like a declared-vacuous envelope.
+
+    Unmeasured never blocks: no card, no sidecar, or a corrupt sidecar leaves
+    the pass alone. Only a measured, below-floor score is refused.
+    """
+    if script is None:
+        return ""
+    card = os.path.join(os.path.dirname(script), f"{_verifier_stem(name)}.card.yaml")
+    if not os.path.isfile(card):
+        card = os.path.join(root or "", "verifiers", f"{_verifier_stem(name)}.card.yaml")
+    if not os.path.isfile(card):
+        return ""
+    try:
+        from mini_ork.gates import verifier_mutation
+    except ImportError:
+        return ""
+    if not verifier_mutation.gate_enabled():
+        return ""
+    score = verifier_mutation.read_score(card)
+    if verifier_mutation.admit(score):
+        return ""
+    return (
+        f"verifier not admitted: mutation kill score {score:.2f} is below "
+        f"{verifier_mutation.min_kill():.2f}"
+    )
+
+
 def _safe_trace_write(payload: dict, db: str) -> None:
     """Persist verifier telemetry without making observability a failure mode."""
     try:
@@ -846,6 +881,9 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                 ok = False
             rc, out_tail = rc, _evidence_tail(r_stdout)
         unmeasured_note = _declared_unmeasured(Path(ev).read_bytes()) if ok else ""
+        if ok and not unmeasured_note:
+            # A measured, non-discriminating verifier's PROVEN is not evidence.
+            unmeasured_note = _unadmitted_verifier(script, root or "", name)
         if unmeasured_note:
             # Neither pass nor fail: recorded so "did not run" stays visible,
             # and kept out of both counts so it cannot lift the verdict.

@@ -50,14 +50,22 @@ UNVERIFIED = "UNVERIFIED"
 
 _MIN_KILL_ENV = "MO_VERIFIER_MUTATION_MIN"
 
+_PRODUCE_ENV = "MO_VERIFIER_MUTATION_PRODUCE"
+
+_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+
 __all__ = [
     "MUTATIONS",
     "DEFAULT_MIN_KILL",
     "mutate",
     "score",
     "admit",
+    "min_kill",
+    "gate_enabled",
     "write_score",
     "read_score",
+    "card_for_spec",
+    "autoproduce",
 ]
 
 
@@ -322,6 +330,24 @@ def admit(kill_score: float | None, *, min_kill: float | None = None) -> bool:
     return float(kill_score) >= threshold
 
 
+def min_kill() -> float:
+    """The admission floor in force (``MO_VERIFIER_MUTATION_MIN`` or the default).
+
+    Public so a caller can say *why* it refused a score instead of restating
+    the threshold in prose that then drifts from this module.
+    """
+    return _min_kill_from_env()
+
+
+def gate_enabled() -> bool:
+    """Whether ``MO_VERIFIER_MUTATION`` leaves mutation-discrimination on.
+
+    The master switch shared by the catalog's ranking and the verifier
+    dispatcher's admission check, so one knob turns both halves off.
+    """
+    return os.environ.get("MO_VERIFIER_MUTATION", "1").strip().lower() not in _OFF_VALUES
+
+
 # --------------------------------------------------------------------------- #
 # sidecar score persistence
 # --------------------------------------------------------------------------- #
@@ -374,3 +400,152 @@ def read_score(card_path: str) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+# --------------------------------------------------------------------------- #
+# autoproduce()
+# --------------------------------------------------------------------------- #
+
+_SPEC_SUFFIXES = (".observable.yaml", ".observable.yml", ".observable.json")
+
+
+def card_for_spec(spec_path: str) -> str:
+    """The catalog card that describes the verifier behind an observable spec.
+
+    The convention is sibling files in one directory:
+    ``api_contract.observable.yaml`` → ``api_contract.card.yaml``, and a bare
+    ``thing.yaml``/``thing.json`` descriptor → ``thing.card.yaml``.
+    """
+    directory = os.path.dirname(spec_path) or "."
+    base = os.path.basename(spec_path)
+    for suffix in _SPEC_SUFFIXES:
+        if base.endswith(suffix):
+            stem = base[: -len(suffix)]
+            break
+    else:
+        stem = os.path.splitext(base)[0]
+    return os.path.join(directory, stem + ".card.yaml")
+
+
+def _find_card(spec_path: str, card_path: str | None) -> str | None:
+    """Resolve the card for a descriptor: explicit, sibling, then ``<ancestor>/verifiers``.
+
+    The catalog's cards live at ``<root>/verifiers/`` while a recipe keeps its
+    observable next to its dispatcher, so the sibling convention alone would
+    never find the card for a recipe-local spec. The walk is bounded (eight
+    levels) and matches the exact stem, so it cannot pick up an unrelated
+    project's card from further up the tree.
+    """
+    if card_path:
+        return card_path if os.path.isfile(card_path) else None
+    sibling = card_for_spec(spec_path)
+    if os.path.isfile(sibling):
+        return sibling
+    stem = os.path.basename(sibling)[: -len(".card.yaml")]
+    directory = os.path.dirname(os.path.abspath(spec_path))
+    for _ in range(8):
+        candidate = os.path.join(directory, "verifiers", stem + ".card.yaml")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    return None
+
+
+def _load_spec_mapping(spec_path: str) -> dict:
+    with open(spec_path, encoding="utf-8") as fh:
+        text = fh.read()
+    if spec_path.endswith((".yaml", ".yml")):
+        import yaml  # lazy: the module's import-time contract stays stdlib-only
+
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"{spec_path}: observable descriptor must be a mapping")
+    return data
+
+
+def autoproduce(
+    spec_path: str,
+    *,
+    card_path: str | None = None,
+    runner=None,
+) -> dict:
+    """Measure a PROVEN observable's verifier and write its sidecar.
+
+    The manual producer is ``mini-ork instruments verifier-mutation``; this is
+    the in-run one, called by :func:`mini_ork.verify.behavioral.main` after a
+    PROVEN verdict. It costs one baseline probe plus one per applicable
+    mutation against the same live target — the price of measuring a verifier
+    that is already passing, paid once per PROVEN behavioral verification.
+
+    Never raises: a missing card, an unparseable spec, or a failed write
+    returns ``measured=False`` with the reason. A verifier that greened a run
+    must not be reddened by the instrument that measures it.
+
+    Returns ``{"measured", "written", "reason", "kill_score"}``.
+    """
+    if not _produce_enabled():
+        return {
+            "measured": False,
+            "written": None,
+            "reason": f"off ({_PRODUCE_ENV})",
+            "kill_score": None,
+        }
+    if not spec_path:
+        return {
+            "measured": False,
+            "written": None,
+            "reason": "no observable spec",
+            "kill_score": None,
+        }
+    card = _find_card(spec_path, card_path)
+    if card is None:
+        # No card means nothing reads the score; writing a sidecar next to a
+        # file nobody declared would only leave litter in the tree.
+        return {
+            "measured": False,
+            "written": None,
+            "reason": f"no verifier card for {spec_path}",
+            "kill_score": None,
+        }
+    try:
+        mapping = _load_spec_mapping(spec_path)
+        result = score(mapping, runner=runner)
+    except Exception as exc:  # fallback-guard: allow: the instrument must not fail the run it measures
+        return {
+            "measured": False,
+            "written": None,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "kill_score": None,
+        }
+    if not result.get("measured"):
+        return {
+            "measured": False,
+            "written": None,
+            "reason": str(result.get("reason") or "not measured"),
+            "kill_score": None,
+        }
+    try:
+        written = write_score(card, result)
+    except OSError as exc:
+        return {
+            "measured": True,
+            "written": None,
+            "reason": f"cannot write the sidecar: {exc}",
+            "kill_score": result.get("kill_score"),
+        }
+    return {
+        "measured": True,
+        "written": written,
+        "reason": "",
+        "kill_score": result.get("kill_score"),
+    }
+
+
+def _produce_enabled() -> bool:
+    """In-run production is on unless ``MO_VERIFIER_MUTATION_PRODUCE`` says no."""
+    return os.environ.get(_PRODUCE_ENV, "1").strip().lower() not in _OFF_VALUES

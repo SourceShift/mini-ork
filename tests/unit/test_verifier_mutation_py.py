@@ -421,3 +421,165 @@ def test_sidecar_unmeasured_stays_none(tmp_path):
         {"kill_score": None, "killed": 0, "survived": 0, "abstained": 0, "measured": False},
     )
     assert verifier_mutation.read_score(card) is None
+
+
+# --------------------------------------------------------------------------- #
+# 10. autoproduce(): the in-run producer for instrument ⑩
+# --------------------------------------------------------------------------- #
+
+
+def _strict_runner(original: dict):
+    """PROVEN for exactly ``original``, REFUTED for any mutated expectation."""
+
+    def _run(observable):
+        return _verdict(PROVEN if observable == original else REFUTED)
+
+    return _run
+
+
+def _spec_and_card(tmp_path, *, with_card=True):
+    """Write an observable spec beside its card; ``with_card=False`` omits the card."""
+    spec = tmp_path / "api_contract.observable.yaml"
+    spec.write_text("surface: api\n", encoding="utf-8")
+    card = tmp_path / "api_contract.card.yaml"
+    if with_card:
+        card.write_text("name: api_contract\nkind: behavioral\n", encoding="utf-8")
+    return str(spec), str(card)
+
+
+def test_card_for_spec_follows_the_sibling_convention():
+    assert verifier_mutation.card_for_spec("/x/api_contract.observable.yaml") == (
+        "/x/api_contract.card.yaml")
+    assert verifier_mutation.card_for_spec("/x/journey.observable.json") == (
+        "/x/journey.card.yaml")
+    assert verifier_mutation.card_for_spec("/x/thing.yaml") == "/x/thing.card.yaml"
+
+
+def test_autoproduce_writes_the_sidecar_a_proven_observable_earns(tmp_path, monkeypatch):
+    spec, card = _spec_and_card(tmp_path)
+    monkeypatch.setattr(verifier_mutation, "_load_spec_mapping", lambda _p: dict(RICH))
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+
+    result = verifier_mutation.autoproduce(spec, runner=_strict_runner(RICH))
+
+    assert result["measured"] is True
+    assert result["written"] == card + ".mutation.json"
+    assert verifier_mutation.read_score(card) == 1.0
+
+
+def test_autoproduce_is_a_no_op_without_a_card(tmp_path, monkeypatch):
+    """No card means no reader — writing a sidecar would only litter the tree."""
+    spec, card = _spec_and_card(tmp_path, with_card=False)
+    monkeypatch.setattr(verifier_mutation, "_load_spec_mapping", lambda _p: dict(RICH))
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+
+    result = verifier_mutation.autoproduce(spec, runner=_strict_runner(RICH))
+
+    assert result["measured"] is False
+    assert result["written"] is None
+    assert spec in result["reason"]
+    assert not Path(card + ".mutation.json").exists()
+
+
+def test_a_recipe_local_spec_finds_the_card_under_an_ancestor_verifiers_dir(
+        tmp_path, monkeypatch):
+    """Cards live at ``<root>/verifiers``; a recipe keeps its observable locally."""
+    root = tmp_path / "repo"
+    recipe = root / "recipes" / "x" / "verifiers"
+    recipe.mkdir(parents=True)
+    (root / "verifiers").mkdir()
+    (root / "verifiers" / "api_contract.card.yaml").write_text("name: api_contract\n")
+    spec = recipe / "api_contract.observable.yaml"
+    spec.write_text("surface: api\n", encoding="utf-8")
+    monkeypatch.setattr(verifier_mutation, "_load_spec_mapping", lambda _p: dict(RICH))
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+
+    result = verifier_mutation.autoproduce(str(spec), runner=_strict_runner(RICH))
+
+    assert result["written"] == str(root / "verifiers" / "api_contract.card.yaml.mutation.json")
+
+
+def test_an_explicit_card_that_does_not_exist_is_not_guessed_around(tmp_path, monkeypatch):
+    """``MO_VERIFIER_MUTATION_CARD`` is an operator instruction, not a hint."""
+    spec, card = _spec_and_card(tmp_path)  # a sibling card DOES exist
+    monkeypatch.setattr(verifier_mutation, "_load_spec_mapping", lambda _p: dict(RICH))
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+
+    result = verifier_mutation.autoproduce(
+        spec, card_path=str(tmp_path / "missing.card.yaml"), runner=_strict_runner(RICH))
+
+    assert result["measured"] is False
+    assert not Path(card + ".mutation.json").exists()
+
+
+def test_autoproduce_honours_an_explicit_card(tmp_path, monkeypatch):
+    spec, _card = _spec_and_card(tmp_path, with_card=False)
+    other = tmp_path / "elsewhere.card.yaml"
+    other.write_text("name: elsewhere\n", encoding="utf-8")
+    monkeypatch.setattr(verifier_mutation, "_load_spec_mapping", lambda _p: dict(RICH))
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+
+    result = verifier_mutation.autoproduce(
+        spec, card_path=str(other), runner=_strict_runner(RICH))
+
+    assert result["written"] == str(other) + ".mutation.json"
+
+
+def test_autoproduce_can_be_switched_off(tmp_path, monkeypatch):
+    spec, card = _spec_and_card(tmp_path)
+    monkeypatch.setenv("MO_VERIFIER_MUTATION_PRODUCE", "off")
+
+    result = verifier_mutation.autoproduce(spec, runner=_strict_runner(RICH))
+
+    assert result["measured"] is False
+    assert "MO_VERIFIER_MUTATION_PRODUCE" in result["reason"]
+    assert not Path(card + ".mutation.json").exists()
+
+
+def test_autoproduce_reports_an_unmeasurable_observable_instead_of_writing_null(
+        tmp_path, monkeypatch):
+    """A ``function`` observable has no mutatable field; ``admit(None)`` is True,
+    so a null sidecar would silently replace a real earlier score."""
+    spec, card = _spec_and_card(tmp_path)
+    flat = {"surface": "api", "target": "/x"}
+    monkeypatch.setattr(verifier_mutation, "_load_spec_mapping", lambda _p: dict(flat))
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+
+    result = verifier_mutation.autoproduce(spec, runner=_strict_runner(flat))
+
+    assert result["measured"] is False
+    assert result["written"] is None
+    assert not Path(card + ".mutation.json").exists()
+
+
+def test_autoproduce_never_raises_on_an_unparseable_spec(tmp_path, monkeypatch):
+    spec, card = _spec_and_card(tmp_path)
+
+    def _boom(_path):
+        raise ValueError("not a mapping")
+
+    monkeypatch.setattr(verifier_mutation, "_load_spec_mapping", _boom)
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_PRODUCE", raising=False)
+
+    result = verifier_mutation.autoproduce(spec, runner=_strict_runner(RICH))
+
+    assert result["measured"] is False
+    assert "not a mapping" in result["reason"]
+    assert not Path(card + ".mutation.json").exists()
+
+
+def test_the_master_switch_covers_both_halves(monkeypatch):
+    for value in ("0", "off", "false", "no"):
+        monkeypatch.setenv("MO_VERIFIER_MUTATION", value)
+        assert verifier_mutation.gate_enabled() is False, value
+    monkeypatch.setenv("MO_VERIFIER_MUTATION", "1")
+    assert verifier_mutation.gate_enabled() is True
+    monkeypatch.delenv("MO_VERIFIER_MUTATION", raising=False)
+    assert verifier_mutation.gate_enabled() is True
+
+
+def test_min_kill_reads_the_floor_from_the_env(monkeypatch):
+    monkeypatch.delenv("MO_VERIFIER_MUTATION_MIN", raising=False)
+    assert verifier_mutation.min_kill() == verifier_mutation.DEFAULT_MIN_KILL
+    monkeypatch.setenv("MO_VERIFIER_MUTATION_MIN", "0.65")
+    assert verifier_mutation.min_kill() == 0.65
