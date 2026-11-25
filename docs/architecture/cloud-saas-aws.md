@@ -100,7 +100,7 @@ flowchart TB
         ROLE["IAM role - ExternalId trust"]
         NAT["NAT gateway - single AZ"]
     end
-    API -->|"HTTPS outbound poll"| NA
+    NA -->|"outbound long-poll, node initiates"| API
     RESOLVE --> API
     NA --> SBX
     NA --> ROLE
@@ -149,7 +149,7 @@ placement).
 
 ### 1.4 The recommended default: an isolation hierarchy, not a winner
 
-★★ **The lens reports never converge on a single isolation primitive, and the design must
+★ **The lens reports never converge on a single isolation primitive, and the design must
 not pretend they do.** (lens-kimi §1.1; lens-glm "Isolation tech dissent") The evidence:
 
 - Firecracker is efficient and peer-reviewed (Agache 2020) **but** its microarchitectural
@@ -174,7 +174,7 @@ The two line items that dominate surprise bills for chatty multi-AZ fleets are t
 gateway** (~$0.045/GB processed + ~$0.045-0.065/hr per AZ) and **cross-AZ transfer**
 ($0.01/GB each way) (GLM-20). The classic trap: a NAT gateway in one AZ serving workloads in
 another bills *both* the processing fee and the cross-AZ fee (GLM-22). Design rule: **one run
-= one AZ**, VPC endpoints for S3 / KMS / STS so routine traffic never traverses NAT. ★★
+= one AZ**, VPC endpoints for S3 / KMS / STS so routine traffic never traverses NAT. ★
 (Codex-C2's two-layer GC and Opus failure mode A agree the run must survive a quiet turn —
 which is why `auto_stop_interval` is 0 and `ttl_minutes` is the cap in
 `docs/architecture/cloud-sandbox-providers.md` DT4.)
@@ -185,7 +185,7 @@ which is why `auto_stop_interval` is 0 and `ttl_minutes` is the cap in
 
 ### 2.1 Split in standard vocabulary
 
-★★ **The split has a name and a standard shape.** The hosted control plane is the NIST
+★ **The split has a name and a standard shape.** The hosted control plane is the NIST
 SP 800-207 **Policy Engine (PE) + Policy Administrator (PA)**; the customer-plane node agent
 is the **Policy Enforcement Point (PEP)** (Rose et al. 2020, NIST SP 800-207; extended to
 multi-location cloud-native deployments by Chandramouli & Butcher 2023, NIST SP 800-207A).
@@ -254,7 +254,7 @@ customer content**.
   says plainly that the ledger is "an application-level capability boundary, not OS
   isolation" — a hosted transform is where that boundary thins.
 
-★★ **The trust asymmetry is the product risk** (lens-opus §3; lens-glm gap 3: the API
+★ **The trust asymmetry is the product risk** (lens-opus §3; lens-glm gap 3: the API
 contract and its visibility limits are exactly what no public BYOC vendor publishes). A
 hosted synthesizer that can read every prompt is a liability, not a telemetry asset.
 
@@ -318,7 +318,7 @@ decision, not packaging.
    killed node cannot be double-billed: `acquire_run_node` / `release_run_node` already
    serialize this per-run across processes (`mini_ork/remote/providers/base.py`), and the
    reaper is a label/age sweep (`reap_node_providers`, `base.py:395`) *plus* a server-side
-   TTL (the two-layer GC in `docs/architecture/cloud-sandbox-providers.md` DT4). ★★ Five
+   TTL (the two-layer GC in `docs/architecture/cloud-sandbox-providers.md` DT4). ★ Five
    surveyed implementations use the two-layer pattern; nobody relies on one (Codex-C2).
 
 ### 3.4 How usage is metered
@@ -472,7 +472,7 @@ Blog 2023-11, GLM-23; Datadog Security Labs 2024-09, GLM-24). The operational go
 
 ### 5.2 Threats, controls, and residual risk
 
-★★ The literature supplies the uncomfortable residual-risk language, and the design must
+★ The literature supplies the uncomfortable residual-risk language, and the design must
 carry it (lens-kimi §2 Goal 5; lens-opus §4).
 
 - **T1 — Customer-supplied code touches mini-ork credentials.** *Control:* the run sandbox
@@ -546,7 +546,7 @@ These are hard constraints, not preferences:
 ## 6. Delivery shape — two tiers in this repo
 
 The repo already documents the two-tier pattern three times (Codex "What this lens hands the
-synthesizer"); the cloud design reuses it rather than inventing a third variant. ★★ The
+synthesizer"); the cloud design reuses it rather than inventing a third variant. ★ The
 simple tier's failure mode — one machine, a local file, one operator — is the same class the
 literature names as the dominant exposure of shared automation with static credentials
 (arXiv:2504.14760), which is why the **security property must not be dropped** when the
@@ -588,7 +588,7 @@ two tenants in one process must use the contextvar layer, never `os.environ`.
   static-tier-with-commission product), not on the shape.
 - **★★ Aliases resolve from the tracked map, and an unknown alias is an error.** Codex
   (`config/agents.yaml:60-65`), Opus (failure mode B), Kimi (Goal 4) converge.
-- **★★ "The artifact graph is not isolation" must be stated, not implied.** Codex
+- **★ "The artifact graph is not isolation" must be stated, not implied.** Codex
   (`docs/architecture/artifact-graph.md:125-128`), Opus (failure mode C) converge — and the
   repo says it verbatim.
 - **★ Metering's tail/median tradeoff.** Kimi (arXiv:2611.24071) quantifies it; Opus (§6 rec 7)
@@ -771,7 +771,7 @@ checkbox in real procurement?
 ## Appendix A — Source manifest
 
 Every URL / arXiv ID / repo path cited across the four lenses and this synthesis, grouped by
-lens source. Repo paths are relative to `/Volumes/docker-ssd/ps/mini-ork` (working tree,
+lens source. Repo paths are relative to the repository root (working tree,
 2026-11-25).
 
 ### Repo (mini-ork) — grounded contracts
