@@ -49,6 +49,11 @@ class WorkflowNode:
     verifier_ref: str = ""
     model_lane: str = ""
     dispatch_mode: str = "serial"
+    # Per-node wall-clock bound, in minutes; 0 inherits MO_NODE_TIMEOUT_S.
+    # Declared by schemas/workflow.schema.json since the schema landed, but
+    # never compiled or read until now, so a recipe that set it got the global
+    # 25-minute node timeout instead.
+    timeout_minutes: float = 0.0
     requires_capabilities: tuple[str, ...] = ()
     # Capability envelope (SE-3 Phase B2): harness-level declarations that
     # travel with the node to dispatch (MO_MCP_SERVERS/MO_SKILLS/MO_AGENT_DOC).
@@ -284,6 +289,17 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
     strict_handshake = details.get("strict_handshake", False)
     if not isinstance(strict_handshake, bool):
         raise WorkflowCompileError(f"node {name} strict_handshake must be a boolean")
+    raw_timeout = details.get("timeout_minutes", 0) or 0
+    try:
+        timeout_minutes = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise WorkflowCompileError(
+            f"node {name} timeout_minutes must be a number"
+        ) from exc
+    if timeout_minutes < 0:
+        raise WorkflowCompileError(
+            f"node {name} timeout_minutes must be >= 0"
+        )
     return WorkflowNode(
         name=name,
         type=node_type,
@@ -292,6 +308,7 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         verifier_ref=str(details.get("verifier_ref") or ""),
         model_lane=str(details.get("model_lane") or ""),
         dispatch_mode=str(details.get("dispatch_mode") or "serial"),
+        timeout_minutes=timeout_minutes,
         requires_capabilities=capabilities,
         mcp_servers=mcp_servers,
         skills=skills,

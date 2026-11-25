@@ -870,6 +870,19 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
             _envelope["MO_SKILLS"] = ",".join(_decl.skills)
         if _decl.agent_doc:
             _envelope["MO_AGENT_DOC"] = _decl.agent_doc
+        # Per-node wall-clock bound. ``timeout_minutes`` was declared in
+        # schemas/workflow.schema.json but read by nothing, so one stalled
+        # lens held a panel for the global 25-minute node timeout. The
+        # dispatcher reads MO_NODE_TIMEOUT_S per lane attempt; publishing it
+        # here binds exactly this node. A node that declares no bound gets the
+        # operator's pinned base back, so one node's bound never leaks into
+        # the next dispatch.
+        _minutes = float(_decl.timeout_minutes or 0.0)
+        _base = int(_minutes * 60) if _minutes > 0 else _pinned_node_timeout()
+        publish_env({
+            "MO_NODE_TIMEOUT_S": str(_cap_dispatch_timeout(
+                _base, _deadline_remaining if _deadline_armed else None)),
+        })
     publish_env(_envelope)
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
     # diff captures only the implementer's delta (not pre-existing dirt from a
