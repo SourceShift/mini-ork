@@ -52,6 +52,55 @@ def _root_multi_project_config() -> str:
     return ""
 
 
+FEATURE_CFG_RE = re.compile(r'feature\s*=\s*"([A-Za-z0-9_\-]+)"')
+
+
+def manifest_for(path: str) -> str:
+    """Nearest Cargo.toml at or above ``path``; "" when there is none."""
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        cand = os.path.join(d, "Cargo.toml")
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            return ""
+        d = parent
+
+
+def package_name(manifest: str) -> str:
+    """``name`` from the manifest's [package] table, "" when unreadable."""
+    try:
+        with open(manifest, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    table = re.search(r"(?ms)^\[package\]\s*$(.*?)(?=^\[|\Z)", text)
+    if not table:
+        return ""
+    name = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', table.group(1))
+    return name.group(1) if name else ""
+
+
+def declared_features(manifest: str) -> set[str]:
+    """Keys of the manifest's [features] table, empty when it has none."""
+    try:
+        with open(manifest, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return set()
+    names: set[str] = set()
+    in_table = False
+    for line in text.splitlines():
+        s = line.split("#", 1)[0].strip()
+        if s.startswith("["):
+            in_table = s == "[features]"
+            continue
+        if in_table and "=" in s:
+            names.add(s.split("=", 1)[0].strip())
+    return names
+
+
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
 try:
@@ -170,6 +219,9 @@ rust_tail = ""
 rust_argv = []
 rust_pkgs = []
 rust_skipped = ""
+feature_rc = 0
+feature_tail = ""
+feature_argv = []
 RUST_FILES = [p for p in TOUCHED.split() if p.endswith(".rs") and os.path.exists(p)]
 if RUST_FILES:
     rust_pkgs = rust_packages(RUST_FILES)
@@ -184,6 +236,41 @@ if RUST_FILES:
         ev.write(f"$ {shlex.join(rust_argv)}\n")
         ev.flush()
         rust_rc, rust_tail = run_logged(rust_argv, EVIDENCE, stream=ev)
+
+        # A default-features run never executes a module behind an
+        # off-by-default feature: `#[cfg(feature = "x")]` compiles out, its
+        # tests disappear with it, and tier2 reports green on code it never
+        # ran (the OTel span work shipped that way; three tier4 lenses
+        # caught it). So when the touched files name a feature their own
+        # crate declares, run that crate once more with the feature on. Only
+        # features the manifest actually declares are enabled, so a
+        # `cfg(feature = ...)` borrowed from a dependency cannot turn into a
+        # cargo error.
+        cfg_feats: set[str] = set()
+        for p in RUST_FILES:
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    cfg_feats.update(FEATURE_CFG_RE.findall(fh.read()))
+            except OSError:
+                continue
+        if cfg_feats and rust_rc == 0:
+            per_pkg: dict[str, set[str]] = {}
+            for p in RUST_FILES:
+                mf = manifest_for(p)
+                pkg = package_name(mf)
+                if pkg not in rust_pkgs:
+                    continue
+                feats = declared_features(mf) & cfg_feats
+                if feats:
+                    per_pkg.setdefault(pkg, set()).update(feats)
+            for pkg in sorted(per_pkg):
+                feature_argv = ["cargo", "test", "--quiet", "-p", pkg,
+                                "--features", ",".join(sorted(per_pkg[pkg]))]
+                ev.write(f"$ {shlex.join(feature_argv)}\n")
+                ev.flush()
+                feature_rc, feature_tail = run_logged(feature_argv, EVIDENCE, stream=ev)
+                if feature_rc != 0:
+                    break
 
 # ── Python ──────────────────────────────────────────────────────────────────
 # A touched module runs its sibling test_<module>.py when one exists. Probing
@@ -207,7 +294,7 @@ if python_tests:
         ev.flush()
         python_rc, python_tail = run_logged(python_argv, EVIDENCE, stream=ev)
 
-passed = ts_passed and rust_rc == 0 and python_rc == 0
+passed = ts_passed and rust_rc == 0 and feature_rc == 0 and python_rc == 0
 
 ev.close()
 payload = {
@@ -218,6 +305,8 @@ payload = {
     "test_files": " ".join(TEST_FILES),
     "rust_rc": rust_rc,
     "rust_packages": rust_pkgs,
+    "rust_feature_rc": feature_rc,
+    "rust_feature_argv": " ".join(feature_argv),
     "python_rc": python_rc,
     "python_tests": python_tests,
 }
@@ -234,6 +323,7 @@ if not passed:
     for ok, suite_argv, rc, tail in (
         (ts_passed, argv, jest_rc, jest_tail),
         (rust_rc == 0, rust_argv, rust_rc, rust_tail),
+        (feature_rc == 0, feature_argv, feature_rc, feature_tail),
         (python_rc == 0, python_argv, python_rc, python_tail),
     ):
         if ok:
