@@ -1256,14 +1256,18 @@ def _write_execute_log(run_dir: str, out: str, err: str) -> None:
 def _memory_backend_for_record() -> tuple[str, str]:
     """The backend that served this run's memory (design §5): ``cn|sql`` + reason.
 
-    S1 leaves the live call sites on SQLite, so an unset/auto selection is
-    recorded as ``sql`` — that is the store the run actually read. An explicit
-    ``MO_MEMORY_BACKEND`` is honoured as declared. No probe: the run record
-    must not add a network round-trip to teardown.
+    S1 leaves the live call sites on SQLite, so the *store the run read* is
+    ``sql`` whatever was asked for — and recording whatever was asked for is
+    exactly the lie §5 exists to prevent. An explicit ``MO_MEMORY_BACKEND=cn``
+    is therefore recorded as ``sql`` with ``cn_not_wired``: it names a
+    declared intent the run did not honour, not a fallback that happened. The
+    field starts carrying ``cn`` on the day design §9's flip moves the call
+    sites, and that is the change this record exists to make visible. No probe:
+    the run record must not add a network round-trip to teardown.
     """
     choice = (context_env("MO_MEMORY_BACKEND", "") or "auto").strip().lower()
-    if choice in ("cn", "sql"):
-        return choice, ""
+    if choice == "cn":
+        return "sql", "cn_not_wired"
     return "sql", ""
 
 

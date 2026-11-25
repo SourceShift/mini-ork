@@ -80,6 +80,17 @@ The call sites already funnel through four modules — `memory/semantic.py`,
 Putting the protocol underneath those four is the change; everything above them
 keeps its current import and behaviour.
 
+**Except the readers that speak SQL.** Measured 2026-11-25: `web/routes/learning.py`
+(three queries plus a count), `ide_pages/context.py:625` and
+`ide_pages/learn/memory.py:289` select from `semantic_memory` /
+`semantic_memory_uses` directly, bypassing all four modules. They are the
+*display* surface — lesson tables, usage counts, the learn page — and they want
+exactly what CN cannot answer yet: a filtered listing and aggregate counts
+(§4.1.1). So they stay on SQLite until that endpoint exists, and a deployment
+whose learned memory lives only in CN will render those pages empty. Say that
+out loud rather than discovering it: the seam moves the *decision* path first,
+the display path second.
+
 ## 4. Mapping, table by table
 
 | SQLite | CN surface | Gap |
@@ -115,16 +126,43 @@ These are ContextNest changes, not mini-ork ones, and that repo is PR-only:
 4. **Bulk replay ingest** — one call for N records, so `mini-ork memory sync`
    after an offline period is not N round-trips.
 
+### 4.2 Identity: a synced row cannot be found again
+
+`memory sync` stores a pending row's text and receives an atom id back, and then
+throws it away: `semantic_memory` has no column holding CN's id (checked
+2026-11-25 — the only CN-related column is `pending_cn`). Consequences, in the
+order they bite:
+
+- A synced row cannot be retired in CN later — `tools/discard` takes atom ids.
+- CN's per-atom utility cannot be written back to the row that earned it, so the
+  `uses` / `wins` counters would stay SQLite-only even after a replay.
+- A second `memory sync` run re-stores the same text and relies on content-hash
+  dedupe to keep it as one atom; the local row and the atom remain unlinked.
+
+So the replay is currently one-way, and lossless only for the *text*. Before the
+live path can move, add either `semantic_memory.cn_atom_id TEXT` (nullable,
+guarded ALTER like 0094) or a `semantic_memory_cn(local_id, atom_id)` mapping
+table. The second is preferable: it keeps the SQLite schema free of another
+backend's identifier, and a row can be re-synced without rewriting it.
+
 ## 5. Fallback — the part that must not lie
 
 Most users will not run ContextNest. Two consequences:
 
 1. **`SqlMemoryBackend` is a first-class tier, not a degraded stub.** It is the
    contract all behaviour is written against; CN must match it, not the reverse.
-2. **Every run records which backend served its memory.** The run record gets
-   `memory_backend: cn|sql` and, on fallback, `memory_fallback_reason`. The
+2. **Every run records which backend served its memory.** `<run_dir>/memory-backend.json`
+   gets `memory_backend: cn|sql` and, on fallback, `memory_fallback_reason`. The
    prompt section that carries recalled memory states it in one line, so a
    memory-poor run is visible rather than mistaken for a memory-less problem.
+   It is a sidecar file rather than a `task_runs` column because S1 may not
+   migrate that table, and it is written on teardown — a run parked on an
+   unanswered ask, or killed before its `finally`, records nothing.
+   **It names the store the run actually read, not the one that was asked for:**
+   until §9's flip, a declared `MO_MEMORY_BACKEND=cn` records
+   `{"memory_backend": "sql", "memory_fallback_reason": "cn_not_wired"}`, because
+   a `cn` label on a run that read SQLite is exactly the lie this section exists
+   to prevent.
 
 **A reachable daemon is not a working operation.** `available()` answers a
 health probe in ~1 s; a `retrieve` embeds the query first. Measured on the
@@ -139,6 +177,14 @@ Writes made while CN is down are marked `pending_cn=1` in the SQLite row. When
 CN returns, `mini-ork memory sync` replays them idempotently (content-hash
 dedupe means a replay of an already-synced fact is a no-op) and clears the flag.
 Nothing is dropped, and nothing pretends to have synced.
+
+The queue only drains where CN exists. Today the mark is also set when CN is
+*disabled* (`MO_DISABLE_CN=1`), so an install that will never run ContextNest
+accumulates `pending_cn` rows with no drain target. That is harmless while the
+live path is SQLite — the rows are correct locally — but it would become an
+unbounded queue the moment someone syncs once by mistake. Two things are needed
+before the flip: mark only when CN is expected (not merely absent), and have
+`memory sync` report a permanent-pending state instead of implying progress.
 
 `MO_MEMORY_BACKEND=cn` is the strict mode for deployments that must never read
 stale local memory: with CN down, recall refuses with a clear error naming the
@@ -209,11 +255,20 @@ Before the flip:
 2. `CnMemoryBackend.list_kind` — which today raises `NotImplementedError`
    naming that section — becomes the gate's query.
 3. `semantic_lessons_md` takes a backend from `resolve_backend()` and stops
-   importing `semantic` for the read path; `record_retrievals` and `lookup_key`
-   go through `record_use`.
+   importing `semantic` for the read path. Its three remaining SQL calls map
+   differently and must not be lumped together:
+   - `record_outcome` → `record_use` (the `agent/outcome` call) — direct.
+   - `record_retrievals` is a *pre-outcome* link: it says "this run saw these
+     ids" before the run has finished. CN settles an outcome, it does not hold
+     an open retrieval, so this needs either an S2-side notion of a pending
+     settlement or a local-only ledger. Not a `record_use` call.
+   - `lookup_key` is key → id, which is a metadata filter — it needs §4.1's
+     listing/upsert-by-key, not `record_use`.
 4. A parity test running the same corpus through both backends and asserting the
    same lesson ordering, so "recall still works" is measured rather than assumed.
 
-Until then, `MO_MEMORY_BACKEND=cn` changes the prompt line and nothing else, and
-every run record carries `memory_backend` + `memory_fallback_reason` so the
-before/after is measurable from run records alone.
+Until then `MO_MEMORY_BACKEND=cn` still changes observable behaviour — the prompt
+line says `cn`, and strict mode raises for every seam operation, not just recall
+(each CN method calls `_require`) — but it cannot change *what a plan reads*,
+because no plan-time call site goes through the seam yet. Every teardown writes
+`memory-backend.json` so the before/after is measurable from run records alone.

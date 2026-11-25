@@ -285,6 +285,46 @@ def test_lifecycle_teardown_writes_status_then_releases_the_pid(home: Path, monk
     assert not (run_dir / ".pid").exists()
 
 
+# ── memory backend sidecar (design §5) ──────────────────────────────────────
+
+def test_memory_backend_for_record_names_the_store_that_was_read(monkeypatch) -> None:
+    monkeypatch.delenv("MO_MEMORY_BACKEND", raising=False)
+    assert cli_main._memory_backend_for_record() == ("sql", "")
+
+    monkeypatch.setenv("MO_MEMORY_BACKEND", "sql")
+    assert cli_main._memory_backend_for_record() == ("sql", "")
+
+    # A declared `cn` is not a store this run read: design §9 has not flipped the
+    # call sites, so recording `cn` would claim a backend nothing used.
+    monkeypatch.setenv("MO_MEMORY_BACKEND", "cn")
+    assert cli_main._memory_backend_for_record() == ("sql", "cn_not_wired")
+
+
+def test_teardown_writes_the_memory_backend_sidecar(home: Path, monkeypatch) -> None:
+    run_dir = _seed(home, "run-mem")
+    monkeypatch.setenv("MINI_ORK_DB", str(home / "state.db"))
+    monkeypatch.setenv("MO_MEMORY_BACKEND", "cn")
+    sink = {"run_id": "run-mem", "_pid_run_dir": str(run_dir)}
+
+    cli_main._close_run_record(sink, crashed=False)
+
+    payload = json.loads((run_dir / "memory-backend.json").read_text())
+    assert payload == {
+        "memory_backend": "sql",
+        "memory_fallback_reason": "cn_not_wired",
+    }
+
+
+def test_sidecar_write_failure_does_not_block_teardown(tmp_path: Path, monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+    run_reaper._record_memory_backend(tmp_path, "sql", "cn_not_wired")
+
+    assert not (tmp_path / "memory-backend.json").exists()
+
+
 # ── surfaces ────────────────────────────────────────────────────────────────
 
 def test_the_board_read_reaps_before_it_lists(home: Path, capsys) -> None:
