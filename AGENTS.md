@@ -12,6 +12,7 @@ This file is the canonical context map. Detail lives in `docs/`; procedural know
 - **[Artifact graph contracts](docs/architecture/artifact-graph.md)** — declared ports, run-local manifests, transforms, and visibility limits
 - **[Cloud sandbox providers](docs/architecture/cloud-sandbox-providers.md)** — node providers (static VMs, Daytona, …) behind one node-agent protocol; `--placement remote --env <profile>`
 - **[mini-ork Cloud on AWS](docs/architecture/cloud-saas-aws.md)** — design for running mini-ork in the customer's own AWS account: plane split, static node tiers + commission, customer-set lanes with BYO keys, threat model, build plan
+- **[Memory backend seam](docs/architecture/memory-backend.md)** — where learned memory lives: ContextNest primary when present, SQLite for every install, `MO_MEMORY_BACKEND` picks, fallback is logged and replayable
 - **[Verification stack](docs/architecture/verification-stack.md)** — relations, differential, suite adequacy, level vector, gate hackability, equivalence operator (suite adequacy + level vector gate every code-fix run; the rest run under `mini-ork certify`, at promotion, or opt-in — see the doc's "where each runs" table)
 - **[docs/operator](docs/operator)** — running mini-ork, env vars, troubleshooting
 - **[Python SDK](docs/PYTHON-SDK.md)** — embed mini-ork: importable primitives + the `MiniOrk` orchestrator client
