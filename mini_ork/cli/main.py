@@ -67,6 +67,11 @@ _NATIVE_SUBS = {
     # here for the same reason as `fallbacks` — `_NATIVE_MODULE_SUBS` is
     # pinned as a mirror of the retired runtime-select.sh mapping.
     "contribute",
+    # Deferred post-run learning: a run dispatched with
+    # MO_POST_RUN_LEARNING=0 returns as soon as its verdict is emitted, and
+    # `mini-ork settle <run_id>` runs the rubric/gradient/pattern channels
+    # afterwards. Added here for the same reason as `fallbacks`.
+    "settle",
 }
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this

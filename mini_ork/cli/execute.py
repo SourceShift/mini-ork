@@ -2443,6 +2443,17 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
     5. OTel / Langfuse export of this run (off unless both Langfuse keys
        resolve through the vault chain; MO_OTEL_EXPORT=0 opts out).
     """
+    # Latency gate: the learning side-channels cost 3-5 minutes per run
+    # (rubric grading, gradient extraction, pattern induction). A caller that
+    # places run completion on the critical path — a scheduler dispatching the
+    # next deliverable, a CI loop — can defer them with
+    # MO_POST_RUN_LEARNING=0 and settle later with `mini-ork settle <run_id>`,
+    # which runs this same function. Default unchanged.
+    if os.environ.get("MO_POST_RUN_LEARNING", "1").strip().lower() in {
+            "0", "off", "false", "no", "skip"}:
+        print("  [skip] post-run learning deferred (MO_POST_RUN_LEARNING=0); "
+              f"settle with: mini-ork settle {run_id}")
+        return
     # RB-41: give post-run work its own identity before any side channel runs.
     # ``publish_env`` dual-writes the contextvar (read by
     # ``run_nodes.node_id_for``) and ``os.environ`` (read by llm_dispatch's
