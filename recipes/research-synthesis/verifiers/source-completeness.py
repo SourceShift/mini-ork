@@ -29,13 +29,15 @@ LENSES = ("glm", "kimi", "codex", "opus")
 missing = []
 total_sources = 0
 
-# A code-pattern lens cites code, and its anchor is `path/to/file.ext:42` or
-# `org/repo:path/to/file.ext:42` — not a URL. Counting only URLs scored a
-# 430-line, 73-anchor survey as "2 sources" and failed the run on a citation
-# style, so the file:line anchor counts as a source too.
+# A code-pattern lens cites code, and its anchor is `path/to/file.ext:42`,
+# `file.ext:42`, or `org/repo:path/to/file.ext:42` — not a URL. Counting only
+# URLs scored a 430-line, 73-anchor survey as "2 sources" and failed the run on
+# a citation style, so the file:line anchor counts as a source too. The
+# directory part is optional (repo-root files such as `setup.py:12` are real
+# anchors) and may contain `:` so the `org/repo:` prefix form matches.
 SOURCE_PATTERN = re.compile(
     r"https?://|arxiv:|github\.com/|\([A-Z][a-z]+ [0-9]{4}\)"
-    r"|[\w.-]+/[\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|rb|java|kt|ya?ml|json|md|toml|tf|sh):\d+"
+    r"|[\w.-]+(?:/[\w.:/-]+)?\.(?:py|ts|tsx|js|jsx|go|rs|rb|java|kt|ya?ml|json|md|toml|tf|sh):\d+"
 )
 
 for lens in LENSES:
