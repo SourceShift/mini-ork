@@ -100,3 +100,40 @@ def test_without_a_root_config_the_server_runner_is_still_used(tmp_path, monkeyp
     argv = _recorded("pnpm-argv.txt").read_text(encoding="utf-8")
     assert "test:server" in argv
     assert _TEST_FILE in argv
+
+
+def _rust_fixture(tmp_path: Path) -> Path:
+    crate = tmp_path / "crates" / "foo"
+    (crate / "src").mkdir(parents=True)
+    (crate / "Cargo.toml").write_text(
+        '[package]\nname = "foo"\nversion = "0.1.0"\n', encoding="utf-8")
+    (crate / "src" / "lib.rs").write_text("pub fn x() {}\n", encoding="utf-8")
+    run_dir = tmp_path / "run-rust"
+    run_dir.mkdir()
+    (run_dir / "implementer-summary.json").write_text(
+        json.dumps({"ready_for_tier1": True,
+                    "touched_files": ["crates/foo/src/lib.rs"]}), encoding="utf-8")
+    return run_dir
+
+
+def test_missing_cargo_abstains_instead_of_greening(tmp_path, monkeypatch):
+    """Rust touched, cargo absent: nothing ran, so nothing passed.
+
+    The engine only abstains on a verdict that is NOT ``pass: true``
+    (``mini_ork/verify/levels.py``), so reporting green here made a Rust change
+    with no compiler on the box read as PROVEN.
+    """
+    run_dir = _rust_fixture(tmp_path)
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    env = {**os.environ, "MINI_ORK_RUN_DIR": str(run_dir), "PATH": str(empty_bin)}
+    result = subprocess.run([sys.executable, str(SCRIPT)], cwd=tmp_path, env=env,
+                            capture_output=True, text=True)
+
+    payload = json.loads(result.stdout)
+    assert payload["pass"] is False, result.stdout + result.stderr
+    assert payload["failure_kind"] == "toolchain"
+    assert payload["rust_skipped"] == "cargo is not on PATH"
+    assert result.returncode != 0

@@ -2408,7 +2408,8 @@ def _provision_remote_session(run_id: str, run_dir: str, db) -> bool:
 POST_RUN_NODE_ID = "post-run"
 
 
-def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
+def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None,
+                       *, force=False):
     """Post-run learning side-channels (each best-effort; never fail the run):
 
     0. implementer run-verified stamp (opt-in via MO_IMPL_REWARD=run_verified).
@@ -2449,7 +2450,11 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
     # next deliverable, a CI loop — can defer them with
     # MO_POST_RUN_LEARNING=0 and settle later with `mini-ork settle <run_id>`,
     # which runs this same function. Default unchanged.
-    if os.environ.get("MO_POST_RUN_LEARNING", "1").strip().lower() in {
+    #
+    # ``force`` is for that second caller. ``mini-ork settle`` exists precisely
+    # because the variable is set, so re-reading it there would defer again and
+    # the command would print "[deferred]" and exit 0 having graded nothing.
+    if not force and os.environ.get("MO_POST_RUN_LEARNING", "1").strip().lower() in {
             "0", "off", "false", "no", "skip"}:
         print("  [skip] post-run learning deferred (MO_POST_RUN_LEARNING=0); "
               f"settle with: mini-ork settle {run_id}")

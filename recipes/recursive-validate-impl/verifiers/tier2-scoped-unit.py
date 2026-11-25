@@ -219,6 +219,14 @@ rust_tail = ""
 rust_argv = []
 rust_pkgs = []
 rust_skipped = ""
+# A suite that never ran is not a suite that passed. Leaving ``rust_rc = 0`` for
+# "cargo is missing" let ``passed`` stay True, so the node reported ``pass: true``
+# on Rust code nothing executed — the vacuous green the abstention contract
+# exists to stop (``mini_ork/verify/levels.py``: only a NON-passing verdict can
+# abstain, so a green one carrying ``failure_kind: toolchain`` is still read as
+# PROVEN). The flag below forces ``pass: false`` + ``failure_kind: toolchain``,
+# which the executor turns into an abstention instead of a refutation.
+rust_unverified = False
 feature_rc = 0
 feature_tail = ""
 feature_argv = []
@@ -227,6 +235,7 @@ if RUST_FILES:
     rust_pkgs = rust_packages(RUST_FILES)
     if not shutil.which("cargo"):
         rust_skipped = "cargo is not on PATH"
+        rust_unverified = True
         ev.write("rust files touched but cargo is not on PATH - tier2 abstains on "
                  "the Rust part of this change\n")
     else:
@@ -281,11 +290,13 @@ python_tail = ""
 python_argv = []
 python_tests = python_test_files(TOUCHED.split())
 python_skipped = ""
+python_unverified = False
 if python_tests:
     probe = subprocess.run([sys.executable, "-m", "pytest", "--version"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if probe.returncode != 0:
         python_skipped = "pytest is not importable in this interpreter"
+        python_unverified = True
         ev.write("python tests exist but pytest is not importable - tier2 "
                  "abstains on the Python part of this change\n")
     else:
@@ -294,7 +305,8 @@ if python_tests:
         ev.flush()
         python_rc, python_tail = run_logged(python_argv, EVIDENCE, stream=ev)
 
-passed = ts_passed and rust_rc == 0 and feature_rc == 0 and python_rc == 0
+passed = (ts_passed and rust_rc == 0 and feature_rc == 0 and python_rc == 0
+          and not rust_unverified and not python_unverified)
 
 ev.close()
 payload = {
@@ -333,5 +345,10 @@ if not passed:
         payload["failure_kind"] = "code"
     elif kinds:
         payload["failure_kind"] = kinds[0]
+    elif rust_unverified or python_unverified:
+        # Nothing failed to judge the code — a runner was simply absent. Declare
+        # the toolchain so the executor abstains (ABSTAIN_RC) rather than reading
+        # this as a refutation.
+        payload["failure_kind"] = "toolchain"
 print(json.dumps(payload))
 sys.exit(0 if passed else 1)

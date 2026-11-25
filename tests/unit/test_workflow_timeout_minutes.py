@@ -44,3 +44,13 @@ def test_invalid_timeout_minutes_is_refused(tmp_path, value):
         compile_workflow(_write(tmp_path, [
             f"{{ name: bad, type: verifier, timeout_minutes: {value} }}",
         ]))
+
+
+@pytest.mark.parametrize("value", [".inf", ".nan"])
+def test_non_finite_timeout_minutes_is_refused(tmp_path, value):
+    """NaN fails ``< 0`` and ±inf passes ``int(m * 60)`` right up to dispatch,
+    where OverflowError lands mid-run with no node name in the message."""
+    with pytest.raises(WorkflowCompileError, match="finite"):
+        compile_workflow(_write(tmp_path, [
+            f"{{ name: bad, type: verifier, timeout_minutes: {value} }}",
+        ]))

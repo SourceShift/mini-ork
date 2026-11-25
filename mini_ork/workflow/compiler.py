@@ -7,6 +7,7 @@ explicit for recipes that opt into ``inputs`` / ``outputs`` declarations.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
@@ -299,6 +300,14 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
     if timeout_minutes < 0:
         raise WorkflowCompileError(
             f"node {name} timeout_minutes must be >= 0"
+        )
+    # ``.nan`` / ``.inf`` pass both checks above (a NaN compares False to < 0)
+    # and then blow up far from here — ``int(inf * 60)`` at dispatch raises
+    # OverflowError mid-run. Reject at compile time, where the message names the
+    # node.
+    if not math.isfinite(timeout_minutes):
+        raise WorkflowCompileError(
+            f"node {name} timeout_minutes must be finite"
         )
     return WorkflowNode(
         name=name,
