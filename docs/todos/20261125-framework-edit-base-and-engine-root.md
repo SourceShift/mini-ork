@@ -22,7 +22,10 @@ duplicates merged work, and the only signal is a diff that cannot apply.
 
 Suggested: `workspaces.create` should record its base commit in the run dir, and
 `mini-ork run` should warn (or refuse without `--allow-stale-base`) when the
-primary's HEAD is not an ancestor of `origin/main`. That turns a confusing
+checkout is **behind** — `git rev-list HEAD..origin/main` non-empty, i.e.
+`origin/main` is not an ancestor of HEAD. Note the direction: HEAD being *not an
+ancestor of* `origin/main` means local commits exist upstream does not have,
+which is a different (and usually harmless) condition. That turns a confusing
 apply-time failure into a one-line message at launch.
 
 ## 2. Excluded hunk: `bin/mini-ork` engine-root resolution in a linked worktree
@@ -45,5 +48,10 @@ in the operator notes, and nothing about the memory seam depends on it):
 Status: not started. Remaining: re-apply that hunk on current `main` as its own
 change, with a test that a launcher inside a linked worktree picks the worktree
 when the env pointer targets the worktree's main checkout and still honours the
-pointer when it names a genuinely different engine. The full hunk is in
-`.mini-ork/runs/run-1795604701-80144/framework-edit.diff`.
+pointer when it names a genuinely different engine.
+
+The hunk is preserved verbatim in `docs/todos/20261125-engine-root-hunk.diff`
+(74 lines, four hunks: the `own_root` branch, the moved `ENGINE_ROOT` bootstrap,
+the moved `install` fast path, and the comment above the late resolution). It
+was extracted from the run's `framework-edit.diff` because `.mini-ork/runs/` is
+gitignored and pruned — a pointer to that path would have rotted.

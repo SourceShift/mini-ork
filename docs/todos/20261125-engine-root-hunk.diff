@@ -1,0 +1,73 @@
+diff --git a/bin/mini-ork b/bin/mini-ork
+index 690fab3cea6e2b758391fd4e786eec018470c8f7..abb4fdb00b14533e4ebeebfe6d8c6c514899d982 100755
+--- a/bin/mini-ork
++++ b/bin/mini-ork
+@@ -18,9 +18,21 @@ def _absolute(path: str | Path) -> Path:
+ 
+ 
+ def _resolve_engine_root() -> Path:
++    own_root = _absolute(Path(__file__).resolve().parents[1])
+     for variable in ("MINI_ORK_ENGINE_ROOT", "MINI_ORK_ROOT"):
+         if value := os.environ.get(variable):
+-            return _absolute(value)
++            engine = _absolute(value)
++            main_checkout = _main_checkout_equivalent(own_root)
++            if (engine != own_root and main_checkout is not None
++                    and _absolute(main_checkout) == engine):
++                # This launcher lives in a linked worktree and the inherited
++                # pointer names that worktree's MAIN checkout. Run the
++                # worktree's own code: the worktree is the checkout under test,
++                # and honoring the pointer would silently dispatch its new CLI
++                # subcommands to a different tree (framework-edit runs execute
++                # <worktree>/bin/mini-ork to reach exactly that change).
++                return own_root
++            return engine
+ 
+     pointer_candidates: list[Path] = []
+     if home := os.environ.get("MINI_ORK_HOME"):
+@@ -61,14 +73,6 @@ def _configure_paths() -> Path:
+     return engine_root
+ 
+ 
+-try:
+-    ENGINE_ROOT = _configure_paths()
+-except (OSError, ValueError) as exc:
+-    print(exc, file=sys.stderr)
+-    raise SystemExit(2) from exc
+-sys.path.insert(0, str(ENGINE_ROOT))
+-
+-
+ def _bootstrap_install() -> int:
+     """Run installation without importing the optional full runtime stack."""
+     module_path = ENGINE_ROOT / "mini_ork" / "cli" / "install_command.py"
+@@ -84,10 +88,6 @@ def _bootstrap_install() -> int:
+     return module.main(sys.argv[2:], root=str(ENGINE_ROOT))
+ 
+ 
+-if len(sys.argv) > 1 and sys.argv[1] == "install":
+-    raise SystemExit(_bootstrap_install())
+-
+-
+ def _configure_windows_git_bash() -> None:
+     """Use the Bash bundled with Git for Windows when it is not globally exposed."""
+     if os.name != "nt" or shutil.which("bash"):
+@@ -145,6 +145,20 @@ def _main_checkout_equivalent(root: Path) -> Path | None:
+     return None
+ 
+ 
++# Resolved AFTER ``_main_checkout_equivalent``: ``_resolve_engine_root`` consults
++# it to tell an inherited engine pointer naming this launcher's main checkout
++# from one naming a genuinely different engine.
++try:
++    ENGINE_ROOT = _configure_paths()
++except (OSError, ValueError) as exc:
++    print(exc, file=sys.stderr)
++    raise SystemExit(2) from exc
++sys.path.insert(0, str(ENGINE_ROOT))
++
++if len(sys.argv) > 1 and sys.argv[1] == "install":
++    raise SystemExit(_bootstrap_install())
++
++
+ def _venv_python(root: Path) -> Path:
+     """Return the checkout runtime Python, optionally overridden for operators.

@@ -22,7 +22,7 @@ real cause is the `reference-transaction` guard rejecting the branch that
 fatal: ref updates aborted by hook
 ```
 
-`mini_ork/cli/main.py:1617` catches every `RuntimeError` from
+`mini_ork/cli/main.py:1646` catches every `RuntimeError` from
 `workspaces.create` and prints the single "not a git repo" message, so a guard
 rejection, a lockfile, a disk-full, or a genuinely missing repo are
 indistinguishable. Diagnosing it took a manual `git branch` probe; an operator

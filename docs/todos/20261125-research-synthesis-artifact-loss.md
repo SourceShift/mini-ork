@@ -32,9 +32,10 @@ as sources") · Last worked: 2026-11-25 · Remaining: —
 - Regression test: `tests/unit/test_research_synthesis_source_verifier_py.py`
   (commit `1cb3fd85`), four cases — anchors count, an uncited lens fails, a
   line number is required, the synthesis must name every lens.
-- Known limits, left on purpose (named by the pre-push review): the extension
-  allowlist is fixed and case-sensitive, so a lens citing `.dart`, `.ex` or
-  `Dockerfile:12` still scores 0 on those lines; counting is per line, so N
+- Known limits, left on purpose (named by the pre-push review): `SOURCE_PATTERN`
+  requires `\.<ext>:<digits>` from a fixed, case-sensitive allowlist, so a lens
+  citing `.dart`, `.ex`, or `Dockerfile:12` (no extension at all) still scores 0
+  on those lines; counting is per line, so N
   anchors in one file read as N sources. Both widen what the gate accepts and
   do not reopen this defect; revisit if another lens fails on style.
 
