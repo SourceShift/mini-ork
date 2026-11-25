@@ -51,7 +51,9 @@ Design of record: `docs/architecture/memory-backend.md`.
    section states it in one line.
 8. `tests/unit/test_memory_backend_contract_py.py` parametrizes the suite in
    the design doc §6 over both backends and passes; the CN case uses a recorded
-   HTTP fake, not a live daemon.
+   HTTP fake, not a live daemon. Any test that drives `available()` must clear
+   the file-backed ping cache first (`cn_client._ping_cache_file()`), or a
+   cached `up`/`down` from an earlier test makes the result order-dependent.
 9. `list_kind` is implemented for SQL now and returns a clear
    `NotImplementedError("CN listing: docs/architecture/memory-backend.md §4.1.1")`
    on the CN backend until that endpoint lands — an honest gap, not a silent `[]`.
