@@ -134,7 +134,9 @@ When mini-ork dispatches a Claude Code subagent or sees one stop, it also POSTs 
 
 ### Memory backend seam (`mini_ork/memory/backends.py`)
 
-Learned memory — semantic memory today, lessons and patterns next — goes through one protocol with two implementations, so recall, learning and self-improvement ask the same place instead of each module deciding for itself. Design of record: `docs/architecture/memory-backend.md`.
+Learned memory — semantic memory today, lessons and patterns next — has one protocol with two implementations, so recall, learning and self-improvement can ask the same place instead of each module deciding for itself. Design of record: `docs/architecture/memory-backend.md`.
+
+**Not every caller uses it yet.** As of 2026-11-25 the seam has no production caller on the lesson-assembly path: `context_assembler` still reads and writes `semantic_memory` directly, so a run answers from SQLite whatever `MO_MEMORY_BACKEND` says. The lesson gate is a measured prior (`strength_score`), and CN cannot answer that until `/api/v1/memory/list` exists — design §9 records the gap and what the flip needs.
 
 | Backend | What it serves |
 |---|---|
@@ -142,7 +144,7 @@ Learned memory — semantic memory today, lessons and patterns next — goes thr
 | `sql` | the existing `semantic_memory` / `semantic_memory_uses` tables. This is the contract the CN backend was written against, not a degraded stub |
 | `auto` (default) | CN first; SQLite whenever CN cannot serve. Writes made on the SQLite side are marked `pending_cn=1` for `mini-ork memory sync` |
 
-`mini-ork memory status` prints which store is serving and how many writes are waiting to be replayed. Every run record carries `memory_backend` and `memory_fallback_reason`, so a run that silently answered from SQLite can be found afterwards.
+`mini-ork memory sync` replays writes that were made while CN was unavailable (`pending_cn=1`), idempotently — a replayed fact dedupes on content hash. Each run that reaches a terminal state writes `<run_dir>/memory-backend.json` naming the backend it used, so a run that answered from SQLite can be found afterwards. In S1 that file says `sql` unless `MO_MEMORY_BACKEND` was set explicitly, because SQLite is the store the run actually read; the fallback-reason field starts carrying a value once a live call site can fall back.
 
 ## Configuration
 
@@ -153,7 +155,7 @@ Learned memory — semantic memory today, lessons and patterns next — goes thr
 | `CN_HOOK_TIMEOUT_SEC` | **3** (was 1 pre-PR-1) | Hook POST timeout (the reachability ping uses `CN_TIMEOUT_SEC` instead — PR-1 fix) |
 | `CN_PING_TTL` | `30` | Seconds to cache reachability state |
 | `MO_DISABLE_CN` | unset | `1` → every CN call short-circuits, no network |
-| `MO_MEMORY_BACKEND` | `auto` | Where learned memory lives. `auto` = CN when a call succeeds, SQLite otherwise; `cn` = strict, raises rather than inventing an empty answer; `sql` = local only |
+| `MO_MEMORY_BACKEND` | `auto` | Which backend the learned-memory seam selects. `auto` = CN when a call succeeds, SQLite otherwise; `cn` = strict, raises rather than inventing an empty answer; `sql` = local only. Until the lesson path moves (design §9) this changes what the seam and the run record report, not what a plan reads |
 | `MO_PLANNER_SHARED_CONTEXT` | unset | `1` puts the ContextNest planner blocks (role pack / capsule, recent sessions) and the active-state index back into the planner prompt. Off by default since 2026-10-07 |
 | `MO_USE_ROLE_PACKS` | `1` | **PR-3.** `0` to skip role packs and use only the generic capsule-or-retrieve path (only matters with `MO_PLANNER_SHARED_CONTEXT=1`) |
 | `CN_PREFETCH_REFRESH_SEC` | `1800` | Worker prefetch refresh cadence (30 min) |
@@ -162,7 +164,7 @@ Learned memory — semantic memory today, lessons and patterns next — goes thr
 
 - **CN down** — every helper returns `{}` or empty string. Planner gets no CN block; worker prefetch file is absent. Mini-ork never blocks.
 - **CN slow** — `CN_TIMEOUT_SEC` clips reads at 8s; hooks at 3s. Above threshold, treated as down. The reachability ping (`cn_available`) uses the read budget so it doesn't false-negative under load (PR-1 fix; previous version used the hook budget and flipped to "down" intermittently on populated substrates).
-- **A healthy ping is not a working call** — measured 2026-11-25: `/api/v1/tools/retrieve` took 17.5 s because it embeds the query first, against the same 8 s read budget, so a daemon that answered every ping failed every recall. `MO_MEMORY_BACKEND=auto` therefore degrades to SQLite on a failed *operation* as well as on a failed ping, and marks those writes `pending_cn`. Strict `MO_MEMORY_BACKEND=cn` raises instead: that mode exists to refuse a local answer, not to hide a slow daemon.
+- **A healthy ping is not a working call** — measured 2026-11-25: `/api/v1/tools/retrieve` took 17.5 s because it embeds the query first, against the same 8 s read budget, so a daemon that answered every ping failed every recall. The seam therefore treats a failed *operation* like a failed ping: under `MO_MEMORY_BACKEND=auto` it degrades to SQLite and marks those writes `pending_cn`; under strict `cn` it raises, because that mode exists to refuse a local answer, not to hide a slow daemon. (Today only the seam's own callers see this — see the note above.)
 - **Stale CN data** — accepted. The audit motivating this integration is the proof: fresher than no data, never canonical. Workers should still verify against live code before acting on a CN atom — same rule as for any memory source.
 - **CN under consolidation pressure** — pre-PR-2, the worker would peg CPU at >90% retrying rate-limited embedder calls. PR-2 ships exponential backoff + adaptive concurrency drop, so the worker now backs off when the embedder returns `engine_overloaded`/429/`rate_limit` and recovers when the embedder does.
 
