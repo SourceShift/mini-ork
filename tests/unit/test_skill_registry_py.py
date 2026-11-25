@@ -299,3 +299,37 @@ def test_granted_skills_accepts_a_comma_separated_string():
 
 def test_granted_skills_handles_none():
     assert granted_skills(_Workflow({"n": _Node(None)}), "n") == ()
+
+
+def test_losing_the_materialize_race_is_not_a_node_failure(tmp_path, monkeypatch,
+                                                          capsys):
+    """TOCTOU: the link check said "absent", the symlink call said "exists".
+
+    Parallel tier-4 lenses materialize the same grant at the same moment. The
+    loser raised FileExistsError, which failed the node and, through the
+    quorum, the whole panel (run-1795141239-67295). The skill being present is
+    everything the node needs, so the loser reuses it and carries on.
+    """
+    source = _make_skill(tmp_path / "registry", "rust-skills")
+    destination = target_skills_dir(tmp_path)
+    real_exists = Path.exists
+
+    def racing_exists(self):
+        # Opens the window the fix closes: the link is not there at check time.
+        if self.parent == destination and self.name == "rust-skills":
+            return False
+        return real_exists(self)
+
+    def racing_symlink(self, target, *args, **kwargs):
+        raise FileExistsError(17, "File exists")
+
+    monkeypatch.setattr(Path, "exists", racing_exists)
+    monkeypatch.setattr(Path, "symlink_to", racing_symlink)
+
+    handle = materialize_skills(
+        ["rust-skills"], tmp_path, registry={"rust-skills": source}, mode="symlink",
+    )
+
+    assert handle.skipped == ["rust-skills"]
+    assert handle.created == []
+    assert "materialized concurrently" in capsys.readouterr().err

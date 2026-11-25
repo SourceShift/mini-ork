@@ -163,6 +163,23 @@ def _pinned_node_timeout() -> int:
         return _DISPATCH_TIMEOUT_DEFAULT_S
 
 
+def _node_timeout_seconds(minutes: float | None,
+                          remaining: int | None = None) -> int:
+    """``MO_NODE_TIMEOUT_S`` for one node: its own bound, capped by the deadline.
+
+    A node that declares ``timeout_minutes`` gets exactly that many seconds —
+    ``timeout_minutes`` is declared in ``schemas/workflow.schema.json`` and the
+    dispatcher reads ``MO_NODE_TIMEOUT_S`` per lane attempt, so publishing the
+    product here binds this node and nothing else. A node that declares no
+    bound gets the operator's pinned base back, so one node's bound never leaks
+    into the next dispatch (``_pinned_node_timeout`` explains why re-reading
+    ``MO_NODE_TIMEOUT_S`` would ratchet).
+    """
+    declared = float(minutes or 0.0)
+    base = int(declared * 60) if declared > 0 else _pinned_node_timeout()
+    return _cap_dispatch_timeout(base, remaining)
+
+
 # ── P1.4 per-node retry helpers ──────────────────────────────────────────────
 # Kept module-local so the dispatch_node loop stays one tight block. Each
 # helper fails soft — a missing workflow file, no outputs declared, or a
@@ -877,11 +894,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # here binds exactly this node. A node that declares no bound gets the
         # operator's pinned base back, so one node's bound never leaks into
         # the next dispatch.
-        _minutes = float(_decl.timeout_minutes or 0.0)
-        _base = int(_minutes * 60) if _minutes > 0 else _pinned_node_timeout()
         publish_env({
-            "MO_NODE_TIMEOUT_S": str(_cap_dispatch_timeout(
-                _base, _deadline_remaining if _deadline_armed else None)),
+            "MO_NODE_TIMEOUT_S": str(_node_timeout_seconds(
+                _decl.timeout_minutes,
+                _deadline_remaining if _deadline_armed else None)),
         })
     publish_env(_envelope)
     # Snapshot the tree BEFORE any implementer node edits it, so the reviewer
