@@ -144,7 +144,7 @@ Learned memory — semantic memory today, lessons and patterns next — has one 
 | `sql` | the existing `semantic_memory` / `semantic_memory_uses` tables. This is the contract the CN backend was written against, not a degraded stub |
 | `auto` (default) | CN first; SQLite whenever CN cannot serve. Writes made on the SQLite side are marked `pending_cn=1` for `mini-ork memory sync` |
 
-`mini-ork memory sync` replays writes that were made while CN was unavailable (`pending_cn=1`), idempotently — a replayed fact dedupes on content hash. Each run that reaches a terminal state writes `<run_dir>/memory-backend.json` naming the backend it used, so a run that answered from SQLite can be found afterwards. In S1 that file says `sql` unless `MO_MEMORY_BACKEND` was set explicitly, because SQLite is the store the run actually read; the fallback-reason field starts carrying a value once a live call site can fall back.
+`mini-ork memory sync` replays writes that were made while CN was unavailable (`pending_cn=1`), idempotently — a replayed fact dedupes on content hash. A run that closes through the executor writes `<run_dir>/memory-backend.json` naming the store it actually read, so a memory-poor run can be told from a memory-less one; a run parked on an unanswered ask, or killed before teardown, writes nothing. Until the lesson path moves (design §9) that file always says `sql` — with `cn_not_wired` as the reason when `MO_MEMORY_BACKEND=cn` was declared, since a backend name on a run that never used it is the lie the field exists to prevent.
 
 ## Configuration
 
