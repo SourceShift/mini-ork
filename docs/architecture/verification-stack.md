@@ -165,9 +165,11 @@ flowchart TB
 
 ## Where each instrument runs today (checked 2026-11-25)
 
-"On by default" means on inside the path that calls the instrument. Only ③,
-④ and ⑨ act on ordinary runs. The rest act only under `mini-ork certify`,
-at promotion, or when a recipe opts in, or their producer is a manual command.
+"On by default" means on inside the path that calls the instrument. ③, ④, ⑨
+and ⑩ act on ordinary runs — ⑩ only once a recipe's behavioral verifier has
+returned PROVEN, where it spends up to seven probes measuring that verifier and
+can turn the pass into an unmeasured one. The rest act only under `mini-ork
+certify`, at promotion, when a recipe opts in, or from a manual command.
 
 No instrument is left with a consumer and no producer. ⑩ *was* the last, and
 it had a second hole: its consumer (`rank_verifiers`) had no production
