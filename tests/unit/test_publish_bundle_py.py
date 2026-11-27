@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from mini_ork.publish import SCHEMA, collect_bundle, discover_run_dir
+from mini_ork.publish.bundle import _dag
 from mini_ork.publish.client import PublishError, _record_from_response
 from mini_ork.publish.redact import scan_for_secrets_obj
 
@@ -183,6 +184,112 @@ def test_dag_edges_and_status(run_dir: Path):
     assert "impl-implement.log" in by_id["implement"]["artifacts"]
     assert by_id["review"]["status"] == "failed"
     assert dag["failed_nodes"] == 1
+
+
+def _dag_for(plan: dict, run_dir: Path) -> dict:
+    return _dag(plan, {}, run_dir)
+
+
+def test_dag_projects_top_level_dependencies(tmp_path: Path):
+    """The planner records edges at the top level; the bundle must project them.
+
+    Without this the share page renders a connected plan as a disconnected
+    column, because decomposition nodes carry no ``depends_on``.
+    """
+    plan = {
+        "decomposition": [
+            {"id": "glm_lens", "node_type": "researcher", "description": "glm"},
+            {"id": "kimi_lens", "node_type": "researcher", "description": "kimi"},
+            {"id": "synthesizer", "node_type": "synthesizer", "description": "merge"},
+            {"id": "verifier", "node_type": "verifier", "description": "verify"},
+        ],
+        "dependencies": [
+            {"from": "glm_lens", "to": "synthesizer", "edge_type": "supplies_context_to"},
+            {"from": "kimi_lens", "to": "synthesizer", "edge_type": "supplies_context_to"},
+            {"from": "synthesizer", "to": "verifier", "edge_type": "gates"},
+        ],
+    }
+    dag = _dag_for(plan, tmp_path)
+    assert dag["edges"] == [
+        {"from": "glm_lens", "to": "synthesizer", "type": "supplies_context_to"},
+        {"from": "kimi_lens", "to": "synthesizer", "type": "supplies_context_to"},
+        {"from": "synthesizer", "to": "verifier", "type": "gates"},
+    ]
+    by_id = {node["id"]: node for node in dag["nodes"]}
+    assert by_id["synthesizer"]["depends_on"] == ["glm_lens", "kimi_lens"]
+    assert by_id["verifier"]["depends_on"] == ["synthesizer"]
+    assert by_id["glm_lens"]["depends_on"] == []
+    assert by_id["kimi_lens"]["depends_on"] == []
+
+
+def test_dag_top_level_edge_type_is_optional(tmp_path: Path):
+    decomposition = [
+        {"id": "scan", "node_type": "researcher", "description": "scan"},
+        {"id": "report", "node_type": "writer", "description": "write"},
+    ]
+    for edge_type in (None, ""):
+        entry = {"from": "scan", "to": "report"}
+        if edge_type is not None:
+            entry["edge_type"] = edge_type
+        dag = _dag_for({"decomposition": decomposition, "dependencies": [entry]}, tmp_path)
+        assert dag["edges"] == [{"from": "scan", "to": "report"}]
+    dag = _dag_for({
+        "decomposition": decomposition,
+        "dependencies": [{"from": "scan", "to": "report", "edge_type": "gates"}],
+    }, tmp_path)
+    assert dag["edges"] == [{"from": "scan", "to": "report", "type": "gates"}]
+
+
+def test_dag_drops_unknown_endpoints_and_dedupes(tmp_path: Path):
+    plan = {
+        "decomposition": [
+            {"id": "scan", "node_type": "researcher", "description": "scan"},
+            {"id": "report", "node_type": "writer", "description": "write",
+             "depends_on": ["scan"]},
+        ],
+        "dependencies": [
+            {"from": "ghost", "to": "report", "edge_type": "gates"},
+            {"from": "scan", "to": "phantom", "edge_type": "gates"},
+            {"from": "scan", "to": "report", "edge_type": "gates"},
+        ],
+    }
+    dag = _dag_for(plan, tmp_path)
+    assert dag["edges"] == [{"from": "scan", "to": "report"}]
+    by_id = {node["id"]: node for node in dag["nodes"]}
+    assert by_id["report"]["depends_on"] == ["scan"]
+
+
+def test_dag_tolerates_absent_null_and_nonlist_dependencies(tmp_path: Path):
+    decomposition = [
+        {"id": "scan", "node_type": "researcher", "description": "scan"},
+        {"id": "report", "node_type": "writer", "description": "write"},
+    ]
+    reference = _dag_for({"decomposition": decomposition}, tmp_path)
+    for dependencies in (None, "scan -> report", {"from": "scan", "to": "report"}, 7):
+        dag = _dag_for({"decomposition": decomposition, "dependencies": dependencies}, tmp_path)
+        assert dag["edges"] == []
+        assert dag["nodes"] == reference["nodes"]
+
+
+def test_dag_skips_malformed_dependency_entries(tmp_path: Path):
+    plan = {
+        "decomposition": [
+            {"id": "scan", "node_type": "researcher", "description": "scan"},
+            {"id": "report", "node_type": "writer", "description": "write"},
+        ],
+        "dependencies": [
+            "just a string",
+            None,
+            {"from": 7, "to": "report"},
+            {"from": "scan", "to": ["report"]},
+            {"to": "report"},
+            {"from": "scan"},
+            {"from": "scan", "to": "report", "edge_type": "gates"},
+            {"from": "scan", "to": "report", "edge_type": "gates"},
+        ],
+    }
+    dag = _dag_for(plan, tmp_path)
+    assert dag["edges"] == [{"from": "scan", "to": "report", "type": "gates"}]
 
 
 def test_a_successful_attempt_ledger_is_not_a_failure(run_dir: Path):

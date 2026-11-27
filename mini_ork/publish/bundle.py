@@ -465,11 +465,16 @@ def _dag(plan: dict[str, Any], run_verdict: dict[str, Any], run_dir: Path) -> di
             status = "done"
         else:
             status = "unknown"
+        depends_on: list[str] = []
+        for dep in item.get("depends_on") or []:
+            dep = str(dep)
+            if dep not in depends_on:
+                depends_on.append(dep)
         nodes.append({
             "id": node_id,
             "type": node_type,
             "description": _clip(str(item.get("description") or ""), MAX_DESCRIPTION_CHARS),
-            "depends_on": [str(d) for d in (item.get("depends_on") or [])],
+            "depends_on": depends_on,
             "status": status,
             "artifacts": evidence,
         })
@@ -477,6 +482,35 @@ def _dag(plan: dict[str, Any], run_verdict: dict[str, Any], run_dir: Path) -> di
         {"from": dep, "to": node["id"]}
         for node in nodes for dep in node["depends_on"] if dep in ids
     ]
+    # The planner records edges at the top level of plan.json (the canonical,
+    # richer form: it carries direction and ``edge_type``). Node-level
+    # ``depends_on`` is a lossy projection of it, so project the top level too
+    # and backfill each target node's ``depends_on`` — otherwise a plan whose
+    # nodes carry no ``depends_on`` publishes as a disconnected column.
+    nodes_by_id = {node["id"]: node for node in nodes}
+    seen_edges = {(edge["from"], edge["to"]) for edge in edges}
+    dependencies = plan.get("dependencies")
+    if isinstance(dependencies, list):
+        for entry in dependencies:
+            if not isinstance(entry, dict):
+                continue
+            source = entry.get("from")
+            target = entry.get("to")
+            if not isinstance(source, str) or not isinstance(target, str):
+                continue
+            if source not in ids or target not in ids:
+                continue
+            pair = (source, target)
+            if pair not in seen_edges:
+                seen_edges.add(pair)
+                edge: dict[str, Any] = {"from": source, "to": target}
+                edge_type = entry.get("edge_type")
+                if isinstance(edge_type, str) and edge_type:
+                    edge["type"] = edge_type
+                edges.append(edge)
+            target_node = nodes_by_id[target]
+            if source not in target_node["depends_on"]:
+                target_node["depends_on"].append(source)
     return {
         "nodes": nodes,
         "edges": edges,
