@@ -348,3 +348,22 @@ def test_publish_record_without_a_slug_raises_and_keeps_the_body():
     with pytest.raises(PublishError) as err:
         _record_from_response({"data": {}})
     assert err.value.body == {"data": {}}
+
+
+def test_transcript_budget_counts_utf8_bytes(run_dir: Path):
+    """The caps are bytes; a non-ASCII transcript must not overshoot them."""
+    (run_dir / "agent-implementer.live.jsonl").write_text(
+        json.dumps({
+            "line": json.dumps({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "é" * 100},
+                ]},
+            }),
+        }) + "\n",
+        encoding="utf-8",
+    )
+    bundle, _, _ = collect_bundle(run_dir, max_agent_bytes=80)
+    (agent,) = bundle["agents"]
+    assert agent["transcript_bytes"] <= 80
+    assert agent["truncated"] is True

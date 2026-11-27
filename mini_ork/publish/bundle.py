@@ -236,7 +236,9 @@ def _read_transcript(path: Path, budget: int) -> tuple[list[dict[str, Any]], int
             message = _normalise_message(inner)
             if message is None:
                 continue
-            size = len(json.dumps(message, ensure_ascii=False))
+            # The caps are bytes, so measure the UTF-8 encoding: counting
+            # characters would let a non-ASCII transcript overshoot the cap.
+            size = len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
             if used + size > budget:
                 truncated = True
                 break
