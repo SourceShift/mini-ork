@@ -48,6 +48,23 @@ def resolve_publish_url(base: str) -> str:
     return base + "/api/public/runs"
 
 
+def _record_from_response(data: Any, status: int | None = None) -> dict[str, Any]:
+    """Unwrap the created record from the server's response envelope.
+
+    The control plane wraps every route response in ``{"data": …}`` and the
+    console BFF forwards that body unchanged; a self-hosted endpoint may still
+    answer with the record at the top level. Accept both, and never accept a
+    body that does not name a slug.
+    """
+    if not isinstance(data, dict):
+        raise PublishError("the API returned a non-object body", status=status, body=data)
+    inner = data.get("data")
+    record: Any = inner if isinstance(inner, dict) else data
+    if not isinstance(record, dict) or not record.get("slug"):
+        raise PublishError("the API returned no slug", status=status, body=data)
+    return record
+
+
 def publish(
     bundle: dict[str, Any],
     transcripts: dict[str, list[dict[str, Any]]],
@@ -103,6 +120,4 @@ def publish(
         data = json.loads(body or b"{}")
     except ValueError:
         raise PublishError("the API returned a non-JSON body", status=status) from None
-    if not isinstance(data, dict) or not data.get("slug"):
-        raise PublishError("the API returned no slug", status=status, body=data)
-    return data
+    return _record_from_response(data, status=status)

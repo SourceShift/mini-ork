@@ -71,7 +71,10 @@ REDACTION_RULES: list[tuple[str, re.Pattern[str], str]] = [
         "auth_header",
         re.compile(
             r"(?i)\b(x-api-key|x-auth-token|authorization|cookie|set-cookie)"
-            r"\s*:\s*[^\r\n]+"
+            # The value must start with a non-space: ``Authorization:`` with an
+            # empty value leaks nothing, and requiring a real one keeps the
+            # residual scan from flagging the space our own marker left behind.
+            r"\s*:\s*[^\s\r\n][^\r\n]*"
         ),
         "[auth header redacted]",
     ),

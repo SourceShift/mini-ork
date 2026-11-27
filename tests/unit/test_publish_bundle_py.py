@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from mini_ork.publish import SCHEMA, collect_bundle, discover_run_dir
+from mini_ork.publish.client import PublishError, _record_from_response
 from mini_ork.publish.redact import scan_for_secrets_obj
 
 AGENT_LINES = [
@@ -270,3 +271,25 @@ def test_discover_run_dir_by_id_and_path(run_dir: Path):
     assert discover_run_dir(str(run_dir)).name == "run-42-1"
     with pytest.raises(FileNotFoundError):
         discover_run_dir("run-does-not-exist", home)
+
+
+# ── publish client: the record arrives inside {"data": …} ─────────────────────
+# The control plane wraps every route response, and the console BFF forwards
+# that body unchanged. The first real publish created the row and still failed
+# at the CLI ("the API returned no slug") because only a top-level slug was
+# read — a successful upload reported as a failure. These pin the unwrap.
+
+
+def test_publish_record_is_unwrapped_from_the_data_envelope():
+    record = _record_from_response({"data": {"slug": "abc", "url": "https://x/r/abc"}})
+    assert record["slug"] == "abc"
+
+
+def test_publish_record_accepts_a_top_level_body():
+    assert _record_from_response({"slug": "abc"})["slug"] == "abc"
+
+
+def test_publish_record_without_a_slug_raises_and_keeps_the_body():
+    with pytest.raises(PublishError) as err:
+        _record_from_response({"data": {}})
+    assert err.value.body == {"data": {}}
