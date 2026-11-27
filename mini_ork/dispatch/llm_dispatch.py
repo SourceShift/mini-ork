@@ -356,6 +356,11 @@ def _effective_lanes(root: str, home: str) -> dict | None:
     with no file written per call. Reading the template alone ignored the
     overlay, so a user's lane choice never reached the dispatch chain.
 
+    Above the overlay sits the RUN-SCOPED pin (``MO_LANE_OVERRIDES`` and the
+    ``lane_pins`` the snapshot records beside it): a launch-time assignment is
+    more specific than the operator's default and must survive the overlay
+    merge, both while the env is set and after it is gone (resume/recover).
+
     An unreadable template stays fail-open (None, as before). A broken overlay
     raises ``ValueError`` naming the file: it is the user's own lane choice, and
     skipping it would route their nodes to the team default without a trace.
@@ -363,11 +368,12 @@ def _effective_lanes(root: str, home: str) -> dict | None:
     from mini_ork.dispatch import agents_config
 
     tmpl = ""
+    snapshot = ""
     run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
     if run_dir:
         candidate = os.path.join(run_dir, "config", "agents.yaml")
         if os.path.isfile(candidate):
-            tmpl = candidate
+            tmpl = snapshot = candidate
     if not tmpl and home:
         candidate = os.path.join(home, "config", "agents.yaml")
         if os.path.isfile(candidate):
@@ -393,10 +399,29 @@ def _effective_lanes(root: str, home: str) -> dict | None:
         if over_p is None:
             return None
         base = {}
+    # Read the run's pins BEFORE the overlay merge. The snapshot is a copy of
+    # the merged effective file, so ``lanes`` alone cannot say whether an alias
+    # came from the overlay or from ``MO_LANE_OVERRIDES``. ``lane_pins`` records
+    # the launch-time assignment explicitly (config_resolve writes it), which is
+    # what lets a resume/recover process — one without the env — keep the pins
+    # instead of letting the overlay merge below silently revert them.
+    pins: dict[str, str] = {}
+    if snapshot and isinstance(base.get("lane_pins"), dict):
+        pins = {str(k): str(v) for k, v in base["lane_pins"].items()
+                if k is not None and v is not None and str(v).strip()}
     if over_p is not None:
         base = agents_config.merge(base, agents_config._load_yaml(over_p))
     lanes = base.get("lanes")
-    return lanes if isinstance(lanes, dict) else {}
+    out = dict(lanes) if isinstance(lanes, dict) else {}
+    # Run-scoped assignment is the MOST specific layer: a launch-time pin
+    # (``board start --lane`` / ``$MO_LANE_OVERRIDES``) names the lane THIS run
+    # must use, while the per-user overlay is only the operator's default. The
+    # pin was dropped here before, so lane preflight and the dispatcher probed
+    # the overlay's dead lane and blocked a run whose lane had been overridden.
+    out.update(pins)
+    from mini_ork.dispatch import config_resolve  # local: config_resolve imports agents_config
+    out.update(config_resolve.lane_overrides())
+    return out
 
 
 def resolve_lane_model(node_type, root, home) -> str:

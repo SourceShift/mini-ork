@@ -75,3 +75,93 @@ def test_malformed_pairs_are_dropped_not_raised(monkeypatch) -> None:
 def test_no_env_means_no_overrides(monkeypatch) -> None:
     monkeypatch.delenv(config_resolve.LANE_OVERRIDES_ENV, raising=False)
     assert config_resolve.lane_overrides() == {}
+
+
+# ── the pin must survive the resolvers, not just the snapshot write ───────
+
+
+def _resolver_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                   overlay: str) -> tuple[Path, Path]:
+    """Home with template + personal overlay, and one run dir."""
+    home = tmp_path / "proj" / ".mini-ork"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "agents.yaml").write_text(
+        "lanes:\n  kimi_lens: minimax\n  minimax_lens: minimax\n", encoding="utf-8")
+    (home / "config" / "agents.local.yaml").write_text(overlay, encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(home))
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("MINI_ORK_AGENTS", raising=False)
+    return home, run_dir
+
+
+def test_snapshot_records_the_pinned_aliases(tree, monkeypatch) -> None:
+    """The snapshot names what was pinned, so a resolver can re-apply it."""
+    _home, run_dir = tree
+    monkeypatch.setenv(config_resolve.LANE_OVERRIDES_ENV, "worker=glm")
+    body = _snapshot(run_dir)
+    assert "lane_pins:" in body
+    assert "worker: glm" in body
+
+
+def test_env_override_beats_the_personal_overlay(tmp_path, monkeypatch) -> None:
+    """THE regression: the overlay used to win over the run-scoped pin.
+
+    ``_effective_lanes`` merges ``agents.local.yaml`` over the run snapshot, so
+    a pin that only landed in ``lanes`` was reverted — lane preflight then
+    probed the overlay's (dead) lane and blocked a run whose lane had been
+    overridden. The pin is the most specific layer and must win both here and
+    in ``resolve_lane_family`` (preflight reads the same function).
+    """
+    from mini_ork.dispatch import llm_dispatch
+
+    _home, run_dir = _resolver_tree(
+        tmp_path, monkeypatch,
+        "lanes:\n  kimi_lens: minimax\n  minimax_lens: minimax\n")
+    monkeypatch.setenv(config_resolve.LANE_OVERRIDES_ENV,
+                       "kimi_lens=opus,minimax_lens=deepseek_flash")
+    config_resolve.snapshot_run_config(str(run_dir))
+
+    lanes = llm_dispatch._effective_lanes("", "") or {}
+    assert lanes["kimi_lens"] == "opus", lanes
+    assert lanes["minimax_lens"] == "deepseek_flash", lanes
+    # resolve_lane_family is the preflight's entry point — same answer.
+    assert llm_dispatch.resolve_lane_family("kimi_lens", "", "") == "opus"
+
+
+def test_snapshot_pins_survive_without_the_env(tmp_path, monkeypatch) -> None:
+    """A resume/recover process does not carry ``MO_LANE_OVERRIDES``.
+
+    The pins recorded in the snapshot are what keeps the re-dispatched run on
+    the lanes it was launched with, instead of falling back to the overlay.
+    """
+    from mini_ork.dispatch import llm_dispatch
+
+    _home, run_dir = _resolver_tree(
+        tmp_path, monkeypatch,
+        "lanes:\n  kimi_lens: minimax\n  minimax_lens: minimax\n")
+    monkeypatch.setenv(config_resolve.LANE_OVERRIDES_ENV, "kimi_lens=opus")
+    config_resolve.snapshot_run_config(str(run_dir))
+    monkeypatch.delenv(config_resolve.LANE_OVERRIDES_ENV, raising=False)
+
+    lanes = llm_dispatch._effective_lanes("", "") or {}
+    assert lanes["kimi_lens"] == "opus", lanes
+    # Unpinned aliases still come from the overlay.
+    assert lanes["minimax_lens"] == "minimax", lanes
+
+
+def test_no_pin_leaves_the_overlay_in_charge(tmp_path, monkeypatch) -> None:
+    """Without a run-scoped pin the overlay keeps winning — unchanged."""
+    from mini_ork.dispatch import llm_dispatch
+
+    _home, run_dir = _resolver_tree(
+        tmp_path, monkeypatch,
+        "lanes:\n  kimi_lens: deepseek_flash\n")
+    monkeypatch.delenv(config_resolve.LANE_OVERRIDES_ENV, raising=False)
+    config_resolve.snapshot_run_config(str(run_dir))
+
+    lanes = llm_dispatch._effective_lanes("", "") or {}
+    assert lanes["kimi_lens"] == "deepseek_flash", lanes
+    assert lanes["minimax_lens"] == "minimax", lanes

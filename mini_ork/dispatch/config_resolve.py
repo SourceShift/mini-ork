@@ -148,6 +148,16 @@ def _apply_lane_overrides(dest: str) -> None:
         return
     lanes = doc.get("lanes")
     doc["lanes"] = {**(lanes if isinstance(lanes, dict) else {}), **overrides}
+    # Record WHICH aliases were pinned, not just their values, so a later
+    # resolver can put them back on top of the per-user overlay. The snapshot
+    # is copied from the merged effective file (template + overlay), so a bare
+    # ``lanes.kimi_lens: opus`` here is indistinguishable from the overlay's own
+    # value — and ``llm_dispatch._effective_lanes`` merges the overlay over the
+    # snapshot, which silently reverted every pin on a RE-DISPATCH (resume,
+    # recover) that does not carry ``MO_LANE_OVERRIDES`` in its environment.
+    # With the pins named, the override survives the same way the env does.
+    pins = doc.get("lane_pins")
+    doc["lane_pins"] = {**(pins if isinstance(pins, dict) else {}), **overrides}
     try:
         with open(dest, "w", encoding="utf-8") as fh:
             yaml.safe_dump(doc, fh, sort_keys=True)
