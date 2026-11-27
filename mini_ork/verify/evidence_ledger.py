@@ -94,13 +94,21 @@ def tree_hash(target_repo: str, *, timeout: float = DEFAULT_GIT_TIMEOUT_S) -> st
             # re-hash only changed files. From an empty index every file is
             # re-hashed, which took >30 s on the researcher repo and timed out.
             # It also keeps force-added tracked files a fresh index would drop.
+            #
+            # ``copy2``, not ``copyfile``: the index file's own mtime is the
+            # clock git's racy-git rule compares entries against. A copy that
+            # took "now" as its mtime makes every entry look safely older than
+            # the index, which disables the re-hash that protects a file edited
+            # within the filesystem's timestamp granularity — on a coarse (one
+            # second) clock a same-size edit then hashes to the *old* tree, and
+            # an approval is backed by a tree the working copy never had.
             real = subprocess.run(["git", "-C", target_repo, "rev-parse", "--git-path", "index"],
                                   timeout=timeout, capture_output=True, text=True)
             real_index = real.stdout.strip() if real.returncode == 0 else ""
             if real_index and not os.path.isabs(real_index):
                 real_index = os.path.join(target_repo, real_index)
             if real_index and os.path.isfile(real_index):
-                shutil.copyfile(real_index, tmp_index)
+                shutil.copy2(real_index, tmp_index)
             subprocess.run(["git", "-C", target_repo, "add", "-A"], env=env,
                            timeout=timeout, check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

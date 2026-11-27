@@ -108,6 +108,33 @@ def test_tree_hash_changes_on_edit_and_untracked(tmp_path: Path) -> None:
     assert h1 == _git(r, "rev-parse", "HEAD^{tree}")
 
 
+def test_tree_hash_sees_a_same_size_edit_within_one_clock_tick(tmp_path: Path) -> None:
+    """A stat cache may not hide an edit the filesystem clock cannot separate.
+
+    ``tree_hash`` seeds its temp index from the real one for speed, so its
+    correctness rests on git's racy-git rule: an entry not strictly older than
+    the index's own mtime is re-hashed by content. ``core.checkStat=minimal``
+    plus a restored mtime is the coarse-clock case — a same-size edit inside a
+    single timestamp tick — where that rule is the only thing that can see the
+    change. When the index copy reset the clock, the hash came back as the
+    *pre-edit* tree and a ledger row for the old tree stayed valid (CI run
+    46032943534, `test_valid_rows_void_after_edit`).
+    """
+    r = _repo(tmp_path)
+    _git(r, "config", "core.checkStat", "minimal")
+    before = os.stat(r / "a.py")
+    h1 = el.tree_hash(str(r))
+    # The index is written by the commit above. Let the clock advance past it:
+    # the bug needs the temp index to be *newer* than its entries, which only a
+    # copy that takes "now" as its mtime can be. Preserving the mtime keeps the
+    # entries racy instead, and a racy entry is re-hashed by content.
+    time.sleep(1.1)
+    (r / "a.py").write_text("x = 2\n")          # same size as "x = 1\n"
+    os.utime(r / "a.py", ns=(before.st_atime_ns, before.st_mtime_ns))
+    h2 = el.tree_hash(str(r))
+    assert h1 != h2
+
+
 def test_tree_hash_leaves_index_and_status_untouched(tmp_path: Path) -> None:
     r = _repo(tmp_path)
     (r / "a.py").write_text("x = 2\n")
