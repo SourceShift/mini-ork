@@ -72,6 +72,10 @@ _NATIVE_SUBS = {
     # `mini-ork settle <run_id>` runs the rubric/gradient/pattern channels
     # afterwards. Added here for the same reason as `fallbacks`.
     "settle",
+    # Publish a finished run to the console's public share page. Native and
+    # importable as `mini_ork.cli.publish`, so it belongs in this set rather
+    # than `_NATIVE_MODULE_SUBS` (whose exact mapping is pinned).
+    "publish",
 }
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this
