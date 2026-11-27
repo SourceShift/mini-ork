@@ -128,11 +128,15 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     if args.out:
-        Path(args.out).expanduser().write_text(
-            json.dumps({"bundle": bundle, "transcripts": transcripts},
-                       ensure_ascii=False, indent=1),
-            encoding="utf-8",
-        )
+        try:
+            Path(args.out).expanduser().write_text(
+                json.dumps({"bundle": bundle, "transcripts": transcripts},
+                           ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        except OSError as err:
+            print(f"publish: cannot write {args.out}: {err}", file=sys.stderr)
+            return 3
 
     run = bundle["run"]
     summary = {

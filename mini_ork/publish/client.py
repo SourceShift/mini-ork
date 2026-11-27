@@ -17,6 +17,7 @@ Both carry the same body; only the path differs.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -115,6 +116,11 @@ def publish(
                            body=parsed) from None
     except urllib.error.URLError as err:
         raise PublishError(f"cannot reach {resolve_publish_url(api_url)}: {err.reason}") from None
+    except (TimeoutError, OSError, http.client.HTTPException) as err:
+        # The connection opened but the response did not arrive intact. The
+        # row may or may not exist server-side; say what happened, not a
+        # traceback, and let the operator decide whether to retry.
+        raise PublishError(f"the response was cut off after upload: {err}") from None
 
     try:
         data = json.loads(body or b"{}")

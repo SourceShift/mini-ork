@@ -244,6 +244,61 @@ def test_no_transcripts_flag_keeps_summaries_only(run_dir: Path):
     assert agent["transcript_messages"] == 0
 
 
+def test_no_transcripts_still_summarises_the_conversation(run_dir: Path):
+    """``--no-transcripts`` drops the conversation, not the facts about it."""
+    bundle, _, _ = collect_bundle(run_dir, include_transcripts=False)
+    (agent,) = bundle["agents"]
+    assert agent["turns"] >= 1
+    assert agent["tool_calls"] >= 1
+    assert agent["model"]
+    assert agent["cost_usd"] == 0.5
+    assert bundle["run"]["cost_usd"] == 0.5
+
+
+def test_live_and_stream_captures_do_not_duplicate_an_agent(run_dir: Path):
+    """A lane may leave both; they are one conversation, not two agents."""
+    (run_dir / "agent-implementer.stream.jsonl").write_text(
+        json.dumps({
+            "line": json.dumps({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "FROM THE STREAM CAPTURE"},
+                ]},
+            }),
+        }) + "\n",
+        encoding="utf-8",
+    )
+    bundle, transcripts, _ = collect_bundle(run_dir)
+    assert [a["id"] for a in bundle["agents"]].count("implementer") == 1
+    assert "FROM THE STREAM CAPTURE" not in json.dumps(transcripts["implementer"])
+
+
+def test_a_lane_warning_in_execute_log_is_not_a_node_failure(run_dir: Path):
+    """The log is prose; only the verdict's own failure count makes it evidence."""
+    _write(run_dir / "execute.log",
+           "node=review retry exhausted\n"
+           "node=implement lane-quota warning: error budget low\n")
+    bundle, _, _ = collect_bundle(run_dir)
+    by_id = {node["id"]: node for node in bundle["dag"]["nodes"]}
+    assert by_id["review"]["status"] == "failed"
+    assert by_id["implement"]["status"] == "done"
+
+
+def test_a_clean_verdict_is_not_overridden_by_the_execute_log(run_dir: Path):
+    _write(run_dir / "run-verdict.json", {
+        "verdict": "pass",
+        "failed_nodes": 0,
+        "levels": {"L1": "pass"},
+        "levels_ok": True,
+        "levels_decision": "publish",
+    })
+    (run_dir / "retry-exhausted" / "review.error.json").unlink()
+    _write(run_dir / "execute.log", "node=implement error: lane quota exceeded (retrying)\n")
+    bundle, _, _ = collect_bundle(run_dir)
+    assert all(node["status"] != "failed" for node in bundle["dag"]["nodes"])
+    assert bundle["dag"]["failed_nodes"] == 0
+
+
 def test_agent_budget_truncates_with_a_marked_notice(run_dir: Path):
     bundle, transcripts, _ = collect_bundle(run_dir, max_agent_bytes=200)
     (agent,) = bundle["agents"]

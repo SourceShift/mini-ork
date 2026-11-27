@@ -38,6 +38,11 @@ MAX_DESCRIPTION_CHARS = 1_500
 MAX_KICKOFF_CHARS = 3_000
 
 _AGENT_GLOB = re.compile(r"^agent-(?P<role>[A-Za-z0-9_.\-]+)\.(?:live|stream)\.jsonl$")
+
+# Read budget for the summary-only pass (``--no-transcripts``). It is not a
+# shipping cap — nothing of it leaves the process — so it is generous enough
+# that a real transcript is never summarised from a truncated read.
+_SUMMARY_BUDGET = 64 * 1024 * 1024
 _ISSUE_URL_RE = re.compile(
     r"https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/(?:issues|pull)/\d+"
 )
@@ -247,7 +252,16 @@ def _read_transcript(path: Path, budget: int) -> tuple[list[dict[str, Any]], int
 
 
 def _agent_files(run_dir: Path) -> list[tuple[str, Path]]:
-    found: list[tuple[str, Path]] = []
+    """One file per agent role, live sidecar preferred over the stream capture.
+
+    A lane can leave both ``agent-x.live.jsonl`` (the sidecar the run writes)
+    and ``agent-x.stream.jsonl`` (the provider's raw stream) for the same role.
+    They are two views of one conversation, so emitting both would duplicate
+    the agent *and* let the second overwrite the first in the transcripts map.
+    The sidecar is the normalised view and wins; the stream capture is used
+    only when no sidecar exists.
+    """
+    chosen: dict[str, Path] = {}
     for path in sorted(run_dir.glob("agent-*.jsonl")):
         m = _AGENT_GLOB.match(path.name)
         if not m:
@@ -255,10 +269,14 @@ def _agent_files(run_dir: Path) -> list[tuple[str, Path]]:
         role = m.group("role")
         if role.startswith("post-run"):
             continue
-        found.append((role, path))
         # ``agent-x.live.jsonl.1`` continuation files are merged by the
         # ``.1`` suffix on the role; keep them adjacent to the base role.
-    return found
+        current = chosen.get(role)
+        if current is None or (
+            path.name.endswith(".live.jsonl") and not current.name.endswith(".live.jsonl")
+        ):
+            chosen[role] = path
+    return sorted(chosen.items())
 
 
 def _continuation_files(run_dir: Path, role: str) -> list[Path]:
@@ -403,13 +421,22 @@ def _failed_node_ids(run_dir: Path, run_verdict: dict[str, Any]) -> set[str]:
             node = str(data.get("node_id") or path.name.split(".json", 1)[0])
             if node:
                 failed.add(node)
-    log = _read_text(run_dir / "execute.log")
-    for match in re.finditer(
-        r"(?im)^.*\bnode[=:\s]+[\"']?([A-Za-z0-9_.\-]+)[\"']?\b.*"
-        r"\b(?:fail|failed|error|abort|aborted)\b.*$",
-        log,
-    ):
-        failed.add(match.group(1))
+    # ``execute.log`` is a human log, not a verdict: a line that names a node
+    # and mentions an error (a lane-quota warning, a retried error) is not a
+    # failure. Only consult it when the verdict itself counted failed node(s),
+    # and never name more nodes than that count.
+    counted = run_verdict.get("failed_nodes")
+    limit = counted if isinstance(counted, int) and counted > 0 else 0
+    if limit:
+        log = _read_text(run_dir / "execute.log")
+        for match in re.finditer(
+            r"(?im)^.*\bnode[=:\s]+[\"']?([A-Za-z0-9_.\-]+)[\"']?\b.*"
+            r"\b(?:fail|failed|error|abort|aborted)\b.*$",
+            log,
+        ):
+            if len(failed) >= limit:
+                break
+            failed.add(match.group(1))
     return failed
 
 
@@ -518,7 +545,8 @@ def collect_bundle(
     total_transcript_bytes = 0
     for role, path in _agent_files(run_dir):
         budget = max(0, min(max_agent_bytes, max_total_bytes - total_transcript_bytes))
-        messages, used, truncated = ([], 0, False)
+        messages: list[dict[str, Any]] = []
+        used, truncated = 0, False
         if include_transcripts and budget > 0:
             messages, used, truncated = _read_transcript(path, budget)
             for extra in _continuation_files(run_dir, role):
@@ -529,7 +557,11 @@ def collect_bundle(
                 messages.extend(more)
                 used += more_used
                 truncated = truncated or more_trunc
-        total_transcript_bytes += used
+            total_transcript_bytes += used
+        else:
+            # The summary describes the run, not the payload: turns, model and
+            # cost are read even when the conversation itself is not shipped.
+            messages, _, _ = _read_transcript(path, _SUMMARY_BUDGET)
         summary = _summarise_messages(messages)
         agent_id = _normalise(role)
         if include_transcripts and messages:
@@ -543,7 +575,7 @@ def collect_bundle(
             "cost_usd": summary["cost_usd"],
             "duration_ms": summary["duration_ms"],
             "transcript_bytes": used,
-            "transcript_messages": len(messages),
+            "transcript_messages": len(messages) if include_transcripts else 0,
             "truncated": truncated,
         })
 

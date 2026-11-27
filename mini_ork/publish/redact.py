@@ -176,6 +176,15 @@ SENSITIVE_KEY_RE = re.compile(
     r"|client[_-]?secret|private[_-]?key|signing[_-]?key|x-api-key"
     r"|anthropic_api_key|openai_api_key|minimax_api_key|glm_api_key"
     r"|deepseek_api_key|openrouter_api_key|cookie|set-cookie"
+    # Shapes the first list missed: a bare token, a qualified one
+    # (``github_token``), and values that carry a whole credential inside.
+    # Over-dropping a harmless value is the safe direction; the shape of the
+    # bundle survives because the key stays.
+    r"|token|bearer|passphrase|credentials"
+    r"|(?:[a-z0-9]+[_-])+token"
+    r"|(?:api|auth|access|secret|signing|private|client|encryption|github"
+    r"|gitlab|npm|slack|openai|anthropic|db|database)[_-](?:key|token|password|passwd)"
+    r"|database[_-]?url|db[_-]?url|dsn|connection[_-]?string|redis[_-]?url"
     r")$"
 )
 

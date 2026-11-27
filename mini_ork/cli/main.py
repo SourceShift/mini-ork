@@ -223,6 +223,9 @@ Lifecycle:
   why <run> <node>               Provenance for one node's artifact: the lane it
                                    asked for, the lane that served it, the route
                                    reason, the chain walked and the memory injected
+  publish <run> [--dry-run]      Share a finished run as a redacted public page
+                                   (builds, scrubs, re-scans; uploads only when
+                                   nothing matches a secret rule)
   recipe-eval                    Static evaluation of recipe definitions (style
                                    score; never gates)
   recipes check [<recipe>...]    Recipe integrity: every prompt_ref / verifier_ref

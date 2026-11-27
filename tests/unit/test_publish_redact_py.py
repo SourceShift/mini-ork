@@ -148,3 +148,22 @@ def test_json_escaped_newlines_do_not_create_false_auth_headers():
     blob = json.dumps(cleaned)
     assert "abcdefghijklmnopqrstuvwxyz" not in blob
     assert scan_for_secrets_obj(cleaned) == []
+
+
+def test_credential_shaped_keys_lose_their_value():
+    """Keys a config actually uses, not just the names in the first list."""
+    payload = {
+        "db_password": "hunter2",
+        "github_token": "abcdef",
+        "database_url": "postgres://u:p@h/db",
+        "token": "short-value",
+        "dsn": "host=db user=u password=p",
+        "OPENAI_API_KEY": "sk-x",
+    }
+    cleaned = redact_value(payload)
+    assert all(value == "[redacted]" for value in cleaned.values())
+
+
+def test_a_benign_key_keeps_its_value():
+    payload = {"max_tokens": 200, "tokens_used": 12, "sort_key": "created_at"}
+    assert redact_value(payload) == payload
