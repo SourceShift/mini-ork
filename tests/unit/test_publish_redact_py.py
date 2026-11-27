@@ -41,11 +41,11 @@ def test_aws_google_slack_and_jwt_are_replaced():
 
 
 def test_private_key_block_is_redacted_whole():
-    text = (
-        "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n"
-        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n"
-        "-----END OPENSSH PRIVATE KEY-----\nafter"
-    )
+    # One source line: a PEM split across adjacent literals makes the scanner's
+    # matched span include the Python quoting and indentation between them,
+    # which is a property of this file's layout rather than of the fixture.
+    pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END OPENSSH PRIVATE KEY-----"
+    text = "before\n" + pem + "\nafter"
     cleaned = redact_text(text)
     assert "BEGIN OPENSSH" not in cleaned
     assert "before" in cleaned and "after" in cleaned

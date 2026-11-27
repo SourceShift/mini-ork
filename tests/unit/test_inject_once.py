@@ -229,6 +229,17 @@ def test_v2_arm_with_empty_pack_still_omits_the_v1_themes(env, monkeypatch):
     assert block.count(PATTERN_LESSON_1) == 1
 
 
+def _today_block(reference: str) -> str:
+    """Today's v1 block as ``_learned_block`` renders it.
+
+    Every non-empty learned block also carries the one-line memory backend
+    statement (design of record §5), so "byte-identical" means today's block
+    plus that constant suffix — the arms must not differ in the lessons.
+    """
+    return ("\n\n" + reference + "\n"
+            + context_assembler.memory_backend_statement() + "\n")
+
+
 def test_holdout_arm_is_byte_identical_to_include_themes_true(env, monkeypatch):
     db, _run_dir = env
     monkeypatch.setenv("MO_CONTEXT_V2", "on")
@@ -240,7 +251,7 @@ def test_holdout_arm_is_byte_identical_to_include_themes_true(env, monkeypatch):
     reference = context_assembler.failure_modes_md(
         TASK_CLASS, 5, db=db, node_type="implementer",
         include_themes=True).strip()
-    assert node_block == "\n\n" + reference + "\n"
+    assert node_block == _today_block(reference)
     assert node_block.count(THEME_LESSON_1) == 1
     assert node_block.count(THEME_LESSON_2) == 1
 
@@ -257,7 +268,7 @@ def test_non_v2_arms_are_byte_identical_to_today(env, monkeypatch, mode):
     reference = context_assembler.failure_modes_md(
         TASK_CLASS, 5, db=db, node_type="implementer",
         include_themes=True).strip()
-    assert node_block == "\n\n" + reference + "\n"
+    assert node_block == _today_block(reference)
     assert node_block.count(THEME_LESSON_1) == 1
     assert node_block.count(THEME_LESSON_2) == 1
 

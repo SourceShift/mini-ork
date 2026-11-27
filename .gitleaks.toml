@@ -41,6 +41,15 @@ regexes = [
   '''^abcdef123456$''',
   '''^Zk4Qm9vRt2Xb7Lp0Ws3Nh6Yc8Jd1fA5gE2uT$''',
   '''^0123456789abcdef$''',
+  # The publish-redaction fixtures in `test_publish_redact_py.py`: the GCP key
+  # in `test_aws_google_slack_and_jwt_are_replaced` and the OpenSSH block in
+  # `test_private_key_block_is_redacted_whole`, both of which must be scrubbed.
+  # Each is a single source line, so the scanner's span is the value itself —
+  # no quoting or indentation — and the anchor below is the whole fixture. The
+  # PEM body is long enough for the default private-key rule to fire, so this
+  # exemption is exercised by `make secrets`, not assumed.
+  '''^AIzaSyA1234567890abcdefghijklmnopqrstuv$''',
+  '''^-----BEGIN OPENSSH PRIVATE KEY-----\\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\n-----END OPENSSH PRIVATE KEY-----$''',
 ]
 
 # 2. Public client-side analytics keys.
